@@ -5,8 +5,7 @@
 /** Auth strategies for the Gemini API. */
 export type AuthProfile =
   | { kind: 'api-key'; apiKey: string }
-  | { kind: 'vertex'; project: string; location: string }
-  | { kind: 'adc' };
+  | { kind: 'vertex'; project: string; location: string };
 
 /** Resolved model info returned from the registry. */
 export interface ResolvedModel {

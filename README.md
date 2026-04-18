@@ -1,7 +1,7 @@
 # `@qmediat.io/gemini-code-context-mcp`
 
 > **Give Claude Code persistent memory of your codebase, backed by Gemini's 2M-token context.**
-> Turn repeat code-review queries from **~45 s into ~2 s** — same codebase, same answers, a fraction of the cost.
+> Turn repeat code-review queries into second-scale responses — same codebase, same answers, a fraction of the cost.
 
 [![npm version](https://img.shields.io/npm/v/@qmediat.io/gemini-code-context-mcp.svg)](https://www.npmjs.com/package/@qmediat.io/gemini-code-context-mcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
@@ -19,7 +19,7 @@ An MCP (Model Context Protocol) server that wraps Google's Gemini API with **per
 | Maintenance | Abandoned (last release 2025-07) |Actively maintained |
 | Default model | Hardcoded `gemini-3.1-pro-preview` |Dynamic `latest-pro` alias — auto-upgrades with every Gemini release |
 | Backend | Shells out to `gemini` CLI (~200 ms spawn overhead) |Direct `@google/genai` SDK |
-| Repeat queries | Re-sends entire codebase every call (~45 s) |**Files API + Context Cache** (~2 s, ~25 % of input cost) |
+| Repeat queries | Re-sends entire codebase every call |**Files API + Context Cache** — repeat queries reuse the indexed codebase, cached input tokens billed at ~25 % of the uncached rate |
 | Coding delegation | Legacy prompt-injection `changeMode` |Native `thinkingConfig` + optional `codeExecution` |
 | Auth | Key in `~/.claude.json` env var |3-tier: ADC / credentials file (chmod 0600) / env var (+ warning) |
 | Cost control | — |Daily budget cap in USD (`GEMINI_DAILY_BUDGET_USD`) |
@@ -127,7 +127,7 @@ Full threat model + incident response: [`docs/security.md`](./docs/security.md).
 
 ## Cost model
 
-Typical savings vs uncached usage on a 500 k-token repo with 20 queries/day: **~64 % lower spend** with cache enabled, plus 20× faster response on repeats.
+Projected savings vs uncached usage on a 500 k-token repo with 20 queries/day: up to **~60 % lower spend** with cache enabled, with repeat-query latency typically an order of magnitude lower than the first (uncached) call. Actual numbers depend on repo size, TTL, and query volume — we'll publish measured benchmarks after the first real-world deployments.
 
 Per-tool cost breakdown, free-tier guidance, and all the knobs: [`docs/cost-model.md`](./docs/cost-model.md).
 

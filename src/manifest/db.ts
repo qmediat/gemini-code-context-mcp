@@ -199,15 +199,25 @@ export class ManifestDb {
 
   /** Find a file ID for a content hash already uploaded (dedupe helper). */
   findFileIdByHash(workspaceRoot: string, contentHash: string, nowMs: number): string | null {
+    const row = this.findFileRowByHash(workspaceRoot, contentHash, nowMs);
+    return row?.fileId ?? null;
+  }
+
+  /**
+   * Find the full row (including original uploadedAt/expiresAt) for a content hash.
+   * Used by the uploader reuse path to preserve Google's original upload clock
+   * — Google's 48 h auto-delete timer starts at the ORIGINAL upload, not at reuse.
+   */
+  findFileRowByHash(workspaceRoot: string, contentHash: string, nowMs: number): FileRow | null {
     const row = this.db
       .prepare(
-        `SELECT file_id FROM files
+        `SELECT * FROM files
          WHERE workspace_root = ? AND content_hash = ? AND file_id IS NOT NULL
            AND (expires_at IS NULL OR expires_at > ?)
          LIMIT 1`,
       )
-      .get(workspaceRoot, contentHash, nowMs) as { file_id: string | null } | undefined;
-    return row?.file_id ?? null;
+      .get(workspaceRoot, contentHash, nowMs) as Record<string, unknown> | undefined;
+    return row ? rowToFile(row) : null;
   }
 
   insertUsageMetric(metric: UsageMetricRow): void {

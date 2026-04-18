@@ -2,6 +2,8 @@
 
 Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by caching. Here's how billing actually works and what knobs you have.
 
+> **Rates verified 2026-04-18.** Google updates prices without notice — always cross-check at [ai.google.dev/pricing](https://ai.google.dev/pricing). You can override defaults at runtime via `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) without waiting for a patch release.
+
 ## What Gemini bills for
 
 | Line item | Typical rate |

@@ -10,14 +10,12 @@ export function createGeminiClient(profile: AuthProfile): GoogleGenAI {
     case 'api-key':
       return new GoogleGenAI({ apiKey: profile.apiKey });
     case 'vertex':
+      // Vertex path implicitly uses ADC (gcloud application-default credentials).
+      // Set GEMINI_USE_VERTEX=true + GOOGLE_CLOUD_PROJECT to route through here.
       return new GoogleGenAI({
         vertexai: true,
         project: profile.project,
         location: profile.location,
       });
-    case 'adc':
-      // SDK picks up GOOGLE_APPLICATION_CREDENTIALS automatically when vertexai=true
-      // is NOT set; this branch is reserved for non-Vertex ADC flows when Google adds support.
-      return new GoogleGenAI({});
   }
 }

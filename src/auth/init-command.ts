@@ -15,20 +15,25 @@ import { credentialsPath, qmediatConfigDir } from '../utils/paths.js';
 import { saveProfile } from './credentials-store.js';
 import { fingerprint } from './fingerprint.js';
 
-type AuthMethod = 'api-key' | 'vertex' | 'adc';
+type AuthMethod = 'api-key' | 'vertex';
 
 async function askHidden(prompt: string): Promise<string> {
-  // Minimal password-style input: echo '*' for each char. Falls back to echo on
-  // platforms where stdin isn't a TTY.
+  // Refuse to read secrets when stdin is not a TTY. Piped input (`echo $KEY | init`)
+  // leaves the key in shell history, pipe buffers, and screen-recorded CI logs.
+  // Non-interactive environments should use GEMINI_API_KEY env var or Vertex ADC.
   if (!input.isTTY) {
-    const rl = createInterface({ input, output, terminal: false });
-    try {
-      return await rl.question(`${prompt} `);
-    } finally {
-      rl.close();
-    }
+    throw new Error(
+      [
+        'Cannot read a secret without a TTY (stdin is piped or redirected).',
+        'To avoid leaking your key via shell history / CI logs, pick one of:',
+        '  1. Run `init` in an interactive terminal.',
+        '  2. Skip `init` and set GEMINI_API_KEY as an env var in your MCP host config (Tier 3, logs a warning).',
+        '  3. Use Vertex: `gcloud auth application-default login` + GEMINI_USE_VERTEX=true + GOOGLE_CLOUD_PROJECT.',
+      ].join('\n'),
+    );
   }
 
+  // Interactive TTY path: echo '*' for each char so users can verify length without leaking content.
   output.write(`${prompt} `);
   return await new Promise<string>((resolve) => {
     let buf = '';
@@ -106,11 +111,13 @@ export async function runInit(): Promise<void> {
 
     const methodInput = (
       await rl.question(
-        'Auth method? [1] API key (recommended for Gemini Developer API), [2] Vertex AI, [3] ADC only  [1]: ',
+        'Auth method? [1] API key (Gemini Developer API), [2] Vertex AI (enterprise GCP)  [1]: ',
       )
     ).trim();
-    const method: AuthMethod =
-      methodInput === '2' ? 'vertex' : methodInput === '3' ? 'adc' : 'api-key';
+    const method: AuthMethod = methodInput === '2' ? 'vertex' : 'api-key';
+    // Note: raw ADC without Vertex is not a supported path — @google/genai expects
+    // either an API key or a Vertex configuration. Users who want ADC should pick
+    // option 2 and let the SDK pick up GOOGLE_APPLICATION_CREDENTIALS automatically.
 
     const profileInput = (await rl.question('Profile name [default]: ')).trim();
     const profileName = profileInput.length > 0 ? profileInput : 'default';

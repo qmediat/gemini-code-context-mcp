@@ -9,7 +9,7 @@ Your Gemini API key and your workspace content. We treat them with different thr
 - **Never logged.** Only the first 4 and last 4 characters appear in logs (`AIza...xyz9`).
 - **Never stored in MCP host config.** Your `~/.claude.json` (or equivalent) references the profile name, not the key itself.
 - **Stored at rest with `chmod 0600`.** `~/.config/qmediat/credentials` is enforced file-only readable. The parent directory (`~/.config/qmediat`) is enforced `chmod 0700`.
-- **Budget-capped.** `GEMINI_DAILY_BUDGET_USD` stops calls if someone exfiltrates the key and uses it. Combined with Google's per-key usage dashboard, leaks have a bounded blast radius.
+- **Budget-capped.** `GEMINI_DAILY_BUDGET_USD` stops calls once cumulative spend exceeds the cap. Combined with Google's per-key usage dashboard, leaks have a bounded blast radius. **Caveat:** the check runs *before* each call using the cost recorded from completed calls. A single call that by itself exceeds the remaining budget will still complete (we don't estimate cost upfront). In practice this means the cap provides one call of over-run protection. For hard ceilings, use Google's per-key quota limits in addition.
 
 ### Workspace content
 

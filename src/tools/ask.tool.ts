@@ -147,6 +147,12 @@ export const askTool: ToolDefinition<AskInput> = {
         occurredAt: Date.now(),
       });
 
+      if (scan.truncated) {
+        logger.warn(
+          `workspace ${workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,
+        );
+      }
+
       const metadata = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
@@ -161,6 +167,8 @@ export const askTool: ToolDefinition<AskInput> = {
         cacheRebuilt: ctxPrep.rebuilt,
         filesIndexed: scan.files.length,
         filesSkippedTooLarge: scan.skippedTooLarge,
+        workspaceTruncated: scan.truncated,
+        maxFilesCap: ctx.config.maxFilesPerWorkspace,
         durationMs,
       };
 

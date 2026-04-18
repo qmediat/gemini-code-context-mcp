@@ -86,7 +86,26 @@ export async function prepareContext(opts: BuildOptions): Promise<PreparedContex
   const now = Date.now();
   const existing = manifest.getWorkspace(scan.workspaceRoot);
 
-  // 1) Upload / reuse file contents first — needed whether we cache or not.
+  // 1) Ensure the workspace row exists before any file rows reference it.
+  //    The `files` table has a FK to `workspaces(workspace_root)`, so first-time
+  //    uploads on a new workspace would otherwise fail with FOREIGN KEY constraint
+  //    in SQLite. We upsert a placeholder row here; it's finalised with the real
+  //    cache_id / expires_at below once we know the outcome.
+  if (!existing) {
+    manifest.upsertWorkspace({
+      workspaceRoot: scan.workspaceRoot,
+      filesHash: scan.filesHash,
+      model: model.resolved,
+      systemPromptHash,
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+
+  // 2) Upload / reuse file contents — needed whether we cache or not.
   emitter.emit(`indexing ${scan.files.length} files…`, 0, scan.files.length);
   const uploaded = await uploadWorkspaceFiles({
     client,
@@ -121,7 +140,7 @@ export async function prepareContext(opts: BuildOptions): Promise<PreparedContex
     };
   }
 
-  // 2) Reuse existing cache if fingerprints match.
+  // 3) Reuse existing cache if fingerprints match.
   if (isUsableExistingCache(existing, scan, model, systemPromptHash, now)) {
     logger.debug(`cache hit: ${existing?.cacheId}`);
     return {
@@ -134,7 +153,40 @@ export async function prepareContext(opts: BuildOptions): Promise<PreparedContex
     };
   }
 
-  // 3) Build a new cache.
+  // 4) Build a new cache — but only when the workspace is large enough.
+  //    Gemini rejects `caches.create` with 400 when total_token_count < 1024.
+  //    We estimate conservatively at 4 bytes/token from file sizes; when under
+  //    the floor we silently skip the cache attempt and use inline parts.
+  const GEMINI_CACHE_MIN_TOKENS = 1024;
+  const estimatedTokens = scan.files.reduce(
+    (sum: number, f: { size: number }) => sum + Math.ceil(f.size / 4),
+    0,
+  );
+  if (estimatedTokens < GEMINI_CACHE_MIN_TOKENS) {
+    logger.debug(
+      `workspace too small for context cache (~${estimatedTokens} tokens < ${GEMINI_CACHE_MIN_TOKENS}); using inline parts.`,
+    );
+    manifest.upsertWorkspace({
+      workspaceRoot: scan.workspaceRoot,
+      filesHash: scan.filesHash,
+      model: model.resolved,
+      systemPromptHash,
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: uploaded.files.map((f) => f.fileId).filter((v): v is string => v !== null),
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    });
+    return {
+      cacheId: null,
+      cacheExpiresAt: null,
+      inlineFileParts,
+      uploaded,
+      rebuilt: false,
+      reused: false,
+    };
+  }
+
   emitter.emit('building context cache…');
   try {
     const baseConfig = {

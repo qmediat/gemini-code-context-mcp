@@ -203,9 +203,10 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const edits = expectEdits ? parseEdits(text) : [];
       const codeBlocks = parseCodeBlocks(text);
 
-      // Extract code_execution tool artifacts from the response if present.
+      // Extract code_execution tool artifacts + Gemini's thinking summary if present.
       const executedCode: string[] = [];
       const executionOutput: string[] = [];
+      const thoughtTexts: string[] = [];
       const candidates = response.candidates ?? [];
       for (const cand of candidates) {
         const parts = cand.content?.parts ?? [];
@@ -213,8 +214,15 @@ export const codeTool: ToolDefinition<CodeInput> = {
           if (part.executableCode?.code) executedCode.push(part.executableCode.code);
           if (part.codeExecutionResult?.output)
             executionOutput.push(part.codeExecutionResult.output);
+          // `thinkingConfig: { includeThoughts: true }` returns thinking as parts
+          // flagged with `thought: true`. Cap the summary to avoid overwhelming the MCP response.
+          if (part.thought === true && typeof part.text === 'string') {
+            thoughtTexts.push(part.text);
+          }
         }
       }
+      const thinkingSummary =
+        thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
 
       const usage = response.usageMetadata;
       const cached =
@@ -246,6 +254,12 @@ export const codeTool: ToolDefinition<CodeInput> = {
         occurredAt: Date.now(),
       });
 
+      if (scan.truncated) {
+        logger.warn(
+          `workspace ${workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,
+        );
+      }
+
       const structured: Record<string, unknown> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
@@ -266,6 +280,10 @@ export const codeTool: ToolDefinition<CodeInput> = {
         })),
         editCount: edits.length,
         codeBlocks: codeBlocks.map((b) => ({ lang: b.lang, length: b.content.length })),
+        workspaceTruncated: scan.truncated,
+        maxFilesCap: ctx.config.maxFilesPerWorkspace,
+        filesIndexed: scan.files.length,
+        ...(thinkingSummary ? { thinkingSummary } : {}),
         ...(executedCode.length > 0 ? { executedCode } : {}),
         ...(executionOutput.length > 0 ? { executionOutput } : {}),
       };

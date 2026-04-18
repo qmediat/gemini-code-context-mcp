@@ -26,7 +26,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_CODE_CONTEXT_MAX_FILE_SIZE` | `1000000` | Skip files bigger than this (bytes) |
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `GEMINI_CODE_CONTEXT_TELEMETRY` | `false` | Set `true` to opt into anonymous usage counts (nothing happens yet — reserved for future public dashboard) |
-| `GEMINI_PRICING_OVERRIDES` | — | JSON: override per-model pricing for cost estimates |
+| `GEMINI_PRICING_OVERRIDES` | — | JSON map of `model → {inputPerMillion, outputPerMillion, cachedInputPerMillion?}`. See example below. |
 | `XDG_CONFIG_HOME` | — | Override the config directory (defaults to `~/.config`) |
 
 ## Per-call overrides
@@ -75,3 +75,19 @@ Switch profiles per host by setting `GEMINI_CREDENTIALS_PROFILE` in the MCP host
 ```json
 "env": { "GEMINI_CREDENTIALS_PROFILE": "work" }
 ```
+
+## Pricing override example
+
+Gemini prices change; our estimator ships with defaults verified at build time. Override them without a reinstall:
+
+```json
+"env": {
+  "GEMINI_PRICING_OVERRIDES": "{\"gemini-3-pro-preview\":{\"inputPerMillion\":3.00,\"outputPerMillion\":9.00,\"cachedInputPerMillion\":0.75},\"gemini-3-flash-preview\":{\"inputPerMillion\":0.25,\"outputPerMillion\":2.00}}"
+}
+```
+
+All three rate fields are in USD per million tokens. `cachedInputPerMillion` is optional — when omitted, the estimator charges cached tokens at 25 % of the `inputPerMillion` rate.
+
+Use this to:
+- Keep cost estimates accurate after a Google price change before we publish a patch.
+- Model your own Vertex pricing if it differs from Gemini Developer API rates.

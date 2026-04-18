@@ -48,16 +48,20 @@ export async function uploadWorkspaceFiles(args: {
     if (!file) continue;
     emitter.emit(`uploading ${i + 1}/${files.length}: ${file.relpath}`, i + 1, files.length);
 
-    const existing = manifest.findFileIdByHash(workspaceRoot, file.contentHash, now);
-    if (existing) {
+    // Reuse existing upload when the same content hash is already registered
+    // for this workspace and still within Google's 48 h deletion window.
+    // IMPORTANT: preserve the ORIGINAL uploadedAt/expiresAt — Google's auto-delete
+    // timer starts at original upload, not at our reuse moment.
+    const existingRow = manifest.findFileRowByHash(workspaceRoot, file.contentHash, now);
+    if (existingRow?.fileId) {
       reusedCount += 1;
       const row: FileRow = {
         workspaceRoot,
         relpath: file.relpath,
         contentHash: file.contentHash,
-        fileId: existing,
-        uploadedAt: now,
-        expiresAt: now + FILES_API_TTL_MS,
+        fileId: existingRow.fileId,
+        uploadedAt: existingRow.uploadedAt,
+        expiresAt: existingRow.expiresAt,
       };
       manifest.upsertFile(row);
       out.push(row);
@@ -72,9 +76,13 @@ export async function uploadWorkspaceFiles(args: {
           displayName: basename(file.relpath),
         },
       });
-      const fileId = uploaded.name ?? uploaded.uri ?? null;
+      // Prefer `.uri` — that's the full https URL Gemini expects in
+      // `fileData.fileUri` references inside cache contents / generateContent.
+      // `.name` (`files/abc123`) is the admin-API resource name; passing it as
+      // fileUri yields a 400 "Cannot fetch content from the provided URL".
+      const fileId = uploaded.uri ?? uploaded.name ?? null;
       if (!fileId) {
-        logger.warn(`Files API returned no name for ${file.relpath} — skipping.`);
+        logger.warn(`Files API returned no identifier for ${file.relpath} — skipping.`);
         continue;
       }
       uploadedCount += 1;

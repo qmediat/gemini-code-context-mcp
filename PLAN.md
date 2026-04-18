@@ -1,5 +1,9 @@
 # Plan: `@qmediat.io/gemini-code-context-mcp` — SDK-based MCP server with Persistent Context Caching
 
+> **Reader note (2026-04-18):** This file is an internal planning artefact, preserved in the public repo for transparency. It captures a brainstorming session that included verbatim excerpts from three LLM consultations (GPT, Gemini, Grok), whose blunt phrasing reflects the raw advice as given — not our considered stance on any other project or team. We're grateful to jamubc and every prior MCP server author for shaping the space we build on. For the canonical, user-facing docs, start at [README](./README.md) and [docs/](./docs/).
+
+
+
 > **Rev 2 (po konsultacji 3 modeli).** Wersja poprzednia planowała drop-in replacement dla `gemini-mcp-tool` (CLI wrapper, 6 toolów). GPT / Gemini / Grok **zgodnie** wskazali że to commodity — brak moatu, Google może to zunulować w jednym release. Pivot: SDK + Files API + Context Cache = produkt z wyraźnym differentiatorem.
 
 ---

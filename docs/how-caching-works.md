@@ -90,8 +90,9 @@ Files API uploads are auto-deleted by Google after **48 hours**. We track `expir
 The server falls back to inline file parts (slower, more expensive) when:
 
 - The user passes `noCache: true` on `ask`
-- The cache build call fails (network, quota, unsupported model)
 - The workspace has zero matching files
+- **The workspace is under ~1 024 tokens** — Gemini requires a minimum cache size of 1 024 tokens; below that `caches.create` returns 400. We estimate token count from file sizes (~4 bytes/token) and skip the cache attempt silently when below the floor.
+- `caches.create` fails for any other reason (network, quota, model rejection) — we log a warning and degrade to inline parts so the query still succeeds.
 
 ## Observability
 
