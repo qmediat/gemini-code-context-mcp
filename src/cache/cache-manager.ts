@@ -37,6 +37,12 @@ export interface BuildOptions {
   systemPromptHash: string;
   systemInstruction?: string;
   ttlSeconds: number;
+  /**
+   * Minimum estimated workspace tokens required to attempt `caches.create`.
+   * Gemini currently enforces 1024; below that, we silently skip the cache
+   * build and use inline file parts instead. Default: 1024.
+   */
+  cacheMinTokens?: number;
   emitter: ProgressEmitter;
   allowCaching: boolean;
 }
@@ -155,16 +161,20 @@ export async function prepareContext(opts: BuildOptions): Promise<PreparedContex
 
   // 4) Build a new cache — but only when the workspace is large enough.
   //    Gemini rejects `caches.create` with 400 when total_token_count < 1024.
-  //    We estimate conservatively at 4 bytes/token from file sizes; when under
-  //    the floor we silently skip the cache attempt and use inline parts.
-  const GEMINI_CACHE_MIN_TOKENS = 1024;
+  //    We estimate conservatively at 4 bytes/token from file sizes.
+  //    Caveat: minified source (no whitespace) has ~1 token per 2-3 bytes, so our
+  //    estimate under-counts. That's a missed cache optimization on minified
+  //    workspaces, not a correctness bug — try/catch below handles the 400 case.
+  //    The floor is configurable via GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS in case
+  //    Google changes the minimum.
+  const minTokens = opts.cacheMinTokens ?? 1024;
   const estimatedTokens = scan.files.reduce(
     (sum: number, f: { size: number }) => sum + Math.ceil(f.size / 4),
     0,
   );
-  if (estimatedTokens < GEMINI_CACHE_MIN_TOKENS) {
+  if (estimatedTokens < minTokens) {
     logger.debug(
-      `workspace too small for context cache (~${estimatedTokens} tokens < ${GEMINI_CACHE_MIN_TOKENS}); using inline parts.`,
+      `workspace too small for context cache (~${estimatedTokens} tokens < ${minTokens}); using inline parts.`,
     );
     manifest.upsertWorkspace({
       workspaceRoot: scan.workspaceRoot,

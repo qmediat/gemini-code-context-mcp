@@ -22,6 +22,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro` | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID |
 | `GEMINI_DAILY_BUDGET_USD` | unlimited | Hard cap; refuses calls over the cap until UTC midnight |
 | `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` | `3600` | Context Cache TTL (Gemini enforces ≥ 60 s) |
+| `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS` | `1024` | Minimum estimated tokens required before attempting `caches.create`. Below this we skip the cache build and use inline parts. Gemini currently enforces 1024; expose this knob so operators can adjust without a patch release if Google changes the floor. |
 | `GEMINI_CODE_CONTEXT_MAX_FILES` | `2000` | Soft upper bound on files indexed per workspace |
 | `GEMINI_CODE_CONTEXT_MAX_FILE_SIZE` | `1000000` | Skip files bigger than this (bytes) |
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |

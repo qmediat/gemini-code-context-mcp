@@ -91,8 +91,18 @@ The server falls back to inline file parts (slower, more expensive) when:
 
 - The user passes `noCache: true` on `ask`
 - The workspace has zero matching files
-- **The workspace is under ~1 024 tokens** — Gemini requires a minimum cache size of 1 024 tokens; below that `caches.create` returns 400. We estimate token count from file sizes (~4 bytes/token) and skip the cache attempt silently when below the floor.
+- **The workspace is under ~1 024 tokens** — Gemini requires a minimum cache size of 1 024 tokens; below that `caches.create` returns 400. We estimate token count from file sizes (~4 bytes/token) and skip the cache attempt silently when below the floor. Floor is configurable via `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS`.
 - `caches.create` fails for any other reason (network, quota, model rejection) — we log a warning and degrade to inline parts so the query still succeeds.
+
+### Token-estimation caveat (minified / tightly-packed source)
+
+Our 4-bytes-per-token heuristic reflects typical ASCII source with normal whitespace. Minified JavaScript, packed binary-ish formats, or CJK prose tokenise denser (roughly 1 token per 2-3 bytes). In those cases our estimate **under-counts**: a workspace that is genuinely large enough for caching may look "too small" and skip the build. That's a missed optimisation, not a correctness bug — the server still answers your question, just via the inline path.
+
+If you notice consistent inline fallbacks on a workspace you believe is large enough, lower the floor via `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS=800` (or similar). The underlying cache attempt will succeed if the actual token count exceeds Gemini's real minimum; if not, the try/catch fallback still protects the response.
+
+### Orphan manifest rows after failed uploads
+
+If `client.files.upload` fails partway through a fresh-workspace build (network drop, quota exhaustion), the placeholder `workspaces` row created at the start of `prepareContext` persists with `cache_id: null` and a partial set of `files` rows. On the next successful call this row is updated in place — there is no permanent damage. Use `clear` to drop the row explicitly if you want a truly clean slate, or ignore it: the stale row has no negative impact on future queries.
 
 ## Observability
 

@@ -166,6 +166,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
         systemPromptHash,
         systemInstruction: SYSTEM_INSTRUCTION_CODE,
         ttlSeconds: ctx.config.cacheTtlSeconds,
+        cacheMinTokens: ctx.config.cacheMinTokens,
         emitter,
         allowCaching: scan.files.length > 0,
       });

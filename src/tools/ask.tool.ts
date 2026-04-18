@@ -94,6 +94,7 @@ export const askTool: ToolDefinition<AskInput> = {
         systemPromptHash,
         systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
         ttlSeconds: ctx.config.cacheTtlSeconds,
+        cacheMinTokens: ctx.config.cacheMinTokens,
         emitter,
         allowCaching: !input.noCache && scan.files.length > 0,
       });
