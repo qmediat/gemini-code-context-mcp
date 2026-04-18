@@ -158,8 +158,10 @@ export class ManifestDb {
   }
 
   deleteWorkspace(workspaceRoot: string): void {
+    // `files.workspace_root` → `workspaces(workspace_root) ON DELETE CASCADE`
+    // plus `PRAGMA foreign_keys = ON` in the constructor — the child rows
+    // drop automatically. No explicit `DELETE FROM files` needed.
     this.db.prepare('DELETE FROM workspaces WHERE workspace_root = ?').run(workspaceRoot);
-    this.db.prepare('DELETE FROM files WHERE workspace_root = ?').run(workspaceRoot);
   }
 
   getFiles(workspaceRoot: string): FileRow[] {

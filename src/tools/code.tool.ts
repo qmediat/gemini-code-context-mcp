@@ -197,50 +197,60 @@ export const codeTool: ToolDefinition<CodeInput> = {
       ): string | Content[] =>
         cacheId ? userPrompt : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
 
+      let activePrep = ctxPrep;
+      let retriedOnStaleCache = false;
       let response: GenerateContentResponse;
       try {
         response = await ctx.client.models.generateContent({
           model: resolved.resolved,
-          contents: buildContents(ctxPrep.cacheId, ctxPrep.inlineContents),
-          config: buildConfig(ctxPrep.cacheId),
+          contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
+          config: buildConfig(activePrep.cacheId),
         });
       } catch (err) {
-        if (ctxPrep.cacheId && isStaleCacheError(err)) {
+        if (activePrep.cacheId && isStaleCacheError(err)) {
           logger.warn(
-            `Gemini rejected cached content ${ctxPrep.cacheId}; invalidating and retrying once.`,
+            `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
           );
-          await invalidateWorkspaceCache({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            workspaceRoot,
-          });
-          const rebuilt = await prepareContext({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            scan,
-            model: resolved,
-            systemPromptHash,
-            systemInstruction: SYSTEM_INSTRUCTION_CODE,
-            ttlSeconds: ctx.config.cacheTtlSeconds,
-            cacheMinTokens: ctx.config.cacheMinTokens,
-            emitter,
-            allowCaching: scan.files.length > 0,
-          });
-          response = await ctx.client.models.generateContent({
-            model: resolved.resolved,
-            contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-            config: buildConfig(rebuilt.cacheId),
-          });
-          if (rebuilt.cacheId) {
-            ctx.ttlWatcher.markHot(workspaceRoot, rebuilt.cacheId, ctx.config.cacheTtlSeconds);
+          try {
+            await invalidateWorkspaceCache({
+              client: ctx.client,
+              manifest: ctx.manifest,
+              workspaceRoot,
+            });
+            const rebuilt = await prepareContext({
+              client: ctx.client,
+              manifest: ctx.manifest,
+              scan,
+              model: resolved,
+              systemPromptHash,
+              systemInstruction: SYSTEM_INSTRUCTION_CODE,
+              ttlSeconds: ctx.config.cacheTtlSeconds,
+              cacheMinTokens: ctx.config.cacheMinTokens,
+              emitter,
+              allowCaching: scan.files.length > 0,
+            });
+            response = await ctx.client.models.generateContent({
+              model: resolved.resolved,
+              contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
+              config: buildConfig(rebuilt.cacheId),
+            });
+            activePrep = rebuilt;
+            retriedOnStaleCache = true;
+          } catch (retryErr) {
+            throw new Error(
+              `code retry after stale cache failed: ${
+                retryErr instanceof Error ? retryErr.message : String(retryErr)
+              }`,
+              { cause: err },
+            );
           }
         } else {
           throw err;
         }
       }
 
-      if (ctxPrep.cacheId) {
-        ctx.ttlWatcher.markHot(workspaceRoot, ctxPrep.cacheId, ctx.config.cacheTtlSeconds);
+      if (activePrep.cacheId) {
+        ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
       }
 
       const text = response.text ?? '';
@@ -310,7 +320,9 @@ export const codeTool: ToolDefinition<CodeInput> = {
         contextWindow: resolved.inputTokenLimit,
         thinkingBudget,
         codeExecutionUsed: codeExecution,
-        cacheHit: ctxPrep.reused,
+        cacheHit: activePrep.reused,
+        cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
+        retriedOnStaleCache,
         cachedTokens: cached,
         uncachedTokens: uncached,
         thinkingTokens: thinking,
@@ -327,11 +339,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
         workspaceTruncated: scan.truncated,
         maxFilesCap: ctx.config.maxFilesPerWorkspace,
         filesIndexed: scan.files.length,
-        filesUploadFailed: ctxPrep.uploaded.failedCount,
-        ...(ctxPrep.uploaded.failedCount > 0
-          ? { uploadFailures: ctxPrep.uploaded.failures.slice(0, 5) }
+        filesUploadFailed: activePrep.uploaded.failedCount,
+        ...(activePrep.uploaded.failedCount > 0
+          ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
           : {}),
-        inlineOnly: ctxPrep.inlineOnly,
+        inlineOnly: activePrep.inlineOnly,
         ...(thinkingSummary ? { thinkingSummary } : {}),
         ...(executedCode.length > 0 ? { executedCode } : {}),
         ...(executionOutput.length > 0 ? { executionOutput } : {}),

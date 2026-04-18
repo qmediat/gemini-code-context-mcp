@@ -8,13 +8,18 @@ If you're reading this, you've probably been using [jamubc/gemini-mcp-tool](http
 
 ```diff
  "mcpServers": {
-   "gemini-cli": {
-     "command": "node",
+-  "gemini-cli": {
+-    "command": "node",
 -    "args": ["/path/to/gemini-mcp-tool/dist/index.js"]
-+    "args": ["-y", "@qmediat.io/gemini-code-context-mcp"]
++  "gemini-code-context": {
++    "command": "npx",
++    "args": ["-y", "@qmediat.io/gemini-code-context-mcp"],
++    "env": { "GEMINI_CREDENTIALS_PROFILE": "default" }
    }
  }
 ```
+
+Both the `command` changes (`node` → `npx`) and the args shape change. Run `npx @qmediat.io/gemini-code-context-mcp init` first to create the credentials profile.
 
 Then restart Claude Code. That's it.
 

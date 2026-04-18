@@ -121,14 +121,12 @@ export async function uploadWorkspaceFiles(args: {
     return { file, existing: canReuse ? existing : null };
   });
 
-  await runPool(plan, concurrency, async (entry, i) => {
-    completed += 1;
-    emitter.emit(
-      `indexing ${completed}/${files.length}: ${entry.file.relpath}`,
-      completed,
-      files.length,
-    );
+  // In-batch dedup: two ScannedFiles with identical contentHash shouldn't both
+  // upload. We share the first upload's Promise and resolve both to the same
+  // fileId. Keyed on contentHash; scoped to this batch (not persisted).
+  const inBatchUploads = new Map<string, Promise<string>>();
 
+  await runPool(plan, concurrency, async (entry, i) => {
     // Reuse path: preserve original uploadedAt / expiresAt so the Google-side
     // 48 h clock continues from the original upload, not from our reuse moment.
     if (entry.existing?.fileId) {
@@ -143,24 +141,45 @@ export async function uploadWorkspaceFiles(args: {
       };
       manifest.upsertFile(row);
       out[i] = row;
+      completed += 1;
+      emitter.emit(
+        `indexed ${completed}/${files.length}: ${entry.file.relpath}`,
+        completed,
+        files.length,
+      );
       return;
     }
 
-    // Fresh upload.
-    const uploaded = await client.files.upload({
-      file: entry.file.absolutePath,
-      config: {
-        mimeType: uploadMimeType(entry.file.relpath),
-        displayName: basename(entry.file.relpath),
-      },
-    });
-    // Prefer `.uri` — Gemini rejects `files/abc123` (the admin-API name) when
-    // used as `fileData.fileUri`. Verified empirically via integration test.
-    const fileId = uploaded.uri ?? uploaded.name ?? null;
-    if (!fileId) {
-      throw new Error(`Files API returned no identifier for ${entry.file.relpath}`);
+    // Same-batch dedup: if another worker is already uploading this content hash,
+    // wait for their result instead of duplicating the upload.
+    const existingUpload = inBatchUploads.get(entry.file.contentHash);
+    let fileId: string;
+    let isDuplicate = false;
+    if (existingUpload) {
+      fileId = await existingUpload;
+      isDuplicate = true;
+    } else {
+      const uploadPromise = (async () => {
+        const uploaded = await client.files.upload({
+          file: entry.file.absolutePath,
+          config: {
+            mimeType: uploadMimeType(entry.file.relpath),
+            displayName: basename(entry.file.relpath),
+          },
+        });
+        // Prefer `.uri` — Gemini rejects `files/abc123` (the admin-API name)
+        // when used as `fileData.fileUri`. Verified via integration test.
+        const id = uploaded.uri ?? uploaded.name ?? null;
+        if (!id) {
+          throw new Error(`Files API returned no identifier for ${entry.file.relpath}`);
+        }
+        return id;
+      })();
+      inBatchUploads.set(entry.file.contentHash, uploadPromise);
+      fileId = await uploadPromise;
+      uploadedCount += 1;
     }
-    uploadedCount += 1;
+
     const row: FileRow = {
       workspaceRoot,
       relpath: entry.file.relpath,
@@ -171,6 +190,13 @@ export async function uploadWorkspaceFiles(args: {
     };
     manifest.upsertFile(row);
     out[i] = row;
+    if (isDuplicate) reusedCount += 1;
+    completed += 1;
+    emitter.emit(
+      `indexed ${completed}/${files.length}: ${entry.file.relpath}`,
+      completed,
+      files.length,
+    );
   }).then((settled) => {
     // Collect failures after the pool finishes — don't lose the mapping to files.
     for (let i = 0; i < settled.length; i += 1) {

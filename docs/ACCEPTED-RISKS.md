@@ -64,6 +64,23 @@ This list is the flip side of `docs/KNOWN-DEFICITS.md`: deficits are issues we'l
 
 ---
 
+## Pre-rebuild `caches.delete` loses working cache on transient create failure
+
+**Source:** Grok code review, April 2026 — "transient Gemini outage now costs the cache".
+
+**Risk claim:** The cache-manager deletes an existing stale cache BEFORE calling `caches.create`. If the create then fails with a transient 5xx (Gemini outage, rate limit), the user has lost their working cache and falls back to inline parts for the rest of the session.
+
+**Why we accept:** The alternative — create-then-delete-old — leaks the old cache on Google's side when create succeeds with a new ID (the orphan keeps billing at storage rate until TTL expiry). We picked "lose-on-transient-failure" over "leak-on-success" because:
+1. Transient 5xx is rare (<1% of calls) and recovers on the next `ask`/`code` (which rebuilds).
+2. Orphan caches on success are COMMON (every filesHash change) and cost money every time.
+3. The total expected loss from transient failures is bounded by 1h of cache-miss input token costs; orphan caches bill over 1h × N failures.
+
+**What would change our mind:** Real observability from users showing frequent transient 5xx (e.g. >5% of rebuilds) would justify moving to a `Promise.allSettled` two-step pattern (run delete in parallel with create; if create fails, retain old cacheId).
+
+**Mitigation available now:** Set `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS=3600` (default) and accept that a single Gemini outage costs one cache-build worth of input tokens (~$0.5-$3 for large workspaces). Users on very large workspaces who feel this pain can report it.
+
+---
+
 ## PLAN.md is committed to the public repo
 
 **Source:** Prior `/6step` self-review.

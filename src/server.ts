@@ -18,8 +18,26 @@ import { TOOLS } from './tools/index.js';
 import { type ToolContext, type ToolResult, errorResult } from './tools/registry.js';
 import { logger } from './utils/logger.js';
 
+import { readFileSync } from 'node:fs';
+import { dirname as pathDirname, join as pathJoin } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 const SERVER_NAME = '@qmediat.io/gemini-code-context-mcp';
-const SERVER_VERSION = '0.0.0';
+/**
+ * Read version from package.json at runtime. `server.js` lives in `dist/` after
+ * compilation (or `src/` under `tsx`) so package.json is the parent directory.
+ * Falls back to `0.0.0-dev` if the lookup fails (never throws).
+ */
+const SERVER_VERSION = ((): string => {
+  try {
+    const here = pathDirname(fileURLToPath(import.meta.url));
+    const pkgPath = pathJoin(here, '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: string };
+    return typeof pkg.version === 'string' ? pkg.version : '0.0.0-dev';
+  } catch {
+    return '0.0.0-dev';
+  }
+})();
 
 export async function runServer(): Promise<void> {
   const config = loadConfig();

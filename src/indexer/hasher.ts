@@ -7,6 +7,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import type { Stats } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 
 interface CacheEntry {
@@ -26,9 +27,15 @@ function rememberHash(path: string, entry: CacheEntry): void {
   cache.set(path, entry);
 }
 
-/** Hash a file's content, using cached value when mtime+size match. */
-export async function hashFile(absolutePath: string): Promise<string> {
-  const stats = await stat(absolutePath);
+/**
+ * Hash a file's content, using cached value when mtime+size match.
+ *
+ * Accepts an optional pre-fetched `Stats` to avoid a redundant `stat` syscall —
+ * callers that already have the stats (e.g. `workspace-scanner` after size check)
+ * can pass them in to halve filesystem metadata traffic.
+ */
+export async function hashFile(absolutePath: string, prefetched?: Stats): Promise<string> {
+  const stats = prefetched ?? (await stat(absolutePath));
   const cached = cache.get(absolutePath);
   if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
     return cached.hash;
@@ -40,9 +47,16 @@ export async function hashFile(absolutePath: string): Promise<string> {
   return hash;
 }
 
-/** Merge individual file hashes into a single workspace hash. */
+/**
+ * Merge individual file hashes into a single workspace hash.
+ *
+ * Uses `localeCompare` for sorting so duplicate relpaths (should not occur given
+ * the scanner's Set-based dedup, but defensive matters when hashes feed cache keys)
+ * get a deterministic equality result. A comparator that never returns 0 violates
+ * the Array.sort contract and can yield engine-dependent ordering.
+ */
 export function mergeHashes(fileHashes: ReadonlyArray<{ relpath: string; hash: string }>): string {
-  const sorted = [...fileHashes].sort((a, b) => (a.relpath < b.relpath ? -1 : 1));
+  const sorted = [...fileHashes].sort((a, b) => a.relpath.localeCompare(b.relpath));
   const hasher = createHash('sha256');
   for (const { relpath, hash } of sorted) {
     hasher.update(relpath);

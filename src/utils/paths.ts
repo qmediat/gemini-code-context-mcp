@@ -19,8 +19,20 @@ export function qmediatConfigDir(): string {
   return xdg && xdg.length > 0 ? join(xdg, 'qmediat') : join(homedir(), '.config', 'qmediat');
 }
 
-/** State directory for manifest DB — `~/.qmediat/gemini-code-context-mcp/`. */
+/**
+ * State directory for manifest DB.
+ *
+ * Follows XDG base-dir when `XDG_STATE_HOME` is set (per spec:
+ * https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html).
+ * Otherwise defaults to `~/.qmediat/gemini-code-context-mcp/` — pre-XDG for
+ * backwards compatibility with existing installs. Users on strict-XDG systems
+ * (NixOS, some BSDs) can set `XDG_STATE_HOME=~/.local/state` to route here.
+ */
 export function qmediatStateDir(): string {
+  const xdg = process.env.XDG_STATE_HOME;
+  if (xdg && xdg.length > 0) {
+    return join(xdg, 'qmediat', 'gemini-code-context-mcp');
+  }
   return join(homedir(), '.qmediat', 'gemini-code-context-mcp');
 }
 

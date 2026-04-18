@@ -149,6 +149,30 @@ export interface MatchConfig {
   excludeFileNames: readonly string[];
 }
 
+/**
+ * Normalise an `includeGlobs` entry. Accepts three shapes per the tool schema:
+ *   - `.ext`    → literal extension suffix (matched via `endsWith`)
+ *   - `*.ext`   → glob form; we strip the `*` and treat as extension
+ *   - `Name`    → literal filename (matched via strict equality)
+ *
+ * Heuristic for the filename branch: no `*`, no `.`, no path separators →
+ * treat as a filename (e.g. `Dockerfile`, `Makefile`). Otherwise extension.
+ */
+function normalizeIncludeGlob(pattern: string): string {
+  if (pattern.startsWith('.')) return pattern;
+  if (pattern.startsWith('*.')) return `.${pattern.slice(2)}`;
+  if (
+    !pattern.includes('*') &&
+    !pattern.includes('.') &&
+    !pattern.includes('/') &&
+    !pattern.includes('\\')
+  ) {
+    // Looks like a filename — pass through literally.
+    return pattern;
+  }
+  return `.${pattern}`;
+}
+
 export function defaultMatchConfig(
   extra: { includeGlobs?: readonly string[]; excludeGlobs?: readonly string[] } = {},
 ): MatchConfig {
@@ -156,8 +180,7 @@ export function defaultMatchConfig(
   const extraDirs: string[] = [];
 
   for (const pattern of extra.includeGlobs ?? []) {
-    const normalized = pattern.startsWith('.') ? pattern : `.${pattern.replace(/^\*\./, '')}`;
-    extraExts.push(normalized);
+    extraExts.push(normalizeIncludeGlob(pattern));
   }
   for (const pattern of extra.excludeGlobs ?? []) {
     extraDirs.push(pattern);

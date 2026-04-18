@@ -83,6 +83,16 @@ export function toMicrosUsd(dollars: number): number {
   return Math.round(dollars * 1_000_000);
 }
 
+/**
+ * Raw conversion: `micros → dollars` as a full-precision float. Sub-cent values
+ * survive, so `usageMetrics` tracking of e.g. $0.0043 calls remains visible.
+ * Use `formatDollarsToCents` when you want 2-decimal presentation.
+ */
 export function microsToDollars(micros: number): number {
-  return Math.round((micros / 1_000_000) * 100) / 100;
+  return micros / 1_000_000;
+}
+
+/** Round a dollar amount to cents. Presentation helper. */
+export function formatDollarsToCents(dollars: number): number {
+  return Math.round(dollars * 100) / 100;
 }

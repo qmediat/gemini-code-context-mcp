@@ -14,6 +14,7 @@
  *   default_model = latest-flash
  */
 
+import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -24,7 +25,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname } from 'node:path';
 import { logger } from '../utils/logger.js';
 import { credentialsPath, qmediatConfigDir } from '../utils/paths.js';
 
@@ -163,9 +163,18 @@ export function loadProfile(name: string): ProfileData {
  * such protection; this whitelist is the authoritative defense.
  */
 export function sanitizeProfileName(name: string): string {
-  if (!/^[a-zA-Z0-9._-]{1,32}$/.test(name)) {
+  // Block INI-syntax chars (`[`, `]`, `=`, `#`, `;`), whitespace-class chars
+  // that readline may pass through (`\n`, `\r`, `\t`), and ASCII control chars
+  // (`\x00`-`\x1f`). Unicode letters (accented, CJK, etc.) are allowed because
+  // profile names are stored locally and displayed back to their creator — no
+  // reason to restrict to ASCII.
+  if (name.length === 0 || name.length > 32) {
+    throw new Error(`Invalid profile name '${name}': must be 1-32 characters.`);
+  }
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control chars IS the intent here
+  if (/[[\]=#;\n\r\t]/.test(name) || /[\u0000-\u001f]/.test(name)) {
     throw new Error(
-      `Invalid profile name '${name}': must be 1-32 chars, only letters, digits, dot, underscore, hyphen.`,
+      `Invalid profile name '${name}': must not contain INI syntax chars ('[', ']', '=', '#', ';') or whitespace/control chars.`,
     );
   }
   return name;
@@ -182,8 +191,20 @@ export function sanitizeProfileName(name: string): string {
 export function saveProfile(name: string, data: ProfileData): void {
   const safeName = sanitizeProfileName(name);
   const dir = qmediatConfigDir();
+
+  // Create OR tighten the config directory BEFORE any write. `mkdirSync({mode})`
+  // only applies when creating — for an existing dir (possibly created by a
+  // previous tool at 0o755), we need an explicit chmod up front so the symlink
+  // window is as narrow as possible.
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+  if (process.platform !== 'win32') {
+    try {
+      chmodSync(dir, 0o700);
+    } catch {
+      /* best-effort — dir may be held by another process */
+    }
   }
 
   const path = credentialsPath();
@@ -191,7 +212,10 @@ export function saveProfile(name: string, data: ProfileData): void {
   profiles.set(safeName, data);
 
   const content = serializeIni(profiles);
-  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+  // Random suffix (64 bits of entropy) defeats any attempt to predict the tmp
+  // name and pre-create a symlink at that path. `flag: 'wx'` then additionally
+  // fails if the path exists, so combined the attack surface is essentially nil.
+  const tmpPath = `${path}.tmp.${randomBytes(8).toString('hex')}`;
 
   try {
     // `flag: 'wx'` → O_CREAT | O_EXCL — fails if tmpPath exists, preventing
@@ -215,14 +239,5 @@ export function saveProfile(name: string, data: ProfileData): void {
       /* best-effort cleanup */
     }
     throw err;
-  }
-
-  // Parent directory is already 0o700 from mkdirSync; re-chmod as defense-in-depth.
-  if (process.platform !== 'win32') {
-    try {
-      chmodSync(dirname(path), 0o700);
-    } catch {
-      /* best-effort — dir may be held by another process */
-    }
   }
 }

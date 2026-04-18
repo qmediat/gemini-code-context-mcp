@@ -18,7 +18,7 @@
  * the consecutive-user-role-violation risk on stricter Gemini models.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import type { Content, GoogleGenAI, Part } from '@google/genai';
 import type { ScanResult } from '../indexer/workspace-scanner.js';
 import type { ManifestDb } from '../manifest/db.js';
@@ -114,38 +114,71 @@ function buildContentFromUploaded(files: { fileId: string | null; relpath: strin
 
 /**
  * Build inline text Content directly from disk — used on the no-cache path.
- * Skips the Files API entirely: we read each file, prefix with a path marker,
- * and embed as a single `{text}` part. Saves one network round-trip per file
- * and avoids Gemini's 48 h auto-delete housekeeping on small workspaces.
+ * Skips the Files API entirely: we read each file (async, parallel per worker),
+ * prefix with a path marker, and embed as a single `{text}` part. Saves one
+ * network round-trip per file and avoids Gemini's 48 h auto-delete housekeeping
+ * on small workspaces.
+ *
+ * Hard aggregate cap (`MAX_INLINE_TOTAL_BYTES`) prevents a single pathological
+ * file from blocking the event loop or exhausting V8's string length cap. Files
+ * that would push the total over the cap are replaced with a visible
+ * `[SKIPPED: inline size cap]` marker so the model knows they were omitted.
  */
-function buildInlineContentFromDisk(scan: ScanResult): Content[] {
+const MAX_INLINE_TOTAL_BYTES = 20 * 1024 * 1024; // 20 MB aggregate inline content
+
+async function buildInlineContentFromDisk(scan: ScanResult): Promise<Content[]> {
   const parts: Part[] = [];
+  let total = 0;
   for (const f of scan.files) {
+    if (total + f.size > MAX_INLINE_TOTAL_BYTES) {
+      parts.push({
+        text: `\n\n--- FILE: ${f.relpath} [SKIPPED: inline size cap reached] ---\n`,
+      });
+      continue;
+    }
     let content: string;
     try {
-      content = readFileSync(f.absolutePath, 'utf8');
+      content = await readFile(f.absolutePath, 'utf8');
     } catch (err) {
       logger.warn(`failed to read ${f.relpath}: ${String(err)}`);
       continue;
     }
     parts.push({ text: `\n\n--- FILE: ${f.relpath} ---\n${content}\n` });
+    total += f.size;
   }
   if (parts.length === 0) return [];
   return [{ role: 'user', parts }];
 }
 
 /**
- * In-process mutex. Concurrent `prepareContext` calls for the same workspace
- * coalesce onto a single in-flight promise, avoiding duplicate cache creation
- * (which would leak orphaned Gemini caches at $$$/M-token-hour).
+ * In-process mutex. Concurrent `prepareContext` calls for the SAME
+ * `(workspaceRoot, filesHash, model, systemPromptHash, allowCaching, cacheMinTokens)`
+ * fingerprint coalesce onto a single in-flight promise, avoiding duplicate
+ * cache creation (which would leak orphaned Gemini caches at $$$/M-token-hour).
+ *
+ * Keying on the full fingerprint is critical: `ask` and `code` tools use
+ * different system instructions, so their `systemPromptHash` differs. Coalescing
+ * on workspaceRoot alone would serve one tool's PreparedContext to the other —
+ * wrong cache / system-instruction mismatch. This bug was flagged by GPT + Copilot.
  *
  * Scope: single Node process. Cross-process races (two MCP servers sharing the
  * same manifest DB) are not covered — documented in docs/KNOWN-DEFICITS.md.
  */
 const inFlight = new Map<string, Promise<PreparedContext>>();
 
+function inFlightKey(opts: BuildOptions): string {
+  return [
+    opts.scan.workspaceRoot,
+    opts.scan.filesHash,
+    opts.model.resolved,
+    opts.systemPromptHash,
+    String(opts.allowCaching),
+    String(opts.cacheMinTokens ?? ''),
+  ].join('\u241E'); // record-separator sentinel unlikely to appear in any field
+}
+
 export async function prepareContext(opts: BuildOptions): Promise<PreparedContext> {
-  const key = opts.scan.workspaceRoot;
+  const key = inFlightKey(opts);
   const pending = inFlight.get(key);
   if (pending) return pending;
   const promise = (async () => {
@@ -186,7 +219,7 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   //    file text inline. No upload round-trip, no 48 h housekeeping.
   if (!allowCaching) {
     logger.debug('caching disabled — embedding files inline from disk.');
-    const inlineContents = buildInlineContentFromDisk(scan);
+    const inlineContents = await buildInlineContentFromDisk(scan);
     manifest.upsertWorkspace({
       workspaceRoot: scan.workspaceRoot,
       filesHash: scan.filesHash,
@@ -209,42 +242,12 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
     };
   }
 
-  // 3) Token-floor check — Gemini rejects caches below 1024 tokens. Skip the
-  //    Files API entirely here too — there's no cache benefit for small
-  //    workspaces and we save the upload overhead.
-  const minTokens = opts.cacheMinTokens ?? 1024;
-  const estimatedTokens = scan.files.reduce(
-    (sum: number, f: { size: number }) => sum + Math.ceil(f.size / 4),
-    0,
-  );
-  if (estimatedTokens < minTokens) {
-    logger.debug(
-      `workspace too small for context cache (~${estimatedTokens} tokens < ${minTokens}); embedding inline.`,
-    );
-    const inlineContents = buildInlineContentFromDisk(scan);
-    manifest.upsertWorkspace({
-      workspaceRoot: scan.workspaceRoot,
-      filesHash: scan.filesHash,
-      model: model.resolved,
-      systemPromptHash,
-      cacheId: null,
-      cacheExpiresAt: null,
-      fileIds: [],
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-    });
-    return {
-      cacheId: null,
-      cacheExpiresAt: null,
-      inlineContents,
-      uploaded: { files: [], uploadedCount: 0, reusedCount: 0, failedCount: 0, failures: [] },
-      rebuilt: false,
-      reused: false,
-      inlineOnly: true,
-    };
-  }
-
-  // 4) Cache-eligible path. Reuse existing cache if fingerprints match.
+  // 3) Reuse existing cache if fingerprints match. This runs BEFORE the
+  //    token-floor check because reuse costs nothing — even a workspace that
+  //    shrank below the floor should keep its valid cache until TTL expiry
+  //    rather than being forced inline (which would orphan the cache on
+  //    Google's side). Reordering from the previous build->reuse order was
+  //    flagged by GPT review.
   if (isUsableExistingCache(existing, scan, model, systemPromptHash, now)) {
     logger.debug(`cache hit: ${existing?.cacheId}`);
     return {
@@ -255,6 +258,42 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       rebuilt: false,
       reused: true,
       inlineOnly: false,
+    };
+  }
+
+  // 4) Token-floor check — Gemini rejects `caches.create` below 1024 tokens.
+  //    Skip the Files API entirely — there's no cache-build benefit for small
+  //    workspaces and we save the upload overhead. Only applies when we're
+  //    about to BUILD a new cache (reuse above already returned).
+  const minTokens = opts.cacheMinTokens ?? 1024;
+  const estimatedTokens = scan.files.reduce(
+    (sum: number, f: { size: number }) => sum + Math.ceil(f.size / 4),
+    0,
+  );
+  if (estimatedTokens < minTokens) {
+    logger.debug(
+      `workspace too small for context cache (~${estimatedTokens} tokens < ${minTokens}); embedding inline.`,
+    );
+    const inlineContents = await buildInlineContentFromDisk(scan);
+    manifest.upsertWorkspace({
+      workspaceRoot: scan.workspaceRoot,
+      filesHash: scan.filesHash,
+      model: model.resolved,
+      systemPromptHash,
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    });
+    return {
+      cacheId: null,
+      cacheExpiresAt: null,
+      inlineContents,
+      uploaded: { files: [], uploadedCount: 0, reusedCount: 0, failedCount: 0, failures: [] },
+      rebuilt: false,
+      reused: false,
+      inlineOnly: true,
     };
   }
 
@@ -271,8 +310,12 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
 
   // If enough uploads failed that the context is clearly lossy, bail now so the
   // caller surfaces an error instead of silently returning a partial answer.
-  // Threshold: 5 % of files or ≥ 3 failures (whichever is larger).
-  const failureThreshold = Math.max(3, Math.ceil(scan.files.length * 0.05));
+  // Threshold: tiny workspaces (≤5 files) fail-fast on ANY upload failure; larger
+  // workspaces tolerate ≤5 % or <3 failures. The tiny-workspace carve-out
+  // prevents a 2-file repo with both uploads failing from falling through to a
+  // confusing Gemini 400 on empty contents.
+  const failureThreshold =
+    scan.files.length <= 5 ? 1 : Math.max(3, Math.ceil(scan.files.length * 0.05));
   if (uploaded.failedCount >= failureThreshold) {
     const preview = uploaded.failures
       .slice(0, 3)

@@ -6,9 +6,21 @@
  */
 
 import { readdir, stat } from 'node:fs/promises';
-import { join, relative } from 'node:path';
+import { join, sep as pathSep, relative } from 'node:path';
 import { type MatchConfig, defaultMatchConfig, isFileIncluded, isPathExcluded } from './globs.js';
 import { hashFile, mergeHashes } from './hasher.js';
+
+/**
+ * Normalise a path separator to POSIX-style `/`.
+ *
+ * `node:path.relative()` returns OS-native separators (`\` on Windows), but our
+ * glob checks in `globs.ts` and the cache-key hashing expect `/`. Every relpath
+ * that flows out of the scanner is normalised here so Windows users see the same
+ * exclude/include behaviour as POSIX users.
+ */
+function toPosix(p: string): string {
+  return pathSep === '/' ? p : p.split(pathSep).join('/');
+}
 
 export interface ScanOptions {
   includeGlobs?: readonly string[];
@@ -42,7 +54,7 @@ async function walk(
   const entries = await readdir(currentDir, { withFileTypes: true });
   for (const entry of entries) {
     const absolutePath = join(currentDir, entry.name);
-    const rel = relative(root, absolutePath);
+    const rel = toPosix(relative(root, absolutePath));
 
     if (entry.isDirectory()) {
       if (isPathExcluded(rel, config)) continue;
@@ -84,8 +96,9 @@ export async function scanWorkspace(
       skippedTooLarge += 1;
       continue;
     }
-    const rel = relative(workspaceRoot, absolutePath);
-    const hash = await hashFile(absolutePath);
+    const rel = toPosix(relative(workspaceRoot, absolutePath));
+    // Pass the already-fetched stats to avoid a second stat() inside hashFile.
+    const hash = await hashFile(absolutePath, stats);
     files.push({ relpath: rel, absolutePath, size: stats.size, contentHash: hash });
   }
 

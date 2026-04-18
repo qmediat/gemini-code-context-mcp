@@ -4,7 +4,6 @@
 
 import { resolve } from 'node:path';
 import { z } from 'zod';
-import { fingerprint } from '../auth/fingerprint.js';
 import { listAvailableModels } from '../gemini/model-registry.js';
 import { microsToDollars } from '../utils/cost-estimator.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
@@ -107,7 +106,6 @@ export const statusTool: ToolDefinition<StatusInput> = {
         `  total cost:    $${microsToDollars(stats.totalCostMicros).toFixed(4)}`,
         `  last 24h:      $${microsToDollars(stats.last24hCostMicros).toFixed(4)}`,
       ].join('\n');
-      void fingerprint; // keep import graph happy in case we expand here
 
       return textResult(human, structured);
     } catch (err) {

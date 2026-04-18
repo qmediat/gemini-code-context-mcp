@@ -6,7 +6,7 @@
  * profile by name rather than embedding the key.
  */
 
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
@@ -48,6 +48,15 @@ async function askHidden(prompt: string): Promise<string> {
       } catch {
         /* best-effort */
       }
+      // Detach process-level handlers so repeated askHidden calls don't
+      // accumulate listeners (Node warns at >10). `process.off` is a no-op
+      // if the handler isn't registered, so calling unconditionally is safe.
+      try {
+        process.off('SIGINT', cleanup);
+        process.off('exit', cleanup);
+      } catch {
+        /* best-effort */
+      }
     };
     const listener = (chunk: Buffer): void => {
       const s = chunk.toString('utf8');
@@ -80,17 +89,44 @@ async function askHidden(prompt: string): Promise<string> {
           i += 1;
           continue;
         }
-        // Strip ANSI escape sequences (arrow keys, Home/End, etc.) — they'd otherwise
-        // silently corrupt the key. Arrow keys emit ESC[<letter>; we skip the whole
-        // sequence up to the final letter.
+        // Strip ANSI escape sequences — they'd otherwise silently corrupt the key.
+        // Handle the four main ESC forms that terminals emit during password entry:
+        //   CSI:  ESC [ <params> <final-letter>       (arrow keys, Home/End)
+        //   SS3:  ESC O <letter>                      (F1-F4 on xterm/tmux)
+        //   OSC:  ESC ] <params> <BEL or ESC \>       (title sets, clipboard pastes)
+        //   DCS:  ESC P <params> <ESC \>              (device control, rare)
+        // Anything else starting with ESC is consumed as a 2-byte sequence (ESC + next).
         if (ch === '\u001b') {
           i += 1;
-          // Skip optional '['
-          if (s[i] === '[') i += 1;
-          // Skip parameters until a final byte (a letter).
-          while (i < s.length && !/[A-Za-z~]/.test(s[i] ?? '')) i += 1;
-          // Skip the final letter.
-          i += 1;
+          const next = s[i];
+          if (next === '[') {
+            // CSI: skip params then the final letter.
+            i += 1;
+            while (i < s.length && !/[A-Za-z~]/.test(s[i] ?? '')) i += 1;
+            i += 1;
+          } else if (next === 'O') {
+            // SS3: ESC O <letter> — consume the letter.
+            i += 1; // skip 'O'
+            if (i < s.length) i += 1; // skip final letter
+          } else if (next === ']' || next === 'P') {
+            // OSC / DCS: terminated by BEL (\x07) or ST (ESC \).
+            i += 1; // skip ']' or 'P'
+            while (i < s.length) {
+              const c = s[i];
+              if (c === '\u0007') {
+                i += 1;
+                break;
+              }
+              if (c === '\u001b' && s[i + 1] === '\\') {
+                i += 2;
+                break;
+              }
+              i += 1;
+            }
+          } else {
+            // Unknown ESC-prefixed sequence: consume ESC + next byte.
+            if (i < s.length) i += 1;
+          }
           continue;
         }
         // Reject other control chars (0x00-0x1F except handled above, and 0x7F).
@@ -112,7 +148,7 @@ async function askHidden(prompt: string): Promise<string> {
   });
 }
 
-function claudeCodeConfigDir(): string {
+function claudeCodeConfigPath(): string {
   return join(process.env.HOME ?? '', '.claude.json');
 }
 
@@ -132,9 +168,12 @@ function detectGitUnderConfigDir(): boolean {
     cwd = parent;
   }
   try {
-    const output = execSync('git rev-parse --show-toplevel 2>/dev/null', {
+    // `execFileSync` (no shell) → no `2>/dev/null` quirks on Windows cmd.exe.
+    // stderr suppressed via `stdio: ['ignore', 'pipe', 'ignore']`.
+    const output = execFileSync('git', ['rev-parse', '--show-toplevel'], {
       cwd,
       encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
     const top = output.trim();
     return top.length > 0 && existsSync(top);
@@ -237,7 +276,7 @@ export async function runInit(): Promise<void> {
     log('  }');
     log('');
 
-    const claudeConfig = claudeCodeConfigDir();
+    const claudeConfig = claudeCodeConfigPath();
     if (existsSync(claudeConfig)) {
       const stats = statSync(claudeConfig);
       log(`Detected Claude Code config at ${claudeConfig} (${stats.size} bytes).`);

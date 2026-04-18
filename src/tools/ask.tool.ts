@@ -114,54 +114,71 @@ export const askTool: ToolDefinition<AskInput> = {
       ): string | Content[] =>
         cacheId ? input.prompt : [...inline, { role: 'user', parts: [{ text: input.prompt }] }];
 
+      // Track the prepared-context used for the FINAL successful call. Starts
+      // pointing at the initial ctxPrep; retry branch below reassigns to the
+      // rebuilt PreparedContext so post-call markHot + metadata reflect reality.
+      let activePrep = ctxPrep;
+      let retriedOnStaleCache = false;
       let response: GenerateContentResponse;
       try {
         response = await ctx.client.models.generateContent({
           model: resolved.resolved,
-          contents: buildContents(ctxPrep.cacheId, ctxPrep.inlineContents),
-          config: buildConfig(ctxPrep.cacheId),
+          contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
+          config: buildConfig(activePrep.cacheId),
         });
       } catch (err) {
         // Self-heal: if Gemini rejected our cached content (evicted, expired,
         // externally deleted), invalidate locally and retry ONCE with a fresh
         // cache. Prevents users from seeing hard failures they'd otherwise need
-        // to clear/reindex manually.
-        if (ctxPrep.cacheId && isStaleCacheError(err)) {
+        // to clear/reindex manually. Budget: one retry; a second stale-cache
+        // error propagates with both errors chained via Error.cause.
+        if (activePrep.cacheId && isStaleCacheError(err)) {
           logger.warn(
-            `Gemini rejected cached content ${ctxPrep.cacheId}; invalidating and retrying once.`,
+            `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
           );
-          await invalidateWorkspaceCache({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            workspaceRoot,
-          });
-          const rebuilt = await prepareContext({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            scan,
-            model: resolved,
-            systemPromptHash,
-            systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
-            ttlSeconds: ctx.config.cacheTtlSeconds,
-            cacheMinTokens: ctx.config.cacheMinTokens,
-            emitter,
-            allowCaching: !input.noCache && scan.files.length > 0,
-          });
-          response = await ctx.client.models.generateContent({
-            model: resolved.resolved,
-            contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-            config: buildConfig(rebuilt.cacheId),
-          });
-          if (rebuilt.cacheId) {
-            ctx.ttlWatcher.markHot(workspaceRoot, rebuilt.cacheId, ctx.config.cacheTtlSeconds);
+          try {
+            await invalidateWorkspaceCache({
+              client: ctx.client,
+              manifest: ctx.manifest,
+              workspaceRoot,
+            });
+            const rebuilt = await prepareContext({
+              client: ctx.client,
+              manifest: ctx.manifest,
+              scan,
+              model: resolved,
+              systemPromptHash,
+              systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
+              ttlSeconds: ctx.config.cacheTtlSeconds,
+              cacheMinTokens: ctx.config.cacheMinTokens,
+              emitter,
+              allowCaching: !input.noCache && scan.files.length > 0,
+            });
+            response = await ctx.client.models.generateContent({
+              model: resolved.resolved,
+              contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
+              config: buildConfig(rebuilt.cacheId),
+            });
+            activePrep = rebuilt;
+            retriedOnStaleCache = true;
+          } catch (retryErr) {
+            // Preserve the ORIGINAL stale-cache error as `cause` so ops can
+            // root-cause diagnostics across both the first 404 and any
+            // rebuild-time failure.
+            throw new Error(
+              `ask retry after stale cache failed: ${
+                retryErr instanceof Error ? retryErr.message : String(retryErr)
+              }`,
+              { cause: err },
+            );
           }
         } else {
           throw err;
         }
       }
 
-      if (ctxPrep.cacheId) {
-        ctx.ttlWatcher.markHot(workspaceRoot, ctxPrep.cacheId, ctx.config.cacheTtlSeconds);
+      if (activePrep.cacheId) {
+        ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
       }
 
       const text = response.text ?? '';
@@ -211,14 +228,15 @@ export const askTool: ToolDefinition<AskInput> = {
         outputTokens: output,
         thinkingTokens: thinking,
         costEstimateUsd: Math.round(cost * 10000) / 10000,
-        cacheHit: ctxPrep.reused,
-        cacheRebuilt: ctxPrep.rebuilt,
-        inlineOnly: ctxPrep.inlineOnly,
+        cacheHit: activePrep.reused,
+        cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
+        retriedOnStaleCache,
+        inlineOnly: activePrep.inlineOnly,
         filesIndexed: scan.files.length,
         filesSkippedTooLarge: scan.skippedTooLarge,
-        filesUploadFailed: ctxPrep.uploaded.failedCount,
-        ...(ctxPrep.uploaded.failedCount > 0
-          ? { uploadFailures: ctxPrep.uploaded.failures.slice(0, 5) }
+        filesUploadFailed: activePrep.uploaded.failedCount,
+        ...(activePrep.uploaded.failedCount > 0
+          ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
           : {}),
         workspaceTruncated: scan.truncated,
         maxFilesCap: ctx.config.maxFilesPerWorkspace,
