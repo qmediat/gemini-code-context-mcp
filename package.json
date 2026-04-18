@@ -1,0 +1,78 @@
+{
+  "name": "@qmediat.io/gemini-code-context-mcp",
+  "version": "0.0.0",
+  "description": "MCP server that gives Claude Code persistent memory of your codebase, backed by Gemini's 2M-token context. Drop-in upgrade over the abandoned gemini-mcp-tool.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "gemini",
+    "claude-code",
+    "context-cache",
+    "files-api",
+    "code-review",
+    "2m-context"
+  ],
+  "homepage": "https://github.com/qmediat/gemini-code-context-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/qmediat/gemini-code-context-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qmediat/gemini-code-context-mcp.git"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "Quantum Media Technologies sp. z o.o.",
+    "email": "contact@qmt.email",
+    "url": "https://www.qmediat.io"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "gemini-code-context-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run test/integration",
+    "lint": "biome check src test",
+    "format": "biome format --write src test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "better-sqlite3": "^11.0.0",
+    "zod": "^3.23.0",
+    "zod-to-json-schema": "^3.24.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "@changesets/cli": "^2.27.0",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@vitest/coverage-v8": "^4.1.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
