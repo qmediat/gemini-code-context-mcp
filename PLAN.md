@@ -515,7 +515,51 @@ time <call ask "explain module Y">         # cached: ~2-3s
 
 ---
 
-## Decyzje domknięte (po rundzie pytań + 2 follow-up)
+## Auth & Credentials Security (Rev 3)
+
+**Problem:** Klucz API w envvar w `~/.claude.json` ma 4 realne ryzyka: plaintext w dotfiles repo (jedno nieuważne git commit = wyciek), widoczność w `/proc/<pid>/environ`, brak revocation, brak cost cap.
+
+**Multi-tier architektura:**
+
+| Tier | Mechanizm | Kiedy | Trust |
+|---|---|---|---|
+| **1 (recommended)** | Google ADC via `gcloud auth application-default login` | User ma GCP setup | Najwyższy — Google-managed, auto-rotation, revocable |
+| **2 (domyślne)** | Credentials file `~/.config/qmediat/credentials` (chmod 0600) via `init` command | Wszyscy inni | Wysoki — local, permissions-enforced, poza Claude Code config |
+| **3 (dev fallback)** | `GEMINI_API_KEY` env var z warning przy starcie | Quick test / CI | Niski — warning nagłówek przy starcie |
+
+**`init` subcommand flow:**
+```bash
+npx @qmediat.io/gemini-code-context-mcp init
+```
+- Interactive prompts (inquirer z password mask)
+- Wybór auth method (ADC / API key / Vertex)
+- API key: ukryty input → zapis do `~/.config/qmediat/credentials` z `chmod 0600`
+- Auto-detekcja git repo → ostrzeżenie jeśli credentials path pod workingdirem
+- `~/.claude.json` dostaje **tylko profile reference** (`GEMINI_CREDENTIALS_PROFILE: "default"`), nigdy samego klucza
+- Budżet: `GEMINI_DAILY_BUDGET_USD` też pytany i zapisywany do profilu
+
+**Dodatkowe zabezpieczenia (baseline v1.0):**
+- **Key fingerprint logging** — nigdy pełny klucz; tylko `AIza...xyz9`
+- **Cost cap hard stop** — dzienny limit, po przekroczeniu server odmawia calli do następnego UTC midnight
+- **Secret scanning** — GitHub push protection włączone na repo
+- **Security.md** — threat model + incident response
+- **No telemetry** — nic nie leci do nas, wszystko local
+- **npm provenance** — publish via GitHub Actions z provenance flag (npm trust badge)
+
+**Folder dodany do architektury:**
+```
+src/auth/
+├── profile-loader.ts      # env → file → ADC (priority chain)
+├── credentials-store.ts   # R/W ~/.config/qmediat/credentials (0600)
+├── init-command.ts        # interactive setup (inquirer)
+└── fingerprint.ts         # safe partial-key preview
+```
+
+**Dropped z planu:** `Dockerfile` + `ghcr.io` — zbędne dla stdio MCP. `npx @qmediat.io/gemini-code-context-mcp` jest prostszą i bezpieczniejszą ścieżką dystrybucji.
+
+---
+
+## Decyzje domknięte (po rundzie pytań + 3 follow-up)
 
 - **Nazwa:** `@qmediat.io/gemini-code-context-mcp` (user accepted kebab-case variant proponowany przeze mnie zamiast compound `codecontext`).
 - **Scope v1.0:** 5 core tooli (`ask`, **`code`**, `status`, `reindex`, `clear`). Wycięte z v1.0: legacy `changeMode`, `brainstorm`, `fetch-chunk` — zastąpione przez lepszą architekturę (native Gemini thinking/code execution w `code` tool).
