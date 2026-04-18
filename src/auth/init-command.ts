@@ -99,7 +99,7 @@ export async function runInit(): Promise<void> {
     log('');
 
     if (detectGitUnderConfigDir()) {
-      log('⚠️  Warning: ~/.config/qmediat appears to be inside a git repository.');
+      log('Warning: ~/.config/qmediat appears to be inside a git repository.');
       log('   Make sure `qmediat/credentials` is .gitignored before continuing.');
       log('');
     }
@@ -147,7 +147,7 @@ export async function runInit(): Promise<void> {
     saveProfile(profileName, data);
 
     log('');
-    log(`✅ Saved profile '${profileName}' to ${credentialsPath()} (chmod 0600).`);
+    log(`Saved profile '${profileName}' to ${credentialsPath()} (chmod 0600).`);
     if (data.geminiApiKey) {
       log(`   Key fingerprint: ${fingerprint(data.geminiApiKey)}`);
     }
