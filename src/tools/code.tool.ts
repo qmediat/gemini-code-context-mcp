@@ -10,9 +10,13 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { GenerateContentConfig, GenerateContentResponse } from '@google/genai';
+import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
 import { z } from 'zod';
-import { prepareContext } from '../cache/cache-manager.js';
+import {
+  invalidateWorkspaceCache,
+  isStaleCacheError,
+  prepareContext,
+} from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
@@ -181,20 +185,59 @@ export const codeTool: ToolDefinition<CodeInput> = {
           : `generating with thinking=${thinkingBudget}…`,
       );
 
-      const baseConfig: GenerateContentConfig = {
+      const buildConfig = (cacheId: string | null): GenerateContentConfig => ({
         systemInstruction: SYSTEM_INSTRUCTION_CODE,
         thinkingConfig: { thinkingBudget, includeThoughts: true },
-        ...(ctxPrep.cacheId ? { cachedContent: ctxPrep.cacheId } : {}),
+        ...(cacheId ? { cachedContent: cacheId } : {}),
         ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
-      };
-
-      const response: GenerateContentResponse = await ctx.client.models.generateContent({
-        model: resolved.resolved,
-        contents: ctxPrep.cacheId
-          ? userPrompt
-          : [...ctxPrep.inlineFileParts, { role: 'user', parts: [{ text: userPrompt }] }],
-        config: baseConfig,
       });
+      const buildContents = (
+        cacheId: string | null,
+        inline: typeof ctxPrep.inlineContents,
+      ): string | Content[] =>
+        cacheId ? userPrompt : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
+
+      let response: GenerateContentResponse;
+      try {
+        response = await ctx.client.models.generateContent({
+          model: resolved.resolved,
+          contents: buildContents(ctxPrep.cacheId, ctxPrep.inlineContents),
+          config: buildConfig(ctxPrep.cacheId),
+        });
+      } catch (err) {
+        if (ctxPrep.cacheId && isStaleCacheError(err)) {
+          logger.warn(
+            `Gemini rejected cached content ${ctxPrep.cacheId}; invalidating and retrying once.`,
+          );
+          await invalidateWorkspaceCache({
+            client: ctx.client,
+            manifest: ctx.manifest,
+            workspaceRoot,
+          });
+          const rebuilt = await prepareContext({
+            client: ctx.client,
+            manifest: ctx.manifest,
+            scan,
+            model: resolved,
+            systemPromptHash,
+            systemInstruction: SYSTEM_INSTRUCTION_CODE,
+            ttlSeconds: ctx.config.cacheTtlSeconds,
+            cacheMinTokens: ctx.config.cacheMinTokens,
+            emitter,
+            allowCaching: scan.files.length > 0,
+          });
+          response = await ctx.client.models.generateContent({
+            model: resolved.resolved,
+            contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
+            config: buildConfig(rebuilt.cacheId),
+          });
+          if (rebuilt.cacheId) {
+            ctx.ttlWatcher.markHot(workspaceRoot, rebuilt.cacheId, ctx.config.cacheTtlSeconds);
+          }
+        } else {
+          throw err;
+        }
+      }
 
       if (ctxPrep.cacheId) {
         ctx.ttlWatcher.markHot(workspaceRoot, ctxPrep.cacheId, ctx.config.cacheTtlSeconds);
@@ -284,6 +327,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
         workspaceTruncated: scan.truncated,
         maxFilesCap: ctx.config.maxFilesPerWorkspace,
         filesIndexed: scan.files.length,
+        filesUploadFailed: ctxPrep.uploaded.failedCount,
+        ...(ctxPrep.uploaded.failedCount > 0
+          ? { uploadFailures: ctxPrep.uploaded.failures.slice(0, 5) }
+          : {}),
+        inlineOnly: ctxPrep.inlineOnly,
         ...(thinkingSummary ? { thinkingSummary } : {}),
         ...(executedCode.length > 0 ? { executedCode } : {}),
         ...(executionOutput.length > 0 ? { executionOutput } : {}),

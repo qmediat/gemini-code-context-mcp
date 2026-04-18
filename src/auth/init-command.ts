@@ -8,11 +8,11 @@
 
 import { execSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import { createInterface } from 'node:readline/promises';
 import { credentialsPath, qmediatConfigDir } from '../utils/paths.js';
-import { saveProfile } from './credentials-store.js';
+import { sanitizeProfileName, saveProfile } from './credentials-store.js';
 import { fingerprint } from './fingerprint.js';
 
 type AuthMethod = 'api-key' | 'vertex';
@@ -35,35 +35,77 @@ async function askHidden(prompt: string): Promise<string> {
 
   // Interactive TTY path: echo '*' for each char so users can verify length without leaking content.
   output.write(`${prompt} `);
-  return await new Promise<string>((resolve) => {
+  return await new Promise<string>((resolve, reject) => {
     let buf = '';
+    // Ensure the terminal is ALWAYS restored, even on exit / uncaught errors.
+    // Without this, Ctrl+C leaves the shell in raw mode — no echo, no line editing —
+    // until the user blindly types `reset`.
+    const cleanup = (): void => {
+      try {
+        input.off('data', listener);
+        input.setRawMode?.(false);
+        input.pause();
+      } catch {
+        /* best-effort */
+      }
+    };
     const listener = (chunk: Buffer): void => {
       const s = chunk.toString('utf8');
-      for (const ch of s) {
+      let i = 0;
+      while (i < s.length) {
+        const ch = s[i];
+        if (ch === undefined) {
+          i += 1;
+          continue;
+        }
         if (ch === '\r' || ch === '\n') {
           output.write('\n');
-          input.off('data', listener);
-          input.setRawMode?.(false);
-          input.pause();
+          cleanup();
           resolve(buf);
           return;
         }
         if (ch === '\u0003') {
-          // Ctrl+C
+          // Ctrl+C — restore terminal before exiting, otherwise the shell is left unusable.
           output.write('\n');
-          process.exit(130);
+          cleanup();
+          // Use reject so the caller's try/finally (runInit → rl.close) still fires.
+          reject(new Error('Interrupted by user (Ctrl+C)'));
+          return;
         }
         if (ch === '\u007f' || ch === '\b') {
           if (buf.length > 0) {
             buf = buf.slice(0, -1);
             output.write('\b \b');
           }
+          i += 1;
+          continue;
+        }
+        // Strip ANSI escape sequences (arrow keys, Home/End, etc.) — they'd otherwise
+        // silently corrupt the key. Arrow keys emit ESC[<letter>; we skip the whole
+        // sequence up to the final letter.
+        if (ch === '\u001b') {
+          i += 1;
+          // Skip optional '['
+          if (s[i] === '[') i += 1;
+          // Skip parameters until a final byte (a letter).
+          while (i < s.length && !/[A-Za-z~]/.test(s[i] ?? '')) i += 1;
+          // Skip the final letter.
+          i += 1;
+          continue;
+        }
+        // Reject other control chars (0x00-0x1F except handled above, and 0x7F).
+        const code = ch.charCodeAt(0);
+        if (code < 0x20 || code === 0x7f) {
+          i += 1;
           continue;
         }
         buf += ch;
         output.write('*');
+        i += 1;
       }
     };
+    process.once('SIGINT', cleanup);
+    process.once('exit', cleanup);
     input.setRawMode?.(true);
     input.resume();
     input.on('data', listener);
@@ -74,10 +116,24 @@ function claudeCodeConfigDir(): string {
   return join(process.env.HOME ?? '', '.claude.json');
 }
 
+/**
+ * Detect whether the credentials directory sits inside a git-tracked tree.
+ *
+ * On a fresh install the credentials dir doesn't exist yet; running `git` there
+ * fails with ENOENT and previously returned `false` — missing the warning for
+ * users whose home / dotfiles repo tracks `~/.config/`. We walk up the path
+ * hierarchy until we hit an existing ancestor and run the check from there.
+ */
 function detectGitUnderConfigDir(): boolean {
+  let cwd = qmediatConfigDir();
+  while (!existsSync(cwd)) {
+    const parent = dirname(cwd);
+    if (parent === cwd) return false;
+    cwd = parent;
+  }
   try {
     const output = execSync('git rev-parse --show-toplevel 2>/dev/null', {
-      cwd: qmediatConfigDir(),
+      cwd,
       encoding: 'utf8',
     });
     const top = output.trim();
@@ -120,7 +176,14 @@ export async function runInit(): Promise<void> {
     // option 2 and let the SDK pick up GOOGLE_APPLICATION_CREDENTIALS automatically.
 
     const profileInput = (await rl.question('Profile name [default]: ')).trim();
-    const profileName = profileInput.length > 0 ? profileInput : 'default';
+    // Validate now so we fail fast with a clear message instead of at write time.
+    let profileName: string;
+    try {
+      profileName = sanitizeProfileName(profileInput.length > 0 ? profileInput : 'default');
+    } catch (err) {
+      log(err instanceof Error ? err.message : String(err));
+      return;
+    }
 
     const data: Parameters<typeof saveProfile>[1] = {};
 

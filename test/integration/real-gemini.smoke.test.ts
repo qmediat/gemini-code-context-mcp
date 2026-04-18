@@ -70,11 +70,15 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
         emitter: noopEmitter,
         allowCaching: true,
       });
-      expect(first.uploaded.files.length).toBe(2);
-      // Workspace is well under Gemini's 1024-token cache minimum → fallback path.
+      // Under Gemini's 1024-token cache minimum → we skip upload entirely and
+      // embed files inline from disk. No Files API round-trips for small workspaces.
       expect(first.cacheId).toBeNull();
+      expect(first.inlineOnly).toBe(true);
+      expect(first.inlineContents.length).toBe(1);
+      expect(first.uploaded.files.length).toBe(0);
+      expect(first.uploaded.failedCount).toBe(0);
 
-      // Second call: files are reused via dedup, still in inline-fallback mode.
+      // Second call: still inline-only, no uploads, no Files API calls.
       const second = await prepareContext({
         client,
         manifest,
@@ -86,8 +90,9 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
         emitter: noopEmitter,
         allowCaching: true,
       });
-      expect(second.uploaded.reusedCount).toBe(2);
+      expect(second.inlineOnly).toBe(true);
       expect(second.uploaded.uploadedCount).toBe(0);
+      expect(second.uploaded.reusedCount).toBe(0);
     } finally {
       manifest.close();
     }

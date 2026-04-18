@@ -14,8 +14,18 @@
  *   default_model = latest-flash
  */
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
+import { logger } from '../utils/logger.js';
 import { credentialsPath, qmediatConfigDir } from '../utils/paths.js';
 
 export interface ProfileData {
@@ -101,10 +111,29 @@ function serializeIni(profiles: ProfilesMap): string {
   return chunks.join('\n');
 }
 
+/**
+ * Warn if the credentials file has permissions broader than owner-only on POSIX.
+ * Windows NTFS ACLs can't be inspected via `mode`; we log a one-shot note there.
+ */
+function warnOnLoosePermissions(path: string): void {
+  if (process.platform === 'win32') return;
+  try {
+    const mode = statSync(path).mode & 0o777;
+    if ((mode & 0o077) !== 0) {
+      logger.warn(
+        `Credentials file ${path} has permissions 0${mode.toString(8).padStart(3, '0')} — group/other have access. Run 'chmod 0600 ${path}' to restrict.`,
+      );
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Load all profiles from disk. Returns empty map if the file doesn't exist. */
 export function loadCredentials(): ProfilesMap {
   const path = credentialsPath();
   if (!existsSync(path)) return new Map();
+  warnOnLoosePermissions(path);
   try {
     const raw = readFileSync(path, 'utf8');
     return parseIni(raw);
@@ -125,8 +154,33 @@ export function loadProfile(name: string): ProfileData {
   return profile;
 }
 
-/** Persist a single profile, preserving other profiles. */
+/**
+ * Validate a profile name against injection vectors.
+ *
+ * INI section headers are `[name]` — if `name` contains `]`, `[`, `\n`, `\r`,
+ * or `=`, a malicious name could create phantom sections or confuse the parser.
+ * readline strips `\n` from interactive input, but a programmatic caller has no
+ * such protection; this whitelist is the authoritative defense.
+ */
+export function sanitizeProfileName(name: string): string {
+  if (!/^[a-zA-Z0-9._-]{1,32}$/.test(name)) {
+    throw new Error(
+      `Invalid profile name '${name}': must be 1-32 chars, only letters, digits, dot, underscore, hyphen.`,
+    );
+  }
+  return name;
+}
+
+/**
+ * Persist a single profile, preserving other profiles.
+ *
+ * Writes atomically via `tmp + rename` so that a chmod / write failure never
+ * leaves the secret on disk with the wrong permissions. On POSIX, tmp is
+ * created with `O_EXCL` (`flag:'wx'`) to defeat symlink attacks between the
+ * existence check and the write.
+ */
 export function saveProfile(name: string, data: ProfileData): void {
+  const safeName = sanitizeProfileName(name);
   const dir = qmediatConfigDir();
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -134,11 +188,41 @@ export function saveProfile(name: string, data: ProfileData): void {
 
   const path = credentialsPath();
   const profiles = existsSync(path) ? loadCredentials() : new Map<string, ProfileData>();
-  profiles.set(name, data);
+  profiles.set(safeName, data);
 
-  writeFileSync(path, serializeIni(profiles), { mode: 0o600 });
-  // Defensive: force permissions even if umask or existing file allowed more.
-  chmodSync(path, 0o600);
-  // Defensive: also lock down parent directory.
-  chmodSync(dirname(path), 0o700);
+  const content = serializeIni(profiles);
+  const tmpPath = `${path}.tmp.${process.pid}.${Date.now()}`;
+
+  try {
+    // `flag: 'wx'` → O_CREAT | O_EXCL — fails if tmpPath exists, preventing
+    // symlink-attack overwrite of arbitrary targets.
+    writeFileSync(tmpPath, content, { mode: 0o600, flag: 'wx' });
+    if (process.platform !== 'win32') {
+      // Defensive: ensure perms even if umask altered the initial create mode.
+      chmodSync(tmpPath, 0o600);
+    } else {
+      logger.warn(
+        `Running on Windows — chmod(0600) has no effect on NTFS. The credentials file inherits ACLs from its parent directory. Verify access via: icacls "${path}"`,
+      );
+    }
+    // Atomic on same filesystem. After this line, the secret is at `path`
+    // with 0600 perms; there is no window where it exists with looser perms.
+    renameSync(tmpPath, path);
+  } catch (err) {
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {
+      /* best-effort cleanup */
+    }
+    throw err;
+  }
+
+  // Parent directory is already 0o700 from mkdirSync; re-chmod as defense-in-depth.
+  if (process.platform !== 'win32') {
+    try {
+      chmodSync(dirname(path), 0o700);
+    } catch {
+      /* best-effort — dir may be held by another process */
+    }
+  }
 }

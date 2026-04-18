@@ -14,7 +14,14 @@ import { type ModelInfo, listAvailableModels } from './model-registry.js';
 
 const ALIASES = {
   'latest-pro': (models: ModelInfo[]): ModelInfo | undefined =>
-    models.find((m) => m.id.includes('pro') && !m.id.includes('image') && !m.id.includes('tts')),
+    models.find(
+      (m) =>
+        m.id.includes('pro') &&
+        !m.id.includes('image') &&
+        !m.id.includes('tts') &&
+        !m.id.includes('vision') &&
+        !m.id.includes('audio'),
+    ),
   'latest-pro-thinking': (models: ModelInfo[]): ModelInfo | undefined =>
     models.find(
       (m) =>
@@ -23,17 +30,33 @@ const ALIASES = {
         !m.id.includes('image') &&
         !m.id.includes('tts'),
     ) ??
-    models.find((m) => m.id.includes('pro') && !m.id.includes('image') && !m.id.includes('tts')),
+    models.find(
+      (m) =>
+        m.id.includes('pro') &&
+        !m.id.includes('image') &&
+        !m.id.includes('tts') &&
+        !m.id.includes('vision') &&
+        !m.id.includes('audio'),
+    ),
   'latest-flash': (models: ModelInfo[]): ModelInfo | undefined =>
     models.find(
       (m) =>
         m.id.includes('flash') &&
         !m.id.includes('image') &&
         !m.id.includes('tts') &&
-        !m.id.includes('lite'),
+        !m.id.includes('lite') &&
+        !m.id.includes('vision') &&
+        !m.id.includes('audio'),
     ),
   'latest-lite': (models: ModelInfo[]): ModelInfo | undefined =>
-    models.find((m) => m.id.includes('lite') && !m.id.includes('image')),
+    models.find(
+      (m) =>
+        m.id.includes('lite') &&
+        !m.id.includes('image') &&
+        !m.id.includes('tts') &&
+        !m.id.includes('vision') &&
+        !m.id.includes('audio'),
+    ),
 } as const;
 
 export type Alias = keyof typeof ALIASES;
