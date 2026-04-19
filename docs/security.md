@@ -9,7 +9,7 @@ Your Gemini API key and your workspace content. We treat them with different thr
 - **Never logged.** Only the first 4 and last 4 characters appear in logs (`AIza...xyz9`).
 - **Never stored in MCP host config.** Your `~/.claude.json` (or equivalent) references the profile name, not the key itself.
 - **Stored at rest with `chmod 0600`.** `~/.config/qmediat/credentials` is enforced file-only readable. The parent directory (`~/.config/qmediat`) is enforced `chmod 0700`.
-- **Budget-capped.** `GEMINI_DAILY_BUDGET_USD` stops calls once cumulative spend exceeds the cap. Combined with Google's per-key usage dashboard, leaks have a bounded blast radius. **Caveat:** the check runs *before* each call using the cost recorded from completed calls. A single call that by itself exceeds the remaining budget will still complete (we don't estimate cost upfront). In practice this means the cap provides one call of over-run protection. For hard ceilings, use Google's per-key quota limits in addition.
+- **Budget-capped atomically.** `GEMINI_DAILY_BUDGET_USD` stops calls once the cap would be exceeded. The check is an atomic `BEGIN IMMEDIATE` SQLite transaction — N concurrent tool calls cannot all pass a pre-check and then collectively overshoot the cap. The reservation uses a conservative pre-call estimate (workspace size × 4 bytes/token + prompt + `maxOutputTokens` cap), so a single runaway response cannot exceed its reservation silently. On completion, the estimate is replaced with the measured cost. **Caveat:** the bytes/4 heuristic undercounts multibyte / CJK / emoji-dense content; see `docs/FOLLOW-UP-PRS.md#T17`. For hard ceilings beyond this, use Google's per-key quota limits in addition.
 
 ### Workspace content
 
@@ -25,9 +25,10 @@ Your Gemini API key and your workspace content. We treat them with different thr
 | `~/.claude.json` synced to a dotfiles repo | We intentionally don't put the key there. The config references the profile name only. |
 | Other local processes reading `/proc/<pid>/environ` | Prefer Tier 1 (Vertex/ADC) or Tier 2 (credentials file) over Tier 3 (env var). The env-var path logs a warning at startup. |
 | API key exfiltrated, attacker runs up usage | `GEMINI_DAILY_BUDGET_USD` caps daily spend. Rotate the key in Google AI Studio. |
-| Sensitive files accidentally indexed | `includeGlobs`/`excludeGlobs` on every tool call. Default excludes cover `node_modules`, `.git`, build outputs, lockfiles. |
+| Sensitive files accidentally indexed | `includeGlobs`/`excludeGlobs` on every tool call. Default excludes cover `node_modules`, `.git`, build outputs, lockfiles, AND secret-bearing directories (`.ssh`, `.aws`, `.gnupg`, `.gpg`, `.kube`, `.docker`, `.1password`, `.pki`, `.gcloud`, `.azure`, `.config/gcloud`, `.config/azure`, `Keychains`) plus secret-bearing files (`.netrc`, `.pypirc`, `.npmrc`, `.pgpass`, `.git-credentials`, `credentials`). These excludes are unconditional — `includeGlobs` cannot re-enable them. |
 | Malicious MCP host | Users trust their MCP host (Claude Code/Desktop). If you don't, don't install MCP servers. |
-| Path traversal via `workspace` arg | Paths resolved via `path.resolve(cwd)` then used in `readdir(withFileTypes)` — we never execute paths. |
+| Prompt-injected agent redirecting `workspace` at `$HOME` or `/etc` | `validateWorkspacePath` refuses paths that are neither descendants of the MCP host's cwd nor contain a recognised workspace marker (`.git`, `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `Makefile`, `Dockerfile`, …). Both sides of the cwd-ancestry check are canonicalised via `realpath`, so symlinks cannot bypass the guard. Escape hatch for genuine non-workspace roots: `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE=true`. |
+| Arbitrary file read via workspace path argument | Handled by the same `validateWorkspacePath` check above. Paths are never executed — only passed to `readdir(withFileTypes)` — but unrestricted paths were a content-exfiltration vector before this guard landed. |
 | Arbitrary code execution via `code` tool | The `codeExecution` flag enables **Gemini's** sandboxed Python env, not local exec. Nothing runs on your machine. |
 | Supply-chain compromise of a dependency | Only 5 runtime deps (`@modelcontextprotocol/sdk`, `@google/genai`, `better-sqlite3`, `zod`, `zod-to-json-schema`). CI runs `npm audit`. Dependabot alerts on. |
 

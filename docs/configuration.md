@@ -27,6 +27,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_CODE_CONTEXT_MAX_FILE_SIZE` | `1000000` | Skip files bigger than this (bytes) |
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `GEMINI_CODE_CONTEXT_TELEMETRY` | `false` | Set `true` to opt into anonymous usage counts (nothing happens yet — reserved for future public dashboard) |
+| `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE` | `false` | Set `true` to bypass the `validateWorkspacePath` guard that rejects paths outside the MCP host's cwd unless they contain a recognised workspace marker. Only set this for genuinely unconventional roots (CI sandboxes, generated build dirs). Do NOT set it to work around a prompt-injection vector — the guard is the security control. |
 | `GEMINI_PRICING_OVERRIDES` | — | JSON map of `model → {inputPerMillion, outputPerMillion, cachedInputPerMillion?}`. See example below. |
 | `XDG_CONFIG_HOME` | — | Override the config directory (defaults to `~/.config`) |
 
