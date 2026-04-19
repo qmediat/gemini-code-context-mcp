@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-04-19
+
+Ship-blocker patch. v1.0.0 and v1.0.1 silently failed to register tools in strict MCP clients (Claude Code, Claude Desktop): the server appeared connected but none of its five tools were callable. Every Claude Code user of those releases was affected.
+
 ### Fixed
 
-- **`tools/list` response now has spec-compliant `inputSchema`** — every tool's `inputSchema` emits `type: "object"` at the root instead of a `{ $ref, definitions }` envelope. MCP clients that strictly validate the spec (Claude Code, Claude Desktop) silently rejected the previous shape with `Failed to fetch tools: Invalid input: expected "object"` and left the server connected but tool-less. Affects v1.0.0 and v1.0.1. Fix: drop the `name` option from `zod-to-json-schema`; centralise the serialisation in `buildToolInputSchema()` so the `tools/list` handler and the new conformance test agree by construction. Added `test/unit/tool-input-schema.test.ts` that also round-trips the whole payload through `@modelcontextprotocol/sdk`'s own `ListToolsResultSchema`, so any future regression is caught by the SDK's authoritative validator.
+- **`tools/list` response now has spec-compliant `inputSchema`** — every tool's `inputSchema` emits `type: "object"` at the root instead of a `{ $ref, definitions }` envelope. MCP clients that strictly validate the spec rejected the previous shape with `Failed to fetch tools: Invalid input: expected "object"` and dropped every tool from their namespace. Root cause: the `name` option on `zod-to-json-schema` triggers a named-wrapper envelope that lacks the spec-mandated root `type`. Fix: drop the `name` option; centralise the serialisation in `buildToolInputSchema()` so the `tools/list` handler and the new conformance test share one source of truth. Added `test/unit/tool-input-schema.test.ts` that also round-trips the whole payload through `@modelcontextprotocol/sdk`'s own `ListToolsResultSchema`, so any future regression is caught by the SDK's authoritative validator.
+
+### Operators / forks
+
+- If you published a fork based on 1.0.0 or 1.0.1, the same silent-tool-registration failure affects your users. Upgrade the `zod-to-json-schema` call to omit `name`, or rebase onto 1.0.2.
+- 1.0.0 and 1.0.1 are now deprecated on npm.
 
 ## [1.0.1] — 2026-04-19
 
