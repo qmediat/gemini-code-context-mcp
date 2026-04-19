@@ -456,7 +456,13 @@ export const codeTool: ToolDefinition<CodeInput> = {
     } catch (err) {
       logger.error(`code failed: ${String(err)}`);
       if (reservationId !== null) {
-        ctx.manifest.cancelBudgetReservation(reservationId);
+        try {
+          ctx.manifest.cancelBudgetReservation(reservationId);
+        } catch (cancelErr) {
+          logger.error(
+            `code: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
+          );
+        }
         reservationId = null;
       }
       return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`);

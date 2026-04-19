@@ -337,9 +337,18 @@ export const askTool: ToolDefinition<AskInput> = {
     } catch (err) {
       logger.error(`ask failed: ${String(err)}`);
       // Release any unconsumed budget reservation so the failed call's
-      // estimate doesn't eat into future headroom for today.
+      // estimate doesn't eat into future headroom for today. Wrap in its
+      // own try/catch — better-sqlite3 can throw SQLITE_BUSY or I/O errors
+      // and we must not let a rollback-time DB failure replace the real
+      // tool error the user is waiting on.
       if (reservationId !== null) {
-        ctx.manifest.cancelBudgetReservation(reservationId);
+        try {
+          ctx.manifest.cancelBudgetReservation(reservationId);
+        } catch (cancelErr) {
+          logger.error(
+            `ask: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
+          );
+        }
         reservationId = null;
       }
       return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`);
