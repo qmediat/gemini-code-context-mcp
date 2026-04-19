@@ -1,0 +1,78 @@
+# Dependabot — automatic dependency updates.
+#
+# Two ecosystems tracked:
+#   1. npm       — runtime + dev deps in package.json.
+#   2. github-actions — versions pinned in .github/workflows/*.yml.
+#
+# Grouping strategy:
+#   - Security updates: always individual PRs, no grouping, no delay.
+#   - Non-security patch/minor: grouped weekly into one PR per ecosystem to
+#     reduce review fatigue.
+#   - Major updates: individual PRs for dedicated review (breaking-change risk).
+
+version: 2
+
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: Europe/Warsaw
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - automated
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(dev-deps)"
+      include: scope
+    groups:
+      non-major-patches:
+        applies-to: version-updates
+        update-types:
+          - patch
+        patterns:
+          - "*"
+      non-major-minor:
+        applies-to: version-updates
+        update-types:
+          - minor
+        patterns:
+          - "*"
+    ignore:
+      # Vendor-pin @modelcontextprotocol/sdk to its minor; the protocol is
+      # still in flux and a breaking change there needs a human-reviewed PR.
+      - dependency-name: "@modelcontextprotocol/sdk"
+        update-types:
+          - version-update:semver-major
+      # Same discipline for @google/genai — SDK changes often shift shapes
+      # (cache/files API) and want deliberate review, not automerge.
+      - dependency-name: "@google/genai"
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: Europe/Warsaw
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - github-actions
+      - automated
+    commit-message:
+      prefix: "chore(ci)"
+      include: scope
+    groups:
+      actions-non-major:
+        applies-to: version-updates
+        update-types:
+          - patch
+          - minor
+        patterns:
+          - "*"
