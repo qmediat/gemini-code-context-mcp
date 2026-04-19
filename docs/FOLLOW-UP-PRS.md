@@ -207,3 +207,34 @@ Real improvements surfaced by `/6step` and `/coderev` analysis that are out of s
 **Sizing:** ~30 min. Pure cleanup; no user-visible change.
 
 **Trigger:** Combine with the next real schema migration to avoid a DB-bump for one trivial change.
+
+---
+
+## T17. Tokenizer-accurate pre-call cost estimate
+
+**Source:** 2026-04-19 code review (gpt + grok, 2/3 consensus).
+
+**Why:** The pre-call cost estimator (`src/utils/cost-estimator.ts:124-134`) currently approximates input tokens as `Math.ceil(bytes / 4)` and `Math.ceil(chars / 4)`. This is roughly accurate on ASCII source but undercounts by ~40-50% on dense UTF-8 / CJK / emoji content, so the budget-reservation "true upper bound" claim (same file, lines 115-123) can overshoot by one call on CJK-heavy repos (bounded to a single finalize write per day, not unbounded drain).
+
+**Options:**
+1. Ship an official tokenizer (e.g. `@google/generative-ai` `countTokens` call, or a local BPE) and replace the heuristic entirely. Adds a dep + pre-call latency; exact bound.
+2. Keep the heuristic but tighten to `Math.ceil(bytes / 3)` (+33% padding) to cover the CJK tail; cheap, still bounded, still occasionally over-estimates on pure ASCII.
+3. Document the limitation; accept the single-call overshoot as a known UX quirk.
+
+**Sizing:** Option 1 — half a day (integration + test). Options 2 / 3 — under an hour.
+
+**Trigger:** First user report of a CJK-heavy repo blowing through `GEMINI_DAILY_BUDGET_USD` by more than the per-call estimate.
+
+---
+
+## T18. Precise budget accounting during stale-cache retry
+
+**Source:** 2026-04-19 code review (grok, 1/3 consensus).
+
+**Why:** When `ask` / `code` hit a stale-cache error (Gemini-side cache eviction) and retry once via `markCacheStale` + `prepareContext` rebuild, the original `reservationId` is reused. Concurrent callers during the retry window see the original estimate (sized for the failed call's uncached upload) counted against the daily budget until `finalizeBudgetReservation` writes the real cost. Because the rebuild reuses the same scan and content-hash deduplication avoids re-uploading, real cost is ≤ the reservation estimate — so the bias is toward false-reject (over-reporting) rather than cap bypass. It's a UX / accounting precision issue, not a safety one.
+
+**Scope:** Cleaner design — `cancelBudgetReservation(original)` → re-estimate for the rebuild path → re-reserve. Requires care: a transient race between cancel and re-reserve could let a concurrent call squeak past the cap it would otherwise fail. Needs design discussion on an atomic "adjust reservation" primitive vs cancel+reserve with a short-lived lock.
+
+**Sizing:** 1-2 days including new DB primitive, migration, and tests.
+
+**Trigger:** If a high-concurrency user reports spurious "daily budget cap would be exceeded" errors during cache-rebuild windows.
