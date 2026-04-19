@@ -14,7 +14,7 @@ import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cach
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import { validateWorkspacePath } from '../indexer/workspace-validation.js';
-import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
+import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
@@ -60,16 +60,7 @@ export const askTool: ToolDefinition<AskInput> = {
     validateWorkspacePath(workspaceRoot);
     const model = input.model ?? ctx.config.defaultModel;
 
-    // Budget cap check.
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const spentToday = ctx.manifest.todaysCostMicros(Date.now()) / 1_000_000;
-      if (spentToday >= ctx.config.dailyBudgetUsd) {
-        return errorResult(
-          `Daily budget cap reached ($${spentToday.toFixed(4)} ≥ $${ctx.config.dailyBudgetUsd.toFixed(2)}). Calls will resume after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-        );
-      }
-    }
-
+    let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       emitter.emit(`resolving model '${model}'…`);
@@ -82,6 +73,36 @@ export const askTool: ToolDefinition<AskInput> = {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
+
+      // Atomic budget reservation. Happens AFTER scan (so the estimate is
+      // accurate) but BEFORE any billable upload or generateContent call.
+      // Concurrent tool calls cannot all pass a pre-check and then
+      // collectively overshoot the cap: `reserveBudget` uses a
+      // `BEGIN IMMEDIATE` SQLite transaction that serialises check-and-insert.
+      if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
+        const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+        const estimateUsd = estimatePreCallCostUsd({
+          model: resolved.resolved,
+          workspaceBytes,
+          promptChars: input.prompt.length,
+          expectedOutputTokens: 8000,
+        });
+        const reserve = ctx.manifest.reserveBudget({
+          workspaceRoot,
+          toolName: 'ask',
+          model: resolved.resolved,
+          estimatedCostMicros: toMicrosUsd(estimateUsd),
+          dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+          nowMs: Date.now(),
+        });
+        if ('rejected' in reserve) {
+          const spentUsd = reserve.spentMicros / 1_000_000;
+          return errorResult(
+            `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
+          );
+        }
+        reservationId = reserve.id;
+      }
 
       const systemPromptHash = createHash('sha256')
         .update(SYSTEM_INSTRUCTION_Q_AND_A)
@@ -203,16 +224,26 @@ export const askTool: ToolDefinition<AskInput> = {
       const costMicros = toMicrosUsd(cost);
 
       const durationMs = Date.now() - started;
-      ctx.manifest.insertUsageMetric({
-        workspaceRoot,
-        toolName: 'ask',
-        model: resolved.resolved,
-        cachedTokens: cached,
-        uncachedTokens: uncached,
-        costUsdMicro: costMicros,
-        durationMs,
-        occurredAt: Date.now(),
-      });
+      if (reservationId !== null) {
+        ctx.manifest.finalizeBudgetReservation(reservationId, {
+          cachedTokens: cached,
+          uncachedTokens: uncached,
+          costUsdMicro: costMicros,
+          durationMs,
+        });
+        reservationId = null; // consumed — don't let the catch below re-cancel.
+      } else {
+        ctx.manifest.insertUsageMetric({
+          workspaceRoot,
+          toolName: 'ask',
+          model: resolved.resolved,
+          cachedTokens: cached,
+          uncachedTokens: uncached,
+          costUsdMicro: costMicros,
+          durationMs,
+          occurredAt: Date.now(),
+        });
+      }
 
       if (scan.truncated) {
         logger.warn(
@@ -248,6 +279,12 @@ export const askTool: ToolDefinition<AskInput> = {
       return textResult(text, metadata);
     } catch (err) {
       logger.error(`ask failed: ${String(err)}`);
+      // Release any unconsumed budget reservation so the failed call's
+      // estimate doesn't eat into future headroom for today.
+      if (reservationId !== null) {
+        ctx.manifest.cancelBudgetReservation(reservationId);
+        reservationId = null;
+      }
       return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       emitter.stop();

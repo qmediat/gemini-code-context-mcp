@@ -118,6 +118,123 @@ describe('ManifestDb', () => {
     expect(stats.totalCostMicros).toBe(3500);
   });
 
+  it('reserves budget atomically and rejects when cap would be exceeded', () => {
+    const now = Date.now();
+    // Cap: $0.01 = 10_000 micros.
+    const cap = 10_000;
+
+    // First reservation — fits.
+    const r1 = db.reserveBudget({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      estimatedCostMicros: 6_000,
+      dailyBudgetMicros: cap,
+      nowMs: now,
+    });
+    expect('id' in r1).toBe(true);
+
+    // Second reservation — would push over cap (6_000 + 5_000 > 10_000).
+    const r2 = db.reserveBudget({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      estimatedCostMicros: 5_000,
+      dailyBudgetMicros: cap,
+      nowMs: now,
+    });
+    expect('rejected' in r2).toBe(true);
+    if ('rejected' in r2) {
+      expect(r2.spentMicros).toBe(6_000);
+      expect(r2.capMicros).toBe(cap);
+    }
+  });
+
+  it('finalizes a reservation with the measured cost', () => {
+    const now = Date.now();
+    const r = db.reserveBudget({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      estimatedCostMicros: 8_000,
+      dailyBudgetMicros: 100_000,
+      nowMs: now,
+    });
+    expect('id' in r).toBe(true);
+    if (!('id' in r)) throw new Error('reservation rejected');
+
+    db.finalizeBudgetReservation(r.id, {
+      cachedTokens: 500,
+      uncachedTokens: 200,
+      costUsdMicro: 3_500,
+      durationMs: 1234,
+    });
+
+    const stats = db.workspaceStats('/tmp/wks');
+    expect(stats.callCount).toBe(1);
+    expect(stats.totalCachedTokens).toBe(500);
+    expect(stats.totalUncachedTokens).toBe(200);
+    // Actual cost (3_500) overwrites the estimate (8_000).
+    expect(stats.totalCostMicros).toBe(3_500);
+  });
+
+  it('cancels a reservation so its estimate does not burn budget', () => {
+    const now = Date.now();
+    const cap = 20_000;
+
+    const r = db.reserveBudget({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      estimatedCostMicros: 15_000,
+      dailyBudgetMicros: cap,
+      nowMs: now,
+    });
+    expect('id' in r).toBe(true);
+    if (!('id' in r)) throw new Error('reservation rejected');
+
+    db.cancelBudgetReservation(r.id);
+
+    // After cancellation, a fresh reservation with the same estimate fits again.
+    const r2 = db.reserveBudget({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      estimatedCostMicros: 15_000,
+      dailyBudgetMicros: cap,
+      nowMs: now,
+    });
+    expect('id' in r2).toBe(true);
+  });
+
+  it("counts only today's reservations against the cap (UTC midnight boundary)", () => {
+    const now = Date.now();
+    // Insert an "yesterday" high-cost row directly so we can verify the
+    // daily SUM excludes it.
+    const yesterday = now - 25 * 3600 * 1000;
+    db.insertUsageMetric({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      cachedTokens: 0,
+      uncachedTokens: 0,
+      costUsdMicro: 999_999_999,
+      durationMs: 0,
+      occurredAt: yesterday,
+    });
+
+    const r = db.reserveBudget({
+      workspaceRoot: '/tmp/wks',
+      toolName: 'ask',
+      model: 'gemini-3-pro-preview',
+      estimatedCostMicros: 5_000,
+      dailyBudgetMicros: 10_000,
+      nowMs: now,
+    });
+    // Yesterday's massive row must NOT count — reservation fits under today's cap.
+    expect('id' in r).toBe(true);
+  });
+
   it('cascades file deletes when a workspace is deleted', () => {
     const now = Date.now();
     db.upsertWorkspace({

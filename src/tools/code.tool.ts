@@ -16,7 +16,7 @@ import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cach
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import { validateWorkspacePath } from '../indexer/workspace-validation.js';
-import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
+import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
@@ -133,15 +133,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
     const expectEdits = input.expectEdits ?? true;
     const codeExecution = input.codeExecution ?? false;
 
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const spentToday = ctx.manifest.todaysCostMicros(Date.now()) / 1_000_000;
-      if (spentToday >= ctx.config.dailyBudgetUsd) {
-        return errorResult(
-          `Daily budget cap reached ($${spentToday.toFixed(4)} ≥ $${ctx.config.dailyBudgetUsd.toFixed(2)}).`,
-        );
-      }
-    }
-
+    let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       emitter.emit(`resolving model '${modelRequest}'…`);
@@ -154,6 +146,34 @@ export const codeTool: ToolDefinition<CodeInput> = {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
+
+      // Atomic budget reservation — see ask.tool.ts for the full rationale.
+      // Estimate includes the thinking budget (billed as output tokens on Pro).
+      if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
+        const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+        const estimateUsd = estimatePreCallCostUsd({
+          model: resolved.resolved,
+          workspaceBytes,
+          promptChars: input.task.length,
+          expectedOutputTokens: 16_000,
+          thinkingTokens: thinkingBudget,
+        });
+        const reserve = ctx.manifest.reserveBudget({
+          workspaceRoot,
+          toolName: 'code',
+          model: resolved.resolved,
+          estimatedCostMicros: toMicrosUsd(estimateUsd),
+          dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+          nowMs: Date.now(),
+        });
+        if ('rejected' in reserve) {
+          const spentUsd = reserve.spentMicros / 1_000_000;
+          return errorResult(
+            `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
+          );
+        }
+        reservationId = reserve.id;
+      }
 
       const systemPromptHash = createHash('sha256')
         .update(SYSTEM_INSTRUCTION_CODE)
@@ -320,16 +340,26 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const costMicros = toMicrosUsd(cost);
 
       const durationMs = Date.now() - started;
-      ctx.manifest.insertUsageMetric({
-        workspaceRoot,
-        toolName: 'code',
-        model: resolved.resolved,
-        cachedTokens: cached,
-        uncachedTokens: uncached,
-        costUsdMicro: costMicros,
-        durationMs,
-        occurredAt: Date.now(),
-      });
+      if (reservationId !== null) {
+        ctx.manifest.finalizeBudgetReservation(reservationId, {
+          cachedTokens: cached,
+          uncachedTokens: uncached,
+          costUsdMicro: costMicros,
+          durationMs,
+        });
+        reservationId = null; // consumed — don't let the catch below re-cancel.
+      } else {
+        ctx.manifest.insertUsageMetric({
+          workspaceRoot,
+          toolName: 'code',
+          model: resolved.resolved,
+          cachedTokens: cached,
+          uncachedTokens: uncached,
+          costUsdMicro: costMicros,
+          durationMs,
+          occurredAt: Date.now(),
+        });
+      }
 
       if (scan.truncated) {
         logger.warn(
@@ -375,6 +405,10 @@ export const codeTool: ToolDefinition<CodeInput> = {
       return textResult(text, structured);
     } catch (err) {
       logger.error(`code failed: ${String(err)}`);
+      if (reservationId !== null) {
+        ctx.manifest.cancelBudgetReservation(reservationId);
+        reservationId = null;
+      }
       return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       emitter.stop();
