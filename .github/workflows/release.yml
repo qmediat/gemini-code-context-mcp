@@ -1,0 +1,85 @@
+name: Release
+
+# Fires on any `v*` tag push. Full flow: validate (lint + typecheck + unit
+# tests + build) → publish to npm with provenance → create GitHub Release with
+# auto-generated notes.
+#
+# Required repository secret: NPM_TOKEN — an npm "Automation" access token
+# (NOT a classic token) with the scope `@qmediat.io` and "Publish" permission.
+# Create at https://www.npmjs.com/settings/qmediat/tokens/granular-access-tokens.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write      # create GitHub Release
+  id-token: write      # provenance signing via OIDC
+
+jobs:
+  release:
+    name: Publish to npm + GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so release notes can reference prior commits
+          # and provenance can link back to an auditable build record.
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        # Integration tests auto-skip without GEMINI_API_KEY, so CI runs the
+        # unit + mock tests only. Real-API smoke lives in local dev workflows.
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify tag matches package.json version
+        # Prevents shipping a tag that disagrees with package.json (e.g. if
+        # someone forgets to bump version before tagging). The tag name arrives
+        # as refs/tags/v1.2.3; we strip the prefix and compare.
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error ::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+          echo "Tag $GITHUB_REF_NAME matches package.json version $PKG_VERSION"
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # --provenance links the tarball to this exact workflow run,
+        # producing a public supply-chain attestation on npmjs.com.
+        # --access public is required for the first publish of a scoped package
+        # and harmless on subsequent publishes.
+        run: npm publish --provenance --access public
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --latest
