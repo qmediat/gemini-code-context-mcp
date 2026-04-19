@@ -164,6 +164,22 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
       });
       expect(typeof response.text).toBe('string');
       expect(response.usageMetadata?.cachedContentTokenCount ?? 0).toBeGreaterThan(0);
+
+      // REGRESSION GUARD: Gemini rejects generateContent({cachedContent, systemInstruction})
+      // with 400 "CachedContent can not be used with GenerateContent request setting
+      // system_instruction, tools or tool_config." The production tool (ask/code) must
+      // NEVER pass systemInstruction alongside cachedContent. This call verifies the
+      // failure mode so a future refactor that re-adds systemInstruction is caught.
+      await expect(
+        client.models.generateContent({
+          model: resolved.resolved,
+          contents: 'What files exist?',
+          config: {
+            cachedContent: first.cacheId,
+            systemInstruction: 'You are a test harness.',
+          },
+        }),
+      ).rejects.toThrow(/INVALID_ARGUMENT|cached[_ ]?content|system_instruction/i);
     } finally {
       manifest.close();
     }

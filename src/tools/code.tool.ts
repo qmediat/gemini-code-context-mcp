@@ -172,7 +172,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
         ttlSeconds: ctx.config.cacheTtlSeconds,
         cacheMinTokens: ctx.config.cacheMinTokens,
         emitter,
-        allowCaching: scan.files.length > 0,
+        // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
+        // which Gemini rejects together with cachedContent. Force inline path
+        // when codeExecution is requested so we have actual inline file parts
+        // to embed alongside the prompt.
+        allowCaching: scan.files.length > 0 && !codeExecution,
       });
 
       const userPrompt = expectEdits
@@ -185,17 +189,39 @@ export const codeTool: ToolDefinition<CodeInput> = {
           : `generating with thinking=${thinkingBudget}…`,
       );
 
-      const buildConfig = (cacheId: string | null): GenerateContentConfig => ({
-        systemInstruction: SYSTEM_INSTRUCTION_CODE,
-        thinkingConfig: { thinkingBudget, includeThoughts: true },
-        ...(cacheId ? { cachedContent: cacheId } : {}),
-        ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
-      });
+      // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
+      // with 400. System instruction is baked into the cache at build time; tools
+      // (codeExecution) cannot be combined with a cache built without them. When
+      // codeExecution is requested AND a cache is active, we can't use both — in that
+      // case we bypass the cache so the user's explicit codeExecution request wins.
+      const canUseCache = (cacheId: string | null): boolean => cacheId !== null && !codeExecution;
+      if (ctxPrep.cacheId && codeExecution) {
+        logger.warn(
+          'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
+        );
+      }
+      const buildConfig = (cacheId: string | null): GenerateContentConfig => {
+        if (canUseCache(cacheId) && cacheId) {
+          // With cache: system_instruction is baked in; thinkingConfig remains OK.
+          return {
+            cachedContent: cacheId,
+            thinkingConfig: { thinkingBudget, includeThoughts: true },
+          };
+        }
+        // Without cache (or cache bypassed for codeExecution): pass full config.
+        return {
+          systemInstruction: SYSTEM_INSTRUCTION_CODE,
+          thinkingConfig: { thinkingBudget, includeThoughts: true },
+          ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
+        };
+      };
       const buildContents = (
         cacheId: string | null,
         inline: typeof ctxPrep.inlineContents,
       ): string | Content[] =>
-        cacheId ? userPrompt : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
+        canUseCache(cacheId)
+          ? userPrompt
+          : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
 
       let activePrep = ctxPrep;
       let retriedOnStaleCache = false;
@@ -227,7 +253,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
               ttlSeconds: ctx.config.cacheTtlSeconds,
               cacheMinTokens: ctx.config.cacheMinTokens,
               emitter,
-              allowCaching: scan.files.length > 0,
+              allowCaching: scan.files.length > 0 && !codeExecution,
             });
             response = await ctx.client.models.generateContent({
               model: resolved.resolved,
