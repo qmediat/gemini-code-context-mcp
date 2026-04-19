@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-04-19
+
+Docs-only patch. No behavioural changes. Triggered by user spotting an inaccurate claim about the incumbent `jamubc/gemini-mcp-tool` in the README comparison table.
+
+### Fixed
+
+After empirical verification against both the published npm v1.1.4 tarball AND the project's `main` branch on GitHub, four comparison-table claims were corrected. All structural points (hardcoded default, no caching, CLI backend, unreleased improvements) still hold; wording was imprecise.
+
+- **Default model** — was stated as hardcoded `gemini-3.1-pro-preview`. That's true of npm v1.1.4, but on GitHub `main` (which is what anyone browsing the repo sees — last commit 2025-07-23) the hardcoded value is `gemini-2.5-pro`. Table now anchors to `main` and a footnote calls out the npm-vs-main drift.
+- **Repeat queries** — "Re-sends entire codebase every call" was misleading; jamubc doesn't auto-index the workspace. Users control what's sent via `@file` syntax. The accurate delta is **no caching layer**: each call re-tokenises referenced files regardless of whether they've been tokenised before.
+- **Auth** — "Key in `~/.claude.json` env var" was wrong for typical jamubc setups. The server inherits the `gemini` CLI's own auth — browser OAuth via `gemini auth login`, or `GEMINI_API_KEY` env var.
+- **Dead deps** — numerical correction. On GitHub `main` the unused-in-src deps are five (`ai`, `chalk`, `d3-shape`, `inquirer`, `prismjs`). In the shipped npm `v1.1.4` tarball only three (`ai`, `d3-shape`, `prismjs`) are unused — `chalk` and `inquirer` are imported in `dist/` for that version. Table anchors to `main`; footnote acknowledges the npm-side count.
+- Added table footnote explaining that all comparisons reference jamubc on GitHub `main` and acknowledging the ~9-month drift between that and the published npm version.
+
+Same corrections applied in `docs/migration-from-jamubc.md`.
+
+### Why this matters
+
+The v1.0.0 README was the first public artefact advertising the project on npm. Claims about a competing project must be defensible line-by-line. One reader's spot-check caught the drift, which triggered a full empirical audit of the table. The corrections don't change our value proposition — they just describe the incumbent accurately.
+
 ## [1.0.0] — 2026-04-19
 
 First public release. An MCP server that wraps Google's Gemini API with persistent Context Caching so Claude Code (and other MCP hosts) can query large codebases with cached input tokens instead of re-sending the entire workspace on every prompt.

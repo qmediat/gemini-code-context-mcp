@@ -16,14 +16,16 @@ An MCP (Model Context Protocol) server that wraps Google's Gemini API with **per
 
 |  | [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool) | **`@qmediat.io/gemini-code-context-mcp`** |
 |---|---|---|
-| Maintenance | Abandoned (last release 2025-07) |Actively maintained |
-| Default model | Hardcoded `gemini-3.1-pro-preview` |Dynamic `latest-pro` alias — auto-upgrades with every Gemini release |
-| Backend | Shells out to `gemini` CLI (~200 ms spawn overhead) |Direct `@google/genai` SDK |
-| Repeat queries | Re-sends entire codebase every call |**Files API + Context Cache** — repeat queries reuse the indexed codebase, cached input tokens billed at ~25 % of the uncached rate |
-| Coding delegation | Legacy prompt-injection `changeMode` |Native `thinkingConfig` + optional `codeExecution` |
-| Auth | Key in `~/.claude.json` env var |3-tier: ADC / credentials file (chmod 0600) / env var (+ warning) |
-| Cost control | — |Daily budget cap in USD (`GEMINI_DAILY_BUDGET_USD`) |
-| Dead deps | 5 unused packages (`ai`, `chalk`, `d3-shape`, …) |Zero dead deps |
+| Maintenance | Abandoned (last release 2025-07) | Actively maintained |
+| Default model | Hardcoded `gemini-2.5-pro` (main) — no runtime override | Dynamic `latest-pro` alias — resolves against your API key tier at startup |
+| Backend | Shells out to `gemini` CLI (subprocess per call) | Direct `@google/genai` SDK |
+| Repeat queries | No caching layer — each call re-tokenises referenced files | **Files API + Context Cache** — repeat queries reuse the indexed codebase; cached input tokens billed at ~25 % of the uncached rate |
+| Coding delegation | Prompt-injection `changeMode` (OLD/NEW format in system text) | Native `thinkingConfig` + optional `codeExecution` |
+| Auth | Inherits `gemini` CLI auth (browser OAuth via `gemini auth login`, or env var) | 3-tier: Vertex ADC / credentials file (chmod 0600 atomic write) / env var (+ warning) |
+| Cost control | — | Daily budget cap in USD (`GEMINI_DAILY_BUDGET_USD`) |
+| Dead deps | 5 unused packages (`ai`, `chalk`, `d3-shape`, `inquirer`, `prismjs`) | Zero dead deps |
+
+> *Comparison points reference `jamubc/gemini-mcp-tool` as seen on its GitHub `main` branch (most current snapshot, last commit 2025-07-23). The published npm v1.1.4 is ~9 months older and differs in a few specifics — default model is `gemini-3.1-pro-preview` there instead of `gemini-2.5-pro`, and only 3 of the 5 deps are dead in that tarball (`chalk` and `inquirer` still imported). The structural claims (hardcoded model, no caching, `gemini` CLI backend, unreleased improvements stuck behind an abandoned npm registry entry) hold for both.*
 
 ## Quick start
 
