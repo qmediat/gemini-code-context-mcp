@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-04-19
+
+Security + cost-correctness release. Closes a HIGH-severity prompt-injection vector that let a malicious MCP client exfiltrate local files via the `workspace` argument, and a MEDIUM-severity TOCTOU race that let concurrent tool calls collectively overshoot `GEMINI_DAILY_BUDGET_USD`. Also bundles drift-guards and hardening surfaced by a full 3-way code review (GPT, Gemini, Grok) plus three Copilot review rounds. No breaking changes — all existing workspace paths under the MCP host's cwd continue to work without any config.
+
 ### Security
 
 - **Workspace-path validation** — tools that scan the filesystem (`ask`, `code`, `reindex`) now require the `workspace` argument to either be a descendant of the MCP host's cwd OR contain a recognised workspace marker (`.git`, `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, …). Without this, a prompt-injected MCP client could redirect the indexer at `$HOME` or `/etc` and exfiltrate local files through the Files API upload path. Escape hatch: `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE=true` for genuinely unconventional roots.
