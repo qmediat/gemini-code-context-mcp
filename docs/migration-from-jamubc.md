@@ -29,11 +29,11 @@ Then restart Claude Code. That's it.
 |---|---|---|
 | Under the hood | Shells out to `gemini` CLI | Direct `@google/genai` SDK |
 | Tool names | `ask-gemini`, `brainstorm`, `fetch-chunk`, `ping`, `Help`, `timeout-test` | `ask`, `code`, `status`, `reindex`, `clear` |
-| Default model | Hardcoded `gemini-3.1-pro-preview` | Dynamic alias `latest-pro` — auto-upgrades when Google releases new models |
+| Default model | Hardcoded `gemini-2.5-pro` on main, `gemini-3.1-pro-preview` on npm v1.1.4 — frozen, no env var override | Dynamic alias `latest-pro` — resolves against your API key tier at startup |
 | Quota fallback | Hardcoded to `gemini-2.5-flash` | Generic `models.list()` → pick best available |
-| Repeat queries | Full codebase on every call | Persistent Context Cache — 20× faster, ~4× cheaper |
-| Coding delegation | Prompt-injected OLD/NEW format | Native `thinkingConfig` + optional `codeExecution` |
-| Auth | User-level `gemini auth login` or `GEMINI_API_KEY` env | 3-tier: ADC / profile file (chmod 0600) / env var |
+| Repeat queries | No caching — each call re-tokenises referenced files | Persistent Context Cache — typically ~5× faster, ~4× cheaper on repeat queries |
+| Coding delegation | Prompt-injected OLD/NEW format (`changeMode`) | Native `thinkingConfig` + optional `codeExecution` |
+| Auth | Inherits `gemini` CLI auth (browser OAuth or `GEMINI_API_KEY` env) | 3-tier: Vertex ADC / profile file (chmod 0600) / env var |
 | Cost control | — | Daily budget cap in USD |
 
 ## Tool name mapping
