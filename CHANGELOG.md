@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tools/list` response now has spec-compliant `inputSchema`** — every tool's `inputSchema` emits `type: "object"` at the root instead of a `{ $ref, definitions }` envelope. MCP clients that strictly validate the spec (Claude Code, Claude Desktop) silently rejected the previous shape with `Failed to fetch tools: Invalid input: expected "object"` and left the server connected but tool-less. Affects v1.0.0 and v1.0.1. Fix: drop the `name` option from `zod-to-json-schema`; centralise the serialisation in `buildToolInputSchema()` so the `tools/list` handler and the new conformance test agree by construction. Added `test/unit/tool-input-schema.test.ts` that also round-trips the whole payload through `@modelcontextprotocol/sdk`'s own `ListToolsResultSchema`, so any future regression is caught by the SDK's authoritative validator.
+
 ## [1.0.1] — 2026-04-19
 
 Docs-only patch. No behavioural changes. Triggered by user spotting an inaccurate claim about the incumbent `jamubc/gemini-mcp-tool` in the README comparison table.

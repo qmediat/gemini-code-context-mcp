@@ -9,13 +9,17 @@ import {
   type CallToolResult,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import { TtlWatcher } from './cache/ttl-watcher.js';
 import { loadConfig } from './config.js';
 import { createGeminiClient } from './gemini/client.js';
 import { ManifestDb } from './manifest/db.js';
 import { TOOLS } from './tools/index.js';
-import { type ToolContext, type ToolResult, errorResult } from './tools/registry.js';
+import {
+  type ToolContext,
+  type ToolResult,
+  buildToolInputSchema,
+  errorResult,
+} from './tools/registry.js';
 import { logger } from './utils/logger.js';
 
 import { readFileSync } from 'node:fs';
@@ -65,10 +69,7 @@ export async function runServer(): Promise<void> {
       name: tool.name,
       title: tool.title,
       description: tool.description,
-      inputSchema: zodToJsonSchema(tool.schema, {
-        name: `${tool.name}Input`,
-        $refStrategy: 'none',
-      }) as Record<string, unknown>,
+      inputSchema: buildToolInputSchema(tool),
     })),
   }));
 

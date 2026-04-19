@@ -5,6 +5,7 @@
 import type { GoogleGenAI } from '@google/genai';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { z } from 'zod';
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { TtlWatcher } from '../cache/ttl-watcher.js';
 import type { Config } from '../config.js';
 import type { ManifestDb } from '../manifest/db.js';
@@ -46,4 +47,15 @@ export function errorResult(message: string): ToolResult {
     content: [{ type: 'text', text: message }],
     isError: true,
   };
+}
+
+/**
+ * Produce the `inputSchema` payload for a tool's entry in a `tools/list`
+ * response. The MCP spec mandates `type: "object"` at the root; the
+ * `zod-to-json-schema` `name` option wraps output in `{ $ref, definitions }`
+ * and violates that, so we deliberately omit it. Centralised here so the
+ * server handler and the schema-conformance test agree by construction.
+ */
+export function buildToolInputSchema(tool: ToolDefinition<unknown>): Record<string, unknown> {
+  return zodToJsonSchema(tool.schema, { $refStrategy: 'none' }) as Record<string, unknown>;
 }
