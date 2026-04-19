@@ -94,7 +94,13 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
 ];
 
 /**
- * Directory names excluded regardless of depth.
+ * Path fragments excluded regardless of depth.
+ *
+ * Matched by `isPathExcluded` (below) against the workspace-relative POSIX path
+ * in three modes: exact equality, `${dir}/` prefix, and `/${dir}/` substring.
+ * Entries are therefore typically directory *basenames* (`node_modules`,
+ * `.ssh`), but multi-segment fragments like `.config/gcloud` also match
+ * correctly — the matcher sees the full relative path, not just `dirent.name`.
  *
  * Two classes of entries:
  *   - **Build / cache artefacts** — indexing them wastes tokens on derived output
