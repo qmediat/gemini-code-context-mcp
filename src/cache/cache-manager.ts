@@ -72,6 +72,35 @@ function ttlString(seconds: number): string {
   return `${Math.max(60, Math.floor(seconds))}s`;
 }
 
+/**
+ * Convert whatever identifier we stored in `files.file_id` back to the
+ * `files/<id>` resource name that `client.files.delete` expects.
+ *
+ * The uploader stores `.uri` in preference to `.name` (see
+ * `src/cache/files-uploader.ts:170-176` — `fileData.fileUri` at cache build
+ * time rejects the bare `files/abc` form). But the `files.delete` endpoint
+ * takes the resource-name form, so we need the reverse transform on
+ * teardown. The URI looks like
+ * `https://generativelanguage.googleapis.com/v1beta/files/abc123-xyz`;
+ * extract everything after the last `/files/` and re-prepend `files/`.
+ *
+ * Falls back to passing the identifier through unchanged when neither form
+ * is recognised — lets the SDK decide, and the surrounding try/catch still
+ * protects against propagating the failure.
+ */
+function toFileResourceName(identifier: string): string {
+  if (identifier.startsWith('files/')) return identifier;
+  const marker = '/files/';
+  const markerIdx = identifier.lastIndexOf(marker);
+  if (markerIdx >= 0) {
+    const tail = identifier.slice(markerIdx + marker.length);
+    // Strip any query string or fragment that might follow the file ID.
+    const cleaned = tail.split(/[?#]/)[0] ?? tail;
+    if (cleaned.length > 0) return `files/${cleaned}`;
+  }
+  return identifier;
+}
+
 function isUsableExistingCache(
   ws: WorkspaceRow | null,
   scan: ScanResult,
@@ -462,10 +491,18 @@ export async function invalidateWorkspaceCache(args: {
           idx += 1;
           const id = fileIds[i];
           if (!id) continue;
+          // `files-uploader.ts:172` deliberately stores `uploaded.uri` (the
+          // `https://…/files/abc` form) rather than `uploaded.name` because
+          // Gemini's `fileData.fileUri` reference rejects the bare `files/abc`
+          // resource-name form at `caches.create` time. But `files.delete`
+          // wants the RESOURCE NAME, not the URI (different endpoint,
+          // different parameter expectation). Normalise here so deletes
+          // actually hit — otherwise B3's cost-leak fix silently no-ops.
+          const deleteName = toFileResourceName(id);
           try {
-            await args.client.files.delete({ name: id });
+            await args.client.files.delete({ name: deleteName });
           } catch (err) {
-            logger.debug(`files.delete (${id}) failed: ${String(err)}`);
+            logger.debug(`files.delete (${deleteName}, stored as ${id}) failed: ${String(err)}`);
           }
         }
       }),

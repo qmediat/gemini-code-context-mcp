@@ -109,9 +109,13 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
  *     user or prompt-injected agent points `workspace` at `$HOME`, we refuse to
  *     even walk these even if `workspace-validation.ts` is bypassed. Defense in
  *     depth against credential exfiltration through the Files API upload path.
- *     Users with legitimately distinctive secret-dir names inside a repo can
- *     override via tool-level includeGlobs — the scanner's exclusion check runs
- *     before any include match.
+ *
+ * Entries here are ALWAYS excluded: `isFileIncluded` checks `isPathExcluded`
+ * first, and `defaultMatchConfig` only ever APPENDS extra excludes supplied by
+ * the caller. Tool-level `includeGlobs` cannot re-include a directory that is
+ * in this list — if a repo has a legitimately-named dir that collides with
+ * one of these, the fix is to rename the dir or fork the list, not to try to
+ * punch through via `includeGlobs`.
  */
 export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   // Dependencies / build output

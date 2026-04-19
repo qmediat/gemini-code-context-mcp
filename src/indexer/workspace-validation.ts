@@ -151,7 +151,22 @@ export function validateWorkspacePath(workspaceRoot: string): void {
     );
   }
 
-  if (isUnderCwd(canonical)) return;
+  // Canonicalise cwd too so the ancestry check compares like-with-like.
+  // macOS has common cwd symlinks: `/var → /private/var`, `/tmp → /private/tmp`.
+  // Without this, a workspace legitimately under cwd (after realpath on both
+  // sides agrees) gets rejected because `relative('/var/foo', '/private/var/foo/ws')`
+  // returns `'../../private/var/foo/ws'`, which fails the cwd-descendant test.
+  // If the `realpathSync(process.cwd())` call itself fails (unlikely — cwd
+  // removed mid-flight, EACCES), fall back to the raw `process.cwd()` to
+  // preserve the previous behaviour rather than introduce a new hard failure.
+  let canonicalCwd: string;
+  try {
+    canonicalCwd = realpathSync(process.cwd());
+  } catch {
+    canonicalCwd = process.cwd();
+  }
+
+  if (isUnderCwd(canonical, canonicalCwd)) return;
 
   for (const marker of WORKSPACE_MARKERS) {
     if (existsSync(join(canonical, marker))) return;
