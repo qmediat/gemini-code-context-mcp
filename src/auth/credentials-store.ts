@@ -202,8 +202,16 @@ export function saveProfile(name: string, data: ProfileData): void {
   if (process.platform !== 'win32') {
     try {
       chmodSync(dir, 0o700);
-    } catch {
-      /* best-effort — dir may be held by another process */
+    } catch (err) {
+      // chmod can fail on read-only filesystems (bind mounts, immutable
+      // container layers, NFS without chmod support) or when another
+      // process holds the dir open with restrictive ACLs. In those cases
+      // the credentials FILE is still written with 0o600, so its CONTENT
+      // is protected — but the DIR may be listable, leaking the filename
+      // to other local users. Warn so operators can investigate.
+      logger.warn(
+        `Failed to chmod credentials dir ${dir} to 0o700: ${String(err)}. The credentials file will still be written with 0o600, but other local users on this host may be able to list this directory and learn the file's existence. Check dir permissions manually.`,
+      );
     }
   }
 

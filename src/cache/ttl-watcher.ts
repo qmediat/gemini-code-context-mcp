@@ -21,9 +21,17 @@ interface HotEntry {
   ttlSeconds: number;
 }
 
+/** Match 404 / NOT_FOUND patterns in Gemini error strings. Conservative by design. */
+function isNotFoundError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\b404\b|NOT_FOUND|not[_ ]?found|not-found|does not exist/i.test(msg);
+}
+
 export class TtlWatcher {
   private readonly hot = new Map<string, HotEntry>();
   private timer: NodeJS.Timeout | null = null;
+  /** Re-entrancy guard: a slow `caches.update` round-trip must not overlap the next tick. */
+  private tickInProgress = false;
 
   constructor(
     private readonly client: GoogleGenAI,
@@ -57,31 +65,59 @@ export class TtlWatcher {
   }
 
   private async tick(): Promise<void> {
-    const now = Date.now();
-    for (const [key, entry] of this.hot) {
-      if (now - entry.lastUsed > HOT_WINDOW_MS) {
-        this.hot.delete(key);
-        continue;
+    // Prevent overlap: if the previous tick is still running (slow Gemini
+    // round-trips, throttle), skip this firing entirely rather than issuing
+    // concurrent `caches.update` calls on the same names.
+    if (this.tickInProgress) {
+      logger.debug('ttl tick already in progress, skipping this firing');
+      return;
+    }
+    this.tickInProgress = true;
+    try {
+      const now = Date.now();
+      for (const [key, entry] of this.hot) {
+        if (now - entry.lastUsed > HOT_WINDOW_MS) {
+          this.hot.delete(key);
+          continue;
+        }
+        const ws = this.manifest.getWorkspace(entry.workspaceRoot);
+        if (!ws?.cacheId || ws.cacheId !== entry.cacheId) {
+          this.hot.delete(key);
+          continue;
+        }
+        if (ws.cacheExpiresAt !== null && ws.cacheExpiresAt - now > REFRESH_IF_EXPIRES_WITHIN_MS) {
+          continue; // plenty of time left
+        }
+        try {
+          await this.client.caches.update({
+            name: entry.cacheId,
+            config: { ttl: `${entry.ttlSeconds}s` },
+          });
+          const newExpires = now + entry.ttlSeconds * 1000;
+          this.manifest.upsertWorkspace({ ...ws, cacheExpiresAt: newExpires, updatedAt: now });
+          logger.debug(`refreshed TTL for ${entry.cacheId}`);
+        } catch (err) {
+          // Evict the entry when Gemini reports the cache is gone (deleted
+          // externally, admin quota action, etc). Without this, we'd retry
+          // the update every TICK_MS forever and log-spam the 404.
+          if (isNotFoundError(err)) {
+            logger.debug(
+              `ttl refresh for ${entry.cacheId} returned not-found; dropping hot entry and nulling manifest cacheId`,
+            );
+            this.hot.delete(key);
+            this.manifest.upsertWorkspace({
+              ...ws,
+              cacheId: null,
+              cacheExpiresAt: null,
+              updatedAt: now,
+            });
+          } else {
+            logger.debug(`ttl refresh failed for ${entry.cacheId}: ${String(err)}`);
+          }
+        }
       }
-      const ws = this.manifest.getWorkspace(entry.workspaceRoot);
-      if (!ws?.cacheId || ws.cacheId !== entry.cacheId) {
-        this.hot.delete(key);
-        continue;
-      }
-      if (ws.cacheExpiresAt !== null && ws.cacheExpiresAt - now > REFRESH_IF_EXPIRES_WITHIN_MS) {
-        continue; // plenty of time left
-      }
-      try {
-        await this.client.caches.update({
-          name: entry.cacheId,
-          config: { ttl: `${entry.ttlSeconds}s` },
-        });
-        const newExpires = now + entry.ttlSeconds * 1000;
-        this.manifest.upsertWorkspace({ ...ws, cacheExpiresAt: newExpires, updatedAt: now });
-        logger.debug(`refreshed TTL for ${entry.cacheId}`);
-      } catch (err) {
-        logger.debug(`ttl refresh failed for ${entry.cacheId}: ${String(err)}`);
-      }
+    } finally {
+      this.tickInProgress = false;
     }
   }
 }
