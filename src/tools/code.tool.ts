@@ -172,6 +172,16 @@ export const codeTool: ToolDefinition<CodeInput> = {
           ? Math.min(CODE_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
           : CODE_MAX_OUTPUT_TOKENS_DEFAULT;
 
+      // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
+      // is carved out of the candidate-output allowance). The tool schema
+      // allows thinkingBudget up to 65_536 and defaults to 16_384, but the
+      // hard cap above may clamp maxOutputTokens as low as the model's
+      // `outputTokenLimit` (e.g. 8_192 on Flash-lite). Clamp the effective
+      // thinkingBudget so the generateContent call never 400s on this
+      // invariant; reserve at least 1_024 tokens for the actual completion.
+      const effectiveThinkingBudget =
+        thinkingBudget > 0 ? Math.max(0, Math.min(thinkingBudget, maxOutputTokens - 1024)) : 0;
+
       // Atomic budget reservation — see ask.tool.ts for the full rationale.
       // Estimate includes the thinking budget (billed as output tokens on Pro)
       // PLUS the candidate output cap.
@@ -182,7 +192,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
           workspaceBytes,
           promptChars: input.task.length,
           expectedOutputTokens: maxOutputTokens,
-          thinkingTokens: thinkingBudget,
+          thinkingTokens: effectiveThinkingBudget,
         });
         const reserve = ctx.manifest.reserveBudget({
           workspaceRoot,
@@ -229,8 +239,8 @@ export const codeTool: ToolDefinition<CodeInput> = {
 
       emitter.emit(
         codeExecution
-          ? `generating with thinking=${thinkingBudget} + codeExecution…`
-          : `generating with thinking=${thinkingBudget}…`,
+          ? `generating with thinking=${effectiveThinkingBudget} + codeExecution…`
+          : `generating with thinking=${effectiveThinkingBudget}…`,
       );
 
       // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
@@ -251,14 +261,14 @@ export const codeTool: ToolDefinition<CodeInput> = {
           // so the reservation is a TRUE upper bound (Copilot review C7).
           return {
             cachedContent: cacheId,
-            thinkingConfig: { thinkingBudget, includeThoughts: true },
+            thinkingConfig: { thinkingBudget: effectiveThinkingBudget, includeThoughts: true },
             maxOutputTokens,
           };
         }
         // Without cache (or cache bypassed for codeExecution): pass full config.
         return {
           systemInstruction: SYSTEM_INSTRUCTION_CODE,
-          thinkingConfig: { thinkingBudget, includeThoughts: true },
+          thinkingConfig: { thinkingBudget: effectiveThinkingBudget, includeThoughts: true },
           maxOutputTokens,
           ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
         };
@@ -411,7 +421,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
         contextWindow: resolved.inputTokenLimit,
-        thinkingBudget,
+        thinkingBudget: effectiveThinkingBudget,
         codeExecutionUsed: codeExecution,
         cacheHit: activePrep.reused,
         cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
