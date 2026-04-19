@@ -49,6 +49,14 @@ export async function runServer(): Promise<void> {
     `starting ${SERVER_NAME} v${SERVER_VERSION} (auth: ${config.auth.source}, key: ${config.auth.keyFingerprint}, default model: ${config.defaultModel})`,
   );
 
+  // Preflight every tool's input schema before we accept a single request.
+  // If a tool has a malformed Zod schema (non-object root, etc.) we'd rather
+  // crash here with a clear message than register a half-broken MCP endpoint
+  // that appears healthy but rejects tool lookups on the client side.
+  for (const tool of TOOLS) {
+    buildToolInputSchema(tool);
+  }
+
   const manifest = new ManifestDb();
   const client = createGeminiClient(config.auth.profile);
   const ttlWatcher = new TtlWatcher(client, manifest);

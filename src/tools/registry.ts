@@ -19,6 +19,19 @@ export interface ToolContext {
   progressToken: string | number | undefined;
 }
 
+/**
+ * MCP-compliant `tools[*].inputSchema` shape. The root MUST be `type: "object"`
+ * per the MCP protocol — strict clients (Claude Code, Claude Desktop) reject
+ * anything else. Extra keys (`$schema`, `additionalProperties`, `required`, …)
+ * pass through the index signature.
+ */
+export interface McpInputSchema {
+  type: 'object';
+  properties?: Record<string, unknown>;
+  required?: readonly string[];
+  [key: string]: unknown;
+}
+
 export interface ToolDefinition<TInput = unknown> {
   name: string;
   title: string;
@@ -50,12 +63,38 @@ export function errorResult(message: string): ToolResult {
 }
 
 /**
- * Produce the `inputSchema` payload for a tool's entry in a `tools/list`
- * response. The MCP spec mandates `type: "object"` at the root; the
- * `zod-to-json-schema` `name` option wraps output in `{ $ref, definitions }`
- * and violates that, so we deliberately omit it. Centralised here so the
- * server handler and the schema-conformance test agree by construction.
+ * Build the `inputSchema` payload for a tool's entry in a `tools/list`
+ * response. Two non-negotiable constraints on the serialisation:
+ *
+ *   1. The `name` option is deliberately omitted. With `name` set,
+ *      `zod-to-json-schema` wraps its output in `{ $ref, definitions }` — a
+ *      shape that lacks the `type: "object"` the MCP spec mandates at the
+ *      root. Strict clients (Claude Code, Claude Desktop) reject that with
+ *      `Invalid input: expected "object"` and silently drop every tool from
+ *      their namespace. This was the v1.0.0 / v1.0.1 ship-blocker fixed in
+ *      PR #5.
+ *
+ *   2. `$refStrategy: 'none'` is required. MCP clients do not dereference
+ *      `$ref` inside `inputSchema`, so any internal reference would leave
+ *      the schema unresolvable on the client side. The trade-off is payload
+ *      size when heavily-reused sub-schemas appear — acceptable for our
+ *      workload, forced by spec anyway.
+ *
+ * The runtime assert is a belt-and-suspenders guard: `ToolDefinition.schema`
+ * is currently typed loosely as `z.ZodSchema<TInput>`, which permits
+ * non-object roots (unions, primitives, `ZodEffects`) to compile cleanly.
+ * `runServer()` exercises this helper on every tool at startup, so a
+ * malformed schema fails before the stdio transport accepts connections —
+ * much clearer than the silent tool-list rejection the spec-violation path
+ * produces. Compile-time narrowing is tracked in `docs/FOLLOW-UP-PRS.md`.
  */
-export function buildToolInputSchema(tool: ToolDefinition<unknown>): Record<string, unknown> {
-  return zodToJsonSchema(tool.schema, { $refStrategy: 'none' }) as Record<string, unknown>;
+export function buildToolInputSchema(tool: ToolDefinition<unknown>): McpInputSchema {
+  const payload = zodToJsonSchema(tool.schema, { $refStrategy: 'none' }) as Record<string, unknown>;
+  if (payload.type !== 'object') {
+    throw new Error(
+      `buildToolInputSchema: tool '${tool.name}' produced a non-object root schema ` +
+        `(type=${JSON.stringify(payload.type)}). MCP clients require type: "object" at the root.`,
+    );
+  }
+  return payload as McpInputSchema;
 }
