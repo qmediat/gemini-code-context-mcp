@@ -12,14 +12,14 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
 import { z } from 'zod';
-import {
-  invalidateWorkspaceCache,
-  isStaleCacheError,
-  prepareContext,
-} from '../cache/cache-manager.js';
+import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
-import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
+import {
+  WorkspaceValidationError,
+  validateWorkspacePath,
+} from '../indexer/workspace-validation.js';
+import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
@@ -135,17 +135,21 @@ export const codeTool: ToolDefinition<CodeInput> = {
     const expectEdits = input.expectEdits ?? true;
     const codeExecution = input.codeExecution ?? false;
 
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const spentToday = ctx.manifest.todaysCostMicros(Date.now()) / 1_000_000;
-      if (spentToday >= ctx.config.dailyBudgetUsd) {
-        return errorResult(
-          `Daily budget cap reached ($${spentToday.toFixed(4)} ≥ $${ctx.config.dailyBudgetUsd.toFixed(2)}).`,
-        );
-      }
-    }
-
+    let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
+      // Workspace validation inside try → reported as a regular tool error
+      // (errorResult, "code failed: …") rather than an unhandled exception
+      // surfaced by the server-level handler.
+      try {
+        validateWorkspacePath(workspaceRoot);
+      } catch (err) {
+        if (err instanceof WorkspaceValidationError) {
+          return errorResult(`code: ${err.message}`);
+        }
+        throw err;
+      }
+
       emitter.emit(`resolving model '${modelRequest}'…`);
       const resolved = await resolveModel(modelRequest, ctx.client);
 
@@ -156,6 +160,56 @@ export const codeTool: ToolDefinition<CodeInput> = {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
+
+      // Hard cap on candidate output tokens (separate from `thinkingBudget`).
+      // Used both as the generateContent `maxOutputTokens` field and as the
+      // budget-reservation estimate, so the reservation is a true upper bound
+      // (Copilot review C7). 32k is generous for most code-edit responses;
+      // we clamp to the model's advertised limit if smaller.
+      const CODE_MAX_OUTPUT_TOKENS_DEFAULT = 32_768;
+      const maxOutputTokens =
+        typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
+          ? Math.min(CODE_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
+          : CODE_MAX_OUTPUT_TOKENS_DEFAULT;
+
+      // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
+      // is carved out of the candidate-output allowance). The tool schema
+      // allows thinkingBudget up to 65_536 and defaults to 16_384, but the
+      // hard cap above may clamp maxOutputTokens as low as the model's
+      // `outputTokenLimit` (e.g. 8_192 on Flash-lite). Clamp the effective
+      // thinkingBudget so the generateContent call never 400s on this
+      // invariant; reserve at least 1_024 tokens for the actual completion.
+      const effectiveThinkingBudget =
+        thinkingBudget > 0 ? Math.max(0, Math.min(thinkingBudget, maxOutputTokens - 1024)) : 0;
+
+      // Atomic budget reservation — see ask.tool.ts for the full rationale.
+      // Estimate includes the thinking budget (billed as output tokens on Pro)
+      // PLUS the candidate output cap.
+      if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
+        const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+        const estimateUsd = estimatePreCallCostUsd({
+          model: resolved.resolved,
+          workspaceBytes,
+          promptChars: input.task.length,
+          expectedOutputTokens: maxOutputTokens,
+          thinkingTokens: effectiveThinkingBudget,
+        });
+        const reserve = ctx.manifest.reserveBudget({
+          workspaceRoot,
+          toolName: 'code',
+          model: resolved.resolved,
+          estimatedCostMicros: toMicrosUsd(estimateUsd),
+          dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+          nowMs: Date.now(),
+        });
+        if ('rejected' in reserve) {
+          const spentUsd = reserve.spentMicros / 1_000_000;
+          return errorResult(
+            `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
+          );
+        }
+        reservationId = reserve.id;
+      }
 
       const systemPromptHash = createHash('sha256')
         .update(SYSTEM_INSTRUCTION_CODE)
@@ -185,8 +239,8 @@ export const codeTool: ToolDefinition<CodeInput> = {
 
       emitter.emit(
         codeExecution
-          ? `generating with thinking=${thinkingBudget} + codeExecution…`
-          : `generating with thinking=${thinkingBudget}…`,
+          ? `generating with thinking=${effectiveThinkingBudget} + codeExecution…`
+          : `generating with thinking=${effectiveThinkingBudget}…`,
       );
 
       // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
@@ -203,15 +257,19 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const buildConfig = (cacheId: string | null): GenerateContentConfig => {
         if (canUseCache(cacheId) && cacheId) {
           // With cache: system_instruction is baked in; thinkingConfig remains OK.
+          // `maxOutputTokens` couples with the budget reservation estimate
+          // so the reservation is a TRUE upper bound (Copilot review C7).
           return {
             cachedContent: cacheId,
-            thinkingConfig: { thinkingBudget, includeThoughts: true },
+            thinkingConfig: { thinkingBudget: effectiveThinkingBudget, includeThoughts: true },
+            maxOutputTokens,
           };
         }
         // Without cache (or cache bypassed for codeExecution): pass full config.
         return {
           systemInstruction: SYSTEM_INSTRUCTION_CODE,
-          thinkingConfig: { thinkingBudget, includeThoughts: true },
+          thinkingConfig: { thinkingBudget: effectiveThinkingBudget, includeThoughts: true },
+          maxOutputTokens,
           ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
         };
       };
@@ -238,11 +296,10 @@ export const codeTool: ToolDefinition<CodeInput> = {
             `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
           );
           try {
-            await invalidateWorkspaceCache({
-              client: ctx.client,
-              manifest: ctx.manifest,
-              workspaceRoot,
-            });
+            // Reset cache pointer only — preserve `files` rows so the rebuild
+            // reuses uploaded files via content-hash dedup instead of double-
+            // uploading. The Gemini-side cache is already dead.
+            markCacheStale({ manifest: ctx.manifest, workspaceRoot });
             const rebuilt = await prepareContext({
               client: ctx.client,
               manifest: ctx.manifest,
@@ -323,16 +380,36 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const costMicros = toMicrosUsd(cost);
 
       const durationMs = Date.now() - started;
-      ctx.manifest.insertUsageMetric({
-        workspaceRoot,
-        toolName: 'code',
-        model: resolved.resolved,
-        cachedTokens: cached,
-        uncachedTokens: uncached,
-        costUsdMicro: costMicros,
-        durationMs,
-        occurredAt: Date.now(),
-      });
+      if (reservationId !== null) {
+        // Defensive: if `finalize` throws (disk full / lock contention), keep
+        // the reservation row so we don't lose all record of this billable
+        // call. Drop `reservationId` either way so the outer catch doesn't
+        // touch it.
+        try {
+          ctx.manifest.finalizeBudgetReservation(reservationId, {
+            cachedTokens: cached,
+            uncachedTokens: uncached,
+            costUsdMicro: costMicros,
+            durationMs,
+          });
+        } catch (finalizeErr) {
+          logger.error(
+            `code: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
+          );
+        }
+        reservationId = null;
+      } else {
+        ctx.manifest.insertUsageMetric({
+          workspaceRoot,
+          toolName: 'code',
+          model: resolved.resolved,
+          cachedTokens: cached,
+          uncachedTokens: uncached,
+          costUsdMicro: costMicros,
+          durationMs,
+          occurredAt: Date.now(),
+        });
+      }
 
       if (scan.truncated) {
         logger.warn(
@@ -344,7 +421,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
         contextWindow: resolved.inputTokenLimit,
-        thinkingBudget,
+        thinkingBudget: effectiveThinkingBudget,
         codeExecutionUsed: codeExecution,
         cacheHit: activePrep.reused,
         cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
@@ -378,6 +455,16 @@ export const codeTool: ToolDefinition<CodeInput> = {
       return textResult(text, structured);
     } catch (err) {
       logger.error(`code failed: ${String(err)}`);
+      if (reservationId !== null) {
+        try {
+          ctx.manifest.cancelBudgetReservation(reservationId);
+        } catch (cancelErr) {
+          logger.error(
+            `code: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
+          );
+        }
+        reservationId = null;
+      }
       return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       emitter.stop();

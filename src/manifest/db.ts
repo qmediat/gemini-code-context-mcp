@@ -9,6 +9,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database, { type Database as DatabaseType } from 'better-sqlite3';
 import type { FileRow, UsageMetricRow, WorkspaceRow } from '../types.js';
+import { logger } from '../utils/logger.js';
 import { manifestDbPath, qmediatStateDir } from '../utils/paths.js';
 
 const SCHEMA_VERSION = '1';
@@ -67,7 +68,13 @@ function rowToWorkspace(row: Record<string, unknown>): WorkspaceRow {
   try {
     const parsed: unknown = JSON.parse(fileIdsRaw);
     if (Array.isArray(parsed)) fileIds = parsed.filter((v): v is string => typeof v === 'string');
-  } catch {
+  } catch (err) {
+    // Corruption is silent to the runtime (file_ids is currently write-only
+    // and slated for removal in T16), but surface it in logs so users
+    // debugging manifest issues get a signal instead of an empty array.
+    logger.warn(
+      `manifest: failed to parse workspaces.file_ids for ${String(row.workspace_root)}: ${String(err)}; defaulting to []`,
+    );
     fileIds = [];
   }
   return {
@@ -240,6 +247,112 @@ export class ManifestDb {
         metric.durationMs,
         metric.occurredAt,
       );
+  }
+
+  /**
+   * Atomically check the daily budget and — if there's headroom — reserve
+   * an estimate against it, so concurrent tool calls can't all pass the
+   * pre-check and then collectively overshoot the cap.
+   *
+   * Implemented as a `BEGIN IMMEDIATE`-backed SQLite transaction:
+   *
+   *   1. SUM existing `cost_usd_micro` since UTC midnight (includes
+   *      previously-reserved but not yet finalized rows, so concurrent
+   *      reservations see each other).
+   *   2. If `spent + estimate > cap`, rollback and return `rejected`.
+   *   3. Otherwise INSERT a row with the estimate. The caller receives its
+   *      primary-key `id` and is expected to later `finalizeBudgetReservation`
+   *      (on successful call) or `cancelBudgetReservation` (on failure).
+   *
+   * `dailyBudgetMicros` of `Number.POSITIVE_INFINITY` disables the check and
+   * should not be passed here — the caller should branch on `Number.isFinite`
+   * and skip the reservation entirely (plain `insertUsageMetric` after the
+   * call is enough when there's no cap).
+   */
+  reserveBudget(args: {
+    workspaceRoot: string;
+    toolName: string;
+    model: string;
+    estimatedCostMicros: number;
+    dailyBudgetMicros: number;
+    nowMs: number;
+  }):
+    | { id: number }
+    | { rejected: true; spentMicros: number; capMicros: number; estimateMicros: number } {
+    const startOfUtcDay = new Date(args.nowMs);
+    startOfUtcDay.setUTCHours(0, 0, 0, 0);
+    const startMs = startOfUtcDay.getTime();
+
+    const run = this.db.transaction(
+      ():
+        | { id: number }
+        | { rejected: true; spentMicros: number; capMicros: number; estimateMicros: number } => {
+        const row = this.db
+          .prepare(
+            'SELECT COALESCE(SUM(cost_usd_micro), 0) AS total FROM usage_metrics WHERE occurred_at >= ?',
+          )
+          .get(startMs) as { total: number };
+        const spent = row.total ?? 0;
+        if (spent + args.estimatedCostMicros > args.dailyBudgetMicros) {
+          return {
+            rejected: true,
+            spentMicros: spent,
+            capMicros: args.dailyBudgetMicros,
+            estimateMicros: args.estimatedCostMicros,
+          };
+        }
+        const result = this.db
+          .prepare(
+            `INSERT INTO usage_metrics(
+               workspace_root, tool_name, model, cached_tokens, uncached_tokens,
+               cost_usd_micro, duration_ms, occurred_at
+             ) VALUES (?, ?, ?, 0, 0, ?, 0, ?)`,
+          )
+          .run(args.workspaceRoot, args.toolName, args.model, args.estimatedCostMicros, args.nowMs);
+        return { id: Number(result.lastInsertRowid) };
+      },
+    );
+
+    // `immediate` mode acquires a reserved lock at BEGIN so a second process
+    // reaching `BEGIN IMMEDIATE` is serialised. Prevents two concurrent
+    // MCP instances both passing the SUM check on the same headroom.
+    return run.immediate();
+  }
+
+  /**
+   * Replace the placeholder values on a reservation row with the measured
+   * cost and token counts after a tool call completes successfully.
+   */
+  finalizeBudgetReservation(
+    reservationId: number,
+    data: {
+      cachedTokens: number;
+      uncachedTokens: number;
+      costUsdMicro: number;
+      durationMs: number;
+    },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE usage_metrics
+         SET cached_tokens = ?, uncached_tokens = ?, cost_usd_micro = ?, duration_ms = ?
+         WHERE id = ?`,
+      )
+      .run(
+        data.cachedTokens,
+        data.uncachedTokens,
+        data.costUsdMicro,
+        data.durationMs,
+        reservationId,
+      );
+  }
+
+  /**
+   * Drop a reservation row when the tool call failed before producing any
+   * billable output. Idempotent — calling with an unknown id is a no-op.
+   */
+  cancelBudgetReservation(reservationId: number): void {
+    this.db.prepare('DELETE FROM usage_metrics WHERE id = ?').run(reservationId);
   }
 
   /** Sum costs spent today (UTC) in USD micros. */

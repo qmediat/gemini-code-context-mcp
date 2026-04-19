@@ -79,6 +79,21 @@ If your pattern is "one query a week on the same repo", consider running `clear`
 
 Raise it (`{ thinkingBudget: 32000 }`) when the task is hard. Drop it (`{ thinkingBudget: 0 }`) when you want a quick generation without deliberation.
 
+## Budget cap — how the enforcement actually works
+
+`GEMINI_DAILY_BUDGET_USD` is an **atomic** reservation, not a read-then-act check. From v1.0.3 onward:
+
+1. After the workspace is scanned and the model resolved, we compute a conservative cost estimate: `(workspace_bytes ÷ 4 bytes/token) × input_rate + prompt_chars × input_rate + maxOutputTokens × output_rate + thinkingBudget × output_rate`.
+2. That estimate is inserted into the usage-metrics table inside a `BEGIN IMMEDIATE` SQLite transaction. Concurrent tool calls are serialised by SQLite's reserved lock — if the reservation would push cumulative spend over the cap, the transaction rolls back and the tool returns `Daily budget cap would be exceeded: spent $X + estimate $Y > cap $Z`.
+3. The `generateContent` call carries an explicit `maxOutputTokens` matching the estimate, so a runaway response cannot exceed what was reserved.
+4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back.
+
+Result: N concurrent tool calls cannot collectively overshoot the cap. A single call cannot overshoot either, thanks to `maxOutputTokens`.
+
+**Caveat:** the `bytes ÷ 4` token heuristic undercounts multibyte / CJK / emoji-dense content by ~1.3×–2×. For accurate caps on those workloads, set `GEMINI_DAILY_BUDGET_USD` ~2× lower than your true limit until the heuristic is upgraded (see [FOLLOW-UP-PRS.md T17](./FOLLOW-UP-PRS.md)).
+
+**Transient visibility quirk:** `status` sums `usage_metrics.cost_usd_micro` including in-flight reservations. During the seconds between reserve-and-finalize, reported daily spend reads slightly higher than the real amount. It reconciles the moment the call completes. See [KNOWN-DEFICITS.md](./KNOWN-DEFICITS.md) for the schema-migration fix roadmap.
+
 ## Free tier
 
 Gemini's free tier gives you Flash models with 1M context and per-minute rate limits. Context Caching is paid-tier only — on free tier the server falls back to inline file parts (slower, but no monthly commit).

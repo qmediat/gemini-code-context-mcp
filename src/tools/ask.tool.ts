@@ -10,20 +10,31 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
 import { z } from 'zod';
-import {
-  invalidateWorkspaceCache,
-  isStaleCacheError,
-  prepareContext,
-} from '../cache/cache-manager.js';
+import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
-import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
+import {
+  WorkspaceValidationError,
+  validateWorkspacePath,
+} from '../indexer/workspace-validation.js';
+import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 
 const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
+
+/**
+ * Hard cap on Gemini's response size for `ask`. Used both as the
+ * `maxOutputTokens` field on the generateContent config (so the model
+ * actually stops there) and as the `expectedOutputTokens` value passed to
+ * `estimatePreCallCostUsd` for the budget reservation. Coupling them is
+ * the point: the reservation becomes a true upper bound, not a guess that
+ * can be exceeded silently. Q&A answers rarely need more than ~8k tokens;
+ * if the resolved model advertises a smaller limit, we use that instead.
+ */
+const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
 
 export const askInputSchema = z.object({
   prompt: z.string().min(1).describe('The question or analysis request.'),
@@ -62,18 +73,24 @@ export const askTool: ToolDefinition<AskInput> = {
     const workspaceRoot = resolve(input.workspace ?? process.cwd());
     const model = input.model ?? ctx.config.defaultModel;
 
-    // Budget cap check.
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const spentToday = ctx.manifest.todaysCostMicros(Date.now()) / 1_000_000;
-      if (spentToday >= ctx.config.dailyBudgetUsd) {
-        return errorResult(
-          `Daily budget cap reached ($${spentToday.toFixed(4)} ≥ $${ctx.config.dailyBudgetUsd.toFixed(2)}). Calls will resume after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-        );
-      }
-    }
-
+    let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
+      // Workspace path validation lives INSIDE the try so a
+      // `WorkspaceValidationError` is reported as a regular tool error
+      // (errorResult, "ask failed: …") rather than an unhandled tool
+      // exception logged by the server-level handler. Both arrive at the
+      // user as text, but only the inside-try path keeps logs tidy and the
+      // user-facing prefix consistent with other validation failures.
+      try {
+        validateWorkspacePath(workspaceRoot);
+      } catch (err) {
+        if (err instanceof WorkspaceValidationError) {
+          return errorResult(`ask: ${err.message}`);
+        }
+        throw err;
+      }
+
       emitter.emit(`resolving model '${model}'…`);
       const resolved = await resolveModel(model, ctx.client);
 
@@ -84,6 +101,46 @@ export const askTool: ToolDefinition<AskInput> = {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
+
+      // Hard cap on output tokens: bound the reservation estimate and the
+      // actual generateContent request to the same value, so the budget
+      // reservation is a TRUE upper bound (Copilot review C6). If the
+      // resolved model's advertised limit is smaller than our default,
+      // honour that — Gemini would clamp it anyway.
+      const maxOutputTokens =
+        typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
+          ? Math.min(ASK_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
+          : ASK_MAX_OUTPUT_TOKENS_DEFAULT;
+
+      // Atomic budget reservation. Happens AFTER scan (so the estimate is
+      // accurate) but BEFORE any billable upload or generateContent call.
+      // Concurrent tool calls cannot all pass a pre-check and then
+      // collectively overshoot the cap: `reserveBudget` uses a
+      // `BEGIN IMMEDIATE` SQLite transaction that serialises check-and-insert.
+      if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
+        const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+        const estimateUsd = estimatePreCallCostUsd({
+          model: resolved.resolved,
+          workspaceBytes,
+          promptChars: input.prompt.length,
+          expectedOutputTokens: maxOutputTokens,
+        });
+        const reserve = ctx.manifest.reserveBudget({
+          workspaceRoot,
+          toolName: 'ask',
+          model: resolved.resolved,
+          estimatedCostMicros: toMicrosUsd(estimateUsd),
+          dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+          nowMs: Date.now(),
+        });
+        if ('rejected' in reserve) {
+          const spentUsd = reserve.spentMicros / 1_000_000;
+          return errorResult(
+            `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
+          );
+        }
+        reservationId = reserve.id;
+      }
 
       const systemPromptHash = createHash('sha256')
         .update(SYSTEM_INSTRUCTION_Q_AND_A)
@@ -110,8 +167,14 @@ export const askTool: ToolDefinition<AskInput> = {
       // The system instruction was already baked into the cache at build time
       // (see cache-manager.ts:322 `cacheConfig.systemInstruction`), so we must
       // OMIT it on the generate call when a cached context is active.
+      // `maxOutputTokens` is set on every generateContent call so the budget
+      // reservation's `expectedOutputTokens` (derived from the same value) is
+      // a true upper bound — without this cap, a runaway response could
+      // exceed the reserved estimate and silently overshoot `dailyBudgetUsd`.
       const buildConfig = (cacheId: string | null): GenerateContentConfig =>
-        cacheId ? { cachedContent: cacheId } : { systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A };
+        cacheId
+          ? { cachedContent: cacheId, maxOutputTokens }
+          : { systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A, maxOutputTokens };
       const buildContents = (
         cacheId: string | null,
         inline: typeof ctxPrep.inlineContents,
@@ -141,11 +204,11 @@ export const askTool: ToolDefinition<AskInput> = {
             `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
           );
           try {
-            await invalidateWorkspaceCache({
-              client: ctx.client,
-              manifest: ctx.manifest,
-              workspaceRoot,
-            });
+            // Reset the cache pointer only — keep `files` rows so the rebuild
+            // can reuse uploaded files via content-hash dedup instead of
+            // re-uploading. The Gemini-side cache is already dead (that's
+            // what triggered this branch), so no `caches.delete` needed.
+            markCacheStale({ manifest: ctx.manifest, workspaceRoot });
             const rebuilt = await prepareContext({
               client: ctx.client,
               manifest: ctx.manifest,
@@ -205,16 +268,39 @@ export const askTool: ToolDefinition<AskInput> = {
       const costMicros = toMicrosUsd(cost);
 
       const durationMs = Date.now() - started;
-      ctx.manifest.insertUsageMetric({
-        workspaceRoot,
-        toolName: 'ask',
-        model: resolved.resolved,
-        cachedTokens: cached,
-        uncachedTokens: uncached,
-        costUsdMicro: costMicros,
-        durationMs,
-        occurredAt: Date.now(),
-      });
+      if (reservationId !== null) {
+        // The finalize UPDATE on a row we just inserted should be infallible
+        // in practice, but a disk-full / lock-contention edge could throw.
+        // If it does, we'd rather keep the reservation row (estimate stays
+        // billed, slight overcharge) than let the outer catch CANCEL it
+        // — cancelling would erase any record of this billable, completed
+        // call. Either way, drop `reservationId` so the outer catch doesn't
+        // touch it.
+        try {
+          ctx.manifest.finalizeBudgetReservation(reservationId, {
+            cachedTokens: cached,
+            uncachedTokens: uncached,
+            costUsdMicro: costMicros,
+            durationMs,
+          });
+        } catch (finalizeErr) {
+          logger.error(
+            `ask: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
+          );
+        }
+        reservationId = null;
+      } else {
+        ctx.manifest.insertUsageMetric({
+          workspaceRoot,
+          toolName: 'ask',
+          model: resolved.resolved,
+          cachedTokens: cached,
+          uncachedTokens: uncached,
+          costUsdMicro: costMicros,
+          durationMs,
+          occurredAt: Date.now(),
+        });
+      }
 
       if (scan.truncated) {
         logger.warn(
@@ -250,6 +336,21 @@ export const askTool: ToolDefinition<AskInput> = {
       return textResult(text, metadata);
     } catch (err) {
       logger.error(`ask failed: ${String(err)}`);
+      // Release any unconsumed budget reservation so the failed call's
+      // estimate doesn't eat into future headroom for today. Wrap in its
+      // own try/catch — better-sqlite3 can throw SQLITE_BUSY or I/O errors
+      // and we must not let a rollback-time DB failure replace the real
+      // tool error the user is waiting on.
+      if (reservationId !== null) {
+        try {
+          ctx.manifest.cancelBudgetReservation(reservationId);
+        } catch (cancelErr) {
+          logger.error(
+            `ask: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
+          );
+        }
+        reservationId = null;
+      }
       return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       emitter.stop();

@@ -179,3 +179,62 @@ Real improvements surfaced by `/6step` and `/coderev` analysis that are out of s
 **Scope:** Add a `noRestrictedImports` rule in `biome.json` with a per-file override for `src/tools/registry.ts`. Biome's override syntax at the time of writing is still evolving — may need to wait for Biome ≥ 1.10 to express per-file exceptions cleanly.
 
 **Sizing:** ~15 min once Biome override support is mature. Low priority — the test catches the regression; this is belt-and-suspenders.
+
+---
+
+## T15. Migrate from `zod-to-json-schema` to Zod 4's built-in `z.toJSONSchema()`
+
+**Source:** Dependabot PR #13 closure (April 2026). Zod 4 is a type-internals rewrite: the `$ZodTypeInternals` shape replaces `ZodTypeDef`, and `zod-to-json-schema@3.x` rejects the new type with `TS2345: Argument of type 'ZodType<unknown, unknown, $ZodTypeInternals<unknown, unknown>>' is not assignable to parameter of type 'ZodType<any, ZodTypeDef, any>'` at the call site in `src/tools/registry.ts`.
+
+**Why:** The MCP SDK (`@modelcontextprotocol/sdk@1.29.x`) already imports `zod/v4` internally; long-term we want our own schemas on Zod 4 too so there's one version of Zod in the runtime. Zod 4 also has a native `z.toJSONSchema()` that produces MCP-compatible output directly — migrating lets us drop the `zod-to-json-schema` dependency entirely.
+
+**Scope:** (1) Bump `zod` to `^4.x` in `package.json`. (2) Replace `zodToJsonSchema(tool.schema, { $refStrategy: 'none' })` in `buildToolInputSchema` with `z.toJSONSchema(tool.schema, { target: 'draft-7', unrepresentable: 'any' })` (or whatever the final v4 API is — check docs at migration time). (3) Re-run the SDK round-trip conformance test in `test/unit/tool-input-schema.test.ts` to confirm the emitted shape still passes `ListToolsResultSchema`. (4) Drop `zod-to-json-schema` from `package.json`. (5) Remove the `zod` major-ignore entry in `.github/dependabot.yml`.
+
+**Sizing:** ~1 hour. Low runtime risk (our 5 tool schemas are all plain `z.object({...})`), but touches the hot `tools/list` path so the SDK validator is the must-pass gate.
+
+**Trigger:** No external signal needed — routine dependency hygiene once a maintainer has the hour.
+
+---
+
+## T16. Drop the vestigial `workspaces.file_ids` column
+
+**Source:** Post-release 6-step bug hunt (B6 and B12, April 2026).
+
+**Why:** The `file_ids` column on the `workspaces` table is written by `upsertWorkspace` (from `prepareContext`) but **never read** in the runtime path — consumers look up file IDs via `findFileRowByHash` against the `files` table. The column carries three latent costs: (1) silent desynchronisation after model-switch rebuilds (operator-visible but functionally irrelevant); (2) a try/catch around its `JSON.parse` that previously swallowed corruption silently (now logs, per B12 in v1.0.3); (3) confusing reviewers into reasoning about "orphan uploads" that aren't actually orphaned.
+
+**Scope:** (1) Add migration `schema_version = '2'` that `ALTER TABLE workspaces DROP COLUMN file_ids` — supported by recent SQLite via better-sqlite3. (2) Remove `fileIds` from `WorkspaceRow` type and `rowToWorkspace` / `upsertWorkspace` methods. (3) Drop the now-dead `JSON.parse` try/catch and the `logger.warn` added in B12. (4) Update `test/unit/manifest-db.test.ts` (the `round-trips a workspace row` assertion includes `fileIds: ['files/1', 'files/2']` that needs to go).
+
+**Sizing:** ~30 min. Pure cleanup; no user-visible change.
+
+**Trigger:** Combine with the next real schema migration to avoid a DB-bump for one trivial change.
+
+---
+
+## T17. Tokenizer-accurate pre-call cost estimate
+
+**Source:** 2026-04-19 code review (gpt + grok, 2/3 consensus).
+
+**Why:** The pre-call cost estimator (`src/utils/cost-estimator.ts:124-134`) currently approximates input tokens as `Math.ceil(bytes / 4)` and `Math.ceil(chars / 4)`. This is roughly accurate on ASCII source but undercounts by ~40-50% on dense UTF-8 / CJK / emoji content, so the budget-reservation "true upper bound" claim (same file, lines 115-123) can overshoot by one call on CJK-heavy repos (bounded to a single finalize write per day, not unbounded drain).
+
+**Options:**
+1. Ship an official tokenizer (e.g. `@google/generative-ai` `countTokens` call, or a local BPE) and replace the heuristic entirely. Adds a dep + pre-call latency; exact bound.
+2. Keep the heuristic but tighten to `Math.ceil(bytes / 3)` (+33% padding) to cover the CJK tail; cheap, still bounded, still occasionally over-estimates on pure ASCII.
+3. Document the limitation; accept the single-call overshoot as a known UX quirk.
+
+**Sizing:** Option 1 — half a day (integration + test). Options 2 / 3 — under an hour.
+
+**Trigger:** First user report of a CJK-heavy repo blowing through `GEMINI_DAILY_BUDGET_USD` by more than the per-call estimate.
+
+---
+
+## T18. Precise budget accounting during stale-cache retry
+
+**Source:** 2026-04-19 code review (grok, 1/3 consensus).
+
+**Why:** When `ask` / `code` hit a stale-cache error (Gemini-side cache eviction) and retry once via `markCacheStale` + `prepareContext` rebuild, the original `reservationId` is reused. Concurrent callers during the retry window see the original estimate (sized for the failed call's uncached upload) counted against the daily budget until `finalizeBudgetReservation` writes the real cost. Because the rebuild reuses the same scan and content-hash deduplication avoids re-uploading, real cost is ≤ the reservation estimate — so the bias is toward false-reject (over-reporting) rather than cap bypass. It's a UX / accounting precision issue, not a safety one.
+
+**Scope:** Cleaner design — `cancelBudgetReservation(original)` → re-estimate for the rebuild path → re-reserve. Requires care: a transient race between cancel and re-reserve could let a concurrent call squeak past the cap it would otherwise fail. Needs design discussion on an atomic "adjust reservation" primitive vs cancel+reserve with a short-lived lock.
+
+**Sizing:** 1-2 days including new DB primitive, migration, and tests.
+
+**Trigger:** If a high-concurrency user reports spurious "daily budget cap would be exceeded" errors during cache-rebuild windows.

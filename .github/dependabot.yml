@@ -52,6 +52,28 @@ updates:
       - dependency-name: "@google/genai"
         update-types:
           - version-update:semver-major
+      # Cap `@types/node` to the major we target at runtime (`engines.node`).
+      # A newer types package can add typings for APIs not present on Node 22
+      # and let code compile cleanly that fails at runtime on the supported
+      # LTS. Bump this alongside bumping `engines.node`, never separately.
+      - dependency-name: "@types/node"
+        update-types:
+          - version-update:semver-major
+      # Zod 4 rewrote the type internals (`$ZodTypeInternals` replaces
+      # `ZodTypeDef`) and our `zod-to-json-schema` dependency is zod-3-only.
+      # Migrating requires switching to zod 4's built-in `z.toJSONSchema()`
+      # and re-validating the MCP SDK round-trip; tracked as T15 in
+      # docs/FOLLOW-UP-PRS.md, not an automated bump.
+      - dependency-name: "zod"
+        update-types:
+          - version-update:semver-major
+      # Biome 2 is a config-schema migration (`files.ignore` → `files.includes`
+      # with negations, `organizeImports` → `assist.actions.source.organizeImports`)
+      # plus a tighter default ruleset. Run `npx @biomejs/biome migrate` in a
+      # dedicated PR, don't take it via Dependabot.
+      - dependency-name: "@biomejs/biome"
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: "/"

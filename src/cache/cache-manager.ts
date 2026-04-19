@@ -72,6 +72,35 @@ function ttlString(seconds: number): string {
   return `${Math.max(60, Math.floor(seconds))}s`;
 }
 
+/**
+ * Convert whatever identifier we stored in `files.file_id` back to the
+ * `files/<id>` resource name that `client.files.delete` expects.
+ *
+ * The uploader stores `.uri` in preference to `.name` (see
+ * `src/cache/files-uploader.ts:170-176` — `fileData.fileUri` at cache build
+ * time rejects the bare `files/abc` form). But the `files.delete` endpoint
+ * takes the resource-name form, so we need the reverse transform on
+ * teardown. The URI looks like
+ * `https://generativelanguage.googleapis.com/v1beta/files/abc123-xyz`;
+ * extract everything after the last `/files/` and re-prepend `files/`.
+ *
+ * Falls back to passing the identifier through unchanged when neither form
+ * is recognised — lets the SDK decide, and the surrounding try/catch still
+ * protects against propagating the failure.
+ */
+function toFileResourceName(identifier: string): string {
+  if (identifier.startsWith('files/')) return identifier;
+  const marker = '/files/';
+  const markerIdx = identifier.lastIndexOf(marker);
+  if (markerIdx >= 0) {
+    const tail = identifier.slice(markerIdx + marker.length);
+    // Strip any query string or fragment that might follow the file ID.
+    const cleaned = tail.split(/[?#]/)[0] ?? tail;
+    if (cleaned.length > 0) return `files/${cleaned}`;
+  }
+  return identifier;
+}
+
 function isUsableExistingCache(
   ws: WorkspaceRow | null,
   scan: ScanResult,
@@ -408,6 +437,22 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   }
 }
 
+/**
+ * Hard-purge a workspace: delete the Gemini Context Cache, release every
+ * Files API upload we uploaded for this workspace, and drop the manifest rows.
+ *
+ * The Files-API release is the non-obvious bit: Gemini auto-deletes uploads
+ * 48 h after the original `files.upload`, but storage is billed in the
+ * meantime and our `status` tool reports cost from `usage_metrics` only —
+ * any leaked uploads show up on Google Cloud billing but not in our reports.
+ * Best-effort; individual `files.delete` failures are logged at debug level
+ * and do not block the invalidation (the 48 h timer is the safety net).
+ *
+ * This function is for DELIBERATE resets — `reindex` and `clear` tool calls.
+ * The stale-cache self-heal path (ask/code retry after Gemini rejects our
+ * `cachedContent`) wants to keep file rows intact for dedup on the rebuild;
+ * it should call `markCacheStale()` instead.
+ */
 export async function invalidateWorkspaceCache(args: {
   client: GoogleGenAI;
   manifest: ManifestDb;
@@ -421,7 +466,75 @@ export async function invalidateWorkspaceCache(args: {
       logger.debug(`cache delete (${ws.cacheId}) failed: ${String(err)}`);
     }
   }
+
+  // De-duplicate fileIds: the manifest's `files` table can have multiple
+  // (workspaceRoot, relpath) rows pointing at the SAME `fileId` when the
+  // uploader reused an existing upload via content-hash dedup (a tool whose
+  // workspace contains the same file at two paths, or a rebuild that found
+  // an existing in-batch dedup hit). Without `Set`, we'd `files.delete(X)`
+  // multiple times — wasteful API calls + 404 noise after the first delete.
+  const fileIds = Array.from(
+    new Set(
+      args.manifest
+        .getFiles(args.workspaceRoot)
+        .map((r) => r.fileId)
+        .filter((v): v is string => typeof v === 'string' && v.length > 0),
+    ),
+  );
+  if (fileIds.length > 0) {
+    const concurrency = Math.min(10, fileIds.length);
+    let idx = 0;
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (idx < fileIds.length) {
+          const i = idx;
+          idx += 1;
+          const id = fileIds[i];
+          if (!id) continue;
+          // `files-uploader.ts:172` deliberately stores `uploaded.uri` (the
+          // `https://…/files/abc` form) rather than `uploaded.name` because
+          // Gemini's `fileData.fileUri` reference rejects the bare `files/abc`
+          // resource-name form at `caches.create` time. But `files.delete`
+          // wants the RESOURCE NAME, not the URI (different endpoint,
+          // different parameter expectation). Normalise here so deletes
+          // actually hit — otherwise B3's cost-leak fix silently no-ops.
+          const deleteName = toFileResourceName(id);
+          try {
+            await args.client.files.delete({ name: deleteName });
+          } catch (err) {
+            logger.debug(`files.delete (${deleteName}, stored as ${id}) failed: ${String(err)}`);
+          }
+        }
+      }),
+    );
+  }
+
   args.manifest.deleteWorkspace(args.workspaceRoot);
+}
+
+/**
+ * Lightweight cache-pointer reset used by the ask/code stale-cache retry
+ * path. Nulls out `cache_id` / `cache_expires_at` on the workspace row so
+ * the next `prepareContext` builds a fresh cache, but leaves the `files`
+ * table alone — the same uploads can be reused via content-hash dedup
+ * inside `uploadWorkspaceFiles`.
+ *
+ * Synchronous and makes no network calls: the cache is already dead on
+ * Google's side (that's how we detected the staleness), so `caches.delete`
+ * would just 404, and re-uploading files would double-bill for no benefit.
+ */
+export function markCacheStale(args: {
+  manifest: ManifestDb;
+  workspaceRoot: string;
+}): void {
+  const ws = args.manifest.getWorkspace(args.workspaceRoot);
+  if (!ws) return;
+  args.manifest.upsertWorkspace({
+    ...ws,
+    cacheId: null,
+    cacheExpiresAt: null,
+    updatedAt: Date.now(),
+  });
 }
 
 /**

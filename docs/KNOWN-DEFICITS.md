@@ -14,13 +14,71 @@ Entries marked **WATCH** are not actively painful today but would become so unde
 
 **What is the issue?** When two MCP servers run simultaneously against the same `~/.qmediat/` manifest (e.g. two Claude Code windows on the same laptop), both servers' `ttl-watcher` tick at the 5-minute interval. Both read the workspace row, both call `caches.update` on Gemini's side, both write the updated `cacheExpiresAt` back to SQLite. Result: the cache TTL gets extended correctly, but Gemini charges for two `caches.update` requests instead of one, and the SQLite rows race with last-writer-wins semantics (no data corruption — we use `INSERT ... ON CONFLICT DO UPDATE` which is atomic per statement).
 
+A related but distinct race lives in `prepareContext` itself: if both instances take a cache-miss at the same time, both upload files (benign — dedup by content-hash in the shared `files` table) and both call `caches.create`, then both `upsertWorkspace`. Last writer wins, and the *losing* instance's `cacheId` is orphaned on Gemini's side until its TTL expires. Today this is rare (requires two servers hitting the same cold workspace within the upload window) but the cost per orphan is real (cache storage + cache token-hour rate).
+
 **Impact today:** Minimal. `caches.update` is cheap (undocumented micro-fee at most, no noticeable delay). Billing surprise on the order of cents per day even at heavy usage. No correctness issue.
 
-**Why we're not fixing in v1.0:** The obvious fix — `SELECT FOR UPDATE`-style versioned updates with `BEGIN IMMEDIATE` — adds SQLite contention that could worsen single-instance latency for a benefit that most users never see. Better to gather real telemetry from multi-instance users before investing.
+**Why we're not fixing in v1.0:** The obvious fix — `SELECT FOR UPDATE`-style versioned updates with `BEGIN IMMEDIATE` — adds SQLite contention that could worsen single-instance latency for a benefit that most users never see. Better to gather real telemetry from multi-instance users before investing. The `caches.create` race needs a different tool (cross-process `workspace_locks` table with conditional `cache_id` updates), so the full fix is bigger than the `last_refresh_at` throttle sketched in T3.
 
 **Revisit trigger:** Any user report of "my Gemini bill has unexplained `caches.update` charges" or ≥5 users running multi-instance setups. We'll add either a `last_refresh_at` + client-side throttle (simpler) or a proper versioned-update (cleaner).
 
 **Tracking:** `docs/FOLLOW-UP-PRS.md#ttl-watcher-multi-instance-coordination`.
+
+---
+
+## Symlinked directories — silently skipped
+
+**Source:** Post-release bug hunt, April 2026 (B9).
+
+**Status:** Documented; not fixed in v1.0.
+
+**What is the issue?** `src/indexer/workspace-scanner.ts` iterates `fs.readdir(..., { withFileTypes: true })` and recurses only when `entry.isDirectory()` is true. `Dirent.isDirectory()` returns `false` for symbolic links pointing at directories — it does NOT follow. `entry.isFile()` is likewise `false` for symlinks. Net effect: symlinks are **entirely skipped**, in both directions. Workspaces that rely on symlinks — pnpm `node_modules/.pnpm/*` (already excluded, moot), yarn workspaces with `packages/*` symlinks, monorepo root layouts with `apps/web → ../services/web`, dev-env fixtures — appear to Gemini as if those directories were absent, producing "file not found" responses for code the user thinks is in the workspace.
+
+**Impact today:** Security-neutral (we don't follow symlinks into e.g. `/etc`). Correctness cost: degraded answers for users whose repo structure uses symlinked packages. No diagnostic warning is emitted when a symlink is skipped — users currently debug this by staring at `status` output and noticing the `filesIndexed` count is lower than expected.
+
+**Why we're not fixing fully:** Following symlinks requires cycle-detection via canonical-path (`realpath`) tracking + same-filesystem checks + a per-workspace config knob for users who deliberately want to skip symlinks. Correct handling is ~30-60 lines with tests; we want to make sure we get it right rather than bolt it onto a security PR.
+
+**Workaround for affected users:** Replace symlinked package dirs with hardlinks or direct subdirs, or add the symlink target's real path to `includeGlobs` at the tool call. Neither is discoverable without reading this note — hence the tracked follow-up.
+
+**Revisit trigger:** ≥3 user reports of "Gemini doesn't see my packages/* code" or explicit demand from a known monorepo user.
+
+**Tracking:** `docs/FOLLOW-UP-PRS.md` — planned T-number TBD when a maintainer picks it up.
+
+---
+
+## Credentials dir — chmod follows symlinks (Unix TOCTOU window)
+
+**Source:** Post-release bug hunt, April 2026 (B10), complements the existing Windows ACL entry below.
+
+**Status:** WATCH. Partial mitigation (warn on chmod failure) shipped in v1.0.3; full hardening deferred.
+
+**What is the issue?** `saveProfile()` in `src/auth/credentials-store.ts` does `mkdirSync(dir, { mode: 0o700 })` only if the dir doesn't yet exist, then unconditionally `chmodSync(dir, 0o700)`. `chmodSync` follows symbolic links (POSIX `chmod(2)`, not `lchmod`). A local attacker who controls write access to `$XDG_CONFIG_HOME` can pre-plant `~/.config/qmediat → /tmp/evil`; the chmod then adjusts permissions on `/tmp/evil`, not on our intended directory. The subsequent `writeFileSync(tmpPath, content, { mode: 0o600, flag: 'wx' })` uses `O_EXCL` so it cannot overwrite an attacker-planted target file, but the tmp path ends up inside the attacker-controlled directory — the content is protected by 0o600 on the file itself, but the file's location is not where the user expects.
+
+**Impact today:** Narrow. Exploitation requires a local attacker who already has write access to the user's config directory — at which point they have many other attack vectors. The credentials file is still written with 0o600, so its *contents* remain protected from other local users even in the attack scenario.
+
+**Why we're not fixing fully:** Proper defense is `fs.lstatSync(dir).isSymbolicLink()` + refuse-if-symlink *before* any chmod/write. That's 10 lines, but it rejects a legitimate setup on systems where `$XDG_CONFIG_HOME` is itself a symlink (common on servers with separate `/home` vs `/var/config` layouts). We'd need a config knob to allow intentional symlinks. Tracked for a dedicated security-hardening PR.
+
+**Revisit trigger:** Any report of unexpected credentials file location, or a concrete symlink-attack path against the MCP server.
+
+---
+
+## Budget reservation rows inflate `status` cost while a call is in flight
+
+**Source:** Self-review of v1.0.3 atomic-budget implementation, April 2026 (SR3).
+
+**Status:** Documented; not fixed in v1.0.3.
+
+**What is the issue?** The atomic budget reservation (`ManifestDb.reserveBudget`) inserts a row into `usage_metrics` with `cost_usd_micro = estimate` BEFORE the call runs. If the user invokes `status` during that window, `workspaceStats` and `todaysCostMicros` both `SUM(cost_usd_micro)` over the whole table — so the reported daily spend includes the over-conservative estimate. When the call finishes, `finalizeBudgetReservation` overwrites the estimate row with the actual measured cost (typically lower); the next `status` call shows the corrected number.
+
+**Impact today:** Brief, transient inflation of reported spend during the lifetime of a single tool call (seconds to ~1 minute for big workspaces). Operators watching `status` in a tight polling loop see numbers oscillate. Steady-state is correct.
+
+**Why we're not fixing in v1.0.3:** The clean fix is a `state` column on `usage_metrics` (`'reserved'` vs `'final'`) plus a `WHERE state = 'final'` filter on the SUM queries — schema migration. Not worth a v2 schema bump for a transient observability quirk. A cheap workaround that DOES work today: filter SUM on `WHERE duration_ms > 0` (reservations write `duration_ms = 0`; finalize writes the actual). That's a single-line change to `todaysCostMicros` and `workspaceStats`, but it conflates "in-flight" with "very fast call" — risk that a hypothetical sub-millisecond call rounds to `duration_ms = 0` and gets excluded from totals. Keeping the simple SUM is more robust until we have the proper `state` column.
+
+**Workaround for affected users:** Read `status` only between tool calls, not during. The numbers reconcile within seconds of finalize.
+
+**Revisit trigger:** Anyone reporting dashboard alerting flapping on transient overages, or when we touch the schema for another reason.
+
+**Tracking:** Will fold into the next schema migration PR (likely alongside T16's `file_ids` column drop).
 
 ---
 

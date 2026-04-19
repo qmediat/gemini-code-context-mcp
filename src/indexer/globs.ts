@@ -93,12 +93,33 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
   '.gql',
 ];
 
-/** Directory names excluded regardless of depth. */
+/**
+ * Path fragments excluded regardless of depth.
+ *
+ * Matched by `isPathExcluded` (below) against the workspace-relative POSIX path
+ * in three modes: exact equality, `${dir}/` prefix, and `/${dir}/` substring.
+ * Entries are therefore typically directory *basenames* (`node_modules`,
+ * `.ssh`), but multi-segment fragments like `.config/gcloud` also match
+ * correctly — the matcher sees the full relative path, not just `dirent.name`.
+ *
+ * Two classes of entries:
+ *   - **Build / cache artefacts** — indexing them wastes tokens on derived output
+ *     (no value to Gemini).
+ *   - **Secret-bearing directories** (`.ssh`, `.aws`, `.gnupg`, `.kube`, …) — if a
+ *     user or prompt-injected agent points `workspace` at `$HOME`, we refuse to
+ *     even walk these even if `workspace-validation.ts` is bypassed. Defense in
+ *     depth against credential exfiltration through the Files API upload path.
+ *
+ * Entries here are ALWAYS excluded: `isFileIncluded` checks `isPathExcluded`
+ * first, and `defaultMatchConfig` only ever APPENDS extra excludes supplied by
+ * the caller. Tool-level `includeGlobs` cannot re-include a directory that is
+ * in this list — if a repo has a legitimately-named dir that collides with
+ * one of these, the fix is to rename the dir or fork the list, not to try to
+ * punch through via `includeGlobs`.
+ */
 export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
+  // Dependencies / build output
   'node_modules',
-  '.git',
-  '.hg',
-  '.svn',
   'dist',
   'build',
   'out',
@@ -127,10 +148,30 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   'obj',
   '.DS_Store',
   '.terraform',
+  // VCS internals
+  '.git',
+  '.hg',
+  '.svn',
+  '.jj',
+  // Secret-bearing directories — never index, never upload.
+  '.ssh',
+  '.aws',
+  '.gnupg',
+  '.gpg',
+  '.kube',
+  '.docker',
+  '.1password',
+  '.pki',
+  '.gcloud',
+  '.azure',
+  '.config/gcloud',
+  '.config/azure',
+  'Keychains', // macOS: `Library/Keychains`
 ];
 
 /** Files excluded by full relpath suffix (supports either `node_modules` prefix or literal suffix). */
 export const DEFAULT_EXCLUDE_FILE_NAMES: readonly string[] = [
+  // Lockfiles / build metadata
   'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
@@ -141,6 +182,13 @@ export const DEFAULT_EXCLUDE_FILE_NAMES: readonly string[] = [
   'composer.lock',
   '.DS_Store',
   'Thumbs.db',
+  // Secret-bearing files (belt + suspenders on top of directory excludes).
+  '.netrc',
+  '.pypirc',
+  '.npmrc',
+  '.pgpass',
+  '.git-credentials',
+  'credentials', // AWS, qmediat, gcloud all use this filename in config dirs
 ];
 
 export interface MatchConfig {
