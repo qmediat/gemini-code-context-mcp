@@ -93,12 +93,23 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
   '.gql',
 ];
 
-/** Directory names excluded regardless of depth. */
+/**
+ * Directory names excluded regardless of depth.
+ *
+ * Two classes of entries:
+ *   - **Build / cache artefacts** — indexing them wastes tokens on derived output
+ *     (no value to Gemini).
+ *   - **Secret-bearing directories** (`.ssh`, `.aws`, `.gnupg`, `.kube`, …) — if a
+ *     user or prompt-injected agent points `workspace` at `$HOME`, we refuse to
+ *     even walk these even if `workspace-validation.ts` is bypassed. Defense in
+ *     depth against credential exfiltration through the Files API upload path.
+ *     Users with legitimately distinctive secret-dir names inside a repo can
+ *     override via tool-level includeGlobs — the scanner's exclusion check runs
+ *     before any include match.
+ */
 export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
+  // Dependencies / build output
   'node_modules',
-  '.git',
-  '.hg',
-  '.svn',
   'dist',
   'build',
   'out',
@@ -127,10 +138,30 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   'obj',
   '.DS_Store',
   '.terraform',
+  // VCS internals
+  '.git',
+  '.hg',
+  '.svn',
+  '.jj',
+  // Secret-bearing directories — never index, never upload.
+  '.ssh',
+  '.aws',
+  '.gnupg',
+  '.gpg',
+  '.kube',
+  '.docker',
+  '.1password',
+  '.pki',
+  '.gcloud',
+  '.azure',
+  '.config/gcloud',
+  '.config/azure',
+  'Keychains', // macOS: `Library/Keychains`
 ];
 
 /** Files excluded by full relpath suffix (supports either `node_modules` prefix or literal suffix). */
 export const DEFAULT_EXCLUDE_FILE_NAMES: readonly string[] = [
+  // Lockfiles / build metadata
   'package-lock.json',
   'yarn.lock',
   'pnpm-lock.yaml',
@@ -141,6 +172,13 @@ export const DEFAULT_EXCLUDE_FILE_NAMES: readonly string[] = [
   'composer.lock',
   '.DS_Store',
   'Thumbs.db',
+  // Secret-bearing files (belt + suspenders on top of directory excludes).
+  '.netrc',
+  '.pypirc',
+  '.npmrc',
+  '.pgpass',
+  '.git-credentials',
+  'credentials', // AWS, qmediat, gcloud all use this filename in config dirs
 ];
 
 export interface MatchConfig {

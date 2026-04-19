@@ -19,6 +19,7 @@ import {
 } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
+import { validateWorkspacePath } from '../indexer/workspace-validation.js';
 import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
@@ -130,6 +131,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
   async execute(input, ctx) {
     const started = Date.now();
     const workspaceRoot = resolve(input.workspace ?? process.cwd());
+    validateWorkspacePath(workspaceRoot);
     const modelRequest = input.model ?? 'latest-pro-thinking';
     const thinkingBudget = input.thinkingBudget ?? 16_384;
     const expectEdits = input.expectEdits ?? true;
