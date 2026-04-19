@@ -408,6 +408,22 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   }
 }
 
+/**
+ * Hard-purge a workspace: delete the Gemini Context Cache, release every
+ * Files API upload we uploaded for this workspace, and drop the manifest rows.
+ *
+ * The Files-API release is the non-obvious bit: Gemini auto-deletes uploads
+ * 48 h after the original `files.upload`, but storage is billed in the
+ * meantime and our `status` tool reports cost from `usage_metrics` only —
+ * any leaked uploads show up on Google Cloud billing but not in our reports.
+ * Best-effort; individual `files.delete` failures are logged at debug level
+ * and do not block the invalidation (the 48 h timer is the safety net).
+ *
+ * This function is for DELIBERATE resets — `reindex` and `clear` tool calls.
+ * The stale-cache self-heal path (ask/code retry after Gemini rejects our
+ * `cachedContent`) wants to keep file rows intact for dedup on the rebuild;
+ * it should call `markCacheStale()` instead.
+ */
 export async function invalidateWorkspaceCache(args: {
   client: GoogleGenAI;
   manifest: ManifestDb;
@@ -421,7 +437,57 @@ export async function invalidateWorkspaceCache(args: {
       logger.debug(`cache delete (${ws.cacheId}) failed: ${String(err)}`);
     }
   }
+
+  const fileIds = args.manifest
+    .getFiles(args.workspaceRoot)
+    .map((r) => r.fileId)
+    .filter((v): v is string => typeof v === 'string' && v.length > 0);
+  if (fileIds.length > 0) {
+    const concurrency = Math.min(10, fileIds.length);
+    let idx = 0;
+    await Promise.all(
+      Array.from({ length: concurrency }, async () => {
+        while (idx < fileIds.length) {
+          const i = idx;
+          idx += 1;
+          const id = fileIds[i];
+          if (!id) continue;
+          try {
+            await args.client.files.delete({ name: id });
+          } catch (err) {
+            logger.debug(`files.delete (${id}) failed: ${String(err)}`);
+          }
+        }
+      }),
+    );
+  }
+
   args.manifest.deleteWorkspace(args.workspaceRoot);
+}
+
+/**
+ * Lightweight cache-pointer reset used by the ask/code stale-cache retry
+ * path. Nulls out `cache_id` / `cache_expires_at` on the workspace row so
+ * the next `prepareContext` builds a fresh cache, but leaves the `files`
+ * table alone — the same uploads can be reused via content-hash dedup
+ * inside `uploadWorkspaceFiles`.
+ *
+ * Synchronous and makes no network calls: the cache is already dead on
+ * Google's side (that's how we detected the staleness), so `caches.delete`
+ * would just 404, and re-uploading files would double-bill for no benefit.
+ */
+export function markCacheStale(args: {
+  manifest: ManifestDb;
+  workspaceRoot: string;
+}): void {
+  const ws = args.manifest.getWorkspace(args.workspaceRoot);
+  if (!ws) return;
+  args.manifest.upsertWorkspace({
+    ...ws,
+    cacheId: null,
+    cacheExpiresAt: null,
+    updatedAt: Date.now(),
+  });
 }
 
 /**

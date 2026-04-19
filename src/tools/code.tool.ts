@@ -12,11 +12,7 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
 import { z } from 'zod';
-import {
-  invalidateWorkspaceCache,
-  isStaleCacheError,
-  prepareContext,
-} from '../cache/cache-manager.js';
+import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import { validateWorkspacePath } from '../indexer/workspace-validation.js';
@@ -240,11 +236,10 @@ export const codeTool: ToolDefinition<CodeInput> = {
             `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
           );
           try {
-            await invalidateWorkspaceCache({
-              client: ctx.client,
-              manifest: ctx.manifest,
-              workspaceRoot,
-            });
+            // Reset cache pointer only — preserve `files` rows so the rebuild
+            // reuses uploaded files via content-hash dedup instead of double-
+            // uploading. The Gemini-side cache is already dead.
+            markCacheStale({ manifest: ctx.manifest, workspaceRoot });
             const rebuilt = await prepareContext({
               client: ctx.client,
               manifest: ctx.manifest,
