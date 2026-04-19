@@ -104,10 +104,14 @@ export const askTool: ToolDefinition<AskInput> = {
       });
 
       emitter.emit('generating response…');
-      const buildConfig = (cacheId: string | null): GenerateContentConfig => ({
-        systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
-        ...(cacheId ? { cachedContent: cacheId } : {}),
-      });
+      // Gemini rejects `generateContent({cachedContent, systemInstruction})` with 400:
+      // "CachedContent can not be used with GenerateContent request setting
+      //  system_instruction, tools or tool_config. Move those values to CachedContent."
+      // The system instruction was already baked into the cache at build time
+      // (see cache-manager.ts:322 `cacheConfig.systemInstruction`), so we must
+      // OMIT it on the generate call when a cached context is active.
+      const buildConfig = (cacheId: string | null): GenerateContentConfig =>
+        cacheId ? { cachedContent: cacheId } : { systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A };
       const buildContents = (
         cacheId: string | null,
         inline: typeof ctxPrep.inlineContents,
