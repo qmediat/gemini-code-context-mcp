@@ -1,0 +1,12 @@
+{
+  "_comment": "Snippet for ~/.cursor/mcp.json.",
+  "mcpServers": {
+    "gemini-code-context": {
+      "command": "npx",
+      "args": ["-y", "@qmediat.io/gemini-code-context-mcp"],
+      "env": {
+        "GEMINI_CREDENTIALS_PROFILE": "default"
+      }
+    }
+  }
+}
