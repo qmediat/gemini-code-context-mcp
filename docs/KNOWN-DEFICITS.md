@@ -62,6 +62,26 @@ A related but distinct race lives in `prepareContext` itself: if both instances 
 
 ---
 
+## Budget reservation rows inflate `status` cost while a call is in flight
+
+**Source:** Self-review of v1.0.3 atomic-budget implementation, April 2026 (SR3).
+
+**Status:** Documented; not fixed in v1.0.3.
+
+**What is the issue?** The atomic budget reservation (`ManifestDb.reserveBudget`) inserts a row into `usage_metrics` with `cost_usd_micro = estimate` BEFORE the call runs. If the user invokes `status` during that window, `workspaceStats` and `todaysCostMicros` both `SUM(cost_usd_micro)` over the whole table — so the reported daily spend includes the over-conservative estimate. When the call finishes, `finalizeBudgetReservation` overwrites the estimate row with the actual measured cost (typically lower); the next `status` call shows the corrected number.
+
+**Impact today:** Brief, transient inflation of reported spend during the lifetime of a single tool call (seconds to ~1 minute for big workspaces). Operators watching `status` in a tight polling loop see numbers oscillate. Steady-state is correct.
+
+**Why we're not fixing in v1.0.3:** The clean fix is a `state` column on `usage_metrics` (`'reserved'` vs `'final'`) plus a `WHERE state = 'final'` filter on the SUM queries — schema migration. Not worth a v2 schema bump for a transient observability quirk. A cheap workaround that DOES work today: filter SUM on `WHERE duration_ms > 0` (reservations write `duration_ms = 0`; finalize writes the actual). That's a single-line change to `todaysCostMicros` and `workspaceStats`, but it conflates "in-flight" with "very fast call" — risk that a hypothetical sub-millisecond call rounds to `duration_ms = 0` and gets excluded from totals. Keeping the simple SUM is more robust until we have the proper `state` column.
+
+**Workaround for affected users:** Read `status` only between tool calls, not during. The numbers reconcile within seconds of finalize.
+
+**Revisit trigger:** Anyone reporting dashboard alerting flapping on transient overages, or when we touch the schema for another reason.
+
+**Tracking:** Will fold into the next schema migration PR (likely alongside T16's `file_ids` column drop).
+
+---
+
 ## TTL watcher — rolling-window edge case
 
 **Source:** Gemini code review, April 2026 — "TTL watcher breaks rolling-window expectation".

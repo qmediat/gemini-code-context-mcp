@@ -26,6 +26,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Dependabot config hardened** — `@types/node`, `zod`, and `@biomejs/biome` are now pinned to their current major via `ignore: version-update:semver-major`. `@types/node` is capped to our Node runtime target (`engines.node >= 22`) to prevent typings for newer Node APIs from compiling cleanly against a runtime that doesn't support them. `zod` and `@biomejs/biome` majors each require a deliberate migration PR (tracked as T15 and a separate Biome-2 migration PR respectively).
+- **`maxOutputTokens` capped on every Gemini call** — `ask` (8 192) and `code` (32 768) now set an explicit `maxOutputTokens` on the `generateContent` config, derived from the same value used in the budget reservation estimate. Without this, a runaway response could exceed the reserved estimate and silently overshoot `dailyBudgetUsd`. Both values clamp to the resolved model's advertised `outputTokenLimit` if smaller.
+
+### Hardening (post-Copilot review)
+
+- **Workspace path canonicalised before validation** — `validateWorkspacePath` now resolves the input via `realpathSync` before checking cwd ancestry. Without this, a symlink under cwd pointing at `$HOME` or `/etc` would pass the cwd-descendant test even though the actual scan target is outside cwd — defeating the purpose of the guard. `realpath` failures (`ENOENT`, `EACCES`, `ELOOP`) now produce specific error messages instead of being collapsed into a single "does not exist or is not a directory".
+- **Workspace-validation errors handled as regular tool errors** — `ask`, `code`, and `reindex` now catch `WorkspaceValidationError` inside their tool-level try/catch and return a normal `errorResult` ("ask: …", "code: …", "reindex: …") instead of letting the throw bubble to the server-level handler (which logged a noisy `tool 'ask' threw` error and returned an inconsistent message prefix).
+- **Files API delete deduplicates by upload ID** — `invalidateWorkspaceCache` now wraps the file-id list in a `Set` before issuing `client.files.delete` calls. The `files` table can have multiple `(workspace_root, relpath)` rows pointing at the same `fileId` when the uploader reused an existing upload via content-hash dedup; without the `Set`, every duplicate generated a redundant `files.delete` API call (plus 404 noise after the first delete actually removed the file).
+- **`.projectile` removed from `WORKSPACE_MARKERS`** — editor-only scratch files are too weak a signal for a security guard. The remaining markers are VCS dirs, build/dependency manifests with structure, and load-bearing single-file project markers (`Dockerfile`, `Makefile`, `flake.nix`, `build.zig`).
+- **Defensive finalize on budget reservation** — if `finalizeBudgetReservation` throws (disk-full / lock-contention edge), `ask` and `code` now log the error and KEEP the reservation row (estimate stays billed; slight overcharge) instead of letting the outer catch cancel it (which would erase any record of a billable, completed call).
 
 ## [1.0.2] — 2026-04-19
 

@@ -15,7 +15,10 @@ import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
-import { validateWorkspacePath } from '../indexer/workspace-validation.js';
+import {
+  WorkspaceValidationError,
+  validateWorkspacePath,
+} from '../indexer/workspace-validation.js';
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
@@ -127,7 +130,6 @@ export const codeTool: ToolDefinition<CodeInput> = {
   async execute(input, ctx) {
     const started = Date.now();
     const workspaceRoot = resolve(input.workspace ?? process.cwd());
-    validateWorkspacePath(workspaceRoot);
     const modelRequest = input.model ?? 'latest-pro-thinking';
     const thinkingBudget = input.thinkingBudget ?? 16_384;
     const expectEdits = input.expectEdits ?? true;
@@ -136,6 +138,18 @@ export const codeTool: ToolDefinition<CodeInput> = {
     let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
+      // Workspace validation inside try → reported as a regular tool error
+      // (errorResult, "code failed: …") rather than an unhandled exception
+      // surfaced by the server-level handler.
+      try {
+        validateWorkspacePath(workspaceRoot);
+      } catch (err) {
+        if (err instanceof WorkspaceValidationError) {
+          return errorResult(`code: ${err.message}`);
+        }
+        throw err;
+      }
+
       emitter.emit(`resolving model '${modelRequest}'…`);
       const resolved = await resolveModel(modelRequest, ctx.client);
 
@@ -147,15 +161,27 @@ export const codeTool: ToolDefinition<CodeInput> = {
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
 
+      // Hard cap on candidate output tokens (separate from `thinkingBudget`).
+      // Used both as the generateContent `maxOutputTokens` field and as the
+      // budget-reservation estimate, so the reservation is a true upper bound
+      // (Copilot review C7). 32k is generous for most code-edit responses;
+      // we clamp to the model's advertised limit if smaller.
+      const CODE_MAX_OUTPUT_TOKENS_DEFAULT = 32_768;
+      const maxOutputTokens =
+        typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
+          ? Math.min(CODE_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
+          : CODE_MAX_OUTPUT_TOKENS_DEFAULT;
+
       // Atomic budget reservation — see ask.tool.ts for the full rationale.
-      // Estimate includes the thinking budget (billed as output tokens on Pro).
+      // Estimate includes the thinking budget (billed as output tokens on Pro)
+      // PLUS the candidate output cap.
       if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
         const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
         const estimateUsd = estimatePreCallCostUsd({
           model: resolved.resolved,
           workspaceBytes,
           promptChars: input.task.length,
-          expectedOutputTokens: 16_000,
+          expectedOutputTokens: maxOutputTokens,
           thinkingTokens: thinkingBudget,
         });
         const reserve = ctx.manifest.reserveBudget({
@@ -221,15 +247,19 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const buildConfig = (cacheId: string | null): GenerateContentConfig => {
         if (canUseCache(cacheId) && cacheId) {
           // With cache: system_instruction is baked in; thinkingConfig remains OK.
+          // `maxOutputTokens` couples with the budget reservation estimate
+          // so the reservation is a TRUE upper bound (Copilot review C7).
           return {
             cachedContent: cacheId,
             thinkingConfig: { thinkingBudget, includeThoughts: true },
+            maxOutputTokens,
           };
         }
         // Without cache (or cache bypassed for codeExecution): pass full config.
         return {
           systemInstruction: SYSTEM_INSTRUCTION_CODE,
           thinkingConfig: { thinkingBudget, includeThoughts: true },
+          maxOutputTokens,
           ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
         };
       };
@@ -341,13 +371,23 @@ export const codeTool: ToolDefinition<CodeInput> = {
 
       const durationMs = Date.now() - started;
       if (reservationId !== null) {
-        ctx.manifest.finalizeBudgetReservation(reservationId, {
-          cachedTokens: cached,
-          uncachedTokens: uncached,
-          costUsdMicro: costMicros,
-          durationMs,
-        });
-        reservationId = null; // consumed — don't let the catch below re-cancel.
+        // Defensive: if `finalize` throws (disk full / lock contention), keep
+        // the reservation row so we don't lose all record of this billable
+        // call. Drop `reservationId` either way so the outer catch doesn't
+        // touch it.
+        try {
+          ctx.manifest.finalizeBudgetReservation(reservationId, {
+            cachedTokens: cached,
+            uncachedTokens: uncached,
+            costUsdMicro: costMicros,
+            durationMs,
+          });
+        } catch (finalizeErr) {
+          logger.error(
+            `code: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
+          );
+        }
+        reservationId = null;
       } else {
         ctx.manifest.insertUsageMetric({
           workspaceRoot,

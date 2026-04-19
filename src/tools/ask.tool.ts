@@ -13,7 +13,10 @@ import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
-import { validateWorkspacePath } from '../indexer/workspace-validation.js';
+import {
+  WorkspaceValidationError,
+  validateWorkspacePath,
+} from '../indexer/workspace-validation.js';
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
@@ -21,6 +24,17 @@ import { type ToolDefinition, errorResult, textResult } from './registry.js';
 
 const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
+
+/**
+ * Hard cap on Gemini's response size for `ask`. Used both as the
+ * `maxOutputTokens` field on the generateContent config (so the model
+ * actually stops there) and as the `expectedOutputTokens` value passed to
+ * `estimatePreCallCostUsd` for the budget reservation. Coupling them is
+ * the point: the reservation becomes a true upper bound, not a guess that
+ * can be exceeded silently. Q&A answers rarely need more than ~8k tokens;
+ * if the resolved model advertises a smaller limit, we use that instead.
+ */
+const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
 
 export const askInputSchema = z.object({
   prompt: z.string().min(1).describe('The question or analysis request.'),
@@ -57,12 +71,26 @@ export const askTool: ToolDefinition<AskInput> = {
   async execute(input, ctx) {
     const started = Date.now();
     const workspaceRoot = resolve(input.workspace ?? process.cwd());
-    validateWorkspacePath(workspaceRoot);
     const model = input.model ?? ctx.config.defaultModel;
 
     let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
+      // Workspace path validation lives INSIDE the try so a
+      // `WorkspaceValidationError` is reported as a regular tool error
+      // (errorResult, "ask failed: …") rather than an unhandled tool
+      // exception logged by the server-level handler. Both arrive at the
+      // user as text, but only the inside-try path keeps logs tidy and the
+      // user-facing prefix consistent with other validation failures.
+      try {
+        validateWorkspacePath(workspaceRoot);
+      } catch (err) {
+        if (err instanceof WorkspaceValidationError) {
+          return errorResult(`ask: ${err.message}`);
+        }
+        throw err;
+      }
+
       emitter.emit(`resolving model '${model}'…`);
       const resolved = await resolveModel(model, ctx.client);
 
@@ -73,6 +101,16 @@ export const askTool: ToolDefinition<AskInput> = {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
+
+      // Hard cap on output tokens: bound the reservation estimate and the
+      // actual generateContent request to the same value, so the budget
+      // reservation is a TRUE upper bound (Copilot review C6). If the
+      // resolved model's advertised limit is smaller than our default,
+      // honour that — Gemini would clamp it anyway.
+      const maxOutputTokens =
+        typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
+          ? Math.min(ASK_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
+          : ASK_MAX_OUTPUT_TOKENS_DEFAULT;
 
       // Atomic budget reservation. Happens AFTER scan (so the estimate is
       // accurate) but BEFORE any billable upload or generateContent call.
@@ -85,7 +123,7 @@ export const askTool: ToolDefinition<AskInput> = {
           model: resolved.resolved,
           workspaceBytes,
           promptChars: input.prompt.length,
-          expectedOutputTokens: 8000,
+          expectedOutputTokens: maxOutputTokens,
         });
         const reserve = ctx.manifest.reserveBudget({
           workspaceRoot,
@@ -129,8 +167,14 @@ export const askTool: ToolDefinition<AskInput> = {
       // The system instruction was already baked into the cache at build time
       // (see cache-manager.ts:322 `cacheConfig.systemInstruction`), so we must
       // OMIT it on the generate call when a cached context is active.
+      // `maxOutputTokens` is set on every generateContent call so the budget
+      // reservation's `expectedOutputTokens` (derived from the same value) is
+      // a true upper bound — without this cap, a runaway response could
+      // exceed the reserved estimate and silently overshoot `dailyBudgetUsd`.
       const buildConfig = (cacheId: string | null): GenerateContentConfig =>
-        cacheId ? { cachedContent: cacheId } : { systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A };
+        cacheId
+          ? { cachedContent: cacheId, maxOutputTokens }
+          : { systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A, maxOutputTokens };
       const buildContents = (
         cacheId: string | null,
         inline: typeof ctxPrep.inlineContents,
@@ -225,13 +269,26 @@ export const askTool: ToolDefinition<AskInput> = {
 
       const durationMs = Date.now() - started;
       if (reservationId !== null) {
-        ctx.manifest.finalizeBudgetReservation(reservationId, {
-          cachedTokens: cached,
-          uncachedTokens: uncached,
-          costUsdMicro: costMicros,
-          durationMs,
-        });
-        reservationId = null; // consumed — don't let the catch below re-cancel.
+        // The finalize UPDATE on a row we just inserted should be infallible
+        // in practice, but a disk-full / lock-contention edge could throw.
+        // If it does, we'd rather keep the reservation row (estimate stays
+        // billed, slight overcharge) than let the outer catch CANCEL it
+        // — cancelling would erase any record of this billable, completed
+        // call. Either way, drop `reservationId` so the outer catch doesn't
+        // touch it.
+        try {
+          ctx.manifest.finalizeBudgetReservation(reservationId, {
+            cachedTokens: cached,
+            uncachedTokens: uncached,
+            costUsdMicro: costMicros,
+            durationMs,
+          });
+        } catch (finalizeErr) {
+          logger.error(
+            `ask: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
+          );
+        }
+        reservationId = null;
       } else {
         ctx.manifest.insertUsageMetric({
           workspaceRoot,

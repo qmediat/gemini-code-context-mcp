@@ -10,7 +10,10 @@ import { z } from 'zod';
 import { invalidateWorkspaceCache } from '../cache/cache-manager.js';
 import { invalidateModelCache } from '../gemini/model-registry.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
-import { validateWorkspacePath } from '../indexer/workspace-validation.js';
+import {
+  WorkspaceValidationError,
+  validateWorkspacePath,
+} from '../indexer/workspace-validation.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 
@@ -35,7 +38,14 @@ export const reindexTool: ToolDefinition<ReindexInput> = {
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       const workspaceRoot = resolve(input.workspace ?? process.cwd());
-      validateWorkspacePath(workspaceRoot);
+      try {
+        validateWorkspacePath(workspaceRoot);
+      } catch (err) {
+        if (err instanceof WorkspaceValidationError) {
+          return errorResult(`reindex: ${err.message}`);
+        }
+        throw err;
+      }
       emitter.emit('invalidating cache…');
       await invalidateWorkspaceCache({
         client: ctx.client,

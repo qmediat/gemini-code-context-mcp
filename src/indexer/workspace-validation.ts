@@ -24,13 +24,20 @@
  * and prompt-injection paths, not every conceivable abuse.
  */
 
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, join, sep as pathSep, relative } from 'node:path';
 
 /**
  * Files / dirs at a path root that strongly suggest it's a real codebase.
  * Scoped to things that appear in the ROOT — per-file markers deeper in the
  * tree (README.md, .gitignore) aren't reliable signals.
+ *
+ * The list deliberately omits weak signals like editor scratch files
+ * (`.projectile`) — this is a security guard, not a "feels like a project"
+ * heuristic. Stronger signals only: a VCS dir, a build/dependency manifest
+ * with structure, or a known polyglot marker (Dockerfile, Makefile, flake.nix
+ * are kept because they're load-bearing single-file projects, not editor
+ * fragments).
  */
 export const WORKSPACE_MARKERS: readonly string[] = [
   // VCS
@@ -69,8 +76,6 @@ export const WORKSPACE_MARKERS: readonly string[] = [
   'flake.nix',
   'shell.nix',
   'build.zig',
-  // Editor integration (weak signals, still better than none)
-  '.projectile',
 ] as const;
 
 export class WorkspaceValidationError extends Error {
@@ -94,6 +99,12 @@ function isUnderCwd(child: string, cwd: string = process.cwd()): boolean {
  * Throw `WorkspaceValidationError` if `workspaceRoot` is not a plausible
  * codebase root. Intended to be called from tool entry points after
  * `resolve(input.workspace ?? cwd)` but before any filesystem scan.
+ *
+ * The check is performed against the **canonical** path (`fs.realpath`),
+ * not the literal argument. Without this, a symlink under cwd pointing at
+ * `/etc` (or `$HOME`, or anywhere else) would pass the cwd-descendant test
+ * — defeating the purpose of the guard. Resolving to the canonical path
+ * first means the cwd ancestry test sees the real target every time.
  */
 export function validateWorkspacePath(workspaceRoot: string): void {
   if (!isAbsolute(workspaceRoot)) {
@@ -102,22 +113,48 @@ export function validateWorkspacePath(workspaceRoot: string): void {
     );
   }
 
-  let exists = false;
+  // Canonicalise BEFORE any cwd / marker check — see the doc-comment above
+  // for the symlink-bypass rationale. `realpathSync` throws ENOENT for
+  // missing paths, EACCES for unreadable parents, ELOOP for circular
+  // symlinks; we surface each with a precise message instead of mapping
+  // them all onto "does not exist".
+  let canonical: string;
   try {
-    exists = statSync(workspaceRoot).isDirectory();
-  } catch {
-    // not accessible or not a directory
+    canonical = realpathSync(workspaceRoot);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    const reason =
+      code === 'ENOENT'
+        ? 'does not exist'
+        : code === 'EACCES'
+          ? 'is not accessible (permission denied)'
+          : code === 'ELOOP'
+            ? 'is part of a symlink cycle'
+            : `could not be resolved (${code ?? 'unknown error'})`;
+    throw new WorkspaceValidationError(`workspace '${workspaceRoot}' ${reason}`);
   }
-  if (!exists) {
+
+  let isDir = false;
+  try {
+    isDir = statSync(canonical).isDirectory();
+  } catch (err) {
+    // Should not normally fire — realpath succeeded — but defensive: surface
+    // as a regular validation error rather than letting an unexpected stat
+    // failure leak out as an unhandled exception.
     throw new WorkspaceValidationError(
-      `workspace '${workspaceRoot}' does not exist or is not a directory`,
+      `workspace '${workspaceRoot}' resolved to '${canonical}' but stat failed: ${String(err)}`,
+    );
+  }
+  if (!isDir) {
+    throw new WorkspaceValidationError(
+      `workspace '${workspaceRoot}' resolved to '${canonical}' which is not a directory`,
     );
   }
 
-  if (isUnderCwd(workspaceRoot)) return;
+  if (isUnderCwd(canonical)) return;
 
   for (const marker of WORKSPACE_MARKERS) {
-    if (existsSync(join(workspaceRoot, marker))) return;
+    if (existsSync(join(canonical, marker))) return;
   }
 
   if (process.env.GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE === 'true') {
@@ -126,7 +163,7 @@ export function validateWorkspacePath(workspaceRoot: string): void {
 
   const sample = WORKSPACE_MARKERS.slice(0, 5).join(', ');
   throw new WorkspaceValidationError(
-    `Refusing to scan '${workspaceRoot}': path is not under the host's cwd and contains no recognised workspace marker ` +
+    `Refusing to scan '${workspaceRoot}'${canonical !== workspaceRoot ? ` (resolves to '${canonical}')` : ''}: path is not under the host's cwd and contains no recognised workspace marker ` +
       `(${sample}, …). If intentional, set GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE=true.`,
   );
 }

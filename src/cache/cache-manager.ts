@@ -438,10 +438,20 @@ export async function invalidateWorkspaceCache(args: {
     }
   }
 
-  const fileIds = args.manifest
-    .getFiles(args.workspaceRoot)
-    .map((r) => r.fileId)
-    .filter((v): v is string => typeof v === 'string' && v.length > 0);
+  // De-duplicate fileIds: the manifest's `files` table can have multiple
+  // (workspaceRoot, relpath) rows pointing at the SAME `fileId` when the
+  // uploader reused an existing upload via content-hash dedup (a tool whose
+  // workspace contains the same file at two paths, or a rebuild that found
+  // an existing in-batch dedup hit). Without `Set`, we'd `files.delete(X)`
+  // multiple times — wasteful API calls + 404 noise after the first delete.
+  const fileIds = Array.from(
+    new Set(
+      args.manifest
+        .getFiles(args.workspaceRoot)
+        .map((r) => r.fileId)
+        .filter((v): v is string => typeof v === 'string' && v.length > 0),
+    ),
+  );
   if (fileIds.length > 0) {
     const concurrency = Math.min(10, fileIds.length);
     let idx = 0;
