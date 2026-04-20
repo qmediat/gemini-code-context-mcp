@@ -8,7 +8,13 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
+import type {
+  Content,
+  GenerateContentConfig,
+  GenerateContentResponse,
+  ThinkingConfig,
+  ThinkingLevel,
+} from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
@@ -50,37 +56,100 @@ const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
  */
 const THINKING_BUDGET_MODEL_DEFAULT = null;
 
-export const askInputSchema = z.object({
-  prompt: z.string().min(1).describe('The question or analysis request.'),
-  workspace: z
-    .string()
-    .optional()
-    .describe('Absolute or cwd-relative path to the workspace. Defaults to process.cwd().'),
-  model: z
-    .string()
-    .optional()
-    .describe(
-      "Model alias ('latest-pro', 'latest-flash', 'latest-lite') or literal model ID. Defaults to the configured default.",
-    ),
-  includeGlobs: z
-    .array(z.string())
-    .optional()
-    .describe('Additional file extensions or filenames to include.'),
-  excludeGlobs: z.array(z.string()).optional().describe('Additional directory names to exclude.'),
-  noCache: z
-    .boolean()
-    .optional()
-    .describe('Skip the context cache and embed files inline (slower, more expensive).'),
-  thinkingBudget: z
-    .number()
-    .int()
-    .min(-1)
-    .max(65_536)
-    .optional()
-    .describe(
-      "Explicit reasoning-token cap. OMIT to use each model's native default — recommended, and the only path Google supports without caveats on Gemini 3 family models (HIGH dynamic on Gemini 3 Pro). Pass a value only when you need a specific cap: `-1` = legacy dynamic (Gemini 2.5 and older), `0` = disable thinking (rejected by Gemini 3 Pro with 400 'This model only works in thinking mode'), positive integer = fixed cap. CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang without a response — use `-1` or ≥4096 if you must bound it there, or omit and let the model use its HIGH-dynamic default.",
-    ),
-});
+/**
+ * Accepted values for `thinkingLevel`. Uppercased to match `ThinkingLevel`
+ * enum members in `@google/genai` — we map directly without case changes.
+ * `THINKING_LEVEL_UNSPECIFIED` is deliberately excluded: it's the SDK's
+ * "no value set" sentinel, and passing it is semantically equivalent to
+ * omitting the field. Callers who want model-native behaviour should just
+ * omit `thinkingLevel` entirely.
+ *
+ * Per Google's Gemini 3 guide (ai.google.dev/gemini-api/docs/gemini-3):
+ *   - Gemini 3 Pro supports LOW / MEDIUM / HIGH (not MINIMAL); default HIGH.
+ *   - Gemini 3 Flash supports all four; Flash-Lite defaults to MINIMAL.
+ *   - Gemini 2.5 family does NOT support `thinkingLevel` — use `thinkingBudget`.
+ * We accept all four values at the schema boundary and let Gemini reject
+ * unsupported combinations at request time, so the MCP surface stays stable
+ * across model rollouts.
+ */
+const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const;
+
+/**
+ * Conservative per-tier thinking-token reservations for cost estimation.
+ *
+ * Google does not publish the exact per-tier token budgets Gemini consumes
+ * for each `thinkingLevel`. These numbers are heuristic upper bounds based
+ * on Google's documented "MINIMAL ≈ near-zero", "HIGH ≈ up to model's
+ * thinking limit" guidance (ai.google.dev/gemini-api/docs/thinking). Using
+ * tier-aware values (rather than always-worst-case) prevents
+ * `GEMINI_DAILY_BUDGET_USD` from false-rejecting a long sequence of
+ * `MINIMAL` calls where the real spend is ≤1% of a worst-case reservation.
+ *
+ * If Gemini actually consumes MORE than we reserved, `finalizeBudgetReservation`
+ * writes the measured cost over the estimate — the cap remains a true upper
+ * bound across *completed* calls; tiered reservations only affect preflight
+ * acceptance. A call that genuinely exceeds the tier's reserve will succeed
+ * (Gemini honours whatever it decides to spend); a subsequent call will see
+ * the larger measured cost in the budget ledger.
+ *
+ * HIGH intentionally maps to null → the caller code substitutes
+ * `maxOutputTokens - 1024` at call time so the value tracks the model's
+ * actual output cap.
+ */
+export const THINKING_LEVEL_RESERVE: Record<(typeof THINKING_LEVELS)[number], number | null> = {
+  MINIMAL: 512,
+  LOW: 2_048,
+  MEDIUM: 4_096,
+  HIGH: null,
+};
+
+export const askInputSchema = z
+  .object({
+    prompt: z.string().min(1).describe('The question or analysis request.'),
+    workspace: z
+      .string()
+      .optional()
+      .describe('Absolute or cwd-relative path to the workspace. Defaults to process.cwd().'),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        "Model alias ('latest-pro', 'latest-flash', 'latest-lite') or literal model ID. Defaults to the configured default.",
+      ),
+    includeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe('Additional file extensions or filenames to include.'),
+    excludeGlobs: z.array(z.string()).optional().describe('Additional directory names to exclude.'),
+    noCache: z
+      .boolean()
+      .optional()
+      .describe('Skip the context cache and embed files inline (slower, more expensive).'),
+    thinkingBudget: z
+      .number()
+      .int()
+      .min(-1)
+      .max(65_536)
+      .optional()
+      .describe(
+        "Explicit reasoning-token cap. OMIT to use each model's native default — recommended on Gemini 3 (Google flags explicit `thinkingBudget` as 'legacy'). Pass a value only when you need a specific cap: `-1` = legacy dynamic, `0` = disable thinking (rejected by Gemini 3 Pro), positive integer = fixed cap. CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang — use `-1` or ≥4096 if you must bound it there. For discrete-tier control on Gemini 3 use `thinkingLevel` instead — the two are mutually exclusive.",
+      ),
+    thinkingLevel: z
+      .enum(THINKING_LEVELS)
+      .optional()
+      .describe(
+        "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+      ),
+  })
+  .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
+    message:
+      'Cannot specify both `thinkingBudget` and `thinkingLevel` — they are mutually exclusive. Gemini rejects the combination with 400. Choose one: `thinkingLevel` (recommended for Gemini 3) or `thinkingBudget` (required on Gemini 2.5).',
+    // `path: []` (root-level error) reflects that the violation is the
+    // RELATION between two fields, not a problem with either field
+    // individually. MCP clients that render per-field errors won't
+    // misattribute the issue to `thinkingLevel` alone.
+    path: [],
+  });
 
 export type AskInput = z.infer<typeof askInputSchema>;
 
@@ -135,6 +204,13 @@ export const askTool: ToolDefinition<AskInput> = {
           ? Math.min(ASK_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
           : ASK_MAX_OUTPUT_TOKENS_DEFAULT;
 
+      // Single source of truth for "is the caller driving reasoning via the
+      // discrete-tier knob?". Three downstream call sites branch on this
+      // (cost estimate, emitter, thinkingConfig build) — extracting to a
+      // named const keeps them in lockstep and makes future additions hard
+      // to forget.
+      const usingThinkingLevel = input.thinkingLevel !== undefined;
+
       // Normalise thinkingBudget:
       //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)
       //   -1        → -1  (explicit legacy dynamic; kept for Gemini 2.5 and
@@ -144,6 +220,10 @@ export const askTool: ToolDefinition<AskInput> = {
       //              pool is carved out of the candidate-output allowance,
       //              so reserving ≥1024 tokens for the answer prevents 400s
       //              when a caller passes N ≥ maxOutputTokens.
+      //
+      // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel`
+      // are never both set, so we handle them in two mutually-exclusive
+      // branches below.
       const rawThinkingBudget = input.thinkingBudget;
       const effectiveThinkingBudget: number | null =
         rawThinkingBudget === undefined
@@ -154,16 +234,27 @@ export const askTool: ToolDefinition<AskInput> = {
               ? Math.max(0, Math.min(rawThinkingBudget, maxOutputTokens - 1024))
               : 0;
 
-      // Conservative upper bound for cost estimation. Gemini 3 Pro always
-      // spends thinking tokens (cannot be disabled per Google's docs), so we
-      // reserve dynamic-thinking headroom even when the user hasn't opted in
-      // — keeps `dailyBudgetUsd` a TRUE upper bound regardless of which
-      // reasoning tier the model picks. When the user explicitly passes a
-      // positive N, we reserve only that much.
+      // Cost-estimate thinking-token reserve — tier-aware when the caller
+      // uses `thinkingLevel`, worst-case when they use `thinkingBudget: -1`
+      // or omit both fields (Gemini 3 Pro always spends thinking tokens per
+      // Google's docs, so we reserve dynamic-thinking headroom there too).
+      // When the caller passes an explicit positive `thinkingBudget`, we
+      // reserve only that much. Keeps `GEMINI_DAILY_BUDGET_USD` a TRUE
+      // upper bound on completed spend without false-rejecting callers
+      // who legitimately use a low tier (see `THINKING_LEVEL_RESERVE`
+      // rationale above).
+      //
+      // We dereference `input.thinkingLevel` directly (rather than via
+      // `usingThinkingLevel`) so TypeScript narrows the type inside the
+      // ternary — `THINKING_LEVEL_RESERVE[undefined]` would be a compile
+      // error. The `?? worst-case` fallback handles the HIGH tier (which
+      // maps to `null` in the reserve table to mean "use the dynamic cap").
       const thinkingTokensForEstimate =
-        effectiveThinkingBudget === null || effectiveThinkingBudget === -1
-          ? Math.max(0, maxOutputTokens - 1024)
-          : effectiveThinkingBudget;
+        input.thinkingLevel !== undefined
+          ? (THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? Math.max(0, maxOutputTokens - 1024))
+          : effectiveThinkingBudget === null || effectiveThinkingBudget === -1
+            ? Math.max(0, maxOutputTokens - 1024)
+            : effectiveThinkingBudget;
 
       // Atomic budget reservation. Happens AFTER scan (so the estimate is
       // accurate) but BEFORE any billable upload or generateContent call.
@@ -215,11 +306,13 @@ export const askTool: ToolDefinition<AskInput> = {
       });
 
       emitter.emit(
-        effectiveThinkingBudget === null
-          ? 'generating response (thinking=model-default)…'
-          : effectiveThinkingBudget === -1
-            ? 'generating response (thinking=dynamic)…'
-            : `generating response (thinking=${effectiveThinkingBudget})…`,
+        usingThinkingLevel
+          ? `generating response (thinking-level=${input.thinkingLevel})…`
+          : effectiveThinkingBudget === null
+            ? 'generating response (thinking=model-default)…'
+            : effectiveThinkingBudget === -1
+              ? 'generating response (thinking=dynamic)…'
+              : `generating response (thinking=${effectiveThinkingBudget})…`,
       );
       // Gemini rejects `generateContent({cachedContent, systemInstruction})` with 400:
       // "CachedContent can not be used with GenerateContent request setting
@@ -230,15 +323,35 @@ export const askTool: ToolDefinition<AskInput> = {
       // `thinkingConfig` is NOT one of the forbidden fields — it is a
       // per-request reasoning control and travels with every call regardless
       // of cache state. We always set `includeThoughts: true` so callers see
-      // Gemini's reasoning digest in the response; `thinkingBudget` is only
-      // included when the caller explicitly asked for one (omitting it is
-      // the recommended path on Gemini 3 per Google's own guide).
+      // Gemini's reasoning digest in the response.
+      //
+      // Three mutually-exclusive reasoning-control paths (enforced by
+      // schema `.refine()`):
+      //   a) `thinkingLevel` set → pass it through to the SDK enum. Google's
+      //      recommended path on Gemini 3. Rejected by Gemini 2.5 family.
+      //   b) `thinkingBudget` set (non-null after normalisation) → legacy
+      //      budget path. Required on Gemini 2.5; flagged as "legacy" on
+      //      Gemini 3 but still supported.
+      //   c) neither set → omit both fields, keep only `includeThoughts`.
+      //      Model uses its native default (HIGH-dynamic on Gemini 3 Pro).
+      //
       // `maxOutputTokens` is set on every generateContent call so the budget
       // reservation's `expectedOutputTokens` (derived from the same value) is
       // a true upper bound — without this cap, a runaway response could
       // exceed the reserved estimate and silently overshoot `dailyBudgetUsd`.
-      const thinkingConfig =
-        effectiveThinkingBudget === null
+      // Cast to `ThinkingLevel` rather than indexing the runtime enum object
+      // (`ThinkingLevel[input.thinkingLevel]`). For string enums the value
+      // IS the member name, so passing `"HIGH"` as `ThinkingLevel` is
+      // semantically identical at runtime — but it survives SDK renames:
+      // if a future `@google/genai` release renames a member, the literal
+      // string reaches Gemini's wire, which 400s with a clear message
+      // instead of silently becoming `undefined` at the indexing step.
+      const thinkingConfig: ThinkingConfig = usingThinkingLevel
+        ? {
+            thinkingLevel: input.thinkingLevel as ThinkingLevel,
+            includeThoughts: true,
+          }
+        : effectiveThinkingBudget === null
           ? { includeThoughts: true }
           : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
       const buildConfig = (cacheId: string | null): GenerateContentConfig =>
@@ -405,6 +518,7 @@ export const askTool: ToolDefinition<AskInput> = {
         fallbackApplied: resolved.fallbackApplied,
         contextWindow: resolved.inputTokenLimit,
         thinkingBudget: effectiveThinkingBudget,
+        thinkingLevel: input.thinkingLevel ?? null,
         cachedTokens: cached,
         uncachedTokens: uncached,
         outputTokens: output,

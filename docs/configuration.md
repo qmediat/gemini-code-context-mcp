@@ -38,7 +38,8 @@ Every tool accepts runtime overrides that beat the defaults:
 - `ask({ model: "latest-flash" })` — force a cheaper model for this one question
 - `ask({ noCache: true })` — bypass the context cache and send files inline
 - `ask({ thinkingBudget: 0 })` — disable reasoning for a shallow lookup-style question (rejected by Gemini 3 Pro with 400; fine on Gemini 2.5 / Flash)
-- `ask({ thinkingBudget: 8000 })` — explicit cap; use on Gemini 2.5 for cost-bounded deep-dives. On Gemini 3 Pro prefer omitting the param — that triggers the model's HIGH-dynamic default, which is Google's recommended path
+- `ask({ thinkingBudget: 8000 })` — explicit cap; use on Gemini 2.5 for cost-bounded deep-dives. On Gemini 3 Pro prefer `thinkingLevel` or omit reasoning params entirely
+- `ask({ thinkingLevel: "LOW" })` — discrete reasoning tier for Gemini 3 (Google's recommended knob on 3.x). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default when the field is omitted). Rejected by Gemini 2.5 family — use `thinkingBudget` there. Mutually exclusive with `thinkingBudget` — schema refuses both-set with a clear error
 - `code({ thinkingBudget: 32000, codeExecution: true })` — harder problem, let Gemini verify with Python
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
 
