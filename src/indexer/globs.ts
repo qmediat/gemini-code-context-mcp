@@ -167,6 +167,24 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   '.config/gcloud',
   '.config/azure',
   'Keychains', // macOS: `Library/Keychains`
+  // Home-level user directories — defense in depth. If a caller somehow
+  // ends up scanning `$HOME` despite `validateWorkspacePath`'s home-reject
+  // (e.g. a symlinked sibling that points back at home, or a future MCP
+  // host pattern we haven't seen), these are the top offenders: privacy-
+  // hostile, massive, and guaranteed not to be part of any legitimate
+  // codebase. Refusing them blunts the blast radius even in the edge cases
+  // where the root guard doesn't fire.
+  '.Trash', // macOS: Finder trash — large, privacy-sensitive
+  'Trash', // Linux variants: `~/.local/share/Trash/files`
+  'Library', // macOS: app support / caches / prefs — huge, not a codebase
+  'Downloads',
+  'Desktop',
+  'Documents',
+  'Movies', // macOS
+  'Music', // macOS / Linux
+  'Pictures',
+  'Videos',
+  'Public', // macOS
 ];
 
 /** Files excluded by full relpath suffix (supports either `node_modules` prefix or literal suffix). */

@@ -25,6 +25,7 @@
  */
 
 import { existsSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { isAbsolute, join, sep as pathSep, relative } from 'node:path';
 
 /**
@@ -164,6 +165,40 @@ export function validateWorkspacePath(workspaceRoot: string): void {
     canonicalCwd = realpathSync(process.cwd());
   } catch {
     canonicalCwd = process.cwd();
+  }
+
+  // Refuse the user's home directory as a workspace even when it happens to
+  // BE the MCP host's cwd. The canonical MCP launch pattern (this project's
+  // own README recommends it, and `~/.claude.json` installs use it) sets
+  // `cwd: $HOME` specifically to sidestep an npx-in-same-repo conflict —
+  // a side-effect is that an `ask`/`code`/`reindex` call with `workspace`
+  // omitted falls through to `process.cwd() === $HOME` and then passes the
+  // cwd-ancestry check here, scanning everything under `$HOME` (Desktop,
+  // Documents, Downloads, .Trash, etc.) and uploading matched files to the
+  // Gemini Files API.
+  //
+  // No legitimate caller wants `$HOME` as a "project root" — it has no
+  // single-codebase structure, the scan cost scales with years of
+  // accumulated personal files, and exposure is privacy-hostile. Reject
+  // explicitly with a message that tells the caller what to do instead
+  // (pass `workspace` with a real project path).
+  //
+  // This check fires BEFORE the cwd-ancestry test because the point is to
+  // reject even when the path would otherwise pass. The marker-root escape
+  // below still applies to OTHER paths that happen to equal home via
+  // `HOME=/` shenanigans — but `$HOME` itself is refused unconditionally.
+  let canonicalHome: string | null = null;
+  try {
+    canonicalHome = realpathSync(homedir());
+  } catch {
+    // If we can't resolve home (unlikely — process has no HOME env?), fall
+    // through and let the normal cwd / marker checks decide. Not a security
+    // hole — attacker can't make our process forget home to bypass.
+  }
+  if (canonicalHome !== null && canonical === canonicalHome) {
+    throw new WorkspaceValidationError(
+      `Refusing to scan '${workspaceRoot}' — it resolves to the user's home directory ('${canonical}'). This is almost certainly a misconfiguration: the MCP server's cwd is $HOME (standard launch pattern) and no explicit 'workspace' argument was passed, so the tool would recursively index Desktop, Documents, Downloads, .Trash, and every other directory under home. Pass 'workspace' explicitly to the tool with a real project root (a path containing .git, package.json, Cargo.toml, go.mod, pyproject.toml, etc.).`,
+    );
   }
 
   if (isUnderCwd(canonical, canonicalCwd)) return;

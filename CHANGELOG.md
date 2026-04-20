@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **`validateWorkspacePath` now refuses the user's home directory as a workspace.** The canonical MCP launch pattern sets `cwd: $HOME` (to sidestep an `npx`-in-same-repo conflict documented in the README). Before this fix, an `ask`/`code`/`reindex` call that omitted the `workspace` argument fell through to `process.cwd() === $HOME` and PASSED the existing cwd-ancestry check — so the scanner would recursively walk `Desktop`, `Documents`, `Downloads`, `.Trash`, and everything else under `$HOME`, uploading matched files to the Gemini Files API. The guard now canonicalises both `workspaceRoot` and `os.homedir()` via `realpathSync` and refuses any path whose canonical form equals the canonical home directory — regardless of whether home happens to contain a `.git` or other workspace marker, and regardless of symlink bypass attempts. Error message tells the caller explicitly to pass `workspace` with a real project root. Orthogonal defense in depth: `DEFAULT_EXCLUDE_DIRS` now excludes `.Trash`, `Trash` (Linux), `Library` (macOS), `Downloads`, `Desktop`, `Documents`, `Movies`, `Music`, `Pictures`, `Videos`, and `Public` — so even an edge-case path that bypasses the root guard can't exfiltrate those directories' contents. 4 regression tests added under `test/unit/workspace-validation.test.ts` → "refuses the user's home directory as a workspace".
+
 ### Added
 
 - **`code({ thinkingLevel })` parameter** — T21 ships `thinkingLevel` (`MINIMAL` / `LOW` / `MEDIUM` / `HIGH`) on the `code` tool, matching the `ask` surface from v1.2. Google's recommended reasoning knob on Gemini 3 (ai.google.dev/gemini-api/docs/gemini-3); `thinkingBudget` remains the legacy/Gemini-2.5 path, and the two are mutually exclusive (Zod `.refine()` refuses both-set at the schema root with the same cross-field error ask uses). `code` keeps its pre-existing `thinkingBudget` default of 16_384 — coding tasks benefit from strong reasoning out of the box, and changing that default would be a behavioural break for existing callers.
