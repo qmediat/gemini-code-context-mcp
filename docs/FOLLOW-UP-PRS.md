@@ -19,7 +19,7 @@ Each step must fully merge + publish before the next opens:
 | ~~B~~ | ~~**v1.3.0**~~ ✅ SHIPPED | ~~#19~~ | ~~T22 + T23 bundled — TPM throttle + `structuredContent.responseText` wire-format fix~~ | ~~done~~ |
 | ~~B.1~~ | ~~**v1.3.1**~~ ✅ SHIPPED | ~~#20~~ | ~~T22a + T22b + T23a deferred follow-ups — 429 retry-hint wiring + ask/code integration tests + `TextToolResult` type narrowing~~ | ~~done~~ |
 | ~~B.2~~ | ~~**v1.3.2**~~ ✅ SHIPPED | ~~#21~~ | ~~Hotfix — 429 gate on retry-hint parser (hint-poisoning defence) + escaped-JSON proxy edge + test comment correctness. PR #20 round-1 GPT + Grok CRITICAL closure.~~ | ~~~20 min~~ |
-| C | **v1.4.0** (in flight) | #22 | T24 — Model taxonomy with allowlist-first category system + output-cap three-layer precedence. Tools bind to required category; resolver refuses to dispatch outside it. Closes the `nano-banana-doing-code-review` class of bug at its root (flips v1.2.0's blocklist defence). Unmark ✅ SHIPPED only after npm publish verified + tag pushed. | ~6 h |
+| ~~C~~ | ~~**v1.4.0**~~ ✅ SHIPPED | ~~#22~~ | ~~T24 — Model taxonomy with allowlist-first category system + output-cap three-layer precedence. Tools bind to required category; resolver refuses to dispatch outside it. Closes the `nano-banana-doing-code-review` class of bug at its root (flips v1.2.0's blocklist defence).~~ | ~~~6 h~~ |
 | D | **v1.5.0** | T19 | Opt-in `GEMINI_CODE_CONTEXT_*_TIMEOUT_MS` env var (default disabled). Complements T22's preflight with a post-call bounded-wait for stuck connections. | ~2 h |
 | E | **v1.6.0** | T20 | Migrate `ask` / `code` to `generateContentStream` for in-flight thinking heartbeat. Pairs with T19's `AbortController` for real stall detection — stream heartbeat + timeout abort = closed loop. | ~1 day |
 
