@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`code({ thinkingLevel })` parameter** — T21 ships `thinkingLevel` (`MINIMAL` / `LOW` / `MEDIUM` / `HIGH`) on the `code` tool, matching the `ask` surface from v1.2. Google's recommended reasoning knob on Gemini 3 (ai.google.dev/gemini-api/docs/gemini-3); `thinkingBudget` remains the legacy/Gemini-2.5 path, and the two are mutually exclusive (Zod `.refine()` refuses both-set at the schema root with the same cross-field error ask uses). `code` keeps its pre-existing `thinkingBudget` default of 16_384 — coding tasks benefit from strong reasoning out of the box, and changing that default would be a behavioural break for existing callers.
+- **`src/tools/shared/thinking.ts`** — new shared module hosting `THINKING_LEVELS` and `THINKING_LEVEL_RESERVE`, moved out of `ask.tool.ts`. Single source of truth for both tools. When Google publishes per-tier token budgets (or ships a new level), one edit propagates to `ask` + `code` and any future reasoning-capable tool we add (e.g. when T19/T20 land).
+
+### Changed
+
+- **`code`'s structured metadata now echoes `thinkingLevel`** (null when the caller used `thinkingBudget` instead), alongside the existing `thinkingBudget` field. Callers can audit which path the request took — mirrors `ask`'s metadata shape.
+
 ### Changed (post-review polish on PR #16, `ask({ thinkingLevel })`)
 
 - **Tier-aware cost-estimate reservations for `thinkingLevel`** — `MINIMAL` now reserves 512 thinking tokens, `LOW` 2_048, `MEDIUM` 4_096, `HIGH` the full `maxOutputTokens - 1024` dynamic cap. Replaces the previous always-worst-case behaviour that could false-reject long sequences of `MINIMAL`/`LOW` calls against `GEMINI_DAILY_BUDGET_USD` when the real spend was ≤1% of the reservation. Values are heuristic upper bounds (Google does not publish per-tier budgets). Exported as `THINKING_LEVEL_RESERVE` from `src/tools/ask.tool.ts` for testing and future reuse in `code.tool.ts` (tracked as T21).

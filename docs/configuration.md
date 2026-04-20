@@ -41,6 +41,7 @@ Every tool accepts runtime overrides that beat the defaults:
 - `ask({ thinkingBudget: 8000 })` — explicit cap; use on Gemini 2.5 for cost-bounded deep-dives. On Gemini 3 Pro prefer `thinkingLevel` or omit reasoning params entirely
 - `ask({ thinkingLevel: "LOW" })` — discrete reasoning tier for Gemini 3 (Google's recommended knob on 3.x). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default when the field is omitted). Rejected by Gemini 2.5 family — use `thinkingBudget` there. Mutually exclusive with `thinkingBudget` — schema refuses both-set with a clear error
 - `code({ thinkingBudget: 32000, codeExecution: true })` — harder problem, let Gemini verify with Python
+- `code({ thinkingLevel: "HIGH" })` — discrete reasoning tier on Gemini 3 (Google's recommended knob there); mutually exclusive with `thinkingBudget`. `code` still defaults to `thinkingBudget: 16384` when neither is passed — a stronger default than `ask`'s "omit entirely" because coding genuinely benefits from reasoning
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
 
 ## Model aliases

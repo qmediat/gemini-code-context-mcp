@@ -2,6 +2,27 @@
 
 Real improvements surfaced by `/6step` and `/coderev` analysis that are out of scope for the v1.0 core PR. Each entry is sized, scoped, and ready to split off once a maintainer picks it up.
 
+## Planned release sequencing for the thinking-mode follow-ups (T19 / T20 / T21)
+
+After PR #16 (`ask({ thinkingLevel })`) merged to `main` we have three thinking-related follow-ups in flight. The release plan is **three small, sequential publishes** rather than one big batch, because:
+
+- **Bug attribution:** each release hits npm in isolation — if an external user reports a regression, it maps to exactly one PR, not three.
+- **Rollback surface:** reverting one focused commit is cheaper than unwinding a multi-PR merge.
+- **Review quality:** T20 is a ~1-day structural refactor (`generateContent` → `generateContentStream`). Landing it together with T19/T21 would inflate reviewer load and delay the simpler fixes that are already 100% ready.
+- **External testing velocity:** external users can test v1.2 (full `thinkingLevel` coverage) immediately rather than waiting for the full stream-migration delta.
+
+The sequence — each step must fully merge + publish before the next opens:
+
+| Phase | Release | PR | Scope | Expected size |
+|-------|---------|----|----|--------------|
+| A | **v1.2.0** | T21 | `thinkingLevel` parity on `code.tool.ts` (copy-paste of `ask`'s schema + refine + buildConfig branches) | ~1 h |
+| B | **v1.3.0** | T19 | Opt-in `GEMINI_CODE_CONTEXT_*_TIMEOUT_MS` env var (default disabled) | ~2 h |
+| C | **v1.4.0** | T20 | Migrate `ask`/`code` to `generateContentStream` for in-flight thinking heartbeat; pairs with T19's `AbortController` for bounded stall detection | ~1 day |
+
+**Why this sequence (not T19 → T20 → T21):** T21 is the logical capstone of the v1.2 `thinkingLevel` feature set — shipping it alongside the `ask` support would have made one big PR #16; shipping it as the first follow-up closes the story coherently. T19 is a clean prerequisite for T20 — T20's stall detector needs T19's `AbortController` plumbing already in place. T21 has no dependencies on T19/T20.
+
+**Non-goal:** skipping one of v1.2/v1.3 and landing two features together. Even for small PRs, keeping the 1:1 PR:release ratio preserves the review/rollback properties above.
+
 ---
 
 ## T1. Unit test coverage for `cache-manager`, `files-uploader`, `ttl-watcher`, `profile-loader`

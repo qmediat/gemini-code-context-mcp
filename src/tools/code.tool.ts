@@ -10,7 +10,13 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Content, GenerateContentConfig, GenerateContentResponse } from '@google/genai';
+import type {
+  Content,
+  GenerateContentConfig,
+  GenerateContentResponse,
+  ThinkingConfig,
+  ThinkingLevel,
+} from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
@@ -23,6 +29,7 @@ import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/c
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 
 const SYSTEM_INSTRUCTION_CODE = [
   'You are an expert software engineer. Generate production-quality, idiomatic code with proper error handling.',
@@ -47,37 +54,52 @@ const SYSTEM_INSTRUCTION_CODE = [
   'Always explain briefly WHY a change is made before the edit block.',
 ].join('\n');
 
-export const codeInputSchema = z.object({
-  task: z.string().min(1).describe('Describe the coding task — what to build, refactor, or fix.'),
-  workspace: z.string().optional().describe('Workspace path (default: cwd).'),
-  model: z
-    .string()
-    .optional()
-    .describe(
-      "Model alias or literal ID. Defaults to 'latest-pro-thinking' for strongest coding performance.",
-    ),
-  thinkingBudget: z
-    .number()
-    .int()
-    .min(0)
-    .max(65_536)
-    .optional()
-    .describe(
-      'Reasoning tokens Gemini is allowed to spend before generating. Default: 16384. Higher = better quality for complex tasks, more expensive.',
-    ),
-  codeExecution: z
-    .boolean()
-    .optional()
-    .describe(
-      "Enable Gemini's Code Execution tool — Gemini can run Python in a sandbox to verify its output. Off by default.",
-    ),
-  expectEdits: z
-    .boolean()
-    .optional()
-    .describe('Request OLD/NEW diff format in the response (default: true).'),
-  includeGlobs: z.array(z.string()).optional(),
-  excludeGlobs: z.array(z.string()).optional(),
-});
+export const codeInputSchema = z
+  .object({
+    task: z.string().min(1).describe('Describe the coding task — what to build, refactor, or fix.'),
+    workspace: z.string().optional().describe('Workspace path (default: cwd).'),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        "Model alias or literal ID. Defaults to 'latest-pro-thinking' for strongest coding performance.",
+      ),
+    thinkingBudget: z
+      .number()
+      .int()
+      .min(0)
+      .max(65_536)
+      .optional()
+      .describe(
+        'Explicit reasoning-token cap. Default (when both `thinkingBudget` and `thinkingLevel` are omitted): 16384 — a strong default for coding. Pass a positive integer to cap reasoning at that many tokens; `0` disables thinking (rejected by Gemini 3 Pro with 400). CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang — use ≥4096 if you must bound it. For discrete-tier control on Gemini 3 use `thinkingLevel` instead — the two are mutually exclusive.',
+      ),
+    thinkingLevel: z
+      .enum(THINKING_LEVELS)
+      .optional()
+      .describe(
+        "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+      ),
+    codeExecution: z
+      .boolean()
+      .optional()
+      .describe(
+        "Enable Gemini's Code Execution tool — Gemini can run Python in a sandbox to verify its output. Off by default.",
+      ),
+    expectEdits: z
+      .boolean()
+      .optional()
+      .describe('Request OLD/NEW diff format in the response (default: true).'),
+    includeGlobs: z.array(z.string()).optional(),
+    excludeGlobs: z.array(z.string()).optional(),
+  })
+  .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
+    message:
+      'Cannot specify both `thinkingBudget` and `thinkingLevel` — they are mutually exclusive. Gemini rejects the combination with 400. Choose one: `thinkingLevel` (recommended for Gemini 3) or `thinkingBudget` (required on Gemini 2.5).',
+    // `path: []` (root-level error) reflects that the violation is the
+    // RELATION between two fields, not a problem with either field
+    // individually.
+    path: [],
+  });
 
 export type CodeInput = z.infer<typeof codeInputSchema>;
 
@@ -131,9 +153,22 @@ export const codeTool: ToolDefinition<CodeInput> = {
     const started = Date.now();
     const workspaceRoot = resolve(input.workspace ?? process.cwd());
     const modelRequest = input.model ?? 'latest-pro-thinking';
-    const thinkingBudget = input.thinkingBudget ?? 16_384;
     const expectEdits = input.expectEdits ?? true;
     const codeExecution = input.codeExecution ?? false;
+
+    // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel` are
+    // never both set. `usingThinkingLevel` is a single source of truth for
+    // the "is the caller driving reasoning via the discrete-tier knob?"
+    // predicate — used by the cost estimate, the emitter message, and the
+    // thinkingConfig shape below.
+    const usingThinkingLevel = input.thinkingLevel !== undefined;
+
+    // `code` keeps its pre-existing default of 16_384 for the `thinkingBudget`
+    // path (strong reasoning for coding out of the box — coding tasks
+    // genuinely benefit from it and callers rarely want to disable thinking).
+    // When the caller uses `thinkingLevel` instead, `thinkingBudget` stays
+    // undefined and we take the level branch below.
+    const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
 
     let reservationId: number | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
@@ -173,14 +208,30 @@ export const codeTool: ToolDefinition<CodeInput> = {
           : CODE_MAX_OUTPUT_TOKENS_DEFAULT;
 
       // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
-      // is carved out of the candidate-output allowance). The tool schema
-      // allows thinkingBudget up to 65_536 and defaults to 16_384, but the
-      // hard cap above may clamp maxOutputTokens as low as the model's
-      // `outputTokenLimit` (e.g. 8_192 on Flash-lite). Clamp the effective
-      // thinkingBudget so the generateContent call never 400s on this
-      // invariant; reserve at least 1_024 tokens for the actual completion.
+      // is carved out of the candidate-output allowance). The hard cap above
+      // may clamp maxOutputTokens as low as the model's `outputTokenLimit`
+      // (e.g. 8_192 on Flash-lite). Clamp the effective thinkingBudget so
+      // the generateContent call never 400s on this invariant; reserve at
+      // least 1_024 tokens for the actual completion.
+      //
+      // Only meaningful on the thinkingBudget path — when the caller uses
+      // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
+      // value is ignored by the thinkingConfig builder below.
       const effectiveThinkingBudget =
-        thinkingBudget > 0 ? Math.max(0, Math.min(thinkingBudget, maxOutputTokens - 1024)) : 0;
+        thinkingBudget !== undefined && thinkingBudget > 0
+          ? Math.max(0, Math.min(thinkingBudget, maxOutputTokens - 1024))
+          : 0;
+
+      // Cost-estimate thinking-token reserve — tier-aware when the caller
+      // uses `thinkingLevel`, exact-on-the-budget when they use
+      // `thinkingBudget`. Mirror of `ask.tool.ts` logic; see
+      // `THINKING_LEVEL_RESERVE` in `shared/thinking.ts` for the rationale
+      // behind the per-tier numbers and why HIGH falls through to the
+      // dynamic cap.
+      const thinkingTokensForEstimate =
+        input.thinkingLevel !== undefined
+          ? (THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? Math.max(0, maxOutputTokens - 1024))
+          : effectiveThinkingBudget;
 
       // Atomic budget reservation — see ask.tool.ts for the full rationale.
       // Estimate includes the thinking budget (billed as output tokens on Pro)
@@ -192,7 +243,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
           workspaceBytes,
           promptChars: input.task.length,
           expectedOutputTokens: maxOutputTokens,
-          thinkingTokens: effectiveThinkingBudget,
+          thinkingTokens: thinkingTokensForEstimate,
         });
         const reserve = ctx.manifest.reserveBudget({
           workspaceRoot,
@@ -237,11 +288,31 @@ export const codeTool: ToolDefinition<CodeInput> = {
         ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
         : input.task;
 
+      const thinkingDescription = usingThinkingLevel
+        ? `thinking-level=${input.thinkingLevel}`
+        : `thinking=${effectiveThinkingBudget}`;
       emitter.emit(
         codeExecution
-          ? `generating with thinking=${effectiveThinkingBudget} + codeExecution…`
-          : `generating with thinking=${effectiveThinkingBudget}…`,
+          ? `generating with ${thinkingDescription} + codeExecution…`
+          : `generating with ${thinkingDescription}…`,
       );
+
+      // Two mutually-exclusive reasoning-control paths (enforced by schema
+      // `.refine()`):
+      //   a) `thinkingLevel` set → cast to the SDK enum and pass through.
+      //      Google's recommended path on Gemini 3. Rejected by Gemini 2.5.
+      //      Cast rather than runtime enum-object lookup so a future SDK
+      //      rename surfaces as a Gemini 400, not a silent `undefined`.
+      //   b) `thinkingBudget` path (default 16_384, clamped above) → pass
+      //      `thinkingBudget` as before.
+      // `includeThoughts: true` is unconditional so `thinkingSummary`
+      // extraction below always has material to find.
+      const thinkingConfig: ThinkingConfig = usingThinkingLevel
+        ? {
+            thinkingLevel: input.thinkingLevel as ThinkingLevel,
+            includeThoughts: true,
+          }
+        : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
 
       // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
       // with 400. System instruction is baked into the cache at build time; tools
@@ -261,14 +332,14 @@ export const codeTool: ToolDefinition<CodeInput> = {
           // so the reservation is a TRUE upper bound (Copilot review C7).
           return {
             cachedContent: cacheId,
-            thinkingConfig: { thinkingBudget: effectiveThinkingBudget, includeThoughts: true },
+            thinkingConfig,
             maxOutputTokens,
           };
         }
         // Without cache (or cache bypassed for codeExecution): pass full config.
         return {
           systemInstruction: SYSTEM_INSTRUCTION_CODE,
-          thinkingConfig: { thinkingBudget: effectiveThinkingBudget, includeThoughts: true },
+          thinkingConfig,
           maxOutputTokens,
           ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
         };
@@ -421,7 +492,12 @@ export const codeTool: ToolDefinition<CodeInput> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
         contextWindow: resolved.inputTokenLimit,
+        // `thinkingBudget` echoes the clamped value actually sent on the
+        // wire; it's only meaningful on the budget path. On the
+        // `thinkingLevel` path `effectiveThinkingBudget` is `0` (unused) —
+        // callers should read `thinkingLevel` instead.
         thinkingBudget: effectiveThinkingBudget,
+        thinkingLevel: input.thinkingLevel ?? null,
         codeExecutionUsed: codeExecution,
         cacheHit: activePrep.reused,
         cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
