@@ -347,19 +347,83 @@ Empirically confirmed aggregation quirk: `gemini-pro-latest` (our `latest-pro` a
 
 **Scope:**
 - New env var `GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT` (default `80_000`, `0` disables). 80k leaves ~20 % headroom under the observed Tier 1 100k limit for clock-skew and Google's own accounting noise.
-- `src/tools/shared/throttle.ts` (or extend `shared/thinking.ts`) — keep a sliding 60-second window of recent input-token usage per `resolvedModel`. Tracked in-memory; survives nothing; cleared on server restart. `shouldDelay(model, estimatedInputTokens)` returns the delay in ms required before the call would fit under the limit (or `0` if it fits now).
-- `ask.tool.ts` + `code.tool.ts` call `shouldDelay` after the budget reservation but before the `generateContent` call. If >0, emit a progress message (`"throttle: waiting 23s for TPM window"`) and `setTimeout` before proceeding. On the actual response, append `usage.inputTokens` (cached + uncached) to the window.
-- Respect `retryInfo.retryDelay` from any 429 that fires DESPITE preflight — Google's hint is more accurate than our clock; prefer it.
+- `src/tools/shared/throttle.ts` — sliding 60-second window of recent input-token usage per `resolvedModel`. Tracked in-memory; survives nothing; cleared on server restart. **Primary API is a reservation lifecycle — `reserve` / `release` / `cancel` — not a read-only `shouldDelay` peek.** A peek-only API has a TOCTOU race: between `peek()` → `await sleep()` → `await generateContent()` → `record()`, a concurrent MCP tool call observes the same pre-peek window and both callers proceed, collectively overshooting the quota. The MCP `CallToolRequestSchema` handler in `src/server.ts` is async, so this race is reachable under any workflow with parallel `ask`/`code` calls (e.g. `/coderev` sub-agent fan-out).
+- `reserve(model, estimatedInputTokens, nowMs?) → { delayMs, releaseId }` inserts a provisional `WindowEntry` with the caller's estimate IMMEDIATELY (at `nowMs + delayMs`, so the entry represents the time tokens actually hit Gemini's counter). Subsequent concurrent `reserve` calls see the provisional and back off. `release(id, actualTokens)` overwrites the estimate with `promptTokenCount` (cached + uncached — both count toward Gemini's per-minute budget, empirically confirmed) post-response AND deletes the id from the reservation index so a late `cancel` on the same id becomes a safe no-op (previously the id lingered, letting a buggy caller silently remove an already-accounted entry). `cancel(id)` removes the provisional entry on any pre-dispatch failure. `shouldDelay` is preserved as a read-only peek for diagnostics / tests / progress-message rendering but is NOT the primary API for tool integration.
+- Sorted-array invariant: `entries[model]` is kept sorted ascending by `tsMs` via binary-search insert in `reserve` (not naive `push`). A `delayMs = 0` reservation arriving after a future-dated provisional (hint-driven or eviction-driven delay) has a smaller `tsMs` than the provisional's — without sorted-insert, `prune`'s head-only fast-path silently skips expired entries buried mid-array and `computeWindowDelay`'s oldest-first eviction picks the wrong `entries[k].tsMs` to wait for. Empirically demonstrated during the PR #19 review (Copilot + Grok + Gemini independently flagged) — see the regression-test block "sorted-array invariant" in `test/unit/throttle.test.ts`.
+- Multi-entry eviction math: when the window is over-limit, iterate oldest-first and evict entries one at a time until `sum(remaining entries) + estimate ≤ limit`, then wait for the last-evicted entry to age out of the 60s window + randomised jitter. The naïve "wait for just the oldest" implementation under-delays whenever ≥2 large entries remain after the oldest ages out (confirmed empirically: 3×40k entries at t=0/5/10s with limit=80k + estimate=30k → naïve computes 52s wait, but after 52s the t=5s and t=10s entries still sit at 80k in-window → next call busts quota).
+- Randomised jitter `[1_000, 3_000]` ms (was a 2_000 ms constant). Deterministic jitter let concurrent waiters evicting the same entry compute identical waits and wake at the same millisecond — re-creating the burst the jitter was meant to prevent. Gemini flagged this during PR #19 review; docstring on `JITTER_MIN_MS` / `JITTER_MAX_MS` explains the invariant.
+- `ask.tool.ts` + `code.tool.ts` call `reserve` AFTER both the daily-budget reservation AND `prepareContext` (immediately before `generateContent`). Earlier placement (before `prepareContext`) let the reservation's `tsMs` age-anchor minutes before the actual API dispatch on cold-cache calls, so our window could expire while Gemini's still ran — admitting concurrent callers that busted the per-minute quota. Trade-off: two concurrent cold-cache callers will both complete `prepareContext` before one backs off at `reserve` — mostly idempotent via file-hash dedup, minor upload duplication. If `delayMs > 0`, emit a progress message (`"throttle: waiting 23s for TPM window"`) and `await sleep(delayMs)` before proceeding. On successful response, `release(releaseId, promptTokenCount)`. On any error (including stale-cache retry branch), `cancel(releaseId)` before propagating.
+- Respect `retryInfo.retryDelay` from any 429 that fires DESPITE preflight — Google's hint is more accurate than our clock; prefer it. `recordRetryHint(model, retryDelayMs)` is **extend-only**: a shorter new hint replacing a longer existing one would let the next reserve compute a smaller `tsMs` than entries already appended under the longer hint — same ordering break the sorted-insert fix closes, via a different trigger. Only the longer expiry wins. `reserve` uses `max(windowDelay, hintDelay)` while the hint is active.
 - Track different models in separate windows (empirically `latest-pro` vs `latest-flash` use different buckets — no reason to block flash when pro is saturated).
-- New unit tests in `test/unit/throttle.test.ts` with fake timers.
+- Non-monotonic clock handling: maintain a `lastObservedNowMs` floor at the throttle level (not per-entry, since provisional reservations can be future-dated). Clamp each public-method `nowMs` to `max(nowMs, lastObservedNowMs)` so a backward NTP jump doesn't produce negative `ageMs` arithmetic and inflated delays. Using `entry.tsMs` for the clamp (the obvious implementation) breaks multi-entry math by pinning `now` past real-time into scheduled-call time.
+- Input sanitisation: non-finite `nowMs` (NaN, ±Infinity) falls back to `Date.now()` rather than poisoning the floor — consistent with `sanitizeTokens`' "coerce bad caller input rather than crash/deadlock" philosophy. Non-finite / non-positive `estimatedInputTokens` and `actualInputTokens` coerce to 0.
+- Unit tests in `test/unit/throttle.test.ts` with fake timers — 40 tests covering: disabled path, single-entry math, multi-entry eviction with post-delay invariant assertion, TOCTOU race (second concurrent caller sees first caller's provisional), release-with-actual-{less,greater}-than-estimate, cancel, idempotency of release/cancel on unknown IDs (including release-after-cancel of same id), unique release IDs, explicit-nowMs `release` prune path, `shouldDelay` non-inflation invariant, oversize-estimate lockout (deliberate 60s block after a single over-limit call), per-model isolation, retry hints, non-monotonic clock, non-finite `nowMs` poisoning guard, input validation. Plus 7 regression blocks added post-PR #19 review: **sorted-array invariant** (delay=0-after-future-dated, retry-hint downgrade, mid-array eviction), **release lifecycle** (double-release idempotent, cancel-after-release no-op), **jitter randomisation** (distinct delays across 20 samples, bounded range).
 
-**Sizing:** ~4 hours — throttle state, tool integration in two files, test harness with fake timers, env-var docs. Blocker for heavy-review workflows; without this the MCP is effectively single-shot for pro calls with a big cached context.
+**Sizing:** ~5 hours including the reserve/release/cancel API rework surfaced during code review. Blocker for heavy-review workflows; without this the MCP is effectively single-shot for pro calls with a big cached context.
 
 **Blocked on:** nothing. Ships cleanest alongside T23 in the same PR (both are "make the MCP usable for back-to-back reviews" fixes), or as a standalone v1.3.x if T19's timeout arrives first (the throttle's delay-before-generate is conceptually orthogonal to the timeout-after-generate).
 
 **Do NOT include in this PR:**
 - Any change to the daily-budget reservation logic — that's a $ cap, TPM throttle is a rate cap; different constraints, different code paths.
 - Cross-process throttle coordination — in-memory only for v1. Two MCP servers on the same key sharing a TPM pool is T22b.
+- Unbounded-map cleanup: the `windows` and `hints` maps grow only with distinct resolved-model strings (O(10) in practice via `resolveModel`'s fixed alias list). Each empty entries-array self-deletes on `prune`; each expired hint self-deletes on `activeHint`. Truly unreachable models linger until server restart — accepted as LOW (bounded by upstream's published model list). Revisit if literal user-supplied model IDs ever bypass `resolveModel`.
+
+---
+
+## T22a. Wire up Gemini 429 `retryInfo.retryDelay` → `recordRetryHint`
+
+(See scope below. Ship as a standalone v1.3.x patch whenever a maintainer has the hour.)
+
+---
+
+## T22b. Ask/code integration tests for throttle lifecycle
+
+**Source:** GPT round-2 review on PR #19 (2026-04-20). Flagged as IMPORTANT; accepted as LOW/deferred by `/6step`.
+
+**Why:** `test/unit/ask-tool.test.ts` and `test/unit/code-tool.test.ts` are schema-only — they validate input parsing but never exercise the execute path. The throttle integration (`reserve` after `prepareContext`, `release` on success with `promptTokenCount`, `cancel` on failure, **cancel+re-reserve on stale-cache retry**) is covered by module-level unit tests for the throttle itself, plus one stale-cache-retry regression test at the throttle level — but no integration test asserts the CALL ORDERING inside ask/code. A future refactor that accidentally drops `cancel` from the retry branch, or reverts `reserve` to before `prepareContext`, wouldn't surface via the current suite.
+
+**Scope:**
+- Mock `ctx.client.models.generateContent`, `ctx.throttle`, and `ctx.manifest` in new `test/integration/ask-throttle-integration.test.ts` + `code-throttle-integration.test.ts` (or extend the existing `*-tool.test.ts` files).
+- Assert, for each scenario: `prepareContext → reserve → generateContent → release` call ordering; no `reserve` before `prepareContext`; `cancel` called on non-stale errors; `cancel + reserve` (not just `reserve`) on stale-cache retry.
+- Cover: happy path, stale-cache success, stale-cache → rebuild fails, non-stale error post-dispatch, disabled throttle (`tpmThrottleLimit=0`).
+- Unmocked end-to-end smoke is covered by the manual post-publish test plan in the PR body; this task is about the CI-enforced regression guard.
+
+**Sizing:** ~1–2 hours including the mock harness setup. Small PR, shippable as v1.3.x patch or bundled with T22a.
+
+**Blocked on:** nothing. Can ship any time.
+
+---
+
+## T23a. Narrow `ToolResult.structuredContent` type to match runtime invariant
+
+**Source:** GPT round-1 and round-2 review on PR #19 (2026-04-20). NIT-level cosmetic typing drift.
+
+**Why:** `ToolResult.structuredContent` at `src/tools/registry.ts:52` is declared `Record<string, unknown> | undefined` (optional). Post-T23, `textResult()` and `errorResult()` ALWAYS set it (with `responseText` at minimum). The declared type under-commits to the runtime behaviour — downstream TS consumers who write `if (result.structuredContent)` get a nominal-truthy-check that's always true, which conveys the wrong mental model and wastes reader attention. Not a correctness bug (the optional annotation is a strict SUPERSET of the always-present behaviour), just a documentation-through-types gap.
+
+**Scope:** Two options — (a) narrow the interface: `structuredContent: Record<string, unknown>` (required); or (b) split the return type: introduce `TextToolResult = ToolResult & { structuredContent: Record<string, unknown> }` and declare `textResult` / `errorResult` as returning `TextToolResult`. Option (b) preserves the loose `ToolResult` type for any future non-textResult caller that might legitimately omit structured content. Prefer (b).
+
+**Sizing:** ~15 minutes, a few lines in `registry.ts` plus any downstream consumer imports (grep confirms none currently use the narrower shape).
+
+**Blocked on:** nothing.
+
+---
+
+## T22a. Wire up Gemini 429 `retryInfo.retryDelay` → `recordRetryHint` (scope)
+
+**Source:** Scope carry-over from T22 (v1.3.0). The throttle module exposes `recordRetryHint(model, retryDelayMs)` and `reserve` already prefers `max(windowDelay, hintDelay)` while a hint is active. What's missing is wiring the hint up from the `ask`/`code` catch branches when Gemini returns a 429.
+
+**Why:** Even with the T22 preflight throttle correct and honest, a misestimate (under-counted UTF-8 / CJK tokens, new model with different cached-token accounting, tier-boundary drift) can still fire a 429. Google's 429 body includes `retryInfo.retryDelay` (typically 2–16 s — shorter than our 60 s window math, because Google's quota counter is more granular than a simple sliding window). Preferring Google's hint over our clock gets retries right faster and avoids the 60 s worst-case wait our pure-window fallback computes.
+
+**Scope:**
+- In `ask.tool.ts` + `code.tool.ts` catch blocks (both the primary `generateContent` catch AND the stale-cache-retry catch), detect 429 from `@google/genai`'s `ApiError` (has a `.status: number` field; check `err.status === 429` with an `instanceof` narrowing on `ApiError`).
+- Extract `retryInfo.retryDelay` from the error body. `@google/genai`'s ApiError surfaces the body as part of `err.message` (JSON-encoded). A regex on `/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/` reliably captures the "2s" / "15.7s" string form Google uses. Convert to ms, clamp to `[1_000, 60_000]` so a malformed / future-format value can't deadlock.
+- Call `ctx.throttle.recordRetryHint(resolved.resolved, retryDelayMs)` before propagating the error (already-cancel-the-reservation path stays).
+- Expose the parsing helper as an exported function in `src/tools/shared/throttle.ts` or a sibling module (e.g. `retry-hint.ts`) so tests can validate it without going through Gemini. Ship with fixture-driven unit tests for: happy-path "2s" / "15.7s" / "0.5s", missing field, malformed JSON, non-429 errors.
+- Consider: if the response body can be obtained *without* a 429 (some paths surface structured error info on non-429 too), no-op; the hint path is 429-specific.
+
+**Sizing:** ~1–2 hours including tests. Small PR, shippable in a v1.3.x patch.
+
+**Blocked on:** nothing. Ships any time after v1.3.0.
 
 ---
 
@@ -372,18 +436,22 @@ Empirically confirmed aggregation quirk: `gemini-pro-latest` (our `latest-pro` a
 Matters more than it looks: the MCP is **fundamentally useless for code review** while this holds, because every reviewer workflow depends on the reviewer's agent being able to read the answer text to write the review file or emit the `top3` JSON. Users can call `ask`/`code` directly in the main conversation and see the text (because Claude Code DOES render `content[0]` in the main UI) — but any workflow that hands off through a sub-agent silently loses the response.
 
 **Scope:**
-- Add `responseText: text` as a first-class field in the `structuredContent` object emitted by `textResult()`. Canonical location both hosts and sub-agents can rely on; zero interpretation ambiguity.
+- Add `responseText: text` as a first-class field in the `structuredContent` object emitted by `textResult()`. Canonical location both hosts and sub-agents can rely on; zero interpretation ambiguity. Exported as a named constant (`RESPONSE_TEXT_KEY`) from `src/tools/registry.ts` so consumers can import the canonical key rather than hard-coding the string.
 - Keep existing `content: [{type: 'text', text}]` — required for MCP spec compliance and for hosts that DO render it (main conversation UI). Duplicating a few-KB string across both fields costs essentially nothing vs losing the whole response.
-- `ask.tool.ts` metadata object: already spread into `textResult`'s `structured` arg — just ensure `text` is available where `textResult` can copy it. Identical for `code.tool.ts`, `reindex.tool.ts`, `status.tool.ts`, `clear.tool.ts`.
-- Update `test/unit/tool-input-schema.test.ts` — add an assertion that every tool's sample response includes `structuredContent.responseText` matching `content[0].text`.
-- Document in `docs/how-caching-works.md` (or a new `docs/wire-format.md`) that MCP clients consuming structured content should prefer `structuredContent.responseText` for the primary narrative response; `content[]` is rendered by UI hosts but not all consumers read it.
+- `textResult` always emits `structuredContent` (never omits it, even when the caller passes no structured arg) — the invariant sub-agents rely on is "every tool response has `.structuredContent.responseText`", not "only tools that pass metadata do". A tool that emits only a narrative string (e.g. `clear`'s "Cleared cache and manifest for X.") used to produce a response with no structured payload → invisible to sub-agent parsers; now always visible.
+- **`errorResult` also mirrors its message into `structuredContent.responseText`.** Same wire-format gap afflicts error paths — a sub-agent seeing `isError: true` but empty structured content could not extract the failure detail. After the fix: `isError: true` signals failure, `structuredContent.responseText` carries detail, parallel to success responses.
+- Caller's `responseText` key (if any) is overridden by the canonical text. Tools must not shadow the wire-format contract — the test `test/unit/registry-text-result.test.ts` locks this in.
+- Automatically propagates across every tool using `textResult`/`errorResult` — `ask`, `code`, `status`, `reindex`, `clear`. No per-tool edits needed.
+- New file `test/unit/registry-text-result.test.ts` — 8 tests covering: mirror invariant when no structured arg, preservation of caller metadata alongside `responseText`, `structuredContent.responseText === content[0].text` across sample text sizes (empty / short / multiline / 10k chars), caller-override semantics, always-emit-structuredContent regression guard, and matching invariants for `errorResult`.
+- Document in module header in `src/tools/registry.ts` — rationale, the 2026-04-20 empirical observation (three reviewer-agent runs returning "API success but text not surfaced"), and the "sub-agents depend on a single predictable extraction path" constraint.
 
-**Sizing:** ~2 hours — small change in `registry.ts`, echo check in each tool, one new test, a doc paragraph. Easy to verify: re-run the PR #17 coderev after the fix and watch agents successfully extract review text.
+**Sizing:** ~2 hours — ~15 lines in `registry.ts` plus named export, 8 tests, comment in module header. Easy to verify: re-run the PR #17 coderev after publish and watch agents successfully extract review text.
 
 **Blocked on:** nothing. Ship ASAP — this is blocking code-review workflows today. Good candidate to pair with T22 in a "reviewer-workflow fixes" PR.
 
 **Do NOT include in this PR:**
 - Redesigning the tool-result schema — the fix is purely additive; the current shape stays valid.
-- Changes to non-text-generating tools (`reindex`, `clear`) — their existing structured responses are already the primary payload, no text response to duplicate.
+- Per-field annotations or content-block metadata tricks — option 3 in the original design doc; less clear than the chosen additive field.
+- A separate dedicated `docs/wire-format.md` — the rationale lives in `src/tools/registry.ts` comments where the code lives; a standalone doc would drift from the implementation.
 
 ---

@@ -9,6 +9,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import type { TtlWatcher } from '../cache/ttl-watcher.js';
 import type { Config } from '../config.js';
 import type { ManifestDb } from '../manifest/db.js';
+import type { TpmThrottle } from './shared/throttle.js';
 
 export interface ToolContext {
   server: Server;
@@ -17,6 +18,14 @@ export interface ToolContext {
   manifest: ManifestDb;
   ttlWatcher: TtlWatcher;
   progressToken: string | number | undefined;
+  /**
+   * Per-server-process TPM throttle singleton. Tools should call
+   * `throttle.reserve(resolvedModel, estimatedInputTokens)` AFTER the daily-
+   * budget reservation but BEFORE `generateContent`, then `release` on
+   * success with the actual `promptTokenCount` or `cancel` on any pre-
+   * dispatch failure. See `src/tools/shared/throttle.ts`.
+   */
+  throttle: TpmThrottle;
 }
 
 /**
@@ -48,16 +57,43 @@ export interface ToolResult {
   isError?: boolean;
 }
 
+/**
+ * Canonical key under which MCP clients consuming `structuredContent` can
+ * reliably find the tool's primary narrative response. MCP hosts that
+ * render `content[]` (Claude Code's main conversation UI) are unaffected;
+ * hosts that consume ONLY `structuredContent` (Claude Code's sub-agent
+ * tool-result parser as of 2026-04, and likely other headless pipelines)
+ * otherwise silently lose the response text. Duplicating a few-KB string
+ * across `content[0].text` and `structuredContent.responseText` costs
+ * effectively nothing vs losing the whole response to a single-consumer
+ * wire-format gap (2026-04-20: three reviewer-agent runs of `/coderev`
+ * returned "API success but text not surfaced"). This mirror MUST remain
+ * invariant across every tool's response — sub-agent orchestrations depend
+ * on a single, predictable extraction path.
+ */
+export const RESPONSE_TEXT_KEY = 'responseText';
+
 export function textResult(text: string, structured?: Record<string, unknown>): ToolResult {
   return {
     content: [{ type: 'text', text }],
-    ...(structured !== undefined ? { structuredContent: structured } : {}),
+    // Always emit `structuredContent` with `responseText` even when the
+    // caller didn't pass a structured payload — the invariant that
+    // sub-agents rely on is "any tool response has `.structuredContent.responseText`",
+    // not "only tools that pass metadata do". The caller's keys, if any,
+    // spread in first so our canonical `responseText` wins on collision.
+    structuredContent: { ...(structured ?? {}), [RESPONSE_TEXT_KEY]: text },
   };
 }
 
 export function errorResult(message: string): ToolResult {
   return {
     content: [{ type: 'text', text: message }],
+    // Mirror the error text under `responseText` for the same reason
+    // `textResult` does: sub-agents extracting tool output parse
+    // `structuredContent` only, so without this the failure message is
+    // invisible to any orchestration that makes decisions on error text.
+    // `isError: true` still signals failure; `responseText` carries detail.
+    structuredContent: { [RESPONSE_TEXT_KEY]: message },
     isError: true,
   };
 }

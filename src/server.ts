@@ -20,6 +20,7 @@ import {
   buildToolInputSchema,
   errorResult,
 } from './tools/registry.js';
+import { createTpmThrottle } from './tools/shared/throttle.js';
 import { logger } from './utils/logger.js';
 
 import { readFileSync } from 'node:fs';
@@ -61,6 +62,10 @@ export async function runServer(): Promise<void> {
   const client = createGeminiClient(config.auth.profile);
   const ttlWatcher = new TtlWatcher(client, manifest);
   ttlWatcher.start();
+  // Singleton throttle shared across every tool invocation. State is in-memory
+  // only — a server restart clears the window (acceptable: startup is rare and
+  // a first 429 re-seeds `recordRetryHint`). `tpmThrottleLimit === 0` disables.
+  const throttle = createTpmThrottle(config.tpmThrottleLimit);
 
   const server = new Server(
     { name: SERVER_NAME, version: SERVER_VERSION },
@@ -106,6 +111,7 @@ export async function runServer(): Promise<void> {
       manifest,
       ttlWatcher,
       progressToken,
+      throttle,
     };
 
     try {

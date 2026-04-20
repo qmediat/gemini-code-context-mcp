@@ -22,6 +22,18 @@ export interface Config {
   maxFileSizeBytes: number;
   /** Opt-in anonymous usage telemetry (count per tool, no payloads). */
   telemetryEnabled: boolean;
+  /**
+   * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
+   * `0` disables the throttle entirely; positive integer caps how many input
+   * tokens (cached + uncached) we'll let fly to Gemini inside any 60-second
+   * window before delaying the next call. Default `80_000` leaves ~20%
+   * headroom under Gemini's observed Tier 1 paid limit of 100_000 tokens/min
+   * for Gemini 3 Pro; raise if your key is on a higher tier, lower if you
+   * share a quota pool with another app. See `src/tools/shared/throttle.ts`
+   * for the reservation protocol and `docs/FOLLOW-UP-PRS.md` T22 for the
+   * full rationale.
+   */
+  tpmThrottleLimit: number;
 }
 
 function readIntEnv(name: string, fallback: number): number {
@@ -53,6 +65,14 @@ export function loadConfig(): Config {
     auth.dailyBudgetUsd ?? Number.POSITIVE_INFINITY,
   );
 
+  // TPM throttle: clamp to a non-negative integer. Negative / non-finite
+  // env values (`-1`, `"foo"`) fall back to the 80k default rather than
+  // silently disabling the throttle — operator intent when setting an
+  // invalid value is almost certainly "use the default", not "turn it off"
+  // (which has its own explicit `0` sentinel).
+  const tpmThrottleRaw = readIntEnv('GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT', 80_000);
+  const tpmThrottleLimit = tpmThrottleRaw >= 0 ? tpmThrottleRaw : 80_000;
+
   return {
     auth,
     defaultModel,
@@ -62,5 +82,6 @@ export function loadConfig(): Config {
     maxFilesPerWorkspace: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILES', 2000),
     maxFileSizeBytes: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILE_SIZE', 1_000_000),
     telemetryEnabled: process.env.GEMINI_CODE_CONTEXT_TELEMETRY === 'true',
+    tpmThrottleLimit,
   };
 }
