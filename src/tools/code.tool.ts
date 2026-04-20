@@ -228,9 +228,21 @@ export const codeTool: ToolDefinition<CodeInput> = {
       // `THINKING_LEVEL_RESERVE` in `shared/thinking.ts` for the rationale
       // behind the per-tier numbers and why HIGH falls through to the
       // dynamic cap.
+      //
+      // Defensive clamp: tier reserves (MINIMAL=512, LOW=2048, MEDIUM=4096)
+      // are fixed constants, but `maxOutputTokens` can be clamped down to a
+      // resolved model's `outputTokenLimit`. A future small-cap model (say
+      // `outputTokenLimit: 4000`) would let MEDIUM's 4096 exceed the
+      // available headroom and over-estimate the budget reservation. Clamp
+      // every tier's reserve against the dynamic headroom so the upper
+      // bound stays coherent across model rollouts (PR #17 self-review F2).
+      const thinkingHeadroom = Math.max(0, maxOutputTokens - 1024);
       const thinkingTokensForEstimate =
         input.thinkingLevel !== undefined
-          ? (THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? Math.max(0, maxOutputTokens - 1024))
+          ? Math.min(
+              THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? thinkingHeadroom,
+              thinkingHeadroom,
+            )
           : effectiveThinkingBudget;
 
       // Atomic budget reservation — see ask.tool.ts for the full rationale.
@@ -494,9 +506,12 @@ export const codeTool: ToolDefinition<CodeInput> = {
         contextWindow: resolved.inputTokenLimit,
         // `thinkingBudget` echoes the clamped value actually sent on the
         // wire; it's only meaningful on the budget path. On the
-        // `thinkingLevel` path `effectiveThinkingBudget` is `0` (unused) —
-        // callers should read `thinkingLevel` instead.
-        thinkingBudget: effectiveThinkingBudget,
+        // `thinkingLevel` path nothing is sent for `thinkingBudget`, so we
+        // emit `null` (not `0`) — `0` is the wire sentinel for "thinking
+        // disabled" and reporting it here for a level-path call would lie
+        // to downstream audit / dashboard consumers (PR #17 self-review F1,
+        // 3-reviewer consensus: GPT + Copilot + Self). Matches `ask.tool.ts`.
+        thinkingBudget: usingThinkingLevel ? null : effectiveThinkingBudget,
         thinkingLevel: input.thinkingLevel ?? null,
         codeExecutionUsed: codeExecution,
         cacheHit: activePrep.reused,

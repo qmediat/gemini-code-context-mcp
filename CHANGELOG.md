@@ -16,6 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`code`'s structured metadata now echoes `thinkingLevel`** (null when the caller used `thinkingBudget` instead), alongside the existing `thinkingBudget` field. Callers can audit which path the request took — mirrors `ask`'s metadata shape.
 
+### Fixed (post-review on PR #17)
+
+- **`code` metadata `thinkingBudget` now reports `null` on the `thinkingLevel` path** (was `0`). Three reviewers flagged this: GPT, Copilot, and self-review all noted that `0` is the wire sentinel for "thinking disabled" and emitting it for a level-path call misleads audit / dashboard consumers who aggregate by `thinkingBudget === 0`. The fix mirrors `ask`'s behaviour — when `usingThinkingLevel` is true, the metadata field is `null`, consistent with the `thinkingLevel` sibling field's null-when-unused convention.
+- **Tier-reserve defensive clamp against `maxOutputTokens - 1024`** — fixed-value tier reserves (MINIMAL=512, LOW=2048, MEDIUM=4096) now clamp against the dynamic output headroom before being passed into `estimatePreCallCostUsd`. No impact on today's Gemini model lineup (all current text-gen models have `outputTokenLimit ≥ 8_192`), but prevents a future small-cap model from producing an over-reserved budget estimate that could false-reject calls on `GEMINI_DAILY_BUDGET_USD`. PR #17 self-review F2.
+
+### Reviewer notes (PR #17, not a code change)
+
+- **Grok flag "unsafe `input.thinkingLevel as ThinkingLevel` cast" — confirmed FALSE POSITIVE by three exploit attempts in `/6step` analysis.** The cast preserves the literal string all the way to Gemini's wire. If `@google/genai` renames an enum member in a future release, TypeScript rejects the cast at `tsc` time (string-enum value mismatch); if Google silently changes the backend enum encoding (e.g. string → numeric), Gemini returns a 400 with a clear message. No scenario produces silent `undefined`. The rationale is documented in an inline comment at `src/tools/code.tool.ts:303-307` — kept as-is. This is the SAFER pattern vs runtime `ThinkingLevel[key]` lookup, which the `ask` tool adopted in v1.2 for the same reason.
+
 ### Changed (post-review polish on PR #16, `ask({ thinkingLevel })`)
 
 - **Tier-aware cost-estimate reservations for `thinkingLevel`** — `MINIMAL` now reserves 512 thinking tokens, `LOW` 2_048, `MEDIUM` 4_096, `HIGH` the full `maxOutputTokens - 1024` dynamic cap. Replaces the previous always-worst-case behaviour that could false-reject long sequences of `MINIMAL`/`LOW` calls against `GEMINI_DAILY_BUDGET_USD` when the real spend was ≤1% of the reservation. Values are heuristic upper bounds (Google does not publish per-tier budgets). Exported as `THINKING_LEVEL_RESERVE` from `src/tools/ask.tool.ts` for testing and future reuse in `code.tool.ts` (tracked as T21).
