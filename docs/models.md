@@ -177,6 +177,51 @@ Options:
    (internal utility callers only; production tools set it).
 3. Pick an already-supported model from the list above.
 
+## Output length — how to get the model's full 65k capacity
+
+Per [Google's model docs](https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro), Gemini 3.x / 2.5 Pro have `outputTokenLimit: 65,536`. We expose three layers of control:
+
+| Layer | How | Effect |
+|---|---|---|
+| **Default (auto)** | (no config) | `maxOutputTokens` omitted from the `generateContent` config. Gemini uses its model-default cap — per Google docs equal to the model's advertised `outputTokenLimit` (65,536 for current pro tier). Model sizes the response to query complexity; short Q&A doesn't reserve full capacity. |
+| **MCP-host env override** | `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` | Every `ask` / `code` call explicitly sends `maxOutputTokens = modelOutputLimit` (65,536). Use for code-review workloads that routinely produce long OLD/NEW diff blocks. |
+| **Per-call override** | `code({ task, maxOutputTokens: 8192 })` | Tightest — caps ONE call. Overrides both default and env-force. Clamped to model's limit if larger. |
+
+Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` remains a true upper bound regardless of which layer applies.
+
+### Example: force max output for all code reviews
+
+MCP host config:
+
+```jsonc
+{
+  "mcpServers": {
+    "gemini-code-context": {
+      "command": "npx",
+      "args": ["-y", "@qmediat.io/gemini-code-context-mcp"],
+      "env": {
+        "GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT": "true",
+        "GEMINI_DAILY_BUDGET_USD": "50"
+      }
+    }
+  }
+}
+```
+
+Every `code` call now runs at full 65k output capacity. `GEMINI_DAILY_BUDGET_USD=50` sized accordingly.
+
+### Example: cap a specific call tight
+
+```jsonc
+{
+  "tool": "code",
+  "task": "Summarize these changes in ≤200 tokens",
+  "maxOutputTokens": 256
+}
+```
+
+Per-call cap beats any env setting.
+
 ## Response metadata
 
 Every `ask` / `code` response includes classification in its structured

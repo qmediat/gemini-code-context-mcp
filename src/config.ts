@@ -23,6 +23,18 @@ export interface Config {
   /** Opt-in anonymous usage telemetry (count per tool, no payloads). */
   telemetryEnabled: boolean;
   /**
+   * When `true`, `ask` and `code` tools send `maxOutputTokens =
+   * modelOutputLimit` on every `generateContent` call (instead of omitting
+   * the field and relying on Gemini's model-default). Use this in MCP host
+   * configs where you want every call to run at the model's full output
+   * capacity — primary use case is code review that routinely produces
+   * long OLD/NEW diff blocks. Per-call `input.maxOutputTokens` still
+   * overrides (caller can cap a specific call lower). Default `false`
+   * (auto — Gemini decides response length based on query complexity).
+   * Controlled by `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT` env var.
+   */
+  forceMaxOutputTokens: boolean;
+  /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
    * `0` disables the throttle entirely; positive integer caps how many input
    * tokens (cached + uncached) we'll let fly to Gemini inside any 60-second
@@ -83,5 +95,6 @@ export function loadConfig(): Config {
     maxFileSizeBytes: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILE_SIZE', 1_000_000),
     telemetryEnabled: process.env.GEMINI_CODE_CONTEXT_TELEMETRY === 'true',
     tpmThrottleLimit,
+    forceMaxOutputTokens: process.env.GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT === 'true',
   };
 }

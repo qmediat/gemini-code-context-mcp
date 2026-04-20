@@ -15,6 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Output-cap three-layer precedence** (replaces the v1.3.x hard-coded self-caps `ASK_MAX_OUTPUT_TOKENS_DEFAULT=8192` / `CODE_MAX_OUTPUT_TOKENS_DEFAULT=32768` that artificially limited responses below the model's advertised capacity):
+  - **Default (auto)** — `maxOutputTokens` omitted from the `generateContent` wire. Gemini uses its model-default cap which per [Google docs](https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro) equals the model's `outputTokenLimit` (65,536 for Gemini 3.x / 2.5 Pro). Short Q&A doesn't reserve full capacity; long responses get full 65k.
+  - **MCP-host env override** — `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` pins every call at model's full capacity. Primary use case: code-review workloads producing long OLD/NEW diffs.
+  - **Per-call override** — new `maxOutputTokens` field on both `ask` and `code` schemas. Beats both default and env-force. Clamped to model's limit if larger.
+  - Budget reservation uses effective cap (explicit OR model limit) as worst-case regardless of which layer applies, so `GEMINI_DAILY_BUDGET_USD` stays a true upper bound.
+  - New env var documented in `docs/configuration.md`; full three-layer table + examples in `docs/models.md`.
 - **`src/gemini/model-taxonomy.ts`** — new module with `ModelCategory` type, `CATEGORY_RULES` ordered pattern-allowlist, `categorizeModel(id)`, `extractCapabilityFlags(id, sdkMeta)`, `costTierOf(id)`, `isTextGenCategory(cat)`, and the exported `ModelCategoryMismatchError` class with actionable message pointing at `docs/models.md`.
 - **`latest-vision` alias** — picks the newest vision-capable text model (prefers `text-reasoning`, falls back to `text-fast`). Previously users needed to know a specific Gemini 2.5 / 3 Pro model ID for screenshot analysis.
 - **New response metadata fields** on `ask` / `code` structured content: `modelCategory` (string) and `modelCostTier` (`premium` | `standard` | `budget` | `unknown`). Use these for billing dashboards or to verify that an alias resolved to what you expected.

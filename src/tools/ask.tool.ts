@@ -34,15 +34,15 @@ const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
 
 /**
- * Hard cap on Gemini's response size for `ask`. Used both as the
- * `maxOutputTokens` field on the generateContent config (so the model
- * actually stops there) and as the `expectedOutputTokens` value passed to
- * `estimatePreCallCostUsd` for the budget reservation. Coupling them is
- * the point: the reservation becomes a true upper bound, not a guess that
- * can be exceeded silently. Q&A answers rarely need more than ~8k tokens;
- * if the resolved model advertises a smaller limit, we use that instead.
+ * Fallback output cap used only when the resolved model doesn't advertise
+ * an `outputTokenLimit` via `models.list()`. Set generously at the current
+ * Gemini pro-tier ceiling so the default behaviour is "let the model use
+ * its full trained capacity" — per v1.4.0 user feedback, arbitrary
+ * internal caps below the model's advertised limit are unhelpful
+ * self-limiting. Callers who want tighter caps for specific calls pass
+ * `maxOutputTokens` explicitly in the tool input.
  */
-const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
+const ASK_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
 
 /**
  * Sentinel value in our internal normalisation for "user did not pass
@@ -98,6 +98,14 @@ export const askInputSchema = z
       .optional()
       .describe(
         "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+      ),
+    maxOutputTokens: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-call opt-in cap on response length (tokens). OMIT for the default 'auto' behaviour — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value when you want a bounded response (e.g. strict summary length, tighter budget per call). Values larger than the resolved model's limit are clamped down. Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` stays a true upper bound.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -169,15 +177,39 @@ export const askTool: ToolDefinition<AskInput> = {
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
 
-      // Hard cap on output tokens: bound the reservation estimate and the
-      // actual generateContent request to the same value, so the budget
-      // reservation is a TRUE upper bound (Copilot review C6). If the
-      // resolved model's advertised limit is smaller than our default,
-      // honour that — Gemini would clamp it anyway.
-      const maxOutputTokens =
+      // Output-cap strategy (v1.4.0): three-layer precedence.
+      //
+      //   1. `input.maxOutputTokens` (per-call, strongest) — user explicitly
+      //      caps this one call. Clamped to `modelOutputLimit`.
+      //   2. `ctx.config.forceMaxOutputTokens` (env override) — when the
+      //      MCP host sets `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`,
+      //      every call sends `maxOutputTokens = modelOutputLimit` so
+      //      code-review workloads always run at the model's full capacity
+      //      (65,536 tokens for Gemini 3.x / 2.5 Pro per Google docs).
+      //   3. Default (no overrides) — omit `maxOutputTokens` from the
+      //      `generateContent` config. Gemini uses its model-default cap
+      //      (documented as the model's advertised `outputTokenLimit`),
+      //      letting the model size the response to the query's complexity
+      //      rather than reserving full capacity on short Q&A.
+      //
+      // `modelOutputLimit` is the model's advertised ceiling from
+      // `models.list()` (or a fallback if the SDK doesn't report one).
+      // Used as the clamp target and as the budget-reservation worst-case.
+      const modelOutputLimit =
         typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
-          ? Math.min(ASK_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
-          : ASK_MAX_OUTPUT_TOKENS_DEFAULT;
+          ? resolved.outputTokenLimit
+          : ASK_MAX_OUTPUT_TOKENS_FALLBACK;
+      const wireMaxOutputTokens: number | undefined =
+        input.maxOutputTokens !== undefined
+          ? Math.min(input.maxOutputTokens, modelOutputLimit)
+          : ctx.config.forceMaxOutputTokens
+            ? modelOutputLimit
+            : undefined;
+      // Effective cap used for thinking-budget clamp and budget reservation.
+      // When neither override is set, the model's internal default equals
+      // `modelOutputLimit` per Google docs — so using the limit as
+      // worst-case keeps `GEMINI_DAILY_BUDGET_USD` a true upper bound.
+      const effectiveOutputCap = wireMaxOutputTokens ?? modelOutputLimit;
 
       // Single source of truth for "is the caller driving reasoning via the
       // discrete-tier knob?". Three downstream call sites branch on this
@@ -206,7 +238,7 @@ export const askTool: ToolDefinition<AskInput> = {
           : rawThinkingBudget === -1
             ? -1
             : rawThinkingBudget > 0
-              ? Math.max(0, Math.min(rawThinkingBudget, maxOutputTokens - 1024))
+              ? Math.max(0, Math.min(rawThinkingBudget, effectiveOutputCap - 1024))
               : 0;
 
       // Cost-estimate thinking-token reserve — tier-aware when the caller
@@ -226,9 +258,9 @@ export const askTool: ToolDefinition<AskInput> = {
       // maps to `null` in the reserve table to mean "use the dynamic cap").
       const thinkingTokensForEstimate =
         input.thinkingLevel !== undefined
-          ? (THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? Math.max(0, maxOutputTokens - 1024))
+          ? (THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? Math.max(0, effectiveOutputCap - 1024))
           : effectiveThinkingBudget === null || effectiveThinkingBudget === -1
-            ? Math.max(0, maxOutputTokens - 1024)
+            ? Math.max(0, effectiveOutputCap - 1024)
             : effectiveThinkingBudget;
 
       // Estimated input-token count drives both the daily-budget reservation
@@ -252,7 +284,11 @@ export const askTool: ToolDefinition<AskInput> = {
           model: resolved.resolved,
           workspaceBytes,
           promptChars: input.prompt.length,
-          expectedOutputTokens: maxOutputTokens,
+          // Budget reservation uses the effective cap (explicit-user-cap
+          // OR model's full limit) as `expectedOutputTokens` — a TRUE
+          // upper bound, since Gemini's default stops at the model's
+          // advertised `outputTokenLimit`.
+          expectedOutputTokens: effectiveOutputCap,
           thinkingTokens: thinkingTokensForEstimate,
         });
         const reserve = ctx.manifest.reserveBudget({
@@ -347,10 +383,13 @@ export const askTool: ToolDefinition<AskInput> = {
       //   c) neither set → omit both fields, keep only `includeThoughts`.
       //      Model uses its native default (HIGH-dynamic on Gemini 3 Pro).
       //
-      // `maxOutputTokens` is set on every generateContent call so the budget
-      // reservation's `expectedOutputTokens` (derived from the same value) is
-      // a true upper bound — without this cap, a runaway response could
-      // exceed the reserved estimate and silently overshoot `dailyBudgetUsd`.
+      // `maxOutputTokens` is only passed on the wire when the caller set
+      // `input.maxOutputTokens` — otherwise we omit it and Gemini uses
+      // its model-default cap (per docs, = the model's advertised
+      // `outputTokenLimit`, currently 65,536 for pro-tier 3.x/2.5). Budget
+      // reservation always uses `effectiveOutputCap` (= explicit cap OR
+      // model limit) as worst-case upper bound, so the daily cap stays a
+      // true ceiling regardless.
       // Cast to `ThinkingLevel` rather than indexing the runtime enum object
       // (`ThinkingLevel[input.thinkingLevel]`). For string enums the value
       // IS the member name, so passing `"HIGH"` as `ThinkingLevel` is
@@ -366,14 +405,17 @@ export const askTool: ToolDefinition<AskInput> = {
         : effectiveThinkingBudget === null
           ? { includeThoughts: true }
           : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
-      const buildConfig = (cacheId: string | null): GenerateContentConfig =>
-        cacheId
-          ? { cachedContent: cacheId, thinkingConfig, maxOutputTokens }
+      const buildConfig = (cacheId: string | null): GenerateContentConfig => {
+        const maxOutputField =
+          wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
+        return cacheId
+          ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField }
           : {
               systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
               thinkingConfig,
-              maxOutputTokens,
+              ...maxOutputField,
             };
+      };
       const buildContents = (
         cacheId: string | null,
         inline: typeof ctxPrep.inlineContents,

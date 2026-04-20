@@ -84,6 +84,7 @@ function createThrottleSpy(): ThrottleSpy {
 interface BuildCtxOptions {
   readonly tpmThrottleLimit?: number;
   readonly generateContent?: ReturnType<typeof vi.fn>;
+  readonly forceMaxOutputTokens?: boolean;
 }
 
 function buildCtx(opts: BuildCtxOptions = {}): {
@@ -114,6 +115,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       cacheTtlSeconds: 3_600,
       cacheMinTokens: 1_024,
       tpmThrottleLimit: opts.tpmThrottleLimit ?? 80_000,
+      forceMaxOutputTokens: opts.forceMaxOutputTokens ?? false,
     } as ToolContext['config'],
     client: { models: { generateContent } } as unknown as ToolContext['client'],
     manifest: {
@@ -365,5 +367,81 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     await askTool.execute({ prompt: 'q' }, ctx);
 
     expect(order).toEqual(['prepareContext', 'reserve']);
+  });
+});
+
+describe('ask.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.validateWorkspacePath.mockReturnValue(undefined);
+    mocks.scanWorkspace.mockResolvedValue({
+      workspaceRoot: '/fake',
+      filesHash: 'abc',
+      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
+      skippedTooLarge: 0,
+      truncated: false,
+    });
+    mocks.resolveModel.mockResolvedValue({
+      requested: 'latest-pro',
+      resolved: 'gemini-3-pro-preview',
+      inputTokenLimit: 1_048_576,
+      outputTokenLimit: 65_536,
+      fallbackApplied: false,
+      category: 'text-reasoning',
+      capabilities: {
+        supportsThinking: true,
+        supportsVision: true,
+        supportsCodeExecution: true,
+        costTier: 'premium',
+      },
+    });
+    mocks.prepareContext.mockResolvedValue({
+      cacheId: null,
+      inlineContents: [],
+      reused: false,
+      rebuilt: false,
+      inlineOnly: true,
+      uploaded: { failedCount: 0, failures: [] },
+    });
+    mocks.isStaleCacheError.mockReturnValue(false);
+  });
+
+  function lastGenerateContentCall(gc: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    const call = gc.mock.calls[gc.mock.calls.length - 1];
+    const firstArg = call?.[0] as { config?: Record<string, unknown> } | undefined;
+    return firstArg?.config ?? {};
+  }
+
+  it('default (no overrides) → maxOutputTokens omitted from wire (auto behaviour)', async () => {
+    // Per Gemini docs, omitting `maxOutputTokens` lets the model use its
+    // default cap (= advertised `outputTokenLimit`, currently 65,536). We
+    // don't set the field; Gemini decides response length on complexity.
+    const { ctx, generateContent } = buildCtx();
+    await askTool.execute({ prompt: 'q' }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config).not.toHaveProperty('maxOutputTokens');
+  });
+
+  it('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true → wire carries model.outputTokenLimit', async () => {
+    // MCP-host env override: every call runs at full model capacity.
+    const { ctx, generateContent } = buildCtx({ forceMaxOutputTokens: true });
+    await askTool.execute({ prompt: 'q' }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(65_536);
+  });
+
+  it('per-call input.maxOutputTokens overrides both default and env-force', async () => {
+    // Strongest layer: caller wants a tight cap regardless of env setting.
+    const { ctx, generateContent } = buildCtx({ forceMaxOutputTokens: true });
+    await askTool.execute({ prompt: 'q', maxOutputTokens: 4_096 }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(4_096);
+  });
+
+  it('per-call cap above model limit is clamped down to the model limit', async () => {
+    const { ctx, generateContent } = buildCtx();
+    await askTool.execute({ prompt: 'q', maxOutputTokens: 999_999 }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(65_536);
   });
 });

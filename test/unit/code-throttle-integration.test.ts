@@ -66,6 +66,7 @@ function createThrottleSpy(): ThrottleSpy {
 interface BuildCtxOptions {
   readonly tpmThrottleLimit?: number;
   readonly generateContent?: ReturnType<typeof vi.fn>;
+  readonly forceMaxOutputTokens?: boolean;
 }
 
 function buildCtx(opts: BuildCtxOptions = {}): {
@@ -95,6 +96,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       cacheTtlSeconds: 3_600,
       cacheMinTokens: 1_024,
       tpmThrottleLimit: opts.tpmThrottleLimit ?? 80_000,
+      forceMaxOutputTokens: opts.forceMaxOutputTokens ?? false,
     } as ToolContext['config'],
     client: { models: { generateContent } } as unknown as ToolContext['client'],
     manifest: {
@@ -251,5 +253,87 @@ describe('code.tool.ts throttle call sequence (T22b regression)', () => {
     const { ctx, throttleSpy } = buildCtx({ tpmThrottleLimit: 0 });
     await codeTool.execute({ task: 'x' }, ctx);
     expect(methodSequence(throttleSpy)).toEqual([]);
+  });
+});
+
+describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.validateWorkspacePath.mockReturnValue(undefined);
+    mocks.scanWorkspace.mockResolvedValue({
+      workspaceRoot: '/fake',
+      filesHash: 'abc',
+      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
+      skippedTooLarge: 0,
+      truncated: false,
+    });
+    mocks.resolveModel.mockResolvedValue({
+      requested: 'latest-pro-thinking',
+      resolved: 'gemini-3-pro-preview',
+      inputTokenLimit: 1_048_576,
+      outputTokenLimit: 65_536,
+      fallbackApplied: false,
+      category: 'text-reasoning',
+      capabilities: {
+        supportsThinking: true,
+        supportsVision: true,
+        supportsCodeExecution: true,
+        costTier: 'premium',
+      },
+    });
+    mocks.prepareContext.mockResolvedValue({
+      cacheId: null,
+      inlineContents: [],
+      reused: false,
+      rebuilt: false,
+      inlineOnly: true,
+      uploaded: { failedCount: 0, failures: [] },
+    });
+    mocks.isStaleCacheError.mockReturnValue(false);
+  });
+
+  function lastGenerateContentCall(gc: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    const call = gc.mock.calls[gc.mock.calls.length - 1];
+    const firstArg = call?.[0] as { config?: Record<string, unknown> } | undefined;
+    return firstArg?.config ?? {};
+  }
+
+  it('default (no overrides) → maxOutputTokens omitted (auto)', async () => {
+    const { ctx } = buildCtx();
+    const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    await codeTool.execute({ task: 'refactor' }, ctx);
+    expect(lastGenerateContentCall(generateContent)).not.toHaveProperty('maxOutputTokens');
+  });
+
+  it('forceMaxOutputTokens=true → wire carries 65_536', async () => {
+    const { ctx } = buildCtx({ forceMaxOutputTokens: true });
+    const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    await codeTool.execute({ task: 'refactor' }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(65_536);
+  });
+
+  it('per-call input.maxOutputTokens wins over forceMaxOutputTokens', async () => {
+    const { ctx } = buildCtx({ forceMaxOutputTokens: true });
+    const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    await codeTool.execute({ task: 'refactor', maxOutputTokens: 8_192 }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(8_192);
+  });
+
+  it('per-call cap above model limit is clamped', async () => {
+    const { ctx } = buildCtx();
+    const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    await codeTool.execute({ task: 'refactor', maxOutputTokens: 1_000_000 }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(65_536);
   });
 });
