@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-04-20
+
+**Model taxonomy — allowlist-first category system.** The v1.2.0–v1.3.2 defence against `nano-banana-pro-preview` (image-gen) resolving to `latest-pro-thinking` was a reactive substring blocklist (`NON_TEXT_GEN_MARKERS = ['banana', 'lyria', 'research', ...]`). Every new non-text-gen family Google shipped under a `pro` / `flash` token required a patch release. v1.4.0 flips the model: each model ID is matched against an explicit rule set that assigns one of nine functional categories (`text-reasoning`, `text-fast`, `text-lite`, `image-generation`, `audio-generation`, `video-generation`, `embedding`, `agent`, `unknown`). Tools declare a required category; the resolver refuses to dispatch outside that set. Unknown families land in `unknown` and are excluded from every alias until the taxonomy is extended — forcing a conscious patch release rather than silent admission.
+
+**Why this is a minor bump (1.4.0 not 1.3.3)**: the `ResolvedModel` type exported from `src/types.ts` gains two required fields (`category`, `capabilities`). Internal consumers compile cleanly; external TS consumers (none documented) would see the addition as type-surface widening. Runtime behaviour is strictly safer — existing aliases work identically for legitimate use, and the only callers that see new behaviour are those passing an image-gen / audio-gen model ID where a text-gen model was expected (pre-v1.4.0 silently dispatched; now throws `ModelCategoryMismatchError` with an actionable message).
+
+### Added
+
+- **`src/gemini/model-taxonomy.ts`** — new module with `ModelCategory` type, `CATEGORY_RULES` ordered pattern-allowlist, `categorizeModel(id)`, `extractCapabilityFlags(id, sdkMeta)`, `costTierOf(id)`, `isTextGenCategory(cat)`, and the exported `ModelCategoryMismatchError` class with actionable message pointing at `docs/models.md`.
+- **`latest-vision` alias** — picks the newest vision-capable text model (prefers `text-reasoning`, falls back to `text-fast`). Previously users needed to know a specific Gemini 2.5 / 3 Pro model ID for screenshot analysis.
+- **New response metadata fields** on `ask` / `code` structured content: `modelCategory` (string) and `modelCostTier` (`premium` | `standard` | `budget` | `unknown`). Use these for billing dashboards or to verify that an alias resolved to what you expected.
+- **New docs — [`docs/models.md`](./docs/models.md)** — complete guide: category table with descriptions, alias contract, usage examples (code review, quick Q&A, vision analysis, explicit model IDs), failure-mode walkthroughs (wrong category error, unknown future family error), and the "when to extend the taxonomy" maintainer note.
+- **48 new unit tests** (`test/unit/model-taxonomy.test.ts`) covering every current Gemini model's expected categorisation, precedence rules (the core invariant — `nano-banana-pro-preview` must resolve to `image-generation`, not `text-reasoning`), `unknown` fallback for future families, `costTierOf` + `extractCapabilityFlags` paths, and `ModelCategoryMismatchError` shape.
+- **9 new resolver tests** in `test/unit/models.test.ts` covering v1.4.0 contract: `ResolvedModel` carries `category` + `capabilities`, `requiredCategory` rejects literal model IDs in the wrong category, alias path enforces category too, `latest-vision` picks vision-capable, `latest-lite` binds strictly to budget tier, unknown-category explicit ID throws under required-category gate, + `describeAlias` / `listAliases` public API tests.
+
+### Changed
+
+- **`ResolvedModel` interface** (`src/types.ts`) gains `category: ModelCategory` and `capabilities: CapabilityFlags` required fields. Populated by `src/gemini/models.ts`'s `resolveModel` via `src/gemini/model-taxonomy.ts`.
+- **`resolveModel(requested, client, opts?)`** (`src/gemini/models.ts`) accepts `opts.requiredCategory: readonly ModelCategory[]` — the set of categories this call-site accepts. Throws `ModelCategoryMismatchError` if the resolved model (alias-picked or literal) falls outside that set. Tools pass this parameter:
+  - `ask.tool.ts` → `['text-reasoning', 'text-fast', 'text-lite']` (any text tier)
+  - `code.tool.ts` → `['text-reasoning']` (strictest; coding benefits from reasoning tokens and we refuse to dispatch to fast/lite tiers for correctness)
+- **Literal model ID fallback removed** — pre-v1.4.0, passing a literal ID that wasn't in the API-key's registry silently swapped to `latest-pro`, which could resolve to an image-gen model. v1.4.0 throws a clear error instead: `Model 'X' is not available for this API key. Pass an alias (…) or a literal ID available on your tier (…). See docs/models.md.`
+- **Alias fallback across categories removed** — pre-v1.4.0, if `latest-pro-thinking` found nothing, it fell back to `latest-pro` → `latest-flash` → `latest-lite` → first model. This meant a registry with only image-gen pro models would return an image model for a code-review alias. v1.4.0 throws a clear error naming the required category and listing available categories for the API key.
+- **Existing blocklist `NON_TEXT_GEN_MARKERS`** retained as belt-and-suspenders defence — runs AFTER categorisation. If a taxonomy rule erroneously classifies a model as text-gen but its ID matches a blocklist marker, the resolver logs and demotes it to `unknown`. Empirically fired once during testing for `gemini-2.5-flash-native-audio-preview-09-2025` (flash-token + audio-suffix combo); that pattern has since been added to the primary taxonomy rule set, so the belt-and-suspenders should no longer fire under the current model lineup.
+- **New native-audio rule** in the taxonomy: `gemini-*-native-audio-*` → `audio-generation`. Surfaced by the belt-and-suspenders path during Phase 3 integration testing.
+- **`docs/configuration.md`** alias table updated with category column and a link to the new `docs/models.md`.
+- **`README.md`** gains an "Model aliases (v1.4.0+)" block explaining the category safety property.
+
+### Reviewer notes (not a code change)
+
+- Implemented in five phases (taxonomy → resolver refactor → tool integration → docs → validate/PR), each locked behind user review checkpoint per global `CLAUDE.md` phase-by-phase rule.
+- The allowlist-first design was chosen explicitly over the v1.2.0–v1.3.2 reactive blocklist after the user flagged the core concern: "never let `nano-banana` do my code review". Blocklists catch *known* offenders; allowlists refuse *everything unknown*. Google shipping a new `pro`-token image-gen family that we haven't classified is now a `HARD ERROR` with a clear upgrade path, not a silent pricing surprise.
+- Belt-and-suspenders `NON_TEXT_GEN_MARKERS` blocklist retained even though the taxonomy is primary — shouldn't fire in practice, catches taxonomy bugs before they reach production.
+
 ## [1.3.2] — 2026-04-20
 
 Security-flavoured hotfix closing hint-poisoning attack surface flagged in PR #20 (v1.3.1) multi-round review. **Two review rounds on this hotfix itself** (PR #21 round-1 + round-2) refined the gate design — the initial substring fallback was itself bypassable and got tightened to prototype-based SDK provenance. `/6step` verified all findings closed end-to-end against a real `@google/genai` `ApiError` instance.

@@ -192,7 +192,16 @@ export const codeTool: ToolDefinition<CodeInput> = {
       }
 
       emitter.emit(`resolving model '${modelRequest}'…`);
-      const resolved = await resolveModel(modelRequest, ctx.client);
+      // `code` is strictly text-reasoning — coding tasks genuinely benefit
+      // from reasoning tokens, and dispatching to fast/lite tiers would
+      // degrade output quality without meaningful cost savings. Crucially:
+      // this category gate prevents image-gen / audio-gen / agent models
+      // (which may share `pro` tokens with text models in Google's registry)
+      // from reaching `generateContent` with a code-review prompt — the
+      // primary motivation for the v1.4.0 taxonomy work.
+      const resolved = await resolveModel(modelRequest, ctx.client, {
+        requiredCategory: ['text-reasoning'],
+      });
       resolvedModelKey = resolved.resolved;
 
       emitter.emit(`scanning workspace ${workspaceRoot}…`);
@@ -552,6 +561,8 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const structured: Record<string, unknown> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
+        modelCategory: resolved.category,
+        modelCostTier: resolved.capabilities.costTier,
         contextWindow: resolved.inputTokenLimit,
         // `thinkingBudget` echoes the clamped value actually sent on the
         // wire; it's only meaningful on the budget path. On the

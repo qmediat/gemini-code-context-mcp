@@ -19,6 +19,19 @@ export interface ResolvedModel {
   inputTokenLimit: number | null;
   /** Output token limit advertised by the model. */
   outputTokenLimit: number | null;
+  /**
+   * Functional taxonomy classification of the resolved model. Tools bind
+   * to a required category via `resolveModel(..., { requiredCategory })`
+   * and the resolver refuses to return models outside that category.
+   * See `docs/models.md` for the category table and guidance on picking
+   * aliases by tool.
+   */
+  category: import('./gemini/model-taxonomy.js').ModelCategory;
+  /**
+   * Orthogonal capability flags (thinking / vision / code execution /
+   * cost tier). Multiple can apply to a single model.
+   */
+  capabilities: import('./gemini/model-taxonomy.js').CapabilityFlags;
 }
 
 /** Canonical workspace row stored in the manifest DB. */

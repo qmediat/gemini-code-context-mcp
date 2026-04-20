@@ -151,7 +151,14 @@ export const askTool: ToolDefinition<AskInput> = {
       }
 
       emitter.emit(`resolving model '${model}'…`);
-      const resolved = await resolveModel(model, ctx.client);
+      // `ask` accepts all three text-gen tiers — caller picks via alias
+      // (`latest-pro` / `latest-flash` / `latest-lite` / `latest-vision`)
+      // or literal model ID. Resolver refuses to dispatch to a category
+      // outside this set — protects against an image/audio/agent model
+      // slipping in (e.g. `nano-banana-pro-preview` pre-v1.4.0).
+      const resolved = await resolveModel(model, ctx.client, {
+        requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
+      });
       resolvedModelKey = resolved.resolved;
 
       emitter.emit(`scanning workspace ${workspaceRoot}…`);
@@ -543,6 +550,8 @@ export const askTool: ToolDefinition<AskInput> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
         fallbackApplied: resolved.fallbackApplied,
+        modelCategory: resolved.category,
+        modelCostTier: resolved.capabilities.costTier,
         contextWindow: resolved.inputTokenLimit,
         thinkingBudget: effectiveThinkingBudget,
         thinkingLevel: input.thinkingLevel ?? null,

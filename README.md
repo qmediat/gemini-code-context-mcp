@@ -64,6 +64,20 @@ See [`docs/getting-started.md`](./docs/getting-started.md) for a 3-minute walkth
 
 All tools accept an optional `workspace` path (defaults to `cwd`), `model` alias or literal ID, and glob overrides.
 
+### Model aliases (v1.4.0+)
+
+Aliases are **category-safe** — they resolve against a known functional category (text-reasoning, text-fast, text-lite, etc.) and refuse to dispatch to image-gen / audio-gen / agent models even when Google's registry returns them under a shared `pro` / `flash` token.
+
+| Alias | Category | Typical use |
+|---|---|---|
+| `latest-pro-thinking` *(default for `code`)* | `text-reasoning` + thinking | Code review, deep analysis |
+| `latest-pro` | `text-reasoning` | Best pro-tier text model |
+| `latest-flash` | `text-fast` | Fast Q&A, cheap |
+| `latest-lite` | `text-lite` | Simplest / cheapest |
+| `latest-vision` | `text-reasoning` ∪ `text-fast` + vision | Screenshot / image analysis |
+
+Full contract, category table, and examples: [`docs/models.md`](./docs/models.md).
+
 ## Installation methods
 
 | Method | Config |

@@ -153,9 +153,14 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
       resolved: 'gemini-3-pro-preview',
       inputTokenLimit: 2_000_000,
       outputTokenLimit: 65_536,
-      supportsThinking: true,
-      supportsCaching: true,
       fallbackApplied: false,
+      category: 'text-reasoning',
+      capabilities: {
+        supportsThinking: true,
+        supportsVision: true,
+        supportsCodeExecution: true,
+        costTier: 'premium',
+      },
     });
     mocks.prepareContext.mockResolvedValue({
       cacheId: null,

@@ -47,16 +47,19 @@ Every tool accepts runtime overrides that beat the defaults:
 
 ## Model aliases
 
-The server enumerates models available to your API key at startup. Aliases resolve dynamically, so when Google ships a new Pro model and your key can reach it, `latest-pro` picks it up without any change on your end.
+The server enumerates models available to your API key at startup, classifies each by functional **category** (`text-reasoning`, `text-fast`, `text-lite`, `image-generation`, `audio-generation`, `video-generation`, `embedding`, `agent`, `unknown`), and only matches aliases within the correct category. When Google ships a new Pro text-gen model that your key can reach, `latest-pro` picks it up automatically; when they ship a new image-gen family that shares the `pro` token, it stays out of `latest-pro`'s path.
 
-| Alias | Picks |
-|---|---|
-| `latest-pro` | Newest non-image / non-tts Pro model |
-| `latest-pro-thinking` | Newest Pro model with `thinking: true` |
-| `latest-flash` | Newest Flash model |
-| `latest-lite` | Newest Lite model |
+| Alias | Category | Picks |
+|---|---|---|
+| `latest-pro` | `text-reasoning` | Newest pro-tier text model |
+| `latest-pro-thinking` | `text-reasoning` + `supportsThinking` | Newest pro model with reasoning support (default for `code`) |
+| `latest-flash` | `text-fast` | Newest flash-tier text model |
+| `latest-lite` | `text-lite` | Newest lite-tier (cheapest) text model |
+| `latest-vision` | `text-reasoning` ∪ `text-fast` + `supportsVision` | Newest vision-capable text model |
 
-Literal IDs always work too: `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, etc.
+Literal IDs always work too: `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, etc. They're category-checked too — passing e.g. `nano-banana-pro-preview` to `code` throws `ModelCategoryMismatchError` with an actionable message (image-gen models have 10× pricing and a different API shape; we refuse to dispatch silently).
+
+**Full category table, alias contract, failure-mode examples, and the "what happens when Google ships a new family" walkthrough** — see [`docs/models.md`](./models.md).
 
 ## Credentials file format
 
