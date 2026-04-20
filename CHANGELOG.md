@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-04-20
+
+### Docs
+
+- **README — "Upgrading to a new release"** subsection under *Installation methods*. Documents the `rm -rf ~/.npm/_npx` workaround for users on the `npx -y` install path who don't see a freshly-published version. Root cause: `npx -y` caches resolved packages, and npm's registry-metadata cache can keep serving the previously-installed version for a while after `npm publish`. Global-install and local-dev paths are unaffected and upgrade via `npm update -g` / `git pull && npm run build`.
+
 ## [1.4.0] — 2026-04-20
 
 **Model taxonomy — allowlist-first category system.** The v1.2.0–v1.3.2 defence against `nano-banana-pro-preview` (image-gen) resolving to `latest-pro-thinking` was a reactive substring blocklist (`NON_TEXT_GEN_MARKERS = ['banana', 'lyria', 'research', ...]`). Every new non-text-gen family Google shipped under a `pro` / `flash` token required a patch release. v1.4.0 flips the model: each model ID is matched against an explicit rule set that assigns one of nine functional categories (`text-reasoning`, `text-fast`, `text-lite`, `image-generation`, `audio-generation`, `video-generation`, `embedding`, `agent`, `unknown`). Tools declare a required category; the resolver refuses to dispatch outside that set. Unknown families land in `unknown` and are excluded from every alias until the taxonomy is extended — forcing a conscious patch release rather than silent admission.

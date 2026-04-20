@@ -86,6 +86,16 @@ Full contract, category table, and examples: [`docs/models.md`](./docs/models.md
 | **Global install** | `npm install -g @qmediat.io/gemini-code-context-mcp` → `"command": "gemini-code-context-mcp"` |
 | **Local dev** | `git clone …; npm install; npm run build` → `"command": "node", "args": ["/path/to/dist/index.js"]` |
 
+### Upgrading to a new release
+
+If you use the **npx** method and a new version has been published but you're still getting the old one, clear the npx cache and restart your MCP host:
+
+```bash
+rm -rf ~/.npm/_npx
+```
+
+`npx -y` caches resolved packages, and npm's registry-metadata cache can keep serving the previously-installed version for a while after `npm publish`. The command above forces a fresh fetch on next MCP startup. Global-install and local-dev users upgrade via `npm update -g @qmediat.io/gemini-code-context-mcp` and `git pull && npm run build` respectively.
+
 ## How the caching works
 
 ```
