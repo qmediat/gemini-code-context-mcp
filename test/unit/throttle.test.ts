@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createTpmThrottle, parseRetryDelayMs } from '../../src/tools/shared/throttle.js';
+import {
+  createTpmThrottle,
+  isGemini429,
+  parseRetryDelayMs,
+} from '../../src/tools/shared/throttle.js';
 
 describe('tpm throttle', () => {
   beforeEach(() => {
@@ -571,8 +575,12 @@ describe('tpm throttle', () => {
       expect(parseRetryDelayMs('"retryDelay":"10"')).toBeNull();
     });
 
-    it('returns null on negative / zero values', () => {
+    it('returns null on zero / negative values', () => {
+      // Zero fails the `seconds <= 0` guard after successful regex match.
       expect(parseRetryDelayMs('"retryDelay":"0s"')).toBeNull();
+      // Negative fails at the regex stage — the `\d+` class doesn't match
+      // a leading `-`, so the guard below never sees the value. Both paths
+      // converge on null (PR #20 round-2 Grok NIT — comment correctness).
       expect(parseRetryDelayMs('"retryDelay":"-1s"')).toBeNull();
     });
 
@@ -582,6 +590,27 @@ describe('tpm throttle', () => {
       // hand us anything via `err.message` type-coerced.
       expect(parseRetryDelayMs(undefined as unknown as string)).toBeNull();
       expect(parseRetryDelayMs(null as unknown as string)).toBeNull();
+    });
+
+    it('handles escaped-JSON form (proxy/non-JSON-content-type edge)', () => {
+      // SDK's `throwErrorIfNotOK` wraps non-JSON error body into
+      // `{error: {message: "<raw-text>"}}` then `JSON.stringify`s the
+      // whole wrapper — escaping any literal quotes in the HTML/text.
+      // Corporate proxy returning an HTML 429 page that happens to
+      // contain a `"retryDelay":"3s"` literal would reach us as escaped.
+      // PR #20 round-1 Grok finding.
+      const proxyWrapped =
+        '{"error":{"message":"<html>HTTP 429 \\"retryDelay\\":\\"3s\\" Too Many</html>","code":429}}';
+      expect(parseRetryDelayMs(proxyWrapped)).toBe(3_000);
+    });
+
+    it('handles mixed bare + escaped forms — bare wins (matches first)', () => {
+      // Defensive: if a body contains both bare (genuine) and escaped
+      // (proxy-wrapped) retryDelay values, the bare-form match runs
+      // first and wins. Prevents the unescape step from ever shadowing
+      // a legitimate Google-sourced hint.
+      const mixed = '"retryDelay":"5s" and later \\"retryDelay\\":\\"99s\\"';
+      expect(parseRetryDelayMs(mixed)).toBe(5_000);
     });
 
     it('seeds the throttle via recordRetryHint — end-to-end use case', () => {
@@ -595,6 +624,52 @@ describe('tpm throttle', () => {
       // Next reserve must back off by at least the hint.
       const r = throttle.reserve('gemini-3-pro', 1);
       expect(r.delayMs).toBeGreaterThanOrEqual(7_990); // -10ms test-clock slack
+    });
+  });
+
+  describe('isGemini429 (v1.3.2 — hint-poisoning gate)', () => {
+    it('returns true for real @google/genai ApiError with status 429', () => {
+      // Shape matches the SDK's `new ApiError({message, status})` construction.
+      const apiErr = Object.assign(new Error('429 body'), { status: 429 });
+      expect(isGemini429(apiErr)).toBe(true);
+    });
+
+    it('returns true on RESOURCE_EXHAUSTED substring fallback (no status field)', () => {
+      // Wrapper / re-thrown error loses the typed `.status`. Substring
+      // fallback on the canonical AIP-193 status keeps the gate open for
+      // legitimate 429s routed through logger/plain-Error paths.
+      const wrapped = new Error('Gemini call failed: RESOURCE_EXHAUSTED: quota exceeded');
+      expect(isGemini429(wrapped)).toBe(true);
+    });
+
+    it('returns FALSE for errors with user-controlled retryDelay substring (poisoning guard)', () => {
+      // Attack scenario: user prompt contains `"retryDelay":"60s"` and
+      // gets echoed into a non-429 error body (safety filter path, etc.).
+      // Without the gate, parseRetryDelayMs would extract the 60s and
+      // poison the throttle's per-model hint for the MCP server lifetime.
+      // v1.3.2 fix — GPT + Grok both flagged this as hint-poisoning.
+      const nonQuotaErr = new Error(
+        'Generation blocked: prompt contained {"retryDelay":"60s"} payload',
+      );
+      expect(isGemini429(nonQuotaErr)).toBe(false);
+    });
+
+    it('returns false for status 500 / 400 / other codes', () => {
+      expect(isGemini429(Object.assign(new Error(), { status: 500 }))).toBe(false);
+      expect(isGemini429(Object.assign(new Error(), { status: 400 }))).toBe(false);
+      expect(isGemini429(Object.assign(new Error(), { status: 503 }))).toBe(false);
+    });
+
+    it('returns false for non-Error values', () => {
+      expect(isGemini429('RESOURCE_EXHAUSTED')).toBe(false);
+      expect(isGemini429({ status: 429, message: 'x' })).toBe(false);
+      expect(isGemini429(null)).toBe(false);
+      expect(isGemini429(undefined)).toBe(false);
+    });
+
+    it('returns false when status is a non-number', () => {
+      // Defensive: some wrappers stringify status. Gate should ignore.
+      expect(isGemini429(Object.assign(new Error(), { status: '429' }))).toBe(false);
     });
   });
 

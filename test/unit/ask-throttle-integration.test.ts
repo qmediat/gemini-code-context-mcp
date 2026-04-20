@@ -232,8 +232,9 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel', 'reserve', 'release']);
   });
 
-  it('429 error: reserve → recordRetryHint → cancel (T22a)', async () => {
-    // Simulate Gemini 429 error body containing retryInfo.retryDelay.
+  it('429 error via RESOURCE_EXHAUSTED substring: reserve → recordRetryHint → cancel (T22a)', async () => {
+    // Wrapped/re-thrown 429: plain Error, no `.status` field. Substring
+    // fallback in `isGemini429` catches it.
     const generateContent = vi
       .fn()
       .mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED {"retryInfo":{"retryDelay":"7s"}}'));
@@ -242,13 +243,47 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     const result = await askTool.execute({ prompt: 'q' }, ctx);
 
     expect(result.isError).toBe(true);
-    // Expected order: reserve happened before generateContent attempt,
-    // then recordRetryHint seeded from the 429 body, then cancel cleaned up.
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'recordRetryHint', 'cancel']);
-    // Verify the extracted retry-delay made it into the hint (7s = 7000ms).
     const hintCall = throttleSpy.calls.find((c) => c.method === 'recordRetryHint');
     expect(hintCall?.args[0]).toBe('gemini-3-pro-preview');
     expect(hintCall?.args[1]).toBe(7_000);
+  });
+
+  it('429 error via ApiError.status: reserve → recordRetryHint → cancel (v1.3.2 gate)', async () => {
+    // Real @google/genai ApiError carries typed `.status: 429`. Gate
+    // catches this via the status check without needing the substring
+    // fallback. Regression guard for v1.3.2 hotfix.
+    const apiErr = Object.assign(new Error('{"error":{"details":[{"retryDelay":"4s"}]}}'), {
+      status: 429,
+    });
+    const generateContent = vi.fn().mockRejectedValue(apiErr);
+    const { ctx, throttleSpy } = buildCtx({ generateContent });
+
+    await askTool.execute({ prompt: 'q' }, ctx);
+
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'recordRetryHint', 'cancel']);
+    const hintCall = throttleSpy.calls.find((c) => c.method === 'recordRetryHint');
+    expect(hintCall?.args[1]).toBe(4_000);
+  });
+
+  it('non-429 error with decoy retryDelay: NO hint seeded (v1.3.2 poisoning guard)', async () => {
+    // v1.3.2 regression: user-controlled substring `"retryDelay":"60s"`
+    // echoed into a non-429 error body must NOT seed the retry-hint.
+    // Without the `isGemini429` gate this would poison the per-model
+    // bucket at clamp ceiling for the MCP server's lifetime (GPT + Grok
+    // flagged as hint-poisoning in PR #20 round-1 review).
+    const generateContent = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('Safety filter blocked generation: prompt contained {"retryDelay":"60s"}'),
+      );
+    const { ctx, throttleSpy } = buildCtx({ generateContent });
+
+    await askTool.execute({ prompt: 'q' }, ctx);
+
+    // Critical: recordRetryHint must NOT be in the call sequence.
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
+    expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
   });
 
   it('disabled throttle (tpmThrottleLimit=0): no reserve/release/cancel', async () => {

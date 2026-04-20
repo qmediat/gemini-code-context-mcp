@@ -30,7 +30,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
-import { parseRetryDelayMs } from './shared/throttle.js';
+import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 const SYSTEM_INSTRUCTION_CODE = [
   'You are an expert software engineer. Generate production-quality, idiomatic code with proper error handling.',
@@ -595,9 +595,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
       return textResult(text, structured);
     } catch (err) {
       logger.error(`code failed: ${String(err)}`);
-      // T22a — seed the throttle's retry-hint from any 429 retryInfo.
-      // Mirror of ask.tool.ts — see there for rationale.
-      const retryDelayMs = err instanceof Error ? parseRetryDelayMs(err.message) : null;
+      // T22a + v1.3.2 hotfix — seed the throttle's retry-hint from any
+      // Gemini 429 retryInfo, gated on `isGemini429` to prevent
+      // hint-poisoning from user-controlled substrings in non-429 error
+      // bodies. Mirror of ask.tool.ts — see there for full rationale.
+      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs((err as Error).message) : null;
       if (retryDelayMs !== null && resolvedModelKey !== null) {
         ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
       }

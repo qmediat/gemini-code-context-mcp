@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-04-20
+
+Security-flavoured hotfix for PR #20 (v1.3.1) review findings. One MEDIUM TP (hint-poisoning gate), one LOW TP (escaped-JSON proxy edge), one NIT (test comment correctness). Strong 2-of-3 reviewer consensus (GPT `gpt-5.3-codex` + Grok `grok-4.20-beta-0309-reasoning`; Copilot async queue did not return in the review window). Ship all three together — single-file `throttle.ts` + catch-block call-site edits + test additions.
+
+### Fixed
+
+- **Retry-hint poisoning closed.** `parseRetryDelayMs` was called on EVERY `Error.message` that reached the `ask`/`code` catch blocks — not gated to confirmed 429 responses. A user-controlled prompt containing the literal substring `"retryDelay":"60s"` that got echoed into any non-429 error body (safety filter path, validation error, log re-serialisation) would seed the per-model throttle at the 60s clamp ceiling and self-DoS the MCP server for the rest of its process lifetime. v1.3.2 gates the parser behind a new exported `isGemini429(err)` predicate: `ApiError.status === 429` (the typed signal from `@google/genai`) with a `RESOURCE_EXHAUSTED` substring fallback for wrapped / re-thrown error shapes that lose `.status`. GPT `gpt-5.3-codex` flagged as CRITICAL, Grok `grok-4.20-beta-0309-reasoning` flagged as CRITICAL — `/6step` verdict was MEDIUM (narrow trigger, bounded impact, but trivial fix worth shipping) and the hotfix lands regardless.
+- **Escaped-JSON form now extracted.** `parseRetryDelayMs` previously required bare-quoted `"retryDelay":"Ns"` in the error message. Verified empirically that the common `@google/genai` SDK path produces bare quotes via `JSON.stringify(errorBody)` in `throwErrorIfNotOK`, so real 429s from `generativelanguage.googleapis.com` / Vertex `aiplatform.googleapis.com` match directly — regardless of which auth tier constructed the client (`apiKey` vs `vertexai` paths share the same error-handling code). BUT: the non-JSON content-type branch of `throwErrorIfNotOK` wraps the raw text body into `{error: {message: "<raw-text>"}}` before stringifying, which ESCAPES any literal `"retryDelay":"Ns"` substring inside — a narrow path hit when a corporate proxy / MITM / Cloudflare edge returns an HTML 429 page instead of the upstream JSON. The parser now unescapes once on fallback (`errorMessage.replace(/\\"/g, '"')`) when a `\\"` substring is present, and re-runs the regex. Bare-form common path is unchanged (no allocation). Grok flagged as CRITICAL, `/6step` downgraded to LOW TP (edge case, safe direction — missed hint just falls back to pure-window math, no overshoot risk).
+- **Test comment correctness** — `"returns null on negative / zero values"` test now documents that `"-1s"` fails at the regex stage (the `\d+` class rejects leading `-`) while `"0s"` fails via the `seconds <= 0` guard. Two different reject paths converging on `null`. Grok NIT.
+
+### Added
+
+- **`isGemini429(err): boolean`** exported from `src/tools/shared/throttle.ts`. Liberal on the fallback (substring match on `RESOURCE_EXHAUSTED`) so wrapped errors (plain `Error` with cause, logger-re-thrown, test mocks without ApiError shape) still open the retry-hint path when the message clearly indicates a 429. Conservative on the status check (exact `=== 429` only — a `"429"` string from a quirky wrapper is NOT treated as 429).
+- **7 new unit tests** (`parseRetryDelayMs` escaped form + mixed-form tie-break + 6 `isGemini429` coverage cases).
+- **6 new integration tests across ask + code** — both tool files now cover: 429-via-status-field, 429-via-substring-fallback, and (critical) non-429 error with decoy `"retryDelay":"60s"` substring proving the gate blocks poisoning.
+
+### Tests
+
+- 73 throttle-family tests (up from 56 in v1.3.1 — 9 `parseRetryDelayMs` + 6 `isGemini429` + 40 core throttle + 11 + 7 integration = 73).
+- 212 total PR tests (up from 205). Lint + typecheck + build all green on Node 22.
+
+### Not fixed (documented as accepted)
+
+- Grok CRITICAL on wire-format `structuredContent` always-emit — 3-of-4 reviewers (self + GPT + Gemini v1.3.0 round-2) agreed shippable as additive-only; no observed MCP-host break across 4 review rounds. Held.
+- GPT IMPORTANT on numeric / protobuf retry-delay forms (`"retryDelay":5`, `{"seconds":5,"nanos":0}`). Not observed in Gemini REST API output (AIP-140 mandates `"Ns"` string form). Future-proof; defer.
+- Grok IMPORTANT on integration test mock fidelity drift (hand-written shapes vs real types). Follow-up — replace `as Type[...]` casts with `satisfies` in a dedicated cleanup PR.
+- Grok IMPORTANT on `TextToolResult` type narrowing as minor API surface change. Runtime-safe; external TS consumers (none known) would see narrower field type, not break. Patch-safe per DefinitelyTyped conventions.
+
 ## [1.3.1] — 2026-04-20
 
 Patch release closing the three LOW/NIT follow-ups deferred from v1.3.0's multi-round review cycle (T22a retry-hint wiring, T22b ask/code integration tests, T23a helper return-type narrowing). No user-visible API breaks; smallest possible diff that moves GPT's round-2 "still live" findings to closed.

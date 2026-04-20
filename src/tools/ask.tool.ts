@@ -28,7 +28,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
-import { parseRetryDelayMs } from './shared/throttle.js';
+import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
@@ -573,10 +573,18 @@ export const askTool: ToolDefinition<AskInput> = {
       // T22a — extract Gemini's `retryInfo.retryDelay` from 429 bodies and
       // seed the throttle's per-model hint before we release the
       // reservation. Google's hint is typically shorter (2-16s) than our
-      // pure-window math would compute (up to 60s+) so honouring it shortens
-      // the next caller's wait. Best-effort: `parseRetryDelayMs` returns
-      // null on non-429 / malformed bodies and we silently continue.
-      const retryDelayMs = err instanceof Error ? parseRetryDelayMs(err.message) : null;
+      // pure-window math would compute (up to 60s+) so honouring it
+      // shortens the next caller's wait.
+      //
+      // Gated on `isGemini429` BEFORE parsing (v1.3.2 hotfix). Without the
+      // gate, a user-controlled prompt substring `"retryDelay":"60s"` that
+      // gets echoed into ANY non-429 error body would seed a bogus hint
+      // and freeze the per-model throttle for 60 s — a self-DoS vector
+      // flagged by GPT + Grok in PR #20 round-1 review. `isGemini429`
+      // uses `ApiError.status === 429` as the authoritative signal with
+      // a `RESOURCE_EXHAUSTED` substring fallback for wrapped / re-thrown
+      // error shapes where `.status` is lost.
+      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs((err as Error).message) : null;
       if (retryDelayMs !== null && resolvedModelKey !== null) {
         ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
       }

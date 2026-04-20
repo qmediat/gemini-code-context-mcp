@@ -449,17 +449,40 @@ const RETRY_HINT_MAX_MS = 60_000;
  * body, missing `retryDelay` field, non-numeric value). Returns a value
  * in `[RETRY_HINT_MIN_MS, RETRY_HINT_MAX_MS]` on a successful parse.
  *
- * Example error body shape that this extracts from:
+ * Normal `@google/genai` 429 bodies arrive as bare-quote JSON via the
+ * SDK's `JSON.stringify(errorBody)` in `throwErrorIfNotOK`, which matches
+ * `RETRY_DELAY_REGEX` directly. The escaped fallback handles a narrower
+ * path: when a non-JSON content-type response (HTML error page from a
+ * corporate proxy / MITM intercept / Cloudflare edge) is wrapped by the
+ * SDK into `{error: {message: "<html-text>"}}` and then stringified,
+ * any `"retryDelay":"Ns"` literal inside that HTML becomes `\"retryDelay\":\"Ns\"`
+ * — escaped. Unescaping once before the regex catches that edge without
+ * breaking the common path (double-unescape would damage already-bare
+ * JSON). Flagged in PR #20 round-1 review by Grok.
+ *
+ * The helper does NOT discriminate between 429 and non-429 error messages;
+ * callers MUST gate with `isGemini429(err)` before invoking this parser to
+ * prevent hint-poisoning from user-controlled substrings appearing in
+ * unrelated error bodies (PR #20 round-1 GPT + Grok).
+ *
+ * Example error body shapes that this extracts from:
  * ```
  * {"error":{...,"details":[...,{"@type":"...RetryInfo","retryDelay":"2s"}]}}
+ * {"error":{"message":"<html>...\"retryDelay\":\"2s\"...</html>","code":429}}
  * ```
- * Only the `"retryDelay":"<seconds>s"` substring is matched — we don't
- * walk the details array. This is deliberately lenient.
  */
 const RETRY_DELAY_REGEX = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/;
 export function parseRetryDelayMs(errorMessage: string): number | null {
   if (typeof errorMessage !== 'string' || errorMessage.length === 0) return null;
-  const match = errorMessage.match(RETRY_DELAY_REGEX);
+  // Try bare-quote form first (the common `@google/genai` SDK path).
+  let match = errorMessage.match(RETRY_DELAY_REGEX);
+  if (!match && errorMessage.includes('\\"')) {
+    // Fall back to unescaping once for the proxy / non-JSON-content-type
+    // edge case. `replace` on an already-bare string is a no-op, so this
+    // is safe to do unconditionally — but the `includes('\\"')` guard
+    // avoids the string allocation on the common path.
+    match = errorMessage.replace(/\\"/g, '"').match(RETRY_DELAY_REGEX);
+  }
   if (!match || !match[1]) return null;
   const seconds = Number.parseFloat(match[1]);
   if (!Number.isFinite(seconds) || seconds <= 0) return null;
@@ -467,6 +490,37 @@ export function parseRetryDelayMs(errorMessage: string): number | null {
   if (ms < RETRY_HINT_MIN_MS) return RETRY_HINT_MIN_MS;
   if (ms > RETRY_HINT_MAX_MS) return RETRY_HINT_MAX_MS;
   return ms;
+}
+
+/**
+ * True when the error looks like a Gemini 429 RESOURCE_EXHAUSTED — eligible
+ * for retry-hint extraction. Two complementary checks:
+ *
+ *   1. `@google/genai`'s `ApiError` exposes a typed `.status: number` field
+ *      (see `genai.d.ts`). For real SDK 429s, `status === 429` is the
+ *      authoritative signal.
+ *   2. Substring fallback on `RESOURCE_EXHAUSTED` (Google's canonical
+ *      status string from AIP-193) for error shapes that don't surface
+ *      `.status` — wrapper errors with `cause`, logger-re-thrown plain
+ *      Errors, unit-test mocks that construct plain `new Error(message)`
+ *      without an ApiError shape.
+ *
+ * Gating on this BEFORE `parseRetryDelayMs` prevents a user-controlled
+ * substring (e.g. `"retryDelay":"60s"` embedded in a prompt that then
+ * gets echoed into a non-429 error body) from poisoning the throttle's
+ * per-model hint. Flagged as hint-poisoning by GPT + Grok in PR #20
+ * round-1 review; without this gate a single malicious prompt could
+ * seed a 60 s backoff that persists for the MCP server's lifetime.
+ *
+ * Intentionally liberal on the fallback: a non-429 error coincidentally
+ * matching `/RESOURCE_EXHAUSTED/` is benign (parser would simply fail
+ * to extract `retryDelay` for non-429 bodies and return `null`).
+ */
+export function isGemini429(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const status = (err as unknown as { status?: unknown }).status;
+  if (status === 429) return true;
+  return /RESOURCE_EXHAUSTED/.test(err.message);
 }
 
 /**

@@ -1,6 +1,6 @@
 {
   "name": "@qmediat.io/gemini-code-context-mcp",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "MCP server that gives Claude Code persistent memory of your codebase, backed by Gemini's 2M-token context. Drop-in upgrade over the abandoned gemini-mcp-tool.",
   "keywords": [
     "mcp",
