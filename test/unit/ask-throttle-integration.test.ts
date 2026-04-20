@@ -17,6 +17,7 @@
  * on a 429 will fail these tests before shipping.
  */
 
+import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -232,12 +233,15 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel', 'reserve', 'release']);
   });
 
-  it('429 error via RESOURCE_EXHAUSTED substring: reserve → recordRetryHint → cancel (T22a)', async () => {
-    // Wrapped/re-thrown 429: plain Error, no `.status` field. Substring
-    // fallback in `isGemini429` catches it.
-    const generateContent = vi
-      .fn()
-      .mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED {"retryInfo":{"retryDelay":"7s"}}'));
+  it('real ApiError 429: reserve → recordRetryHint → cancel (T22a primary path)', async () => {
+    // Real @google/genai ApiError instance with typed `.status === 429`.
+    // Gate requires BOTH prototype check + status match. This is the only
+    // supported hint-seeding path after v1.3.2 tightening.
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}',
+    });
+    const generateContent = vi.fn().mockRejectedValue(apiErr);
     const { ctx, throttleSpy } = buildCtx({ generateContent });
 
     const result = await askTool.execute({ prompt: 'q' }, ctx);
@@ -249,39 +253,76 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     expect(hintCall?.args[1]).toBe(7_000);
   });
 
-  it('429 error via ApiError.status: reserve → recordRetryHint → cancel (v1.3.2 gate)', async () => {
-    // Real @google/genai ApiError carries typed `.status: 429`. Gate
-    // catches this via the status check without needing the substring
-    // fallback. Regression guard for v1.3.2 hotfix.
-    const apiErr = Object.assign(new Error('{"error":{"details":[{"retryDelay":"4s"}]}}'), {
-      status: 429,
+  it('plain Error with RESOURCE_EXHAUSTED substring: NO hint seeded (v1.3.2 tightening)', async () => {
+    // The earlier v1.3.2 draft had a `/RESOURCE_EXHAUSTED/` substring
+    // fallback that was user-influenceable (echoed prompt content → open
+    // gate → poison). Round-2 GPT + Grok flagged it CRITICAL. Tightened
+    // gate requires the ApiError prototype — substring alone no longer
+    // opens. This test locks in the tighter contract.
+    const generateContent = vi
+      .fn()
+      .mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED {"retryInfo":{"retryDelay":"7s"}}'));
+    const { ctx, throttleSpy } = buildCtx({ generateContent });
+
+    await askTool.execute({ prompt: 'q' }, ctx);
+
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
+    expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
+  });
+
+  it('non-429 error with decoy retryDelay + RESOURCE_EXHAUSTED: NO hint (full poisoning guard)', async () => {
+    // Worst-case poisoning attempt: user prompt crafted with BOTH markers
+    // (`RESOURCE_EXHAUSTED` AND `"retryDelay":"60s"`), echoed into a
+    // non-429 error body. Under the earlier draft's substring fallback
+    // this would have seeded a 60 s hint (GPT/Grok CRITICAL bypass).
+    // Tightened gate rejects non-ApiError errors regardless of message
+    // content. Matches the attack model flagged in round-2 review.
+    const generateContent = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(
+          'Safety filter blocked: RESOURCE_EXHAUSTED detected in prompt {"retryDelay":"60s"}',
+        ),
+      );
+    const { ctx, throttleSpy } = buildCtx({ generateContent });
+
+    await askTool.execute({ prompt: 'q' }, ctx);
+
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
+    expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
+  });
+
+  it('ApiError with non-429 status + retryDelay body: NO hint (status-strict gate)', async () => {
+    // Gate requires BOTH `instanceof ApiError` AND `status === 429`.
+    // A real ApiError with a different status (500, 503, etc.) that
+    // coincidentally contains a `retryDelay` substring in its body must
+    // NOT seed a hint — otherwise future Gemini error shapes that embed
+    // retry-info fields in non-quota errors could poison the throttle.
+    // /6step finding E — marginal hardening test.
+    const apiErr = new ApiError({
+      status: 500,
+      message: '{"error":{"code":500,"details":[{"retryDelay":"15s"}]}}',
     });
     const generateContent = vi.fn().mockRejectedValue(apiErr);
     const { ctx, throttleSpy } = buildCtx({ generateContent });
 
     await askTool.execute({ prompt: 'q' }, ctx);
 
-    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'recordRetryHint', 'cancel']);
-    const hintCall = throttleSpy.calls.find((c) => c.method === 'recordRetryHint');
-    expect(hintCall?.args[1]).toBe(4_000);
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
+    expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
   });
 
-  it('non-429 error with decoy retryDelay: NO hint seeded (v1.3.2 poisoning guard)', async () => {
-    // v1.3.2 regression: user-controlled substring `"retryDelay":"60s"`
-    // echoed into a non-429 error body must NOT seed the retry-hint.
-    // Without the `isGemini429` gate this would poison the per-model
-    // bucket at clamp ceiling for the MCP server's lifetime (GPT + Grok
-    // flagged as hint-poisoning in PR #20 round-1 review).
-    const generateContent = vi
-      .fn()
-      .mockRejectedValue(
-        new Error('Safety filter blocked generation: prompt contained {"retryDelay":"60s"}'),
-      );
+  it('custom wrapper Error with status=429 but no ApiError prototype: NO hint', async () => {
+    // `Object.assign(new Error(...), { status: 429 })` can forge the
+    // status field but NOT the ApiError prototype. Gate rejects.
+    // Prevents Axios re-throws, logger wrappers, upstream HTTP 429s
+    // from unrelated services from reaching the parser.
+    const wrapped = Object.assign(new Error('{"retryDelay":"7s"}'), { status: 429 });
+    const generateContent = vi.fn().mockRejectedValue(wrapped);
     const { ctx, throttleSpy } = buildCtx({ generateContent });
 
     await askTool.execute({ prompt: 'q' }, ctx);
 
-    // Critical: recordRetryHint must NOT be in the call sequence.
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
     expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
   });

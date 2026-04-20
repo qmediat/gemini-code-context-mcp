@@ -576,15 +576,17 @@ export const askTool: ToolDefinition<AskInput> = {
       // pure-window math would compute (up to 60s+) so honouring it
       // shortens the next caller's wait.
       //
-      // Gated on `isGemini429` BEFORE parsing (v1.3.2 hotfix). Without the
-      // gate, a user-controlled prompt substring `"retryDelay":"60s"` that
-      // gets echoed into ANY non-429 error body would seed a bogus hint
-      // and freeze the per-model throttle for 60 s — a self-DoS vector
-      // flagged by GPT + Grok in PR #20 round-1 review. `isGemini429`
-      // uses `ApiError.status === 429` as the authoritative signal with
-      // a `RESOURCE_EXHAUSTED` substring fallback for wrapped / re-thrown
-      // error shapes where `.status` is lost.
-      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs((err as Error).message) : null;
+      // Gated on `isGemini429` BEFORE parsing. The predicate requires BOTH
+      // `err instanceof ApiError` (SDK-provenance marker — user-controlled
+      // content can't forge an ApiError prototype) AND `err.status === 429`
+      // (typed field from the HTTP response). The earlier v1.3.2 draft had
+      // a `RESOURCE_EXHAUSTED` substring fallback; GPT + Grok round-2
+      // review (PR #21) showed that path was user-influenceable — echoed
+      // prompt content re-opened the hint-poisoning class the gate was
+      // meant to close. Removing the fallback drops hint extraction for
+      // errors that lose the ApiError shape in transit, but production
+      // 429s always arrive as real ApiError instances.
+      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
       if (retryDelayMs !== null && resolvedModelKey !== null) {
         ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
       }

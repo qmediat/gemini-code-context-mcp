@@ -7,6 +7,7 @@
  * parity and catch any future divergence.
  */
 
+import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -197,20 +198,11 @@ describe('code.tool.ts throttle call sequence (T22b regression)', () => {
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel', 'reserve', 'release']);
   });
 
-  it('429 via RESOURCE_EXHAUSTED substring: reserve → recordRetryHint → cancel', async () => {
-    const generateContent = vi
-      .fn()
-      .mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED {"retryInfo":{"retryDelay":"12s"}}'));
-    const { ctx, throttleSpy } = buildCtx({ generateContent });
-    const result = await codeTool.execute({ task: 'x' }, ctx);
-    expect(result.isError).toBe(true);
-    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'recordRetryHint', 'cancel']);
-    const hintCall = throttleSpy.calls.find((c) => c.method === 'recordRetryHint');
-    expect(hintCall?.args[1]).toBe(12_000);
-  });
-
-  it('429 via ApiError.status: reserve → recordRetryHint → cancel (v1.3.2 gate)', async () => {
-    const apiErr = Object.assign(new Error('{"retryInfo":{"retryDelay":"6s"}}'), { status: 429 });
+  it('real ApiError 429: reserve → recordRetryHint → cancel (primary path)', async () => {
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"6s"}]}}',
+    });
     const generateContent = vi.fn().mockRejectedValue(apiErr);
     const { ctx, throttleSpy } = buildCtx({ generateContent });
     await codeTool.execute({ task: 'x' }, ctx);
@@ -219,12 +211,31 @@ describe('code.tool.ts throttle call sequence (T22b regression)', () => {
     expect(hintCall?.args[1]).toBe(6_000);
   });
 
-  it('non-429 with decoy retryDelay: NO hint (v1.3.2 poisoning guard)', async () => {
+  it('plain Error with RESOURCE_EXHAUSTED substring: NO hint (tightened gate)', async () => {
+    const generateContent = vi
+      .fn()
+      .mockRejectedValue(new Error('429 RESOURCE_EXHAUSTED {"retryInfo":{"retryDelay":"12s"}}'));
+    const { ctx, throttleSpy } = buildCtx({ generateContent });
+    await codeTool.execute({ task: 'x' }, ctx);
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
+    expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
+  });
+
+  it('non-429 with decoy retryDelay + RESOURCE_EXHAUSTED: NO hint (full poisoning guard)', async () => {
     const generateContent = vi
       .fn()
       .mockRejectedValue(
-        new Error('Validation failed: task text had {"retryDelay":"60s"} embedded'),
+        new Error('Validation failed: RESOURCE_EXHAUSTED in task text {"retryDelay":"60s"}'),
       );
+    const { ctx, throttleSpy } = buildCtx({ generateContent });
+    await codeTool.execute({ task: 'x' }, ctx);
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);
+    expect(throttleSpy.calls.find((c) => c.method === 'recordRetryHint')).toBeUndefined();
+  });
+
+  it('custom wrapper with forged status=429: NO hint (prototype check)', async () => {
+    const wrapped = Object.assign(new Error('{"retryDelay":"9s"}'), { status: 429 });
+    const generateContent = vi.fn().mockRejectedValue(wrapped);
     const { ctx, throttleSpy } = buildCtx({ generateContent });
     await codeTool.execute({ task: 'x' }, ctx);
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'cancel']);

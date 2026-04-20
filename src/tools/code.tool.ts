@@ -595,11 +595,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
       return textResult(text, structured);
     } catch (err) {
       logger.error(`code failed: ${String(err)}`);
-      // T22a + v1.3.2 hotfix — seed the throttle's retry-hint from any
-      // Gemini 429 retryInfo, gated on `isGemini429` to prevent
-      // hint-poisoning from user-controlled substrings in non-429 error
-      // bodies. Mirror of ask.tool.ts — see there for full rationale.
-      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs((err as Error).message) : null;
+      // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
+      // bodies, gated on `isGemini429` (ApiError instance + status===429)
+      // to prevent hint-poisoning. Mirror of ask.tool.ts — see there for
+      // full rationale.
+      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
       if (retryDelayMs !== null && resolvedModelKey !== null) {
         ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
       }

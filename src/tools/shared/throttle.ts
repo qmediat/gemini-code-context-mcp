@@ -57,6 +57,8 @@
  *    preflight-only; it never aborts a `generateContent` in progress.
  */
 
+import { ApiError } from '@google/genai';
+
 const WINDOW_MS = 60_000;
 
 /**
@@ -493,34 +495,41 @@ export function parseRetryDelayMs(errorMessage: string): number | null {
 }
 
 /**
- * True when the error looks like a Gemini 429 RESOURCE_EXHAUSTED — eligible
- * for retry-hint extraction. Two complementary checks:
+ * Type-guard: true iff `err` is a Gemini `@google/genai` `ApiError` with
+ * HTTP status 429 — i.e. a real upstream RESOURCE_EXHAUSTED rate-limit
+ * response, NOT any error that happens to look like one.
  *
- *   1. `@google/genai`'s `ApiError` exposes a typed `.status: number` field
- *      (see `genai.d.ts`). For real SDK 429s, `status === 429` is the
- *      authoritative signal.
- *   2. Substring fallback on `RESOURCE_EXHAUSTED` (Google's canonical
- *      status string from AIP-193) for error shapes that don't surface
- *      `.status` — wrapper errors with `cause`, logger-re-thrown plain
- *      Errors, unit-test mocks that construct plain `new Error(message)`
- *      without an ApiError shape.
+ * Two independent SDK-provenance markers are required together:
  *
- * Gating on this BEFORE `parseRetryDelayMs` prevents a user-controlled
- * substring (e.g. `"retryDelay":"60s"` embedded in a prompt that then
- * gets echoed into a non-429 error body) from poisoning the throttle's
- * per-model hint. Flagged as hint-poisoning by GPT + Grok in PR #20
- * round-1 review; without this gate a single malicious prompt could
- * seed a 60 s backoff that persists for the MCP server's lifetime.
+ *   1. `err instanceof ApiError` — the class is only instantiated by
+ *      `throwErrorIfNotOK` in the SDK's response-handling path, so
+ *      prototype-chain identity guarantees the error originates from a
+ *      real HTTP response (not a user-constructed wrapper, Axios re-throw,
+ *      test mock, or arbitrary `Error` subclass with `.status === 429`).
+ *   2. `err.status === 429` — typed field on ApiError (`genai.d.ts`
+ *      declares `status: number`), matched strictly by identity so a
+ *      stringified `"429"` from a buggy wrapper is rejected.
  *
- * Intentionally liberal on the fallback: a non-429 error coincidentally
- * matching `/RESOURCE_EXHAUSTED/` is benign (parser would simply fail
- * to extract `retryDelay` for non-429 bodies and return `null`).
+ * Why NOT a `RESOURCE_EXHAUSTED` substring fallback: the earlier v1.3.2
+ * draft included one to cover wrapped / re-thrown errors that lose the
+ * ApiError prototype. But GPT + Grok round-2 review (PR #21) flagged
+ * that the substring is user-influenceable — a prompt containing the
+ * literal `RESOURCE_EXHAUSTED` (or `FAKE_RESOURCE_EXHAUSTED`, etc. since
+ * there were no word boundaries) that echoes into any non-429 error body
+ * would re-open the exact hint-poisoning class the gate was meant to
+ * close. Removing the substring path eliminates that bypass class at
+ * the cost of dropping hint extraction for errors that lose the
+ * ApiError shape in transit — an acceptable trade since legitimate
+ * Gemini 429s come as real ApiError instances on every production path.
+ *
+ * Gating `parseRetryDelayMs` on this predicate is load-bearing: without
+ * it, user-controlled `"retryDelay":"60s"` substrings echoed into an
+ * unrelated error body would seed a 60 s throttle-wide backoff that
+ * persists for the MCP server's process lifetime (self-DoS vector).
  */
-export function isGemini429(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  const status = (err as unknown as { status?: unknown }).status;
-  if (status === 429) return true;
-  return /RESOURCE_EXHAUSTED/.test(err.message);
+export function isGemini429(err: unknown): err is ApiError {
+  if (!(err instanceof ApiError)) return false;
+  return err.status === 429;
 }
 
 /**

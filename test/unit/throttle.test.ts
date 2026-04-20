@@ -1,9 +1,17 @@
+import { ApiError } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createTpmThrottle,
   isGemini429,
   parseRetryDelayMs,
 } from '../../src/tools/shared/throttle.js';
+
+/** Build a real `@google/genai` ApiError for gate tests — construction path
+ * identical to what the SDK's `throwErrorIfNotOK` produces, so `instanceof`
+ * check works against the same prototype as production. */
+function makeApiError(status: number, message: string): ApiError {
+  return new ApiError({ status, message });
+}
 
 describe('tpm throttle', () => {
   beforeEach(() => {
@@ -629,35 +637,44 @@ describe('tpm throttle', () => {
 
   describe('isGemini429 (v1.3.2 — hint-poisoning gate)', () => {
     it('returns true for real @google/genai ApiError with status 429', () => {
-      // Shape matches the SDK's `new ApiError({message, status})` construction.
-      const apiErr = Object.assign(new Error('429 body'), { status: 429 });
-      expect(isGemini429(apiErr)).toBe(true);
+      expect(isGemini429(makeApiError(429, 'RESOURCE_EXHAUSTED'))).toBe(true);
     });
 
-    it('returns true on RESOURCE_EXHAUSTED substring fallback (no status field)', () => {
-      // Wrapper / re-thrown error loses the typed `.status`. Substring
-      // fallback on the canonical AIP-193 status keeps the gate open for
-      // legitimate 429s routed through logger/plain-Error paths.
+    it('returns false for non-ApiError Error with status=429 (custom wrapper)', () => {
+      // Round-2 GPT/Grok bypass vector: custom Error subclass or `Object.assign`
+      // into a plain Error can forge `.status=429` but NOT the ApiError
+      // prototype. Gate must reject non-ApiError instances even with
+      // matching status — prevents Axios re-throws, logger wrappers, and
+      // test mocks from reaching the parser.
+      const wrapped = Object.assign(new Error('upstream 429'), { status: 429 });
+      expect(isGemini429(wrapped)).toBe(false);
+    });
+
+    it('returns false for plain Error with RESOURCE_EXHAUSTED substring (primary bypass guard)', () => {
+      // Round-2 GPT/Grok CRITICAL: the earlier v1.3.2 draft had a
+      // `/RESOURCE_EXHAUSTED/` substring fallback that was user-influenceable
+      // (echoed prompt content → open gate → poison). Tightened gate
+      // requires the ApiError prototype — substring alone no longer opens.
       const wrapped = new Error('Gemini call failed: RESOURCE_EXHAUSTED: quota exceeded');
-      expect(isGemini429(wrapped)).toBe(true);
+      expect(isGemini429(wrapped)).toBe(false);
     });
 
-    it('returns FALSE for errors with user-controlled retryDelay substring (poisoning guard)', () => {
-      // Attack scenario: user prompt contains `"retryDelay":"60s"` and
-      // gets echoed into a non-429 error body (safety filter path, etc.).
-      // Without the gate, parseRetryDelayMs would extract the 60s and
-      // poison the throttle's per-model hint for the MCP server lifetime.
-      // v1.3.2 fix — GPT + Grok both flagged this as hint-poisoning.
-      const nonQuotaErr = new Error(
-        'Generation blocked: prompt contained {"retryDelay":"60s"} payload',
+    it('returns false for ApiError with non-429 status', () => {
+      expect(isGemini429(makeApiError(500, 'internal error'))).toBe(false);
+      expect(isGemini429(makeApiError(400, 'bad request'))).toBe(false);
+      expect(isGemini429(makeApiError(503, 'unavailable'))).toBe(false);
+    });
+
+    it('returns FALSE for user-controlled poisoning attempt (even with both markers)', () => {
+      // Attack scenario: user prompt contains BOTH `RESOURCE_EXHAUSTED` AND
+      // `"retryDelay":"60s"` substrings, echoed into a non-429 error body
+      // (safety filter, validation failure). Without the ApiError prototype
+      // check, the gate would open on substring alone. Tightened gate
+      // rejects this — user can't forge an ApiError instance.
+      const attackErr = new Error(
+        'Safety filter blocked: RESOURCE_EXHAUSTED detected in prompt {"retryDelay":"60s"}',
       );
-      expect(isGemini429(nonQuotaErr)).toBe(false);
-    });
-
-    it('returns false for status 500 / 400 / other codes', () => {
-      expect(isGemini429(Object.assign(new Error(), { status: 500 }))).toBe(false);
-      expect(isGemini429(Object.assign(new Error(), { status: 400 }))).toBe(false);
-      expect(isGemini429(Object.assign(new Error(), { status: 503 }))).toBe(false);
+      expect(isGemini429(attackErr)).toBe(false);
     });
 
     it('returns false for non-Error values', () => {
@@ -667,9 +684,13 @@ describe('tpm throttle', () => {
       expect(isGemini429(undefined)).toBe(false);
     });
 
-    it('returns false when status is a non-number', () => {
-      // Defensive: some wrappers stringify status. Gate should ignore.
-      expect(isGemini429(Object.assign(new Error(), { status: '429' }))).toBe(false);
+    it('returns false when ApiError status is a non-number (defensive)', () => {
+      // Strict `=== 429` rejects stringified status from a buggy wrapper.
+      const err = makeApiError(429, 'x');
+      // Mutate to a stringified status post-construction (not a real path,
+      // but guards against future ApiError field-type drift).
+      (err as unknown as { status: unknown }).status = '429';
+      expect(isGemini429(err)).toBe(false);
     });
   });
 
