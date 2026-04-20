@@ -124,6 +124,9 @@ export const askTool: ToolDefinition<AskInput> = {
     const model = input.model ?? ctx.config.defaultModel;
 
     let reservationId: number | null = null;
+    // `-1` signals "no reservation held" (distinct from 0 which is a valid
+    // releaseId). Mirrors the pattern used by `reservationId`.
+    let throttleReservationId = -1;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       // Workspace path validation lives INSIDE the try so a
@@ -214,13 +217,23 @@ export const askTool: ToolDefinition<AskInput> = {
             ? Math.max(0, maxOutputTokens - 1024)
             : effectiveThinkingBudget;
 
+      // Estimated input-token count drives both the daily-budget reservation
+      // (dollars) and the TPM throttle reservation (rate). Hoisted here so
+      // both consumers share one fingerprint — no drift between what the $
+      // ledger thinks we'll spend and what the rate-limiter thinks we'll
+      // send to Gemini. Matches `estimatePreCallCostUsd`'s `Math.ceil(bytes/4)`
+      // tokenisation on purpose; see `docs/FOLLOW-UP-PRS.md` T17 for the
+      // known UTF-8 / CJK undercount.
+      const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+      const estimatedInputTokens =
+        Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4);
+
       // Atomic budget reservation. Happens AFTER scan (so the estimate is
       // accurate) but BEFORE any billable upload or generateContent call.
       // Concurrent tool calls cannot all pass a pre-check and then
       // collectively overshoot the cap: `reserveBudget` uses a
       // `BEGIN IMMEDIATE` SQLite transaction that serialises check-and-insert.
       if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-        const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
         const estimateUsd = estimatePreCallCostUsd({
           model: resolved.resolved,
           workspaceBytes,
@@ -243,6 +256,23 @@ export const askTool: ToolDefinition<AskInput> = {
           );
         }
         reservationId = reserve.id;
+      }
+
+      // TPM throttle reservation. Inserts a provisional entry for this call
+      // BEFORE `prepareContext` so concurrent reserves see our footprint and
+      // back off (the in-process TOCTOU race `reserve/release/cancel` was
+      // designed to eliminate). Sleeping here — rather than after uploads —
+      // avoids burning cache-build / upload work on a call that'd then wait
+      // 60 s for the TPM window to clear. See `docs/FOLLOW-UP-PRS.md` T22.
+      if (ctx.config.tpmThrottleLimit > 0) {
+        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
+        throttleReservationId = reservation.releaseId;
+        if (reservation.delayMs > 0) {
+          emitter.emit(
+            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
+          );
+          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        }
       }
 
       const systemPromptHash = createHash('sha256')
@@ -420,6 +450,16 @@ export const askTool: ToolDefinition<AskInput> = {
         typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0;
       const thinking = typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0;
 
+      // Finalise the throttle reservation with Gemini's actual
+      // `promptTokenCount` — includes cached tokens, which DO count against
+      // the per-minute quota (empirically confirmed 2026-04-20). If actual
+      // < estimate, subsequent reserves see the freed headroom; if >, they
+      // back off accordingly.
+      if (throttleReservationId !== -1) {
+        ctx.throttle.release(throttleReservationId, inputTotal);
+        throttleReservationId = -1;
+      }
+
       const cost = estimateCostUsd({
         model: resolved.resolved,
         uncachedInputTokens: uncached,
@@ -515,6 +555,17 @@ export const askTool: ToolDefinition<AskInput> = {
           );
         }
         reservationId = null;
+      }
+      // Drop the TPM reservation on any failure path. If Gemini actually
+      // consumed quota server-side before failing, our window under-counts
+      // — acceptable: a subsequent 429 with `retryDelay` would re-seed
+      // via `recordRetryHint` (wiring of that hint-parse is tracked in
+      // T22a follow-up, not shipped here). The alternative (release with
+      // estimate) over-counts when the call never reached Gemini at all,
+      // which is more common.
+      if (throttleReservationId !== -1) {
+        ctx.throttle.cancel(throttleReservationId);
+        throttleReservationId = -1;
       }
       return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {

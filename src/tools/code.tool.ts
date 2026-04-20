@@ -171,6 +171,8 @@ export const codeTool: ToolDefinition<CodeInput> = {
     const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
 
     let reservationId: number | null = null;
+    // `-1` signals "no reservation held". Mirror of ask.tool.ts.
+    let throttleReservationId = -1;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       // Workspace validation inside try → reported as a regular tool error
@@ -245,11 +247,16 @@ export const codeTool: ToolDefinition<CodeInput> = {
             )
           : effectiveThinkingBudget;
 
+      // Shared input-token fingerprint for budget + TPM throttle (see
+      // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
+      // used by `estimatePreCallCostUsd`).
+      const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+      const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
+
       // Atomic budget reservation — see ask.tool.ts for the full rationale.
       // Estimate includes the thinking budget (billed as output tokens on Pro)
       // PLUS the candidate output cap.
       if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-        const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
         const estimateUsd = estimatePreCallCostUsd({
           model: resolved.resolved,
           workspaceBytes,
@@ -272,6 +279,19 @@ export const codeTool: ToolDefinition<CodeInput> = {
           );
         }
         reservationId = reserve.id;
+      }
+
+      // TPM throttle — mirror of ask.tool.ts. Reserve BEFORE prepareContext
+      // so an over-limit sleep doesn't waste upload/cache-build work.
+      if (ctx.config.tpmThrottleLimit > 0) {
+        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
+        throttleReservationId = reservation.releaseId;
+        if (reservation.delayMs > 0) {
+          emitter.emit(
+            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
+          );
+          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        }
       }
 
       const systemPromptHash = createHash('sha256')
@@ -453,6 +473,13 @@ export const codeTool: ToolDefinition<CodeInput> = {
         typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0;
       const thinking = typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0;
 
+      // Finalise TPM throttle reservation with actual input tokens
+      // (cached + uncached — both count toward Gemini's per-minute quota).
+      if (throttleReservationId !== -1) {
+        ctx.throttle.release(throttleReservationId, inputTotal);
+        throttleReservationId = -1;
+      }
+
       const cost = estimateCostUsd({
         model: resolved.resolved,
         uncachedInputTokens: uncached,
@@ -555,6 +582,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
           );
         }
         reservationId = null;
+      }
+      // Drop TPM reservation on failure — mirror of ask.tool.ts rationale.
+      if (throttleReservationId !== -1) {
+        ctx.throttle.cancel(throttleReservationId);
+        throttleReservationId = -1;
       }
       return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
