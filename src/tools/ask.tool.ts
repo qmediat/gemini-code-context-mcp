@@ -27,6 +27,7 @@ import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/c
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 
 const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
@@ -56,52 +57,9 @@ const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
  */
 const THINKING_BUDGET_MODEL_DEFAULT = null;
 
-/**
- * Accepted values for `thinkingLevel`. Uppercased to match `ThinkingLevel`
- * enum members in `@google/genai` — we map directly without case changes.
- * `THINKING_LEVEL_UNSPECIFIED` is deliberately excluded: it's the SDK's
- * "no value set" sentinel, and passing it is semantically equivalent to
- * omitting the field. Callers who want model-native behaviour should just
- * omit `thinkingLevel` entirely.
- *
- * Per Google's Gemini 3 guide (ai.google.dev/gemini-api/docs/gemini-3):
- *   - Gemini 3 Pro supports LOW / MEDIUM / HIGH (not MINIMAL); default HIGH.
- *   - Gemini 3 Flash supports all four; Flash-Lite defaults to MINIMAL.
- *   - Gemini 2.5 family does NOT support `thinkingLevel` — use `thinkingBudget`.
- * We accept all four values at the schema boundary and let Gemini reject
- * unsupported combinations at request time, so the MCP surface stays stable
- * across model rollouts.
- */
-const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const;
-
-/**
- * Conservative per-tier thinking-token reservations for cost estimation.
- *
- * Google does not publish the exact per-tier token budgets Gemini consumes
- * for each `thinkingLevel`. These numbers are heuristic upper bounds based
- * on Google's documented "MINIMAL ≈ near-zero", "HIGH ≈ up to model's
- * thinking limit" guidance (ai.google.dev/gemini-api/docs/thinking). Using
- * tier-aware values (rather than always-worst-case) prevents
- * `GEMINI_DAILY_BUDGET_USD` from false-rejecting a long sequence of
- * `MINIMAL` calls where the real spend is ≤1% of a worst-case reservation.
- *
- * If Gemini actually consumes MORE than we reserved, `finalizeBudgetReservation`
- * writes the measured cost over the estimate — the cap remains a true upper
- * bound across *completed* calls; tiered reservations only affect preflight
- * acceptance. A call that genuinely exceeds the tier's reserve will succeed
- * (Gemini honours whatever it decides to spend); a subsequent call will see
- * the larger measured cost in the budget ledger.
- *
- * HIGH intentionally maps to null → the caller code substitutes
- * `maxOutputTokens - 1024` at call time so the value tracks the model's
- * actual output cap.
- */
-export const THINKING_LEVEL_RESERVE: Record<(typeof THINKING_LEVELS)[number], number | null> = {
-  MINIMAL: 512,
-  LOW: 2_048,
-  MEDIUM: 4_096,
-  HIGH: null,
-};
+// `THINKING_LEVELS` + `THINKING_LEVEL_RESERVE` live in `./shared/thinking.ts`
+// so both `ask` and `code` share a single source of truth — when Google
+// publishes per-tier token budgets, one edit propagates to both tools.
 
 export const askInputSchema = z
   .object({

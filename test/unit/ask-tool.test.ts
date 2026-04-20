@@ -13,7 +13,8 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { THINKING_LEVEL_RESERVE, askInputSchema } from '../../src/tools/ask.tool.js';
+import { askInputSchema } from '../../src/tools/ask.tool.js';
+import { THINKING_LEVEL_RESERVE } from '../../src/tools/shared/thinking.js';
 
 describe('ask input schema — thinkingBudget', () => {
   it('accepts omitted thinkingBudget (runtime applies the -1 default)', () => {
