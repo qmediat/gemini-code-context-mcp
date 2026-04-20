@@ -370,13 +370,13 @@ Empirically confirmed aggregation quirk: `gemini-pro-latest` (our `latest-pro` a
 
 ---
 
-## T22a. Wire up Gemini 429 `retryInfo.retryDelay` → `recordRetryHint`
+## ~~T22a.~~ ✅ SHIPPED v1.3.1 — Gemini 429 `retryInfo.retryDelay` → `recordRetryHint`
 
-(See scope below. Ship as a standalone v1.3.x patch whenever a maintainer has the hour.)
+`parseRetryDelayMs` exported from `src/tools/shared/throttle.ts`; wired into `ask.tool.ts` + `code.tool.ts` catch blocks. Closes GPT round-2 "always-cancel under-throttle" finding.
 
 ---
 
-## T22b. Ask/code integration tests for throttle lifecycle
+## ~~T22b.~~ ✅ SHIPPED v1.3.1 — Ask/code integration tests for throttle lifecycle
 
 **Source:** GPT round-2 review on PR #19 (2026-04-20). Flagged as IMPORTANT; accepted as LOW/deferred by `/6step`.
 
@@ -394,7 +394,9 @@ Empirically confirmed aggregation quirk: `gemini-pro-latest` (our `latest-pro` a
 
 ---
 
-## T23a. Narrow `ToolResult.structuredContent` type to match runtime invariant
+## ~~T23a.~~ ✅ SHIPPED v1.3.1 — Narrow `ToolResult.structuredContent` type to match runtime invariant
+
+New `TextToolResult = ToolResult & { structuredContent: Record<string, unknown> }` type; `textResult` + `errorResult` return this narrower type. Scope below kept for historical reference.
 
 **Source:** GPT round-1 and round-2 review on PR #19 (2026-04-20). NIT-level cosmetic typing drift.
 

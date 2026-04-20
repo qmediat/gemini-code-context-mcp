@@ -420,6 +420,56 @@ function sanitizeTokens(n: number): number {
 }
 
 /**
+ * Floor clamp (ms) for a parsed retry-hint. Values below this usually
+ * indicate a Gemini-side instantaneous retry suggestion that, combined with
+ * our window math, would cause tight-loop retries without meaningful
+ * backoff. Round up to 1 s so the hint contributes a perceivable delay.
+ */
+const RETRY_HINT_MIN_MS = 1_000;
+/**
+ * Ceiling clamp (ms) for a parsed retry-hint. Caps malformed or future-
+ * format values that could otherwise poison the hint (e.g. Gemini some-day
+ * returning `"retryDelay": "3600s"` under a tier-upgrade rollout). Aligned
+ * with the throttle's 60 s window since longer waits would be better
+ * served by the caller giving up and retrying fresh.
+ */
+const RETRY_HINT_MAX_MS = 60_000;
+
+/**
+ * Extract a Gemini 429 `retryInfo.retryDelay` value from the `@google/genai`
+ * `ApiError.message` body. Gemini surfaces the retry hint in a structured
+ * error body that gets stringified into the Error message — there is no
+ * typed field on `ApiError` for it (as of `@google/genai@1.50.x`, the
+ * public surface is just `{ status: number; message: string }`). We regex
+ * the "retryDelay" value rather than JSON-parse the whole body because the
+ * body format has varied across Gemini API versions and we don't want a
+ * schema drift to silently disable the hint extraction.
+ *
+ * Returns `null` when no hint is present or parsing fails (malformed
+ * body, missing `retryDelay` field, non-numeric value). Returns a value
+ * in `[RETRY_HINT_MIN_MS, RETRY_HINT_MAX_MS]` on a successful parse.
+ *
+ * Example error body shape that this extracts from:
+ * ```
+ * {"error":{...,"details":[...,{"@type":"...RetryInfo","retryDelay":"2s"}]}}
+ * ```
+ * Only the `"retryDelay":"<seconds>s"` substring is matched — we don't
+ * walk the details array. This is deliberately lenient.
+ */
+const RETRY_DELAY_REGEX = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/;
+export function parseRetryDelayMs(errorMessage: string): number | null {
+  if (typeof errorMessage !== 'string' || errorMessage.length === 0) return null;
+  const match = errorMessage.match(RETRY_DELAY_REGEX);
+  if (!match || !match[1]) return null;
+  const seconds = Number.parseFloat(match[1]);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  const ms = Math.round(seconds * 1000);
+  if (ms < RETRY_HINT_MIN_MS) return RETRY_HINT_MIN_MS;
+  if (ms > RETRY_HINT_MAX_MS) return RETRY_HINT_MAX_MS;
+  return ms;
+}
+
+/**
  * Insert `entry` into `entries` at the position that keeps the array
  * sorted ascending by `tsMs`. Binary-search for the insertion point;
  * `splice` to insert. O(log n) compares + O(n) shift, same asymptotic

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-04-20
+
+Patch release closing the three LOW/NIT follow-ups deferred from v1.3.0's multi-round review cycle (T22a retry-hint wiring, T22b ask/code integration tests, T23a helper return-type narrowing). No user-visible API breaks; smallest possible diff that moves GPT's round-2 "still live" findings to closed.
+
+### Added
+
+- **T22a — Gemini 429 `retryInfo.retryDelay` feeds the TPM throttle.** New exported helper `parseRetryDelayMs(errorMessage: string): number | null` in `src/tools/shared/throttle.ts` extracts the retry-delay hint from `@google/genai`'s `ApiError.message` body (regex-based, tolerant of schema drift). Both `ask.tool.ts` and `code.tool.ts` catch blocks now call it and, on a successful parse, `ctx.throttle.recordRetryHint(resolvedModel, retryDelayMs)` BEFORE cancelling the reservation. Google's hint is typically 2–16s — shorter than our pure-window math would compute (up to 60s) — so honouring it shortens the next caller's wait when Gemini actually 429'd under our preflight. Clamped to `[1s, 60s]` for safety against malformed or future-format values.
+- **T22b — ask/code throttle call-sequence regression tests.** New `test/unit/ask-throttle-integration.test.ts` (6 tests) and `test/unit/code-throttle-integration.test.ts` (5 tests). Mock the leaf dependencies (workspace-scanner, workspace-validation, cache-manager, resolveModel, Gemini client, manifest) and exercise `execute()` end-to-end to assert `ctx.throttle` call ordering for: happy path (`reserve → release`), non-stale error (`reserve → cancel`), stale-cache retry (`reserve → cancel → reserve → release` — the round-3 regression fix), 429 with retry-info (`reserve → recordRetryHint → cancel`), and disabled-throttle (no throttle calls). Locks in the v1.3.0 round-2/round-3 integration invariants so a future refactor can't silently regress them.
+
+### Changed
+
+- **T23a — `textResult` / `errorResult` return narrower `TextToolResult`** type (`ToolResult & { structuredContent: Record<string, unknown> }`). `ToolResult.structuredContent` stays optional on the interface (for any future caller that legitimately omits it), but the two standard helpers now advertise what they actually deliver. Consumers doing `result.structuredContent.responseText` no longer need an optional-chain to satisfy the type checker. Purely additive at the type level — runtime behaviour unchanged.
+- `resolvedModelKey` is now captured in `ask.tool.ts` / `code.tool.ts` immediately after `resolveModel` so the outer catch's `recordRetryHint` call uses the SAME canonical model string that `reserve` used. Using the request alias (`"latest-pro-thinking"`) instead of the resolved ID (`"gemini-3-pro-preview"`) would seed the hint into a different per-model bucket than the one `reserve` consulted.
+
+### Tests
+
+- 50 throttle tests (up from 41 — 9 new `parseRetryDelayMs` tests covering integer-seconds, fractional-seconds, floor/ceil clamp, missing field, malformed body, negative/zero, empty/non-string input, and end-to-end seeding via `recordRetryHint`).
+- 11 new integration tests across the two new test files above.
+- Total PR tests: 196 (up from 185 in v1.3.0). Lint + typecheck + build all green on Node 22 (matching CI).
+
 ## [1.3.0] — 2026-04-20
 
 Reviewer-workflow unblock release. Two fixes that turn the MCP from "works on the happy path" into "actually usable for back-to-back `/coderev`-style pipelines": a client-side TPM (tokens-per-minute) throttle preflight, and a wire-format fix that lets MCP sub-agents extract tool output text.

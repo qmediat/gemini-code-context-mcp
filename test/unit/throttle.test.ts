@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createTpmThrottle } from '../../src/tools/shared/throttle.js';
+import { createTpmThrottle, parseRetryDelayMs } from '../../src/tools/shared/throttle.js';
 
 describe('tpm throttle', () => {
   beforeEach(() => {
@@ -534,6 +534,67 @@ describe('tpm throttle', () => {
       const b = throttle.reserve('gemini-3-pro', 20_000);
       // Window still has 70k from `a`. 70+20=90>80 → must delay.
       expect(b.delayMs).toBeGreaterThan(0);
+    });
+  });
+
+  describe('parseRetryDelayMs (T22a — 429 retryInfo extraction)', () => {
+    it('parses integer-seconds retry delay into ms', () => {
+      const body = '{"error":{"details":[{"@type":"RetryInfo","retryDelay":"2s"}]}}';
+      expect(parseRetryDelayMs(body)).toBe(2_000);
+    });
+
+    it('parses fractional-seconds retry delay', () => {
+      const body = '{"error":{"details":[{"retryDelay":"15.7s"}]}}';
+      expect(parseRetryDelayMs(body)).toBe(15_700);
+    });
+
+    it('clamps sub-second values up to the minimum (1s)', () => {
+      // Gemini occasionally returns sub-second retryDelay values that would
+      // cause tight-loop retries; floor-clamp to 1s so the hint is useful.
+      const body = '"retryDelay":"0.3s"';
+      expect(parseRetryDelayMs(body)).toBe(1_000);
+    });
+
+    it('clamps values above 60s down to the maximum (60s)', () => {
+      const body = '"retryDelay":"3600s"';
+      expect(parseRetryDelayMs(body)).toBe(60_000);
+    });
+
+    it('returns null when retryDelay is absent', () => {
+      expect(parseRetryDelayMs('{"error":{"message":"generic 500"}}')).toBeNull();
+    });
+
+    it('returns null on malformed JSON-like input missing the seconds suffix', () => {
+      // `"retryDelay":"10"` (no trailing `s`) — Gemini always uses the `Ns`
+      // suffix format; a missing suffix is a schema drift and we ignore it
+      // rather than guess.
+      expect(parseRetryDelayMs('"retryDelay":"10"')).toBeNull();
+    });
+
+    it('returns null on negative / zero values', () => {
+      expect(parseRetryDelayMs('"retryDelay":"0s"')).toBeNull();
+      expect(parseRetryDelayMs('"retryDelay":"-1s"')).toBeNull();
+    });
+
+    it('returns null on empty / non-string input', () => {
+      expect(parseRetryDelayMs('')).toBeNull();
+      // Runtime-guard exotic inputs — TS would complain but a JS caller could
+      // hand us anything via `err.message` type-coerced.
+      expect(parseRetryDelayMs(undefined as unknown as string)).toBeNull();
+      expect(parseRetryDelayMs(null as unknown as string)).toBeNull();
+    });
+
+    it('seeds the throttle via recordRetryHint — end-to-end use case', () => {
+      // The intended integration path: ask/code catch block parses the
+      // error message and feeds the hint into the throttle.
+      const throttle = createTpmThrottle(80_000);
+      const errorBody = '{"retryInfo":{"retryDelay":"8s"}}';
+      const delay = parseRetryDelayMs(errorBody);
+      expect(delay).toBe(8_000);
+      throttle.recordRetryHint('gemini-3-pro', delay as number);
+      // Next reserve must back off by at least the hint.
+      const r = throttle.reserve('gemini-3-pro', 1);
+      expect(r.delayMs).toBeGreaterThanOrEqual(7_990); // -10ms test-clock slack
     });
   });
 
