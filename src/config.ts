@@ -62,6 +62,19 @@ function readFloatEnv(name: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
+/**
+ * Parse a boolean env var permissively. Accepts `true`/`1`/`yes`/`on`
+ * case-insensitively as `true`; everything else (including unset) is `false`.
+ * Strict equality to `'true'` (our pre-v1.4.0 pattern) surprised operators
+ * who copied values like `TRUE` / `1` from other docs.
+ */
+function readBoolEnv(name: string): boolean {
+  const raw = process.env[name];
+  if (!raw) return false;
+  const v = raw.trim().toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+}
+
 export function loadConfig(): Config {
   const auth = resolveAuth();
 
@@ -93,8 +106,8 @@ export function loadConfig(): Config {
     cacheMinTokens: readIntEnv('GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS', 1024),
     maxFilesPerWorkspace: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILES', 2000),
     maxFileSizeBytes: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILE_SIZE', 1_000_000),
-    telemetryEnabled: process.env.GEMINI_CODE_CONTEXT_TELEMETRY === 'true',
+    telemetryEnabled: readBoolEnv('GEMINI_CODE_CONTEXT_TELEMETRY'),
     tpmThrottleLimit,
-    forceMaxOutputTokens: process.env.GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT === 'true',
+    forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
   };
 }

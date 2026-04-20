@@ -36,12 +36,19 @@ import {
  * a model as text-gen but its ID matches one of these markers, we log and
  * demote it to `unknown` — shouldn't fire in practice with the current rule
  * set but catches taxonomy bugs before they reach production calls.
+ *
+ * `vision` intentionally excluded: Google previously shipped `gemini-pro-vision`
+ * as a legitimate text-reasoning model (image-INPUT, text-OUTPUT), and a future
+ * `gemini-N-pro-vision` text model would get wrongly demoted. The taxonomy
+ * already covers true image-OUTPUT families (`/^nano-banana/`, `/-image(?:-|$)/`,
+ * `/^imagen-/`) — `vision` as a substring is not a reliable output-type signal.
+ * `audio` dropped for the same reason: the taxonomy anchors on `native-audio`
+ * / `tts` / `lyria` with token boundaries; bare `audio` risks demoting a future
+ * legitimate `gemini-N-pro-audio-understanding` text model.
  */
 const NON_TEXT_GEN_MARKERS = [
   'image',
   'tts',
-  'vision',
-  'audio',
   'banana',
   'lyria',
   'research',
@@ -231,8 +238,11 @@ export function listAliases(): readonly Alias[] {
 
 /**
  * Alias contract for documentation / diagnostics. Stable public API —
- * `docs/models.md` is generated from this surface. Returning a fresh copy
- * per call so consumers can't mutate module state.
+ * kept in parity with `docs/models.md`. Returning a fresh copy per call so
+ * consumers can't mutate module state — even though the source array is
+ * `as const` (`readonly` at type level), a TypeScript cast would let a
+ * consumer mutate the live ALIASES table and corrupt future resolver calls.
+ * Spread-copy `[...spec.acceptedCategories]` makes the boundary explicit.
  */
 export function describeAlias(alias: Alias): {
   readonly acceptedCategories: readonly ModelCategory[];
@@ -242,7 +252,7 @@ export function describeAlias(alias: Alias): {
 } {
   const spec = ALIASES[alias];
   return {
-    acceptedCategories: spec.acceptedCategories,
+    acceptedCategories: [...spec.acceptedCategories],
     description: spec.description,
     requiresThinking: alias === 'latest-pro-thinking',
     requiresVision: alias === 'latest-vision',

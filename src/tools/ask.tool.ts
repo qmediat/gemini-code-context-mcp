@@ -73,7 +73,7 @@ export const askInputSchema = z
       .string()
       .optional()
       .describe(
-        "Model alias ('latest-pro', 'latest-flash', 'latest-lite') or literal model ID. Defaults to the configured default.",
+        "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash', 'latest-lite', 'latest-vision') or literal model ID. Defaults to the configured default.",
       ),
     includeGlobs: z
       .array(z.string())
@@ -217,6 +217,24 @@ export const askTool: ToolDefinition<AskInput> = {
       // named const keeps them in lockstep and makes future additions hard
       // to forget.
       const usingThinkingLevel = input.thinkingLevel !== undefined;
+
+      // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
+      // is carved out of the candidate-output allowance). Reject the call
+      // early when the caller's `maxOutputTokens` leaves no headroom for a
+      // positive `thinkingBudget`, rather than silently clamping to 0 —
+      // clamp-to-0 would make Gemini 3 Pro 400 ("thinking disabled"
+      // rejected) and mislead the caller about the actual cause (PR #22
+      // round-3 review finding #C). Minimum answer reserve: 1024 tokens.
+      if (
+        input.thinkingBudget !== undefined &&
+        input.thinkingBudget > 0 &&
+        input.maxOutputTokens !== undefined &&
+        effectiveOutputCap < input.thinkingBudget + 1024
+      ) {
+        return errorResult(
+          `ask: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
+        );
+      }
 
       // Normalise thinkingBudget:
       //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)

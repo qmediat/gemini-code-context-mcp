@@ -84,41 +84,56 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // Lyria = Google's music generation family (`lyria-3-pro-preview` etc.).
   { pattern: /^lyria-/i, category: 'audio-generation', costTier: 'premium' },
   // TTS variants — any model with `-tts` suffix or `text-to-speech` in ID.
-  { pattern: /-tts(?:-|$)/i, category: 'audio-generation', costTier: 'standard' },
-  { pattern: /text-to-speech/i, category: 'audio-generation', costTier: 'standard' },
+  // Token-boundary anchoring prevents `-tts-like-foo` false positives.
+  { pattern: /(?:^|-)tts(?:-|$)/i, category: 'audio-generation', costTier: 'standard' },
+  { pattern: /(?:^|-)text-to-speech(?:-|$)/i, category: 'audio-generation', costTier: 'standard' },
   // Native-audio variants (`gemini-2.5-flash-native-audio-preview-*`) —
   // dialog-native audio generation. Shares `flash` token with text-gen
   // models; must classify before the flash rule.
-  { pattern: /native-audio/i, category: 'audio-generation', costTier: 'standard' },
+  { pattern: /(?:^|-)native-audio(?:-|$)/i, category: 'audio-generation', costTier: 'standard' },
 
   // === Video generation ===
   // Veo = Google's video generation family (`veo-3`, `veo-3.1` etc.).
   { pattern: /^veo-/i, category: 'video-generation', costTier: 'premium' },
 
+  // === Multimodal Live API (bidirectional streaming) ===
+  // `gemini-*-live-*` (e.g. `gemini-2.0-flash-live-001`) uses the
+  // `bidiGenerateContent` WebRTC/streaming API, NOT `generateContent`.
+  // Dispatching a text prompt here returns 400 or an unexpected response
+  // shape. Must classify before the flash/pro text rules to avoid
+  // admission as text-fast. `agent` category signals "not drop-in
+  // replaceable with a text model" (flagged by GPT PR #22 review).
+  { pattern: /(?:^|-)live(?:-|$)/i, category: 'agent', costTier: 'standard' },
+
   // === Embeddings ===
-  { pattern: /embedding/i, category: 'embedding', costTier: 'budget' },
+  // Token-boundary anchoring: matches `text-embedding-004`,
+  // `gemini-embedding-001` etc., rejects hypothetical `foo-embedding-like-helper`.
+  { pattern: /(?:^|-)embedding(?:-|$)/i, category: 'embedding', costTier: 'budget' },
   { pattern: /^text-embedding/i, category: 'embedding', costTier: 'budget' },
 
   // === Agents (not drop-in replaceable) ===
   // Deep Research — a specialised research agent, not a conversational model.
-  { pattern: /deep-research/i, category: 'agent', costTier: 'premium' },
-  { pattern: /-research(?:-|$)/i, category: 'agent', costTier: 'premium' },
+  { pattern: /(?:^|-)deep-research(?:-|$)/i, category: 'agent', costTier: 'premium' },
+  { pattern: /(?:^|-)research(?:-|$)/i, category: 'agent', costTier: 'premium' },
   // `customtools` variants require a `tools` param on every call; mis-used
   // as a conversational model returns errors.
-  { pattern: /customtools/i, category: 'agent', costTier: 'premium' },
+  { pattern: /(?:^|-)customtools(?:-|$)/i, category: 'agent', costTier: 'premium' },
 
   // === Text tiers — AFTER all specialisations above ===
-  // Lite (budget / smallest). Matches `gemini-3-flash-lite`, `gemini-flash-lite`.
+  // Lite (budget / smallest). Matches `gemini-3-flash-lite`, `gemini-flash-lite`,
+  // `flash-lite`. The single `-lite` rule is a superset of the previously
+  // also-listed `flash-lite` rule — the latter was unreachable dead code
+  // (Grok PR #22 review finding F); removed.
   { pattern: /-lite(?:-|$)/i, category: 'text-lite', costTier: 'budget' },
-  { pattern: /flash-lite/i, category: 'text-lite', costTier: 'budget' },
   // Flash (standard speed tier).
   { pattern: /^gemini-.*-flash/i, category: 'text-fast', costTier: 'standard' },
   { pattern: /-flash(?:-|$)/i, category: 'text-fast', costTier: 'standard' },
   // Pro (reasoning / premium tier). Only reaches here if no specialisation
-  // above claimed the model.
+  // above claimed the model. The `^gemini-pro` rule previously at the end
+  // of this list was unreachable because `/-pro(?:-|$)/i` already matches
+  // `gemini-pro` (Grok PR #22 review finding K); removed.
   { pattern: /^gemini-.*-pro/i, category: 'text-reasoning', costTier: 'premium' },
   { pattern: /-pro(?:-|$)/i, category: 'text-reasoning', costTier: 'premium' },
-  { pattern: /^gemini-pro/i, category: 'text-reasoning', costTier: 'premium' },
 ];
 
 /**
@@ -157,31 +172,38 @@ export function extractCapabilityFlags(
   modelId: string,
   sdkMetadata: { readonly supportsThinking: boolean },
 ): CapabilityFlags {
+  // Single categorisation — CATEGORY_RULES runs a regex loop on every call,
+  // and capability derivation previously invoked `categorizeModel` four
+  // times per call. Classify once, then derive flags from the local
+  // `category` variable (Copilot PR #22 review).
+  const category = categorizeModel(modelId);
   return {
     supportsThinking: sdkMetadata.supportsThinking,
     // Most current Gemini text models accept image input (multimodal by
     // default). Only *-lite variants and embedding models don't. Heuristic
     // matches Google's documented vision support table as of 2026-04.
     supportsVision:
-      categorizeModel(modelId) !== 'embedding' &&
-      categorizeModel(modelId) !== 'audio-generation' &&
-      categorizeModel(modelId) !== 'video-generation' &&
+      category !== 'embedding' &&
+      category !== 'audio-generation' &&
+      category !== 'video-generation' &&
       !/-lite(?:-|$)/i.test(modelId),
     // Code execution is an explicit tool flag on generateContent; all
     // current Gemini 2.5+/3.x text models support it. Exclude image /
     // audio / video variants and embeddings.
     supportsCodeExecution:
-      categorizeModel(modelId) === 'text-reasoning' ||
-      categorizeModel(modelId) === 'text-fast' ||
-      categorizeModel(modelId) === 'text-lite',
+      category === 'text-reasoning' || category === 'text-fast' || category === 'text-lite',
     costTier: costTierOf(modelId),
   };
 }
 
 /**
  * True iff `category` is one of the three text-gen tiers — the categories
- * that `ask` / `code` tools accept for their resolver calls. Used by the
- * resolver to validate `requiredCategory` against our tool surface.
+ * that `ask` / `code` tools accept via their `requiredCategory` option.
+ * Exposed for external diagnostics / tooling (`docs/models.md` alias table
+ * derivations, integration tests); the resolver itself does an explicit
+ * `requiredCategory.includes(...)` check per call rather than routing
+ * through this helper, since `requiredCategory` can legitimately be a
+ * narrower subset (`code` → `['text-reasoning']` only).
  */
 export function isTextGenCategory(category: ModelCategory): boolean {
   return category === 'text-reasoning' || category === 'text-fast' || category === 'text-lite';

@@ -254,6 +254,22 @@ export const codeTool: ToolDefinition<CodeInput> = {
       // Only meaningful on the thinkingBudget path — when the caller uses
       // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
       // value is ignored by the thinkingConfig builder below.
+      //
+      // Early-reject when the caller's per-call `maxOutputTokens` can't fit
+      // an explicit positive `thinkingBudget` + 1024-token answer reserve.
+      // Silently clamping to 0 would make Gemini 3 Pro 400 on a
+      // "thinking disabled" error and obscure the real mismatch (PR #22
+      // round-3 review finding #C).
+      if (
+        input.thinkingBudget !== undefined &&
+        input.thinkingBudget > 0 &&
+        input.maxOutputTokens !== undefined &&
+        effectiveOutputCap < input.thinkingBudget + 1024
+      ) {
+        return errorResult(
+          `code: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
+        );
+      }
       const effectiveThinkingBudget =
         thinkingBudget !== undefined && thinkingBudget > 0
           ? Math.max(0, Math.min(thinkingBudget, effectiveOutputCap - 1024))

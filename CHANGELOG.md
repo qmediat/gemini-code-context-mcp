@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **Why this is a minor bump (1.4.0 not 1.3.3)**: the `ResolvedModel` type exported from `src/types.ts` gains two required fields (`category`, `capabilities`). Internal consumers compile cleanly; external TS consumers (none documented) would see the addition as type-surface widening. Runtime behaviour is strictly safer — existing aliases work identically for legitimate use, and the only callers that see new behaviour are those passing an image-gen / audio-gen model ID where a text-gen model was expected (pre-v1.4.0 silently dispatched; now throws `ModelCategoryMismatchError` with an actionable message).
 
+### Breaking
+
+Fail-fast resolver replaces v1.3.x's silent cross-category fallback. Three scenarios that previously produced (possibly mis-routed) calls now throw a clear error:
+
+1. **Literal model ID not in registry** — pre-v1.4.0: silent swap to `latest-pro`. v1.4.0: `Model 'X' is not available for this API key. Pass an alias (…) or a literal ID available on your tier.`
+2. **Alias has no model in its required category** — pre-v1.4.0: cascade `latest-pro-thinking` → `latest-pro` → `latest-flash` → `latest-lite` → first model. v1.4.0: `Alias 'X' could not be resolved — no model in category [...] is available for this API key.`
+3. **Literal model ID in the wrong category for the tool** — pre-v1.4.0: dispatched anyway (e.g. `code({ model: 'nano-banana-pro-preview' })` silently hit an image-gen model at ~10× text pricing). v1.4.0: `ModelCategoryMismatchError: Model 'X' is in category 'image-generation', but this tool requires: text-reasoning.`
+
+Callers on non-default tiers where the required-category list was empty were the ones most likely to hit scenario 2 silently pre-v1.4.0. If your workflow depended on the implicit cross-category fall-through, pass an explicit model ID in the correct category or upgrade your Gemini tier (https://aistudio.google.com/apikey).
+
 ### Added
 
 - **Output-cap three-layer precedence** (replaces the v1.3.x hard-coded self-caps `ASK_MAX_OUTPUT_TOKENS_DEFAULT=8192` / `CODE_MAX_OUTPUT_TOKENS_DEFAULT=32768` that artificially limited responses below the model's advertised capacity):

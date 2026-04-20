@@ -23,6 +23,11 @@ coverage/
 *.swo
 *~
 
+# AI assistant local scratch (private notes, per-machine settings)
+.claude/settings.local.json
+.claude/local-*.md
+.claude/INTERNAL-*.md
+
 # OS
 .DS_Store
 Thumbs.db
