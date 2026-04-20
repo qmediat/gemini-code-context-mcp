@@ -90,6 +90,14 @@ export const codeInputSchema = z
       .boolean()
       .optional()
       .describe('Request OLD/NEW diff format in the response (default: true).'),
+    maxOutputTokens: z
+      .number()
+      .int()
+      .min(1)
+      .optional()
+      .describe(
+        "Per-call opt-in cap on response length (tokens). OMIT for auto — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value to bound a specific call (e.g. `maxOutputTokens: 16384` for a tight code-review summary). Values larger than the resolved model's limit are clamped. Operators who want EVERY call at full model capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level — that env override is still beaten by this per-call field.",
+      ),
     includeGlobs: z.array(z.string()).optional(),
     excludeGlobs: z.array(z.string()).optional(),
   })
@@ -192,7 +200,16 @@ export const codeTool: ToolDefinition<CodeInput> = {
       }
 
       emitter.emit(`resolving model '${modelRequest}'…`);
-      const resolved = await resolveModel(modelRequest, ctx.client);
+      // `code` is strictly text-reasoning — coding tasks genuinely benefit
+      // from reasoning tokens, and dispatching to fast/lite tiers would
+      // degrade output quality without meaningful cost savings. Crucially:
+      // this category gate prevents image-gen / audio-gen / agent models
+      // (which may share `pro` tokens with text models in Google's registry)
+      // from reaching `generateContent` with a code-review prompt — the
+      // primary motivation for the v1.4.0 taxonomy work.
+      const resolved = await resolveModel(modelRequest, ctx.client, {
+        requiredCategory: ['text-reasoning'],
+      });
       resolvedModelKey = resolved.resolved;
 
       emitter.emit(`scanning workspace ${workspaceRoot}…`);
@@ -203,16 +220,29 @@ export const codeTool: ToolDefinition<CodeInput> = {
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
       });
 
-      // Hard cap on candidate output tokens (separate from `thinkingBudget`).
-      // Used both as the generateContent `maxOutputTokens` field and as the
-      // budget-reservation estimate, so the reservation is a true upper bound
-      // (Copilot review C7). 32k is generous for most code-edit responses;
-      // we clamp to the model's advertised limit if smaller.
-      const CODE_MAX_OUTPUT_TOKENS_DEFAULT = 32_768;
-      const maxOutputTokens =
+      // Output-cap strategy (v1.4.0) — see ask.tool.ts for full rationale
+      // of the three-layer precedence. Summary: input.maxOutputTokens
+      // (per-call) > ctx.config.forceMaxOutputTokens (MCP-host env) >
+      // auto (omit from wire; Gemini uses model-default). Code review
+      // commonly produces long OLD/NEW diff blocks, so operators doing
+      // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
+      // to pin every call at the model's full 65,536-token capacity.
+      const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
+      const modelOutputLimit =
         typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
-          ? Math.min(CODE_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
-          : CODE_MAX_OUTPUT_TOKENS_DEFAULT;
+          ? resolved.outputTokenLimit
+          : CODE_MAX_OUTPUT_TOKENS_FALLBACK;
+      const wireMaxOutputTokens: number | undefined =
+        input.maxOutputTokens !== undefined
+          ? Math.min(input.maxOutputTokens, modelOutputLimit)
+          : ctx.config.forceMaxOutputTokens
+            ? modelOutputLimit
+            : undefined;
+      // Effective cap for thinking-budget clamp and budget reservation.
+      // When auto (neither override set), Gemini's model-default equals
+      // modelOutputLimit per Google docs, so using the limit as worst-case
+      // keeps the daily $ cap a true upper bound.
+      const effectiveOutputCap = wireMaxOutputTokens ?? modelOutputLimit;
 
       // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
       // is carved out of the candidate-output allowance). The hard cap above
@@ -224,9 +254,25 @@ export const codeTool: ToolDefinition<CodeInput> = {
       // Only meaningful on the thinkingBudget path — when the caller uses
       // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
       // value is ignored by the thinkingConfig builder below.
+      //
+      // Early-reject when the caller's per-call `maxOutputTokens` can't fit
+      // an explicit positive `thinkingBudget` + 1024-token answer reserve.
+      // Silently clamping to 0 would make Gemini 3 Pro 400 on a
+      // "thinking disabled" error and obscure the real mismatch (PR #22
+      // round-3 review finding #C).
+      if (
+        input.thinkingBudget !== undefined &&
+        input.thinkingBudget > 0 &&
+        input.maxOutputTokens !== undefined &&
+        effectiveOutputCap < input.thinkingBudget + 1024
+      ) {
+        return errorResult(
+          `code: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
+        );
+      }
       const effectiveThinkingBudget =
         thinkingBudget !== undefined && thinkingBudget > 0
-          ? Math.max(0, Math.min(thinkingBudget, maxOutputTokens - 1024))
+          ? Math.max(0, Math.min(thinkingBudget, effectiveOutputCap - 1024))
           : 0;
 
       // Cost-estimate thinking-token reserve — tier-aware when the caller
@@ -243,7 +289,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
       // available headroom and over-estimate the budget reservation. Clamp
       // every tier's reserve against the dynamic headroom so the upper
       // bound stays coherent across model rollouts (PR #17 self-review F2).
-      const thinkingHeadroom = Math.max(0, maxOutputTokens - 1024);
+      const thinkingHeadroom = Math.max(0, effectiveOutputCap - 1024);
       const thinkingTokensForEstimate =
         input.thinkingLevel !== undefined
           ? Math.min(
@@ -266,7 +312,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
           model: resolved.resolved,
           workspaceBytes,
           promptChars: input.task.length,
-          expectedOutputTokens: maxOutputTokens,
+          expectedOutputTokens: effectiveOutputCap,
           thinkingTokens: thinkingTokensForEstimate,
         });
         const reserve = ctx.manifest.reserveBudget({
@@ -371,21 +417,24 @@ export const codeTool: ToolDefinition<CodeInput> = {
         );
       }
       const buildConfig = (cacheId: string | null): GenerateContentConfig => {
+        const maxOutputField =
+          wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
         if (canUseCache(cacheId) && cacheId) {
           // With cache: system_instruction is baked in; thinkingConfig remains OK.
-          // `maxOutputTokens` couples with the budget reservation estimate
-          // so the reservation is a TRUE upper bound (Copilot review C7).
+          // `maxOutputTokens` only emitted when the caller set it explicitly
+          // or `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` — otherwise omit
+          // and Gemini uses its model-default.
           return {
             cachedContent: cacheId,
             thinkingConfig,
-            maxOutputTokens,
+            ...maxOutputField,
           };
         }
         // Without cache (or cache bypassed for codeExecution): pass full config.
         return {
           systemInstruction: SYSTEM_INSTRUCTION_CODE,
           thinkingConfig,
-          maxOutputTokens,
+          ...maxOutputField,
           ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
         };
       };
@@ -552,6 +601,8 @@ export const codeTool: ToolDefinition<CodeInput> = {
       const structured: Record<string, unknown> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
+        modelCategory: resolved.category,
+        modelCostTier: resolved.capabilities.costTier,
         contextWindow: resolved.inputTokenLimit,
         // `thinkingBudget` echoes the clamped value actually sent on the
         // wire; it's only meaningful on the budget path. On the

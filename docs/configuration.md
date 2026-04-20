@@ -26,6 +26,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_CODE_CONTEXT_MAX_FILES` | `2000` | Soft upper bound on files indexed per workspace |
 | `GEMINI_CODE_CONTEXT_MAX_FILE_SIZE` | `1000000` | Skip files bigger than this (bytes) |
 | `GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT` | `80000` | Client-side tokens-per-minute ceiling per resolved model. Delays `ask` / `code` calls that would push the last 60 seconds of input-token usage past this cap — cheaper than burning a 429 round-trip. Default leaves ~20% headroom under Gemini's observed Tier 1 paid limit of 100k tokens/min for Gemini 3 Pro; raise it if your key is on a higher tier or lower it if you share the quota pool with another app. Set `0` to disable the throttle entirely (relies on Gemini's 429 behaviour and `retryInfo.retryDelay` alone). Cached tokens count toward this limit — empirically confirmed against Gemini 3 Pro. |
+| `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT` | `false` | When `true`, every `ask` / `code` call sends `maxOutputTokens = modelOutputLimit` on the wire (currently 65,536 for Gemini 3.x / 2.5 Pro per [Google docs](https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro)) so the model runs at its full output capacity. Primary use case: code-review workloads that routinely produce long OLD/NEW diff blocks. Default `false` means the field is omitted from the `generateContent` config and Gemini uses its own model-default (which per Google docs equals the model's advertised limit — so default behaviour is already "auto = full capacity" without explicitly setting it). Per-call `input.maxOutputTokens` always overrides this env var — callers who want to cap a specific call lower can still do so. Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` remains a true upper bound regardless of this setting. |
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `GEMINI_CODE_CONTEXT_TELEMETRY` | `false` | Set `true` to opt into anonymous usage counts (nothing happens yet — reserved for future public dashboard) |
 | `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE` | `false` | Set `true` to bypass the `validateWorkspacePath` guard that rejects paths outside the MCP host's cwd unless they contain a recognised workspace marker. Only set this for genuinely unconventional roots (CI sandboxes, generated build dirs). Do NOT set it to work around a prompt-injection vector — the guard is the security control. |
@@ -43,20 +44,24 @@ Every tool accepts runtime overrides that beat the defaults:
 - `ask({ thinkingLevel: "LOW" })` — discrete reasoning tier for Gemini 3 (Google's recommended knob on 3.x). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default when the field is omitted). Rejected by Gemini 2.5 family — use `thinkingBudget` there. Mutually exclusive with `thinkingBudget` — schema refuses both-set with a clear error
 - `code({ thinkingBudget: 32000, codeExecution: true })` — harder problem, let Gemini verify with Python
 - `code({ thinkingLevel: "HIGH" })` — discrete reasoning tier on Gemini 3 (Google's recommended knob there); mutually exclusive with `thinkingBudget`. `code` still defaults to `thinkingBudget: 16384` when neither is passed — a stronger default than `ask`'s "omit entirely" because coding genuinely benefits from reasoning
+- `code({ maxOutputTokens: 8192 })` — cap a specific call's response length (defaults to auto = model-full 65,536 per Google docs for Gemini 3.x / 2.5 Pro). Values above the resolved model's limit are clamped. Operators who want EVERY call at full capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level; this per-call field still beats the env override
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
 
 ## Model aliases
 
-The server enumerates models available to your API key at startup. Aliases resolve dynamically, so when Google ships a new Pro model and your key can reach it, `latest-pro` picks it up without any change on your end.
+The server enumerates models available to your API key at startup, classifies each by functional **category** (`text-reasoning`, `text-fast`, `text-lite`, `image-generation`, `audio-generation`, `video-generation`, `embedding`, `agent`, `unknown`), and only matches aliases within the correct category. When Google ships a new Pro text-gen model that your key can reach, `latest-pro` picks it up automatically; when they ship a new image-gen family that shares the `pro` token, it stays out of `latest-pro`'s path.
 
-| Alias | Picks |
-|---|---|
-| `latest-pro` | Newest non-image / non-tts Pro model |
-| `latest-pro-thinking` | Newest Pro model with `thinking: true` |
-| `latest-flash` | Newest Flash model |
-| `latest-lite` | Newest Lite model |
+| Alias | Category | Picks |
+|---|---|---|
+| `latest-pro` | `text-reasoning` | Newest pro-tier text model |
+| `latest-pro-thinking` | `text-reasoning` + `supportsThinking` | Newest pro model with reasoning support (default for `code`) |
+| `latest-flash` | `text-fast` | Newest flash-tier text model |
+| `latest-lite` | `text-lite` | Newest lite-tier (cheapest) text model |
+| `latest-vision` | `text-reasoning` ∪ `text-fast` + `supportsVision` | Newest vision-capable text model |
 
-Literal IDs always work too: `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, etc.
+Literal IDs always work too: `gemini-3-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, etc. They're category-checked too — passing e.g. `nano-banana-pro-preview` to `code` throws `ModelCategoryMismatchError` with an actionable message (image-gen models have 10× pricing and a different API shape; we refuse to dispatch silently).
+
+**Full category table, alias contract, failure-mode examples, and the "what happens when Google ships a new family" walkthrough** — see [`docs/models.md`](./models.md).
 
 ## Credentials file format
 

@@ -23,6 +23,18 @@ export interface Config {
   /** Opt-in anonymous usage telemetry (count per tool, no payloads). */
   telemetryEnabled: boolean;
   /**
+   * When `true`, `ask` and `code` tools send `maxOutputTokens =
+   * modelOutputLimit` on every `generateContent` call (instead of omitting
+   * the field and relying on Gemini's model-default). Use this in MCP host
+   * configs where you want every call to run at the model's full output
+   * capacity — primary use case is code review that routinely produces
+   * long OLD/NEW diff blocks. Per-call `input.maxOutputTokens` still
+   * overrides (caller can cap a specific call lower). Default `false`
+   * (auto — Gemini decides response length based on query complexity).
+   * Controlled by `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT` env var.
+   */
+  forceMaxOutputTokens: boolean;
+  /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
    * `0` disables the throttle entirely; positive integer caps how many input
    * tokens (cached + uncached) we'll let fly to Gemini inside any 60-second
@@ -48,6 +60,19 @@ function readFloatEnv(name: string, fallback: number): number {
   if (!raw || raw.length === 0) return fallback;
   const n = Number.parseFloat(raw);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Parse a boolean env var permissively. Accepts `true`/`1`/`yes`/`on`
+ * case-insensitively as `true`; everything else (including unset) is `false`.
+ * Strict equality to `'true'` (our pre-v1.4.0 pattern) surprised operators
+ * who copied values like `TRUE` / `1` from other docs.
+ */
+function readBoolEnv(name: string): boolean {
+  const raw = process.env[name];
+  if (!raw) return false;
+  const v = raw.trim().toLowerCase();
+  return v === 'true' || v === '1' || v === 'yes' || v === 'on';
 }
 
 export function loadConfig(): Config {
@@ -81,7 +106,8 @@ export function loadConfig(): Config {
     cacheMinTokens: readIntEnv('GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS', 1024),
     maxFilesPerWorkspace: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILES', 2000),
     maxFileSizeBytes: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILE_SIZE', 1_000_000),
-    telemetryEnabled: process.env.GEMINI_CODE_CONTEXT_TELEMETRY === 'true',
+    telemetryEnabled: readBoolEnv('GEMINI_CODE_CONTEXT_TELEMETRY'),
     tpmThrottleLimit,
+    forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
   };
 }

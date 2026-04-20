@@ -14,6 +14,45 @@ npm run typecheck
 npm test
 ```
 
+## Local MCP setup (testing your changes)
+
+If you want to test your local changes inside an MCP host (Claude Code, Claude Desktop, Cursor, …), **do not** copy the README's `npx -y @qmediat.io/gemini-code-context-mcp` invocation as-is. That command pulls the **published** version from npm — it ignores your working tree — and additionally fails with `command not found` when launched from inside this repo (the local `package.json` collides with the published name during `npx` resolution).
+
+Two working options:
+
+**Option A — point at your local build (recommended for active development)**
+
+```jsonc
+{
+  "mcpServers": {
+    "gemini-code-context-dev": {
+      "command": "node",
+      "args": ["/absolute/path/to/gemini-code-context-mcp/dist/index.js"],
+      "env": { "GEMINI_CREDENTIALS_PROFILE": "default" }
+    }
+  }
+}
+```
+
+Workflow: edit code → `npm run build` → restart your MCP host → test.
+
+**Option B — point at the published version (for verifying a release)**
+
+```jsonc
+{
+  "mcpServers": {
+    "gemini-code-context": {
+      "command": "npx",
+      "args": ["-y", "@qmediat.io/gemini-code-context-mcp"],
+      "cwd": "/path/outside/this/repo",
+      "env": { "GEMINI_CREDENTIALS_PROFILE": "default" }
+    }
+  }
+}
+```
+
+The `cwd` field tells the MCP host to spawn `npx` from a directory that doesn't contain a same-named `package.json`, sidestepping the resolution conflict. End users never need this — only contributors who keep their MCP host's `cwd` set to the repo do.
+
 ## Workflow
 
 1. **Fork + branch** — create a feature branch from `main`.
