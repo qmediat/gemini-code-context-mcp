@@ -28,6 +28,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import { parseRetryDelayMs } from './shared/throttle.js';
 
 const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
@@ -127,6 +128,11 @@ export const askTool: ToolDefinition<AskInput> = {
     // `-1` signals "no reservation held" (distinct from 0 which is a valid
     // releaseId). Mirrors the pattern used by `reservationId`.
     let throttleReservationId = -1;
+    // Canonical resolved-model string, captured once after `resolveModel`
+    // so the outer catch can feed retry hints into the same throttle bucket
+    // `reserve` used. `model` at the top of execute is the request alias
+    // ("latest-pro-thinking") — different key, different bucket.
+    let resolvedModelKey: string | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       // Workspace path validation lives INSIDE the try so a
@@ -146,6 +152,7 @@ export const askTool: ToolDefinition<AskInput> = {
 
       emitter.emit(`resolving model '${model}'…`);
       const resolved = await resolveModel(model, ctx.client);
+      resolvedModelKey = resolved.resolved;
 
       emitter.emit(`scanning workspace ${workspaceRoot}…`);
       const scan = await scanWorkspace(workspaceRoot, {
@@ -563,6 +570,16 @@ export const askTool: ToolDefinition<AskInput> = {
       return textResult(text, metadata);
     } catch (err) {
       logger.error(`ask failed: ${String(err)}`);
+      // T22a — extract Gemini's `retryInfo.retryDelay` from 429 bodies and
+      // seed the throttle's per-model hint before we release the
+      // reservation. Google's hint is typically shorter (2-16s) than our
+      // pure-window math would compute (up to 60s+) so honouring it shortens
+      // the next caller's wait. Best-effort: `parseRetryDelayMs` returns
+      // null on non-429 / malformed bodies and we silently continue.
+      const retryDelayMs = err instanceof Error ? parseRetryDelayMs(err.message) : null;
+      if (retryDelayMs !== null && resolvedModelKey !== null) {
+        ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
+      }
       // Release any unconsumed budget reservation so the failed call's
       // estimate doesn't eat into future headroom for today. Wrap in its
       // own try/catch — better-sqlite3 can throw SQLITE_BUSY or I/O errors
@@ -579,12 +596,10 @@ export const askTool: ToolDefinition<AskInput> = {
         reservationId = null;
       }
       // Drop the TPM reservation on any failure path. If Gemini actually
-      // consumed quota server-side before failing, our window under-counts
-      // — acceptable: a subsequent 429 with `retryDelay` would re-seed
-      // via `recordRetryHint` (wiring of that hint-parse is tracked in
-      // T22a follow-up, not shipped here). The alternative (release with
-      // estimate) over-counts when the call never reached Gemini at all,
-      // which is more common.
+      // consumed quota server-side before failing, the hint path above
+      // (T22a) compensates via `recordRetryHint` before we cancel. For
+      // non-429 errors (validation, transport), we under-count slightly
+      // but bounded — accepted trade-off documented in PR #19 round-2.
       if (throttleReservationId !== -1) {
         ctx.throttle.cancel(throttleReservationId);
         throttleReservationId = -1;

@@ -58,6 +58,22 @@ export interface ToolResult {
 }
 
 /**
+ * Narrower return type for `textResult` / `errorResult`: `structuredContent`
+ * is ALWAYS present (always carries at least `responseText` per T23). The
+ * loose `ToolResult` interface stays for any future caller that legitimately
+ * omits structured content, but consumers of the two standard helpers can
+ * rely on the field without an optional-chaining dance.
+ *
+ * Addresses T23a follow-up from PR #19 review: the original helpers declared
+ * `ToolResult` as the return type even though they always populate the
+ * structured payload — a doc-through-types gap that misled readers doing
+ * `if (result.structuredContent) …`.
+ */
+export interface TextToolResult extends ToolResult {
+  structuredContent: Record<string, unknown>;
+}
+
+/**
  * Canonical key under which MCP clients consuming `structuredContent` can
  * reliably find the tool's primary narrative response. MCP hosts that
  * render `content[]` (Claude Code's main conversation UI) are unaffected;
@@ -73,7 +89,7 @@ export interface ToolResult {
  */
 export const RESPONSE_TEXT_KEY = 'responseText';
 
-export function textResult(text: string, structured?: Record<string, unknown>): ToolResult {
+export function textResult(text: string, structured?: Record<string, unknown>): TextToolResult {
   return {
     content: [{ type: 'text', text }],
     // Always emit `structuredContent` with `responseText` even when the
@@ -85,7 +101,7 @@ export function textResult(text: string, structured?: Record<string, unknown>): 
   };
 }
 
-export function errorResult(message: string): ToolResult {
+export function errorResult(message: string): TextToolResult {
   return {
     content: [{ type: 'text', text: message }],
     // Mirror the error text under `responseText` for the same reason

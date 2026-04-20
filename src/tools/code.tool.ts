@@ -30,6 +30,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import { parseRetryDelayMs } from './shared/throttle.js';
 
 const SYSTEM_INSTRUCTION_CODE = [
   'You are an expert software engineer. Generate production-quality, idiomatic code with proper error handling.',
@@ -173,6 +174,9 @@ export const codeTool: ToolDefinition<CodeInput> = {
     let reservationId: number | null = null;
     // `-1` signals "no reservation held". Mirror of ask.tool.ts.
     let throttleReservationId = -1;
+    // Canonical resolved-model string for retry-hint seeding (T22a).
+    // See ask.tool.ts for rationale.
+    let resolvedModelKey: string | null = null;
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       // Workspace validation inside try → reported as a regular tool error
@@ -189,6 +193,7 @@ export const codeTool: ToolDefinition<CodeInput> = {
 
       emitter.emit(`resolving model '${modelRequest}'…`);
       const resolved = await resolveModel(modelRequest, ctx.client);
+      resolvedModelKey = resolved.resolved;
 
       emitter.emit(`scanning workspace ${workspaceRoot}…`);
       const scan = await scanWorkspace(workspaceRoot, {
@@ -590,6 +595,12 @@ export const codeTool: ToolDefinition<CodeInput> = {
       return textResult(text, structured);
     } catch (err) {
       logger.error(`code failed: ${String(err)}`);
+      // T22a — seed the throttle's retry-hint from any 429 retryInfo.
+      // Mirror of ask.tool.ts — see there for rationale.
+      const retryDelayMs = err instanceof Error ? parseRetryDelayMs(err.message) : null;
+      if (retryDelayMs !== null && resolvedModelKey !== null) {
+        ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
+      }
       if (reservationId !== null) {
         try {
           ctx.manifest.cancelBudgetReservation(reservationId);
