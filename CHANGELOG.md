@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (post-review polish on PR #16, `ask({ thinkingLevel })`)
+
+- **Tier-aware cost-estimate reservations for `thinkingLevel`** — `MINIMAL` now reserves 512 thinking tokens, `LOW` 2_048, `MEDIUM` 4_096, `HIGH` the full `maxOutputTokens - 1024` dynamic cap. Replaces the previous always-worst-case behaviour that could false-reject long sequences of `MINIMAL`/`LOW` calls against `GEMINI_DAILY_BUDGET_USD` when the real spend was ≤1% of the reservation. Values are heuristic upper bounds (Google does not publish per-tier budgets). Exported as `THINKING_LEVEL_RESERVE` from `src/tools/ask.tool.ts` for testing and future reuse in `code.tool.ts` (tracked as T21).
+- **`thinkingLevel` send-path uses a string cast, not an enum bracket lookup** — passing `input.thinkingLevel as ThinkingLevel` survives a future `@google/genai` enum-member rename: Gemini will 400 the literal string with a clear error instead of our code silently serialising `undefined`. Equivalent runtime behaviour on the current pinned `1.50.1`.
+- **Mutual-exclusion error attaches at schema root** — `.refine()` now emits `path: []` (root-level) rather than `path: ['thinkingLevel']`, so MCP clients rendering per-field errors don't misattribute the cross-field violation to one of the two fields.
+- **Single source of truth for `thinkingLevel` detection** — extracted `const usingThinkingLevel` to replace three identical `input.thinkingLevel !== undefined` checks (cost estimate, emitter, thinkingConfig build). Prevents future drift between the three branches.
+- **Explicit `ThinkingConfig` type annotation on the built config** — catches a hypothetical future SDK field-shape change at `tsc` time rather than at runtime.
+
 ### Fixed
 
 - **Model-alias resolution no longer picks up Google's non-text-gen `pro` families.** `nano-banana-pro-preview` (image generation) and `lyria-3-pro-preview` (music generation) both share the `pro` substring our `latest-pro` / `latest-pro-thinking` aliases matched on, and the live registry returns them *before* `gemini-pro-latest`. Pre-fix: `.find()` grabbed banana first, so every `ask`/`code` call resolved to an image-gen model — image-tier pricing (~10× text rates), 128k input cap, and hitting the `gemini-3-pro-image` quota after three calls. The exclude list now filters `banana`, `lyria`, `research` (Deep Research is a specialised agent, not a drop-in conversational model), and `customtools` (variant that errors without a `tools` param) across all four aliases. Existing `image`/`tts`/`vision`/`audio` filters kept. Extracted into a single `NON_TEXT_GEN_MARKERS` source of truth so future Google families land in one edit.

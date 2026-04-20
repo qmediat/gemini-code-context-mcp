@@ -21,7 +21,7 @@ Entries marked **WATCH** are not actively painful today but would become so unde
 
 Root cause is on Google's side: Gemini 3 Pro is a "thinking-only" model with an undocumented minimum thinking budget, and the API fails to reject requests below that minimum — it just stalls. The behaviour does not reproduce on `gemini-2.5-pro` (which honours any non-zero budget) or on fresh cache builds (only `cachedContent + low thinkingBudget` together trip it). We cannot observe the minimum from the model registry: `supportsThinking: true` does not imply "low budgets are fine", and `thinkingTokenLimit` is not exposed.
 
-**Impact today:** Any caller who explicitly passes `thinkingBudget` below Gemini 3 Pro's internal floor experiences a 90-180 s hang that looks like a server issue on our side. `-1` (the default) and values ≥1024 are unaffected. Most users never set the knob — default-path users are unaffected.
+**Impact today:** Any caller who explicitly passes `thinkingBudget` below Gemini 3 Pro's internal floor experiences a 90-180 s hang that looks like a server issue on our side. The default path (omitting `thinkingBudget` entirely — v1.2+ behaviour) and explicit values ≥1024 are unaffected. Most users never set the knob — default-path users are unaffected.
 
 **Why we're not fixing fully in v1.1 / v1.2:**
 1. We don't know the true minimum — it could change model-by-model and release-to-release. A hard-coded floor (e.g. "clamp `0 < N < 1024` up to 1024") would be brittle and would surprise callers who intended `256` on a 2.5 model.
@@ -32,6 +32,24 @@ Root cause is on Google's side: Gemini 3 Pro is a "thinking-only" model with an 
 **Revisit trigger:** (a) user reports of `ask` hanging with explicit `thinkingBudget` values, or (b) Gemini publishes the per-model thinking minimums in the model registry. At that point we can add either a registry-driven floor or an adaptive timeout.
 
 **Tracking:** `docs/FOLLOW-UP-PRS.md` — add a "gemini thinking budget timeout guard" item when concrete numbers are available.
+
+---
+
+## Zod `.refine()` cross-field constraints don't round-trip through `zod-to-json-schema`
+
+**Source:** April 2026 three-way code review on PR #16 (Gemini P2 finding).
+
+**Status:** WATCH. Not fixed; documented in schema descriptions instead.
+
+**What is the issue?** Our `askInputSchema` enforces `thinkingBudget ⊕ thinkingLevel` (mutually exclusive) via a `.refine()` at the root (`src/tools/ask.tool.ts:114-118`). Runtime Zod validation catches any caller that sets both and returns a clear `"Cannot specify both ... mutually exclusive"` error before we hit Gemini. However, `zod-to-json-schema` (used in `src/tools/registry.ts:92` to expose `inputSchema` in MCP `tools/list`) does **not** emit `.refine()` constraints into the generated JSON Schema — it has no canonical mapping from an arbitrary refinement predicate to JSON Schema's `not`/`oneOf`/`dependentSchemas` keywords. The schema surface visible to MCP clients therefore shows both fields as independent optionals, and clients that rely on the schema alone (not on description docs or runtime probes) will allow a caller to set both.
+
+**Impact today:** LLM-based clients (Claude, GPT) read field descriptions before constructing a call — both `thinkingBudget` and `thinkingLevel` descriptions explicitly state the mutual-exclusion rule, so these clients avoid the combination. Form-rendering MCP clients that only consume the JSON Schema can present both fields as checkable, then get a runtime error. The error path (`path: []` after finding F6 fix) renders at the schema root, which is the correct spot for a cross-field violation. Net effect: minor UX wart on non-LLM clients; clear error message; no safety or cost consequence.
+
+**Why not fixing fully:** The alternative is a `z.discriminatedUnion` / `z.union` schema shape, which generates `oneOf` in JSON Schema but significantly complicates the inferred `AskInput` TypeScript type and forces call-site code to narrow by discriminator. For a constraint this simple, the ergonomic cost outweighs the JSON Schema fidelity gain — especially since our primary consumers are LLMs reading descriptions.
+
+**Revisit trigger:** A non-LLM MCP client ships that renders tools with hydra-form UIs and can't preview cross-field constraints, AND a user reports frustration with the runtime-only error.
+
+**Tracking:** no follow-up PR — revisit only on the trigger above.
 
 ---
 

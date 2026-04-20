@@ -15,8 +15,9 @@ Real improvements surfaced by `/6step` and `/coderev` analysis that are out of s
 - `files-uploader.test.ts` — mock SDK; verify dedup by hash, safety-margin re-upload when `expires_at` < now+2h, parallel pool respects concurrency, failures collected in `UploadResult.failures` without throwing.
 - `ttl-watcher.test.ts` — fake timers; verify refresh trigger (hot + within-window), skip conditions, manifest writeback.
 - `profile-loader.test.ts` — env sandbox; verify priority chain (Vertex → credentials-file → env-var → throw).
+- **`ask.tool.buildConfig.test.ts`** — mock `GoogleGenAI.models.generateContent`; verify the THREE mutually-exclusive `thinkingConfig` wire shapes actually leave the tool: (a) `thinkingLevel` set → `{ thinkingLevel, includeThoughts: true }` sent, no `thinkingBudget`; (b) `thinkingBudget` set (non-null) → `{ thinkingBudget, includeThoughts: true }` sent, no `thinkingLevel`; (c) neither set → `{ includeThoughts: true }` only. Added in response to PR #16 self-review finding F7 — schema tests alone don't catch drift between the Zod boundary and the `buildConfig` branch logic. Same mocking pattern applies to `code.tool.buildConfig.test.ts` once T21 lands.
 
-**Sizing:** ~3 hours, 4 test files, adds no production deps. Pairs well with a follow-up Vitest mock-setup helper.
+**Sizing:** ~4 hours, 5 test files, adds no production deps. Pairs well with a follow-up Vitest mock-setup helper.
 
 ---
 
@@ -237,11 +238,13 @@ Real improvements surfaced by `/6step` and `/coderev` analysis that are out of s
 
 **Sizing:** 1-2 days including new DB primitive, migration, and tests.
 
+**Trigger:** If a high-concurrency user reports spurious "daily budget cap would be exceeded" errors during cache-rebuild windows.
+
 ---
 
 ## T19. Opt-in per-call timeout for `ask` / `code` via env var
 
-**Source:** April 2026 user feedback while smoke-testing the `thinkingLevel` PR — "timeout przy thinking mode powinien być konfigurowany przez użytkownika serwera MCP, a domyślnie powinien być wyłączony".
+**Source:** April 2026 user feedback while smoke-testing the `thinkingLevel` PR — "the timeout for thinking mode should be configurable by the MCP server operator, and disabled by default" (original Polish: "timeout przy thinking mode powinien być konfigurowany przez użytkownika serwera MCP, a domyślnie powinien być wyłączony").
 
 **Why:** Today `ask` and `code` delegate to Gemini's `generateContent` with no client-side timeout at all. For thinking-capable models (especially Gemini 3 Pro on `thinkingLevel: HIGH`) a single legitimate call can run 2–3 minutes on complex prompts — which is exactly what we WANT, and why an aggressive default timeout would be harmful. But for operators who want a hard upper bound (CI pipelines, budget-sensitive workloads where a stuck connection costs more than a failed request), there's currently no knob.
 
@@ -261,7 +264,7 @@ Real improvements surfaced by `/6step` and `/coderev` analysis that are out of s
 
 ## T20. Migrate `ask` / `code` to `generateContentStream` for in-flight thinking progress
 
-**Source:** April 2026 user feedback — "zbadaj w dokumentacji, czy istnieje możliwość pingowania, czy thinking jest aktywne".
+**Source:** April 2026 user feedback — "check the documentation to see whether there is a way to ping whether thinking is active" (original Polish: "zbadaj w dokumentacji, czy istnieje możliwość pingowania, czy thinking jest aktywne").
 
 **Why:** Gemini API exposes no formal heartbeat/ping for in-progress requests — but `generateContentStream` (SDK: `node_modules/@google/genai/dist/genai.d.ts:8127`) returns an `AsyncGenerator<GenerateContentResponse>` whose successive chunks are a de facto heartbeat. When `includeThoughts: true`, Gemini emits `thought: true` parts progressively while it reasons. A consuming MCP server can forward these as MCP `progress` notifications — the host sees "model is thinking" updates instead of an opaque 3-minute pause.
 
@@ -281,5 +284,27 @@ Today we call `generateContent` (non-streaming) — single round-trip, no signal
 
 **Deliberate non-goal:** this PR does not try to cancel server-side work. Same disclaimer as T19 — `AbortSignal` is client-only.
 
+---
 
-**Trigger:** If a high-concurrency user reports spurious "daily budget cap would be exceeded" errors during cache-rebuild windows.
+## T21. `thinkingLevel` parity on `code.tool.ts`
+
+**Source:** April 2026 three-way code review on PR #16 (Gemini consensus) + self-review finding F5.
+
+**Why:** v1.2's `thinkingLevel` parameter (Google's recommended reasoning knob on Gemini 3 — `LOW` / `MEDIUM` / `HIGH`, plus `MINIMAL` for Flash-Lite) ships only on `ask`. The `code` tool still exposes the legacy `thinkingBudget` only, leaving callers without a discrete-tier option on Gemini 3 Pro (where explicit `thinkingBudget` is flagged as "legacy" and may produce "unexpected performance" per ai.google.dev/gemini-api/docs/gemini-3). Asymmetric MCP surface: callers can say `ask({ thinkingLevel: 'HIGH' })` but not `code({ thinkingLevel: 'HIGH' })` — forcing them back to the omit-budget workaround or the problematic low-budget path.
+
+**Scope:**
+- Mirror the v1.2 `ask.tool.ts` changes onto `code.tool.ts`:
+  - Add `thinkingLevel: z.enum(['MINIMAL','LOW','MEDIUM','HIGH']).optional()` to `codeInputSchema` with a description that mirrors `ask`'s (pointing at Gemini 3 guide + Gemini 2.5 caveat + mutual exclusion).
+  - Zod `.refine({ path: [] })` enforcing mutual exclusion with `thinkingBudget` (same message as `ask`).
+  - Replace the always-`{ thinkingBudget, includeThoughts, maxOutputTokens }` config build with the three-branch `thinkingConfig` shape from `ask.tool.ts` (tier set → `thinkingLevel`; budget set → `thinkingBudget`; neither → `{ includeThoughts: true }` only).
+  - Echo `thinkingLevel` in structured metadata alongside the existing `thinkingBudget`.
+  - Reuse `THINKING_LEVEL_RESERVE` from `ask.tool.ts` (export or move to a shared module) for cost-estimate sizing; fall through to the existing `effectiveThinkingBudget` clamp when `thinkingLevel` is absent.
+- Update schema tests in `test/unit/tool-input-schema.test.ts` — add cases for `code({ thinkingLevel })`, mutual exclusion, and invalid values (mirror `ask`'s coverage).
+- `CHANGELOG.md` entry in `### Added`.
+- `docs/configuration.md` per-call-overrides section: add `code({ thinkingLevel: "HIGH" })` example.
+
+**Sizing:** ~1 hour. Essentially copy-paste the `ask` diff with the code-tool's existing thinkingBudget clamp preserved. Testing is quick because the schema contract is identical — reuse the same invalid-value table.
+
+**Blocked on:** nothing. Can ship any time after v1.2.
+
+**Open question:** should `THINKING_LEVEL_RESERVE` live in a `src/tools/shared/thinking.ts` helper (DRY + a home for T19/T20 common utilities), or stay on `ask.tool.ts` as `export const` and get imported by `code.tool.ts`? Prefer the shared module if T19 ships first (so the timeout helper has somewhere to live).

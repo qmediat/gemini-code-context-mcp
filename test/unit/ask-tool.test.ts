@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { askInputSchema } from '../../src/tools/ask.tool.js';
+import { THINKING_LEVEL_RESERVE, askInputSchema } from '../../src/tools/ask.tool.js';
 
 describe('ask input schema — thinkingBudget', () => {
   it('accepts omitted thinkingBudget (runtime applies the -1 default)', () => {
@@ -124,6 +124,25 @@ describe('ask input schema — thinkingBudget × thinkingLevel mutual exclusion'
     }
   });
 
+  it('attaches the mutual-exclusion error at the schema root (path: [])', () => {
+    // The violation is the RELATION between two fields, not a problem with
+    // either field individually. Emitting the error at the root (path: [])
+    // rather than under one field prevents MCP clients that render
+    // per-field errors from misattributing the issue to `thinkingLevel`
+    // alone (the previous behaviour, see PR #16 self-review finding F6).
+    const parsed = askInputSchema.safeParse({
+      prompt: 'hi',
+      thinkingBudget: 4096,
+      thinkingLevel: 'HIGH',
+    });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      const refineIssue = parsed.error.issues.find((i) => /mutually exclusive/i.test(i.message));
+      expect(refineIssue).toBeDefined();
+      expect(refineIssue?.path).toEqual([]);
+    }
+  });
+
   it('accepts either one alone (thinkingBudget only)', () => {
     expect(askInputSchema.safeParse({ prompt: 'hi', thinkingBudget: 4096 }).success).toBe(true);
   });
@@ -134,6 +153,41 @@ describe('ask input schema — thinkingBudget × thinkingLevel mutual exclusion'
 
   it('accepts neither (default path — runtime omits thinkingConfig budget field)', () => {
     expect(askInputSchema.safeParse({ prompt: 'hi' }).success).toBe(true);
+  });
+});
+
+describe('THINKING_LEVEL_RESERVE — per-tier cost-estimate reservations', () => {
+  // Tier-aware reservations replace the previous "always worst-case" behaviour
+  // that false-rejected long sequences of MINIMAL/LOW calls against
+  // `GEMINI_DAILY_BUDGET_USD`. Actual values are heuristic upper bounds — if
+  // Google changes them, bump here and re-check the comment in ask.tool.ts.
+
+  it('MINIMAL reserves a small positive count', () => {
+    expect(THINKING_LEVEL_RESERVE.MINIMAL).toBe(512);
+  });
+
+  it('LOW reserves more than MINIMAL', () => {
+    expect(THINKING_LEVEL_RESERVE.LOW).toBeGreaterThan(THINKING_LEVEL_RESERVE.MINIMAL as number);
+  });
+
+  it('MEDIUM reserves more than LOW', () => {
+    expect(THINKING_LEVEL_RESERVE.MEDIUM).toBeGreaterThan(THINKING_LEVEL_RESERVE.LOW as number);
+  });
+
+  it('HIGH is null (sentinel for "use maxOutputTokens - 1024" at call site)', () => {
+    // The execute path substitutes the dynamic cap — keeps the reserve in
+    // sync with the model's actual output cap rather than a hard-coded
+    // duplicate of maxOutputTokens.
+    expect(THINKING_LEVEL_RESERVE.HIGH).toBeNull();
+  });
+
+  it('covers every value in the enum (no drift between schema and reserve table)', () => {
+    // If schema adds/renames a level, this test fails with a clear error
+    // pointing at the missing or extra key. Compile-time TypeScript already
+    // enforces this via `Record<(typeof THINKING_LEVELS)[number], …>`, but
+    // a runtime check guards against accidental `as const` regressions.
+    const keys = Object.keys(THINKING_LEVEL_RESERVE).sort();
+    expect(keys).toEqual(['HIGH', 'LOW', 'MEDIUM', 'MINIMAL']);
   });
 });
 
