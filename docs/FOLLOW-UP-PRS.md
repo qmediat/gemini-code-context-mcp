@@ -237,4 +237,49 @@ Real improvements surfaced by `/6step` and `/coderev` analysis that are out of s
 
 **Sizing:** 1-2 days including new DB primitive, migration, and tests.
 
+---
+
+## T19. Opt-in per-call timeout for `ask` / `code` via env var
+
+**Source:** April 2026 user feedback while smoke-testing the `thinkingLevel` PR — "timeout przy thinking mode powinien być konfigurowany przez użytkownika serwera MCP, a domyślnie powinien być wyłączony".
+
+**Why:** Today `ask` and `code` delegate to Gemini's `generateContent` with no client-side timeout at all. For thinking-capable models (especially Gemini 3 Pro on `thinkingLevel: HIGH`) a single legitimate call can run 2–3 minutes on complex prompts — which is exactly what we WANT, and why an aggressive default timeout would be harmful. But for operators who want a hard upper bound (CI pipelines, budget-sensitive workloads where a stuck connection costs more than a failed request), there's currently no knob.
+
+**Scope:**
+- Add `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` env var — positive integer = per-call timeout in ms, `0` or unset = disabled (today's behaviour). Mirror `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS` for `code`.
+- Thread `AbortController` through `ask.tool.ts` / `code.tool.ts` `generateContent` call sites. Schedule `controller.abort()` on timeout, clear on successful response.
+- Surface timeout as a regular `errorResult("ask failed: timed out after <N>ms (override via GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS)")`.
+- Default: **disabled**. Must NOT ship an aggressive default that kills legitimate long-thinking sessions.
+- Document the hard caveat from `@google/genai@1.50.1` types: *"AbortSignal is a client-only operation. Using it to cancel an operation will not cancel the request in the service. You will still be charged usage for any applicable operations."* (node_modules/@google/genai/dist/genai.d.ts:1425-1427). Operators opting in must understand they pay for work Gemini finishes after we disconnect.
+- Release reservation via `cancelBudgetReservation` on abort — the estimated cost is still billed server-side, but our manifest shouldn't also keep the reservation row pinned.
+
+**Sizing:** ~2 hours. Small code change (~40 lines in each tool), schema description update, one new env var in `src/config.ts`, 3-4 unit tests mocking `AbortController`.
+
+**Blocked on:** nothing. Can ship anytime after v1.2.
+
+---
+
+## T20. Migrate `ask` / `code` to `generateContentStream` for in-flight thinking progress
+
+**Source:** April 2026 user feedback — "zbadaj w dokumentacji, czy istnieje możliwość pingowania, czy thinking jest aktywne".
+
+**Why:** Gemini API exposes no formal heartbeat/ping for in-progress requests — but `generateContentStream` (SDK: `node_modules/@google/genai/dist/genai.d.ts:8127`) returns an `AsyncGenerator<GenerateContentResponse>` whose successive chunks are a de facto heartbeat. When `includeThoughts: true`, Gemini emits `thought: true` parts progressively while it reasons. A consuming MCP server can forward these as MCP `progress` notifications — the host sees "model is thinking" updates instead of an opaque 3-minute pause.
+
+Today we call `generateContent` (non-streaming) — single round-trip, no signal until completion. That's fine for short Q&A but hostile to long thinking sessions: the user can't tell whether the model is working or the connection is dead, and our `progress` emitter falls silent at the exact moment where the user most wants reassurance.
+
+**Scope:**
+- Replace `ctx.client.models.generateContent({...})` with `ctx.client.models.generateContentStream({...})` in `ask.tool.ts` and `code.tool.ts`.
+- Iterate the `AsyncGenerator`, accumulating `text` + `candidates` + `usageMetadata` into a single response object compatible with downstream code (parseEdits / parseCodeBlocks / thoughtsSummary extraction).
+- Surface in-flight thought chunks as MCP progress notifications via the existing `emitter` (use `emitter.emit('thinking: <first-N-chars>…')` on each thought part, throttled so we don't flood the host).
+- Combine with T19: a stall detector ("no chunk for M seconds, abort") is only meaningful on a stream. Document that timeout + stream together give both heartbeat detection AND bounded wall-clock.
+- Preserve stale-cache retry (`isStaleCacheError` → `markCacheStale` → rebuild → retry ONCE) — must still work over the streaming API.
+- Preserve the response shape we expose to callers — the `textResult(text, metadata)` contract is stable; internals may refactor.
+
+**Sizing:** ~1 day. Biggest wrinkle is collapsing a stream into the non-streaming response shape without losing `usageMetadata` (which typically only appears on the final chunk) and making sure the stale-cache-retry path still gets a second stream if the first dies. Unit tests need an async-iterable mock client. Integration tests already cover the happy path — re-run them.
+
+**Blocked on:** ideally T19 first, so the stream refactor lands with the stall-detector abort path already designed in. If shipped alone, T20 gives heartbeat UX without bounded timeout; if shipped alone, T19 gives bounded timeout without heartbeat signal. Together they close the loop.
+
+**Deliberate non-goal:** this PR does not try to cancel server-side work. Same disclaimer as T19 — `AbortSignal` is client-only.
+
+
 **Trigger:** If a high-concurrency user reports spurious "daily budget cap would be exceeded" errors during cache-rebuild windows.

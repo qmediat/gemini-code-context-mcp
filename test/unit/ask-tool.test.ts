@@ -71,13 +71,79 @@ describe('ask input schema — thinkingBudget', () => {
   });
 });
 
+describe('ask input schema — thinkingLevel', () => {
+  it('accepts omitted thinkingLevel (runtime falls through to thinkingBudget path)', () => {
+    const parsed = askInputSchema.safeParse({ prompt: 'hi' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.thinkingLevel).toBeUndefined();
+    }
+  });
+
+  it.each(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const)('accepts %s', (level) => {
+    const parsed = askInputSchema.safeParse({ prompt: 'hi', thinkingLevel: level });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.thinkingLevel).toBe(level);
+    }
+  });
+
+  it('rejects unknown enum values', () => {
+    const parsed = askInputSchema.safeParse({ prompt: 'hi', thinkingLevel: 'EXTREME' });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects lowercase values (Google SDK enum is uppercase)', () => {
+    const parsed = askInputSchema.safeParse({ prompt: 'hi', thinkingLevel: 'high' });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('rejects THINKING_LEVEL_UNSPECIFIED (omit instead for model-native default)', () => {
+    const parsed = askInputSchema.safeParse({
+      prompt: 'hi',
+      thinkingLevel: 'THINKING_LEVEL_UNSPECIFIED',
+    });
+    expect(parsed.success).toBe(false);
+  });
+});
+
+describe('ask input schema — thinkingBudget × thinkingLevel mutual exclusion', () => {
+  it('rejects setting both thinkingBudget and thinkingLevel', () => {
+    // Gemini itself returns 400 on this combination ("cannot use both
+    // thinking_level and the legacy thinking_budget parameter"). We refuse
+    // at the schema boundary so callers get a clear Zod error instead of
+    // discovering the conflict after a round-trip to Google.
+    const parsed = askInputSchema.safeParse({
+      prompt: 'hi',
+      thinkingBudget: 4096,
+      thinkingLevel: 'HIGH',
+    });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues.some((i) => /mutually exclusive/i.test(i.message))).toBe(true);
+    }
+  });
+
+  it('accepts either one alone (thinkingBudget only)', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', thinkingBudget: 4096 }).success).toBe(true);
+  });
+
+  it('accepts either one alone (thinkingLevel only)', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', thinkingLevel: 'HIGH' }).success).toBe(true);
+  });
+
+  it('accepts neither (default path — runtime omits thinkingConfig budget field)', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi' }).success).toBe(true);
+  });
+});
+
 describe('ask input schema — core fields unchanged', () => {
   it('requires a non-empty prompt', () => {
     expect(askInputSchema.safeParse({ prompt: '' }).success).toBe(false);
     expect(askInputSchema.safeParse({}).success).toBe(false);
   });
 
-  it('accepts the full optional surface', () => {
+  it('accepts the full optional surface (thinkingBudget variant)', () => {
     const parsed = askInputSchema.safeParse({
       prompt: 'what does this do?',
       workspace: '/tmp/x',
@@ -86,6 +152,19 @@ describe('ask input schema — core fields unchanged', () => {
       excludeGlobs: ['legacy'],
       noCache: true,
       thinkingBudget: -1,
+    });
+    expect(parsed.success).toBe(true);
+  });
+
+  it('accepts the full optional surface (thinkingLevel variant)', () => {
+    const parsed = askInputSchema.safeParse({
+      prompt: 'what does this do?',
+      workspace: '/tmp/x',
+      model: 'latest-pro-thinking',
+      includeGlobs: ['*.proto'],
+      excludeGlobs: ['legacy'],
+      noCache: true,
+      thinkingLevel: 'HIGH',
     });
     expect(parsed.success).toBe(true);
   });
