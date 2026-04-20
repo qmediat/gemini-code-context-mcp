@@ -415,6 +415,10 @@ describe('tpm throttle', () => {
       // window fits), tsMs ≈ 60000. Order preserved: r2.tsMs >= r1.tsMs.
       expect(r2.delayMs).toBeGreaterThanOrEqual(59_985);
       expect(r2.delayMs).toBeLessThanOrEqual(59_990);
+      // Explicit: the shorter-hint must have been rejected. If it had taken
+      // effect, r2.delayMs would be ≤ 5_000 (5s - 11ms = 4989ms). Direct
+      // assertion matching PR #19 round-2 Grok coverage request.
+      expect(r2.delayMs).toBeGreaterThan(5_000);
 
       // Subsequent upgrade to a LONGER hint should succeed.
       throttle.recordRetryHint('gemini-3-pro', 120_000, baseMs + 20);
@@ -462,6 +466,43 @@ describe('tpm throttle', () => {
       // Keep going: prune will eventually evict all entries.
       vi.advanceTimersByTime(10_000); // now at baseMs + 76_000
       expect(throttle.shouldDelay('gemini-3-pro', 1, baseMs + 76_000)).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('stale-cache retry semantics (regression — PR #19 round-2 GPT)', () => {
+    it('cancel + fresh reserve refreshes tsMs to reflect retry dispatch time', () => {
+      // Scenario: first reserve at t=0 stamps tsMs=0. First generateContent
+      // fails with stale-cache error. Rebuild prepareContext takes ~15s.
+      // WITHOUT cancel+re-reserve: retry's generateContent uses the stale
+      // tsMs=0 reservation; our window expires at t=60s but Gemini's runs
+      // t=15s..t=75s. 15s gap where concurrent callers bust quota.
+      // WITH cancel+re-reserve (the shipped fix): retry gets tsMs=15, our
+      // window aligns with Gemini's (t=15s..t=75s).
+      const throttle = createTpmThrottle(80_000);
+      const baseMs = Date.now();
+
+      const first = throttle.reserve('gemini-3-pro', 50_000, baseMs);
+      expect(first.delayMs).toBe(0);
+      // Simulate stale-cache rebuild taking 15s. No release because first
+      // generateContent failed.
+      vi.advanceTimersByTime(15_000);
+      throttle.cancel(first.releaseId);
+
+      // Re-reserve for the retry's actual dispatch.
+      const retry = throttle.reserve('gemini-3-pro', 50_000, baseMs + 15_000);
+      expect(retry.delayMs).toBe(0); // Cancel freed the slot.
+      throttle.release(retry.releaseId, 50_000, baseMs + 15_000);
+
+      // Critical post-condition: the window should reflect tokens aged from
+      // baseMs+15000, not baseMs. A concurrent call at baseMs+60000 (60s
+      // after original first-reserve) would, WITHOUT the fix, see empty
+      // window (entry expired) and admit — but Gemini's counter still has
+      // 50k (dispatched at baseMs+15000, expires at baseMs+75000). Post-fix,
+      // the entry is still in OUR window at baseMs+60000 (tsMs=baseMs+15000,
+      // age=45000 < WINDOW=60000), so a concurrent 50k reserve delays.
+      vi.advanceTimersByTime(45_000); // now at baseMs + 60_000
+      const concurrent = throttle.reserve('gemini-3-pro', 50_000, baseMs + 60_000);
+      expect(concurrent.delayMs).toBeGreaterThan(0);
     });
   });
 
@@ -514,14 +555,16 @@ describe('tpm throttle', () => {
       expect(samples.size).toBeGreaterThanOrEqual(5);
     });
 
-    it('jitter stays within [1s, 3s] range', () => {
+    it('jitter stays within [1s, 3s] range (both bounds inclusive)', () => {
       for (let i = 0; i < 20; i++) {
         const throttle = createTpmThrottle(80_000);
         const baseMs = Date.now();
         const a = throttle.reserve('gemini-3-pro', 60_000, baseMs);
         throttle.release(a.releaseId, 60_000, baseMs);
         const r = throttle.reserve('gemini-3-pro', 30_000, baseMs);
-        // Window math: wait = 0 + 60000 - 0 = 60000. + jitter [1000, 3000].
+        // Window math: wait = 0 + 60000 - 0 = 60000. + jitter [1000, 3000]
+        // (both inclusive — `+1` in the multiplier width in computeJitterMs
+        // makes MAX reachable; without it the range was [1000, 2999]).
         expect(r.delayMs).toBeGreaterThanOrEqual(61_000);
         expect(r.delayMs).toBeLessThanOrEqual(63_000);
       }

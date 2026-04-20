@@ -73,8 +73,15 @@ const WINDOW_MS = 60_000;
  */
 const JITTER_MIN_MS = 1_000;
 const JITTER_MAX_MS = 3_000;
+/**
+ * Uniformly distributed integer in `[JITTER_MIN_MS, JITTER_MAX_MS]` —
+ * BOTH endpoints inclusive. The `+ 1` in the multiplier width ensures
+ * `JITTER_MAX_MS` is reachable (without it, `Math.floor` clamps to
+ * `MAX - 1`, producing the `[1000, 2999]` off-by-one Copilot flagged in
+ * the PR #19 round-2 review).
+ */
 function computeJitterMs(): number {
-  return JITTER_MIN_MS + Math.floor(Math.random() * (JITTER_MAX_MS - JITTER_MIN_MS));
+  return JITTER_MIN_MS + Math.floor(Math.random() * (JITTER_MAX_MS - JITTER_MIN_MS + 1));
 }
 
 interface WindowEntry {
@@ -244,8 +251,9 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
   }
 
   /**
-   * Compute the delay needed before a call estimated at `estimate` tokens
-   * can fit under `limitTokensPerMinute`, given the current `entries`.
+   * Compute the PURE (un-jittered) delay needed before a call estimated at
+   * `estimate` tokens can fit under `limitTokensPerMinute`, given the
+   * current `entries`.
    *
    * Returns `0` when the call fits immediately. Returns `0` when `estimate`
    * alone exceeds the limit — sleeping forever would deadlock the tool;
@@ -255,8 +263,12 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
    * Otherwise: find the smallest `k` such that evicting `entries[0..k]`
    * leaves `sum(entries[k+1..]) + estimate <= limit`, and wait just long
    * enough for `entries[k]` to age out of the 60s window.
+   *
+   * Jitter is NOT applied here — that's the caller's responsibility. See
+   * `computeWindowDelay` for the jittered variant used by `reserve`, and
+   * `shouldDelay` for the un-jittered peek used by diagnostics.
    */
-  function computeWindowDelay(entries: WindowEntry[], estimate: number, nowMs: number): number {
+  function computeWindowDelayPure(entries: WindowEntry[], estimate: number, nowMs: number): number {
     let sum = 0;
     for (const e of entries) sum += e.tokens;
 
@@ -274,12 +286,24 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
       remaining -= e.tokens;
       if (remaining + estimate <= limitTokensPerMinute) {
         const wait = e.tsMs + WINDOW_MS - nowMs;
-        return Math.max(0, wait) + computeJitterMs();
+        return Math.max(0, wait);
       }
     }
     // Unreachable in practice: `estimate < limit` (checked above) means
     // evicting ALL entries (remaining=0) always fits. Return 0 defensively.
     return 0;
+  }
+
+  /**
+   * Jittered variant of `computeWindowDelayPure`. Used by `reserve` so that
+   * concurrent waiters evicting the same entry wake at slightly different
+   * times instead of thundering back into generateContent simultaneously.
+   * Pure delay of `0` stays `0` — jitter only applies when there's actual
+   * waiting to do.
+   */
+  function computeWindowDelay(entries: WindowEntry[], estimate: number, nowMs: number): number {
+    const pure = computeWindowDelayPure(entries, estimate, nowMs);
+    return pure === 0 ? 0 : pure + computeJitterMs();
   }
 
   return {
@@ -359,7 +383,11 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
       const now = effectiveNow(nowMs);
       const estimate = sanitizeTokens(estimatedInputTokens);
       const entries = prune(model, now);
-      const windowDelay = computeWindowDelay(entries, estimate, now);
+      // Peek uses the PURE delay — callers polling for progress-bar
+      // updates or diagnostics would otherwise see bouncing values for
+      // unchanged state, which `computeWindowDelay`'s random jitter
+      // introduces for `reserve`'s thundering-herd avoidance.
+      const windowDelay = computeWindowDelayPure(entries, estimate, now);
       const hint = activeHint(model, now);
       const hintDelay = hint ? Math.max(0, hint.expiresAtMs - now) : 0;
       return Math.max(windowDelay, hintDelay);

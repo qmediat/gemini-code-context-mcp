@@ -372,6 +372,44 @@ Empirically confirmed aggregation quirk: `gemini-pro-latest` (our `latest-pro` a
 
 ## T22a. Wire up Gemini 429 `retryInfo.retryDelay` → `recordRetryHint`
 
+(See scope below. Ship as a standalone v1.3.x patch whenever a maintainer has the hour.)
+
+---
+
+## T22b. Ask/code integration tests for throttle lifecycle
+
+**Source:** GPT round-2 review on PR #19 (2026-04-20). Flagged as IMPORTANT; accepted as LOW/deferred by `/6step`.
+
+**Why:** `test/unit/ask-tool.test.ts` and `test/unit/code-tool.test.ts` are schema-only — they validate input parsing but never exercise the execute path. The throttle integration (`reserve` after `prepareContext`, `release` on success with `promptTokenCount`, `cancel` on failure, **cancel+re-reserve on stale-cache retry**) is covered by module-level unit tests for the throttle itself, plus one stale-cache-retry regression test at the throttle level — but no integration test asserts the CALL ORDERING inside ask/code. A future refactor that accidentally drops `cancel` from the retry branch, or reverts `reserve` to before `prepareContext`, wouldn't surface via the current suite.
+
+**Scope:**
+- Mock `ctx.client.models.generateContent`, `ctx.throttle`, and `ctx.manifest` in new `test/integration/ask-throttle-integration.test.ts` + `code-throttle-integration.test.ts` (or extend the existing `*-tool.test.ts` files).
+- Assert, for each scenario: `prepareContext → reserve → generateContent → release` call ordering; no `reserve` before `prepareContext`; `cancel` called on non-stale errors; `cancel + reserve` (not just `reserve`) on stale-cache retry.
+- Cover: happy path, stale-cache success, stale-cache → rebuild fails, non-stale error post-dispatch, disabled throttle (`tpmThrottleLimit=0`).
+- Unmocked end-to-end smoke is covered by the manual post-publish test plan in the PR body; this task is about the CI-enforced regression guard.
+
+**Sizing:** ~1–2 hours including the mock harness setup. Small PR, shippable as v1.3.x patch or bundled with T22a.
+
+**Blocked on:** nothing. Can ship any time.
+
+---
+
+## T23a. Narrow `ToolResult.structuredContent` type to match runtime invariant
+
+**Source:** GPT round-1 and round-2 review on PR #19 (2026-04-20). NIT-level cosmetic typing drift.
+
+**Why:** `ToolResult.structuredContent` at `src/tools/registry.ts:52` is declared `Record<string, unknown> | undefined` (optional). Post-T23, `textResult()` and `errorResult()` ALWAYS set it (with `responseText` at minimum). The declared type under-commits to the runtime behaviour — downstream TS consumers who write `if (result.structuredContent)` get a nominal-truthy-check that's always true, which conveys the wrong mental model and wastes reader attention. Not a correctness bug (the optional annotation is a strict SUPERSET of the always-present behaviour), just a documentation-through-types gap.
+
+**Scope:** Two options — (a) narrow the interface: `structuredContent: Record<string, unknown>` (required); or (b) split the return type: introduce `TextToolResult = ToolResult & { structuredContent: Record<string, unknown> }` and declare `textResult` / `errorResult` as returning `TextToolResult`. Option (b) preserves the loose `ToolResult` type for any future non-textResult caller that might legitimately omit structured content. Prefer (b).
+
+**Sizing:** ~15 minutes, a few lines in `registry.ts` plus any downstream consumer imports (grep confirms none currently use the narrower shape).
+
+**Blocked on:** nothing.
+
+---
+
+## T22a. Wire up Gemini 429 `retryInfo.retryDelay` → `recordRetryHint` (scope)
+
 **Source:** Scope carry-over from T22 (v1.3.0). The throttle module exposes `recordRetryHint(model, retryDelayMs)` and `reserve` already prefers `max(windowDelay, hintDelay)` while a hint is active. What's missing is wiring the hint up from the `ask`/`code` catch branches when Gemini returns a 429.
 
 **Why:** Even with the T22 preflight throttle correct and honest, a misestimate (under-counted UTF-8 / CJK tokens, new model with different cached-token accounting, tier-boundary drift) can still fire a 429. Google's 429 body includes `retryInfo.retryDelay` (typically 2–16 s — shorter than our 60 s window math, because Google's quota counter is more granular than a simple sliding window). Preferring Google's hint over our clock gets retries right faster and avoids the 60 s worst-case wait our pure-window fallback computes.

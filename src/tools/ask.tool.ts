@@ -286,7 +286,12 @@ export const askTool: ToolDefinition<AskInput> = {
       // two concurrent cold-cache callers will both complete
       // `prepareContext` before one backs off at `reserve` — mostly
       // idempotent via file-hash dedup, minor upload duplication.
-      if (ctx.config.tpmThrottleLimit > 0) {
+      //
+      // Extracted into a helper so the stale-cache retry branch can
+      // cancel-and-re-reserve with an accurate tsMs rather than reusing a
+      // stale reservation stamped before the first (failed) dispatch.
+      const reserveForDispatch = async (): Promise<void> => {
+        if (ctx.config.tpmThrottleLimit <= 0) return;
         const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
         throttleReservationId = reservation.releaseId;
         if (reservation.delayMs > 0) {
@@ -295,7 +300,8 @@ export const askTool: ToolDefinition<AskInput> = {
           );
           await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
         }
-      }
+      };
+      await reserveForDispatch();
 
       emitter.emit(
         usingThinkingLevel
@@ -400,6 +406,18 @@ export const askTool: ToolDefinition<AskInput> = {
               emitter,
               allowCaching: !input.noCache && scan.files.length > 0,
             });
+            // Cancel the original throttle reservation — its `tsMs` was
+            // stamped at first-dispatch time, which is now seconds in the
+            // past (the rebuild took real time). Re-reserve fresh so the
+            // retry's tsMs reflects when the retry call actually hits
+            // Gemini's quota counter. Without this, our window would expire
+            // locally before Gemini's, leaving a gap where concurrent
+            // callers bust the per-minute limit (PR #19 round-2 GPT review).
+            if (throttleReservationId !== -1) {
+              ctx.throttle.cancel(throttleReservationId);
+              throttleReservationId = -1;
+            }
+            await reserveForDispatch();
             response = await ctx.client.models.generateContent({
               model: resolved.resolved,
               contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),

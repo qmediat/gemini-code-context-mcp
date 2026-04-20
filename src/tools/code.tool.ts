@@ -307,7 +307,12 @@ export const codeTool: ToolDefinition<CodeInput> = {
       // `generateContent`, so the reservation's `tsMs` accurately reflects
       // when tokens hit Gemini's quota counter. See ask.tool.ts for the
       // full rationale and the cold-cache-timing concern it fixes.
-      if (ctx.config.tpmThrottleLimit > 0) {
+      //
+      // Extracted into a helper so the stale-cache retry branch can
+      // cancel-and-re-reserve with an accurate tsMs rather than reusing a
+      // stale reservation.
+      const reserveForDispatch = async (): Promise<void> => {
+        if (ctx.config.tpmThrottleLimit <= 0) return;
         const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
         throttleReservationId = reservation.releaseId;
         if (reservation.delayMs > 0) {
@@ -316,7 +321,8 @@ export const codeTool: ToolDefinition<CodeInput> = {
           );
           await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
         }
-      }
+      };
+      await reserveForDispatch();
 
       const userPrompt = expectEdits
         ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
@@ -417,6 +423,15 @@ export const codeTool: ToolDefinition<CodeInput> = {
               emitter,
               allowCaching: scan.files.length > 0 && !codeExecution,
             });
+            // Cancel stale reservation (tsMs was stamped before first
+            // dispatch, now seconds old after rebuild) and re-reserve so
+            // the retry's tsMs matches actual dispatch time. Mirror of
+            // ask.tool.ts — see rationale there.
+            if (throttleReservationId !== -1) {
+              ctx.throttle.cancel(throttleReservationId);
+              throttleReservationId = -1;
+            }
+            await reserveForDispatch();
             response = await ctx.client.models.generateContent({
               model: resolved.resolved,
               contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
