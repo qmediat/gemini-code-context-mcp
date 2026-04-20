@@ -16,7 +16,9 @@ Each step must fully merge + publish before the next opens:
 | Phase | Release | PRs | Scope | Expected size |
 |-------|---------|-----|-------|--------------|
 | ~~A~~ | ~~**v1.2.0**~~ ✅ SHIPPED | ~~#15, #16, #17, #18~~ | ~~`ask`/`code` thinkingLevel + alias fix + home-reject security~~ | ~~done~~ |
-| **B** | **v1.3.0** | T22 + T23 bundled | **Reviewer-workflow unblockers:** TPM preflight throttle (T22, `GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT` env) + MCP wire-format fix (T23, surface text as `structuredContent.responseText`). Without these the MCP is effectively unusable for `/coderev`-style sub-agent pipelines (text invisible to agents) and suffers 429 cascades on back-to-back reasoning calls. Ship together because they're both "make the MCP usable for review workflows" and each is tiny in isolation. | ~6 h combined |
+| ~~B~~ | ~~**v1.3.0**~~ ✅ SHIPPED | ~~#19~~ | ~~T22 + T23 bundled — TPM throttle + `structuredContent.responseText` wire-format fix~~ | ~~done~~ |
+| ~~B.1~~ | ~~**v1.3.1**~~ ✅ SHIPPED | ~~#20~~ | ~~T22a + T22b + T23a deferred follow-ups — 429 retry-hint wiring + ask/code integration tests + `TextToolResult` type narrowing~~ | ~~done~~ |
+| ~~B.2~~ | ~~**v1.3.2**~~ ✅ SHIPPED | ~~#21~~ | ~~Hotfix — 429 gate on retry-hint parser (hint-poisoning defence) + escaped-JSON proxy edge + test comment correctness. PR #20 round-1 GPT + Grok CRITICAL closure.~~ | ~~~20 min~~ |
 | C | **v1.4.0** | T19 | Opt-in `GEMINI_CODE_CONTEXT_*_TIMEOUT_MS` env var (default disabled). Complements T22's preflight with a post-call bounded-wait for stuck connections. | ~2 h |
 | D | **v1.5.0** | T20 | Migrate `ask` / `code` to `generateContentStream` for in-flight thinking heartbeat. Pairs with T19's `AbortController` for real stall detection — stream heartbeat + timeout abort = closed loop. | ~1 day |
 

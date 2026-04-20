@@ -28,7 +28,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
-import { parseRetryDelayMs } from './shared/throttle.js';
+import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 const SYSTEM_INSTRUCTION_Q_AND_A =
   'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.';
@@ -573,10 +573,20 @@ export const askTool: ToolDefinition<AskInput> = {
       // T22a — extract Gemini's `retryInfo.retryDelay` from 429 bodies and
       // seed the throttle's per-model hint before we release the
       // reservation. Google's hint is typically shorter (2-16s) than our
-      // pure-window math would compute (up to 60s+) so honouring it shortens
-      // the next caller's wait. Best-effort: `parseRetryDelayMs` returns
-      // null on non-429 / malformed bodies and we silently continue.
-      const retryDelayMs = err instanceof Error ? parseRetryDelayMs(err.message) : null;
+      // pure-window math would compute (up to 60s+) so honouring it
+      // shortens the next caller's wait.
+      //
+      // Gated on `isGemini429` BEFORE parsing. The predicate requires BOTH
+      // `err instanceof ApiError` (SDK-provenance marker — user-controlled
+      // content can't forge an ApiError prototype) AND `err.status === 429`
+      // (typed field from the HTTP response). The earlier v1.3.2 draft had
+      // a `RESOURCE_EXHAUSTED` substring fallback; GPT + Grok round-2
+      // review (PR #21) showed that path was user-influenceable — echoed
+      // prompt content re-opened the hint-poisoning class the gate was
+      // meant to close. Removing the fallback drops hint extraction for
+      // errors that lose the ApiError shape in transit, but production
+      // 429s always arrive as real ApiError instances.
+      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
       if (retryDelayMs !== null && resolvedModelKey !== null) {
         ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
       }

@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] — 2026-04-20
+
+Security-flavoured hotfix closing hint-poisoning attack surface flagged in PR #20 (v1.3.1) multi-round review. **Two review rounds on this hotfix itself** (PR #21 round-1 + round-2) refined the gate design — the initial substring fallback was itself bypassable and got tightened to prototype-based SDK provenance. `/6step` verified all findings closed end-to-end against a real `@google/genai` `ApiError` instance.
+
+### Fixed
+
+- **Retry-hint poisoning closed via SDK-provenance gate.** `parseRetryDelayMs` was called on EVERY `Error.message` that reached `ask`/`code` catch blocks in v1.3.1 — not gated to confirmed Gemini 429s. A user-controlled prompt containing the literal substring `"retryDelay":"60s"` echoed into any non-429 error body (safety filter, validation rejection, log re-serialisation) would seed the per-model throttle at the clamp ceiling and self-DoS the MCP server for the rest of its process lifetime. v1.3.2 gates the parser behind a new exported `isGemini429(err)` type-guard that requires BOTH `err instanceof ApiError` (prototype-chain identity — class only instantiated by `@google/genai`'s `throwErrorIfNotOK` from real HTTP responses) AND `err.status === 429` (typed field, strict equality — rejects stringified `"429"` from buggy wrappers). User-controlled content cannot forge either marker from prompt-string input. An earlier draft with a `/RESOURCE_EXHAUSTED/` substring fallback was itself flagged by GPT + Grok as bypassable (attacker injects both markers) and removed before merge. GPT + Grok both CRITICAL on round-1, both confirmed closed on round-2.
+- **Escaped-JSON form now extracted.** `parseRetryDelayMs` previously required bare-quoted `"retryDelay":"Ns"` in the error message. Empirically verified that the common `@google/genai` SDK path produces bare quotes via `JSON.stringify(errorBody)` in `throwErrorIfNotOK`, so real 429s from `generativelanguage.googleapis.com` / Vertex `aiplatform.googleapis.com` match directly — regardless of which auth tier constructed the client (`apiKey` vs `vertexai` paths share the same error-handling code). BUT: the non-JSON content-type branch of `throwErrorIfNotOK` wraps raw text body into `{error: {message: "<raw-text>"}}` before stringifying, ESCAPING any literal `"retryDelay":"Ns"` substring inside — a narrow path hit when a corporate proxy / MITM / Cloudflare edge returns an HTML 429 page instead of the upstream JSON. The parser now unescapes once on fallback (`errorMessage.replace(/\\"/g, '"')`) when `\\"` is present, and re-runs the regex. Bare-form common path unchanged (no allocation). `/6step` verdict: LOW TP — safe direction even if missed (falls back to pure-window math, no quota overshoot). With the prototype gate above, user-controlled content can't reach the parser regardless of escape form.
+- **Test comment correctness** — `"returns null on negative / zero values"` now documents that `"-1s"` fails at the regex stage (the `\d+` class rejects leading `-`) while `"0s"` fails via the `seconds <= 0` guard. Two different reject paths converging on `null`. Grok NIT.
+
+### Added
+
+- **`isGemini429(err): err is ApiError`** — type-guard exported from `src/tools/shared/throttle.ts`. Imports `ApiError` from `@google/genai`. Narrows `err` to `ApiError` in call-site catch blocks, eliminating the `(err as Error).message` cast that appeared in an earlier draft.
+- **11 new unit tests** covering: `parseRetryDelayMs` escaped form + mixed bare/escaped tie-break, 7 `isGemini429` cases (real ApiError-429, non-ApiError wrapper with forged status=429, plain Error with RESOURCE_EXHAUSTED substring, ApiError with non-429 status, user-controlled poisoning attempt with both markers, non-Error values, ApiError with non-number status).
+- **8 new integration tests across `ask` + `code`** — both tool files now cover the full bypass-guard surface: real ApiError 429 → hint seeded; plain Error with RESOURCE_EXHAUSTED substring → NO hint (gate tightened, substring path removed); combined-marker poisoning attempt (RESOURCE_EXHAUSTED + retryDelay substring in non-429 error) → NO hint; custom Object.assign wrapper with forged status=429 → NO hint; ApiError with non-429 status + retryDelay in body → NO hint.
+
+### Tests
+
+- 77 throttle-family tests (up from 56 in v1.3.1: 9 `parseRetryDelayMs` + 11 `parseRetryDelayMs` extended cases + 7 `isGemini429` + 40 core throttle + 15 integration = 77). Exact count may vary with jitter randomness.
+- 221 total PR tests (up from 205 in v1.3.1). Lint + typecheck + build all green on Node 22.
+
+### Reviewer notes (not a code change)
+
+**Round-1 on PR #21** (tightening's first draft): GPT `gpt-5.3-codex` + Grok `grok-4.20-beta-0309-reasoning` both flagged the `RESOURCE_EXHAUSTED` substring fallback as itself bypassable — attacker injecting BOTH markers (`RESOURCE_EXHAUSTED` + `"retryDelay":"60s"`) reopened the same poisoning class the gate was meant to close. Grok additionally flagged missing word boundaries, brittle escape-fallback on double-escape, and the type-guard regression risk from the `(err as Error)` cast.
+
+**Round-2 response**: tightened `isGemini429` to require `err instanceof ApiError` (class imported from `@google/genai`) AND `err.status === 429`. Substring fallback REMOVED entirely. Cast eliminated via type-guard signature. Prototype check is not forgeable from user-controlled string input — closes both bypass classes. Copilot's round-2 queue did not return in the review window; 2-of-2 available reviewers (GPT + Grok) on round-1 + `/6step` on round-2 tightening provided sufficient signal.
+
+**Not fixed (documented as accepted)**:
+- Numeric / protobuf retry-delay forms (`"retryDelay":5`, `{"seconds":5,"nanos":0}`). Not observed in Gemini REST API output per AIP-140 (`"Ns"` string form mandated). Future-proof; defer.
+- Integration mock fidelity drift. Hand-written shapes for `scanWorkspace` / `resolveModel` / `prepareContext` leaf mocks. Follow-up: replace `as Type[...]` casts with `satisfies` to force compile-time drift detection.
+- `TextToolResult` type narrowing as minor API surface change. Runtime-safe; external TS consumers (none known) get narrower field type, not break.
+- Disabled-throttle path still runs `parseRetryDelayMs` on every catch — `recordRetryHint` itself no-ops when disabled so the result is discarded. Perf: microseconds. Not worth conditionalizing.
+
 ## [1.3.1] — 2026-04-20
 
 Patch release closing the three LOW/NIT follow-ups deferred from v1.3.0's multi-round review cycle (T22a retry-hint wiring, T22b ask/code integration tests, T23a helper return-type narrowing). No user-visible API breaks; smallest possible diff that moves GPT's round-2 "still live" findings to closed.

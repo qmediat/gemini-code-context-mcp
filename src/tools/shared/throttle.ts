@@ -57,6 +57,8 @@
  *    preflight-only; it never aborts a `generateContent` in progress.
  */
 
+import { ApiError } from '@google/genai';
+
 const WINDOW_MS = 60_000;
 
 /**
@@ -449,17 +451,40 @@ const RETRY_HINT_MAX_MS = 60_000;
  * body, missing `retryDelay` field, non-numeric value). Returns a value
  * in `[RETRY_HINT_MIN_MS, RETRY_HINT_MAX_MS]` on a successful parse.
  *
- * Example error body shape that this extracts from:
+ * Normal `@google/genai` 429 bodies arrive as bare-quote JSON via the
+ * SDK's `JSON.stringify(errorBody)` in `throwErrorIfNotOK`, which matches
+ * `RETRY_DELAY_REGEX` directly. The escaped fallback handles a narrower
+ * path: when a non-JSON content-type response (HTML error page from a
+ * corporate proxy / MITM intercept / Cloudflare edge) is wrapped by the
+ * SDK into `{error: {message: "<html-text>"}}` and then stringified,
+ * any `"retryDelay":"Ns"` literal inside that HTML becomes `\"retryDelay\":\"Ns\"`
+ * — escaped. Unescaping once before the regex catches that edge without
+ * breaking the common path (double-unescape would damage already-bare
+ * JSON). Flagged in PR #20 round-1 review by Grok.
+ *
+ * The helper does NOT discriminate between 429 and non-429 error messages;
+ * callers MUST gate with `isGemini429(err)` before invoking this parser to
+ * prevent hint-poisoning from user-controlled substrings appearing in
+ * unrelated error bodies (PR #20 round-1 GPT + Grok).
+ *
+ * Example error body shapes that this extracts from:
  * ```
  * {"error":{...,"details":[...,{"@type":"...RetryInfo","retryDelay":"2s"}]}}
+ * {"error":{"message":"<html>...\"retryDelay\":\"2s\"...</html>","code":429}}
  * ```
- * Only the `"retryDelay":"<seconds>s"` substring is matched — we don't
- * walk the details array. This is deliberately lenient.
  */
 const RETRY_DELAY_REGEX = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/;
 export function parseRetryDelayMs(errorMessage: string): number | null {
   if (typeof errorMessage !== 'string' || errorMessage.length === 0) return null;
-  const match = errorMessage.match(RETRY_DELAY_REGEX);
+  // Try bare-quote form first (the common `@google/genai` SDK path).
+  let match = errorMessage.match(RETRY_DELAY_REGEX);
+  if (!match && errorMessage.includes('\\"')) {
+    // Fall back to unescaping once for the proxy / non-JSON-content-type
+    // edge case. `replace` on an already-bare string is a no-op, so this
+    // is safe to do unconditionally — but the `includes('\\"')` guard
+    // avoids the string allocation on the common path.
+    match = errorMessage.replace(/\\"/g, '"').match(RETRY_DELAY_REGEX);
+  }
   if (!match || !match[1]) return null;
   const seconds = Number.parseFloat(match[1]);
   if (!Number.isFinite(seconds) || seconds <= 0) return null;
@@ -467,6 +492,44 @@ export function parseRetryDelayMs(errorMessage: string): number | null {
   if (ms < RETRY_HINT_MIN_MS) return RETRY_HINT_MIN_MS;
   if (ms > RETRY_HINT_MAX_MS) return RETRY_HINT_MAX_MS;
   return ms;
+}
+
+/**
+ * Type-guard: true iff `err` is a Gemini `@google/genai` `ApiError` with
+ * HTTP status 429 — i.e. a real upstream RESOURCE_EXHAUSTED rate-limit
+ * response, NOT any error that happens to look like one.
+ *
+ * Two independent SDK-provenance markers are required together:
+ *
+ *   1. `err instanceof ApiError` — the class is only instantiated by
+ *      `throwErrorIfNotOK` in the SDK's response-handling path, so
+ *      prototype-chain identity guarantees the error originates from a
+ *      real HTTP response (not a user-constructed wrapper, Axios re-throw,
+ *      test mock, or arbitrary `Error` subclass with `.status === 429`).
+ *   2. `err.status === 429` — typed field on ApiError (`genai.d.ts`
+ *      declares `status: number`), matched strictly by identity so a
+ *      stringified `"429"` from a buggy wrapper is rejected.
+ *
+ * Why NOT a `RESOURCE_EXHAUSTED` substring fallback: the earlier v1.3.2
+ * draft included one to cover wrapped / re-thrown errors that lose the
+ * ApiError prototype. But GPT + Grok round-2 review (PR #21) flagged
+ * that the substring is user-influenceable — a prompt containing the
+ * literal `RESOURCE_EXHAUSTED` (or `FAKE_RESOURCE_EXHAUSTED`, etc. since
+ * there were no word boundaries) that echoes into any non-429 error body
+ * would re-open the exact hint-poisoning class the gate was meant to
+ * close. Removing the substring path eliminates that bypass class at
+ * the cost of dropping hint extraction for errors that lose the
+ * ApiError shape in transit — an acceptable trade since legitimate
+ * Gemini 429s come as real ApiError instances on every production path.
+ *
+ * Gating `parseRetryDelayMs` on this predicate is load-bearing: without
+ * it, user-controlled `"retryDelay":"60s"` substrings echoed into an
+ * unrelated error body would seed a 60 s throttle-wide backoff that
+ * persists for the MCP server's process lifetime (self-DoS vector).
+ */
+export function isGemini429(err: unknown): err is ApiError {
+  if (!(err instanceof ApiError)) return false;
+  return err.status === 429;
 }
 
 /**
