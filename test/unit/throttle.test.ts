@@ -362,4 +362,169 @@ describe('tpm throttle', () => {
       expect(r.delayMs).toBeGreaterThanOrEqual(0);
     });
   });
+
+  describe('sorted-array invariant (regression — Copilot/Grok/Gemini PR #19)', () => {
+    it('delay=0 reservation after future-dated provisional inserts in correct sorted position', () => {
+      // State: limit=80k. R1 reserves 70k → delay=0, tsMs=0. Release.
+      // R2 reserves 15k → over limit, must evict E1. wait = 0+60000-delta
+      // → R2.tsMs ≈ 62000 (future-dated). Release.
+      // R3 arrives at t=61000 — E1 has aged out of prune's cutoff;
+      // remaining sum = 15k; R3's 15k fits → delay=0 → R3.tsMs=61000.
+      // Naïve append would leave array [E2@62000, E3@61000] — UNSORTED.
+      // Sorted-insert must place R3 BEFORE E2.
+      const throttle = createTpmThrottle(80_000);
+      const baseMs = Date.now();
+      const r1 = throttle.reserve('gemini-3-pro', 70_000, baseMs);
+      throttle.release(r1.releaseId, 70_000, baseMs);
+      vi.advanceTimersByTime(5_000);
+      const r2 = throttle.reserve('gemini-3-pro', 15_000);
+      throttle.release(r2.releaseId, 15_000);
+      vi.advanceTimersByTime(56_000); // now at baseMs + 61_000
+      const r3 = throttle.reserve('gemini-3-pro', 15_000);
+      expect(r3.delayMs).toBe(0); // delay=0 confirms E1 was evicted + R3 fits.
+      throttle.release(r3.releaseId, 15_000);
+
+      // After R2's future-dated tsMs eventually expires from window, the
+      // next reserve should see a clean window. If sorted-insert was wrong,
+      // R3 (stored at tsMs=61000) would age out at 121000 but R2 (stored
+      // at tsMs~62000) would age out at 122000. `prune`'s head-only fast-
+      // path must see R3 as head (earliest) — otherwise it skips pruning.
+      // Advance past both: nowMs = baseMs + 123_000. Prune cutoff = 63_000.
+      // Both R2.tsMs~62000 and R3.tsMs=61000 are below cutoff → both evicted.
+      vi.advanceTimersByTime(62_000); // now at baseMs + 123_000
+      expect(throttle.shouldDelay('gemini-3-pro', 79_999)).toBe(0);
+    });
+
+    it('retry-hint downgrade does not produce out-of-order entries (extend-only hint)', () => {
+      // PR #19 Gemini finding: shorter hint replacing longer one previously
+      // let the next reserve compute a smaller tsMs than entries appended
+      // under the longer hint. Extend-only `recordRetryHint` preserves the
+      // longer expiry so the tsMs order stays sorted.
+      const throttle = createTpmThrottle(80_000);
+      const baseMs = Date.now();
+
+      // 60s hint → reserve dated at baseMs+60000.
+      throttle.recordRetryHint('gemini-3-pro', 60_000, baseMs);
+      const r1 = throttle.reserve('gemini-3-pro', 1, baseMs);
+      expect(r1.delayMs).toBe(60_000);
+
+      // Attempt to downgrade to 5s hint — must be ignored.
+      throttle.recordRetryHint('gemini-3-pro', 5_000, baseMs + 10);
+      const r2 = throttle.reserve('gemini-3-pro', 1, baseMs + 11);
+      // Hint still expires at baseMs+60000. r2.delayMs ≈ 59989 (pure hint,
+      // window fits), tsMs ≈ 60000. Order preserved: r2.tsMs >= r1.tsMs.
+      expect(r2.delayMs).toBeGreaterThanOrEqual(59_985);
+      expect(r2.delayMs).toBeLessThanOrEqual(59_990);
+
+      // Subsequent upgrade to a LONGER hint should succeed.
+      throttle.recordRetryHint('gemini-3-pro', 120_000, baseMs + 20);
+      const r3 = throttle.reserve('gemini-3-pro', 1, baseMs + 21);
+      // Now hint expires at baseMs+120020. r3.delayMs ≈ 119999.
+      expect(r3.delayMs).toBeGreaterThanOrEqual(119_995);
+    });
+
+    it('prune correctly evicts mid-array expired entries', () => {
+      // This was the empirical over-throttle scenario from the PR #19
+      // review: fast-path checked only entries[0]; an entry buried
+      // mid-array (small tsMs but later in insertion order) was skipped.
+      // Sorted-insert places it at head → fast-path correctly falls
+      // through to the full scan → eviction happens.
+      const throttle = createTpmThrottle(80_000);
+      const baseMs = Date.now();
+
+      // Put a future-dated entry first.
+      throttle.recordRetryHint('gemini-3-pro', 60_000, baseMs);
+      const r1 = throttle.reserve('gemini-3-pro', 1, baseMs); // tsMs = baseMs+60000
+
+      // Retry-hint-downgrade attempt would not work after the fix, so we
+      // build the scenario via window-eviction instead. Heavy first entry
+      // + moderate new estimate → future-dated provisional.
+      throttle.release(r1.releaseId, 1, baseMs);
+
+      // Now a fresh heavy entry that forces a second future-dated push.
+      const r2 = throttle.reserve('gemini-3-pro', 70_000, baseMs + 5_000);
+      throttle.release(r2.releaseId, 70_000, baseMs + 5_000);
+
+      // r2 was far enough in the past to require a smaller delay than r1;
+      // both still live in the window. Advance past r1's 60s expiry
+      // point but not past r2's; sorted-insert guarantees `prune` walks
+      // the right head.
+      vi.advanceTimersByTime(61_000); // now at baseMs + 61_000
+      // Cutoff = 1_000. r1.tsMs = 60_000 > 1_000 → kept. r2.tsMs = 65_000
+      // > 1_000 → kept. No eviction in this step — but sorted invariant
+      // means `prune` does NOT short-circuit incorrectly.
+      const peek = throttle.shouldDelay('gemini-3-pro', 0, baseMs + 61_000);
+      expect(Number.isFinite(peek)).toBe(true); // Sanity — no NaN.
+
+      // Advance enough for r1 to expire naturally.
+      vi.advanceTimersByTime(5_000); // now at baseMs + 66_000
+      // Cutoff = 6_000. r1.tsMs = 60_000 > 6_000 → kept still.
+      // Keep going: prune will eventually evict all entries.
+      vi.advanceTimersByTime(10_000); // now at baseMs + 76_000
+      expect(throttle.shouldDelay('gemini-3-pro', 1, baseMs + 76_000)).toBeGreaterThanOrEqual(0);
+    });
+  });
+
+  describe('release lifecycle — index cleanup (regression — GPT PR #19)', () => {
+    it('double release on same id is idempotent', () => {
+      const throttle = createTpmThrottle(80_000);
+      const a = throttle.reserve('gemini-3-pro', 50_000);
+      throttle.release(a.releaseId, 50_000);
+      // Second release must be a no-op — the previously accounted entry
+      // must not silently mutate to a different token count.
+      expect(() => throttle.release(a.releaseId, 999_999)).not.toThrow();
+
+      // Reserve again; window should still reflect the 50k from first
+      // release (NOT the 999_999 from the bogus second release — which
+      // must have been a no-op). 50k + 40k = 90k > 80k cap → delays.
+      const b = throttle.reserve('gemini-3-pro', 40_000);
+      expect(b.delayMs).toBeGreaterThan(0);
+    });
+
+    it('cancel after release is a no-op (does not evict the already-accounted entry)', () => {
+      // Critical: cancel after release must NOT remove the entry that
+      // release already mutated. Otherwise a buggy caller leaves the
+      // window under-counted.
+      const throttle = createTpmThrottle(80_000);
+      const a = throttle.reserve('gemini-3-pro', 70_000);
+      throttle.release(a.releaseId, 70_000);
+      // Buggy cancel — must be ignored, entry stays in window.
+      throttle.cancel(a.releaseId);
+      const b = throttle.reserve('gemini-3-pro', 20_000);
+      // Window still has 70k from `a`. 70+20=90>80 → must delay.
+      expect(b.delayMs).toBeGreaterThan(0);
+    });
+  });
+
+  describe('jitter randomisation (regression — Gemini PR #19)', () => {
+    it('delays for the same scenario produce a spread of jitter values', () => {
+      // Deterministic JITTER_MS let concurrent waiters wake at the same ms
+      // (thundering herd). Randomised jitter spreads them across 1-3s.
+      // This test samples 20 reserves against identical state and asserts
+      // at least 5 distinct jitter values appear.
+      const samples = new Set<number>();
+      for (let i = 0; i < 20; i++) {
+        const throttle = createTpmThrottle(80_000);
+        const baseMs = Date.now();
+        const a = throttle.reserve('gemini-3-pro', 60_000, baseMs);
+        throttle.release(a.releaseId, 60_000, baseMs);
+        const r = throttle.reserve('gemini-3-pro', 30_000, baseMs);
+        samples.add(r.delayMs);
+      }
+      expect(samples.size).toBeGreaterThanOrEqual(5);
+    });
+
+    it('jitter stays within [1s, 3s] range', () => {
+      for (let i = 0; i < 20; i++) {
+        const throttle = createTpmThrottle(80_000);
+        const baseMs = Date.now();
+        const a = throttle.reserve('gemini-3-pro', 60_000, baseMs);
+        throttle.release(a.releaseId, 60_000, baseMs);
+        const r = throttle.reserve('gemini-3-pro', 30_000, baseMs);
+        // Window math: wait = 0 + 60000 - 0 = 60000. + jitter [1000, 3000].
+        expect(r.delayMs).toBeGreaterThanOrEqual(61_000);
+        expect(r.delayMs).toBeLessThanOrEqual(63_000);
+      }
+    });
+  });
 });

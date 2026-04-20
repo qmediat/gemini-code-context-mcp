@@ -281,19 +281,6 @@ export const codeTool: ToolDefinition<CodeInput> = {
         reservationId = reserve.id;
       }
 
-      // TPM throttle — mirror of ask.tool.ts. Reserve BEFORE prepareContext
-      // so an over-limit sleep doesn't waste upload/cache-build work.
-      if (ctx.config.tpmThrottleLimit > 0) {
-        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
-        throttleReservationId = reservation.releaseId;
-        if (reservation.delayMs > 0) {
-          emitter.emit(
-            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
-          );
-          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
-        }
-      }
-
       const systemPromptHash = createHash('sha256')
         .update(SYSTEM_INSTRUCTION_CODE)
         .digest('hex')
@@ -315,6 +302,21 @@ export const codeTool: ToolDefinition<CodeInput> = {
         // to embed alongside the prompt.
         allowCaching: scan.files.length > 0 && !codeExecution,
       });
+
+      // TPM throttle — placed AFTER `prepareContext`, immediately before
+      // `generateContent`, so the reservation's `tsMs` accurately reflects
+      // when tokens hit Gemini's quota counter. See ask.tool.ts for the
+      // full rationale and the cold-cache-timing concern it fixes.
+      if (ctx.config.tpmThrottleLimit > 0) {
+        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
+        throttleReservationId = reservation.releaseId;
+        if (reservation.delayMs > 0) {
+          emitter.emit(
+            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
+          );
+          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        }
+      }
 
       const userPrompt = expectEdits
         ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`

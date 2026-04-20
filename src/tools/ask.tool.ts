@@ -258,23 +258,6 @@ export const askTool: ToolDefinition<AskInput> = {
         reservationId = reserve.id;
       }
 
-      // TPM throttle reservation. Inserts a provisional entry for this call
-      // BEFORE `prepareContext` so concurrent reserves see our footprint and
-      // back off (the in-process TOCTOU race `reserve/release/cancel` was
-      // designed to eliminate). Sleeping here — rather than after uploads —
-      // avoids burning cache-build / upload work on a call that'd then wait
-      // 60 s for the TPM window to clear. See `docs/FOLLOW-UP-PRS.md` T22.
-      if (ctx.config.tpmThrottleLimit > 0) {
-        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
-        throttleReservationId = reservation.releaseId;
-        if (reservation.delayMs > 0) {
-          emitter.emit(
-            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
-          );
-          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
-        }
-      }
-
       const systemPromptHash = createHash('sha256')
         .update(SYSTEM_INSTRUCTION_Q_AND_A)
         .digest('hex')
@@ -292,6 +275,27 @@ export const askTool: ToolDefinition<AskInput> = {
         emitter,
         allowCaching: !input.noCache && scan.files.length > 0,
       });
+
+      // TPM throttle reservation — placed HERE (after `prepareContext`,
+      // immediately before `generateContent`) so the reservation's `tsMs`
+      // accurately reflects when tokens hit Gemini's quota counter. An
+      // earlier reserve (before `prepareContext`) would stamp `tsMs`
+      // minutes before actual dispatch on cold-cache calls; our window
+      // would then expire before Gemini's, leaving a gap where we admit
+      // concurrent calls that bust Gemini's per-minute quota. Trade-off:
+      // two concurrent cold-cache callers will both complete
+      // `prepareContext` before one backs off at `reserve` — mostly
+      // idempotent via file-hash dedup, minor upload duplication.
+      if (ctx.config.tpmThrottleLimit > 0) {
+        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
+        throttleReservationId = reservation.releaseId;
+        if (reservation.delayMs > 0) {
+          emitter.emit(
+            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
+          );
+          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        }
+      }
 
       emitter.emit(
         usingThinkingLevel

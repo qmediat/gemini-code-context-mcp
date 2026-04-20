@@ -30,6 +30,22 @@
  * two or more large entries are still inside the window after that oldest
  * one ages out.
  *
+ * Sorted-array invariant: `entries[model]` is always kept sorted ascending
+ * by `tsMs`. `reserve` uses binary-search insertion (not `push`) because
+ * future-dated provisionals (hint-driven or window-eviction-driven delay)
+ * can produce tsMs values that are out-of-order relative to a subsequent
+ * `delayMs = 0` reservation. Without sorted-insert, `prune`'s head-only
+ * fast-path silently skips expired entries buried mid-array, causing
+ * over-throttle; and `computeWindowDelay`'s oldest-first eviction picks
+ * the wrong `entries[k].tsMs` to wait for. Empirically demonstrated during
+ * PR #19 code review (Copilot + Grok + Gemini independently flagged).
+ *
+ * Retry-hint extend-only: `recordRetryHint` keeps the LONGER of existing
+ * and new expiry. Allowing a shorter hint to replace a longer one would
+ * let a future reserve compute a smaller `tsMs` than an entry previously
+ * appended under the longer hint — same ordering break as above via a
+ * different trigger path.
+ *
  * Deliberate non-goals (tracked in docs/FOLLOW-UP-PRS.md T22 follow-ups):
  *  - Cross-process coordination. State is per-server-process, not shared
  *    across multiple MCP instances keyed on the same API key.
@@ -44,11 +60,22 @@
 const WINDOW_MS = 60_000;
 
 /**
- * Small jitter padded onto computed wait times so a cluster of clients
- * scheduled against the exact same "window clears at T" instant don't all
- * wake simultaneously and re-create the burst they were trying to avoid.
+ * Randomised jitter padded onto computed wait times so a cluster of
+ * concurrent waiters evicting the same entry don't all compute the
+ * identical wait and wake at the same millisecond — which would re-create
+ * the burst they were trying to avoid. Range picked for a human-noticeable
+ * spread (≥1 s) without inflating typical waits excessively (≤3 s).
+ *
+ * `computeJitterMs` is a function (not a constant) because `Math.random()`
+ * MUST be evaluated per-caller — a module-scope `const` would be
+ * deterministic, which is exactly the thundering-herd bug Gemini flagged
+ * during PR #19 review.
  */
-const JITTER_MS = 2_000;
+const JITTER_MIN_MS = 1_000;
+const JITTER_MAX_MS = 3_000;
+function computeJitterMs(): number {
+  return JITTER_MIN_MS + Math.floor(Math.random() * (JITTER_MAX_MS - JITTER_MIN_MS));
+}
 
 interface WindowEntry {
   readonly id: number;
@@ -247,7 +274,7 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
       remaining -= e.tokens;
       if (remaining + estimate <= limitTokensPerMinute) {
         const wait = e.tsMs + WINDOW_MS - nowMs;
-        return Math.max(0, wait) + JITTER_MS;
+        return Math.max(0, wait) + computeJitterMs();
       }
     }
     // Unreachable in practice: `estimate < limit` (checked above) means
@@ -279,11 +306,14 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
         tsMs: now + delayMs,
         tokens: estimate,
       };
-      // Append preserves chronological order: any existing entry has tsMs
-      // in the past or at an earlier future time than `now + delayMs` by
-      // construction (we either computed from the newest existing entry
-      // or from a retry hint, both <= now+delayMs).
-      entries.push(entry);
+      // Sorted-insert by tsMs ascending. Append-order is NOT a reliable
+      // proxy for chronological tsMs order — a `delayMs = 0` reservation
+      // arriving after a future-dated provisional (hint-driven or
+      // eviction-driven delay) has a smaller tsMs than the provisional's.
+      // Without sorted-insert the head-only fast-path in `prune` silently
+      // skips expired entries buried mid-array and `computeWindowDelay`'s
+      // oldest-first eviction picks the wrong entry to wait for.
+      insertSortedByTsMs(entries, entry);
       windows.set(model, entries);
       reservationIndex.set(id, { model, entry });
       return { delayMs, releaseId: id };
@@ -299,6 +329,13 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
       // at the reservation's effective time regardless of how long the
       // response took to arrive.
       ref.entry.tokens = actual;
+      // Delete from the index AFTER mutating so a duplicate `release` or a
+      // late `cancel` on the same id becomes a safe no-op — without this,
+      // `cancel(alreadyReleasedId)` would remove the already-accounted
+      // entry from the window and under-throttle subsequent callers. The
+      // entry itself remains in `windows[model]` to count against the
+      // running window until it ages out naturally.
+      reservationIndex.delete(releaseId);
       // Opportunistically prune while we have a nowMs — amortises cleanup
       // cost across release calls and avoids relying solely on future
       // `reserve` calls for the same model.
@@ -332,7 +369,16 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
       if (disabled) return;
       if (!Number.isFinite(retryDelayMs) || retryDelayMs <= 0) return;
       const now = effectiveNow(nowMs);
-      hints.set(model, { expiresAtMs: now + retryDelayMs, retryDelayMs });
+      const newExpiresAtMs = now + retryDelayMs;
+      // Extend-only: a shorter hint replacing a longer one would produce
+      // a `reserve` that computes a smaller `tsMs` than entries already
+      // appended under the longer hint, breaking the sorted-array
+      // invariant. Keep the longer expiry when both exist — even if the
+      // new hint's `retryDelayMs` is smaller numerically, the wall-clock
+      // expiry monotonically increases.
+      const existing = hints.get(model);
+      if (existing && existing.expiresAtMs >= newExpiresAtMs) return;
+      hints.set(model, { expiresAtMs: newExpiresAtMs, retryDelayMs });
     },
   };
 }
@@ -343,4 +389,31 @@ export function createTpmThrottle(limitTokensPerMinute: number): TpmThrottle {
 function sanitizeTokens(n: number): number {
   if (!Number.isFinite(n) || n <= 0) return 0;
   return n;
+}
+
+/**
+ * Insert `entry` into `entries` at the position that keeps the array
+ * sorted ascending by `tsMs`. Binary-search for the insertion point;
+ * `splice` to insert. O(log n) compares + O(n) shift, same asymptotic
+ * cost as `push + sort` but with a smaller constant factor on the
+ * append-to-end fast path (the common case when clocks and delays are
+ * monotonic).
+ */
+function insertSortedByTsMs(entries: WindowEntry[], entry: WindowEntry): void {
+  // Common case: new entry is latest. Skip the binary search.
+  const last = entries[entries.length - 1];
+  if (!last || entry.tsMs >= last.tsMs) {
+    entries.push(entry);
+    return;
+  }
+  let lo = 0;
+  let hi = entries.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const probe = entries[mid];
+    // `probe` is defined because `mid < hi <= entries.length`.
+    if (probe && probe.tsMs <= entry.tsMs) lo = mid + 1;
+    else hi = mid;
+  }
+  entries.splice(lo, 0, entry);
 }
