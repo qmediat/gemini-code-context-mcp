@@ -6,6 +6,26 @@ Entries marked **WATCH** are not actively painful today but would become so unde
 
 ---
 
+## Reviewer / code-review workflows broken without client-side TPM throttle + wire-format fix
+
+**Source:** 2026-04-20 session — PR #17 three-way code review aborted three times on Gemini-side 429s plus missing `content[0].text` in sub-agent tool results.
+
+**Status:** Blocker for reviewer workflows. Tracked as T22 (throttle) + T23 (wire format) in [`FOLLOW-UP-PRS.md`](./FOLLOW-UP-PRS.md). Both must ship before the MCP is reliable for `/coderev`-style sub-agent pipelines. Direct main-context use of `ask`/`code` still works fine (Claude Code renders `content[0].text` in the UI).
+
+**What is the issue?** Two compounding problems:
+
+1. **No client-side TPM preflight.** Google enforces ~100_000 input tokens/minute on paid Tier 1 Gemini 3 Pro (empirically confirmed via 429 payload's `quotaValue`). Workspaces with a large Context Cache (~108k cached tokens is typical for a modest repo) saturate that limit on the FIRST follow-up call — cached tokens count toward the input-TPM quota. We discover the limit only when Gemini returns 429, at which point the billable round-trip has already happened. Sub-agents defensively sleep 70 s and retry, which works but eats ~2 minutes per call plus burns extra 429 round-trips. See `.claude/local-gemini-rate-limits.md` (gitignored) for the empirical dump.
+
+2. **`content[0].text` is invisible to sub-agents.** `textResult()` in `src/tools/registry.ts:51` emits `{content: [{type: 'text', text}], structuredContent: {...}}`. Claude Code's sub-agent tool-result parser consumes ONLY `structuredContent` when present, treating `content[]` as display-only. So our reviewer output is generated + billed, but the sub-agent cannot read it to write a review file. Three Gemini-review agents in this session returned "API success but text not surfaced" for exactly this reason.
+
+**Impact today:** Any MCP workflow that depends on reading the narrative response inside a sub-agent (coderev pattern, synth pattern, fix-planner pattern) silently fails. The response comes back as "ok, 0 findings" because the agent can't extract the text. Main-context direct use is fine — Claude Code renders `content[0]`.
+
+**Why not fixing immediately:** Each fix is ~2-4 hours and they pair well together as a "reviewer-workflow fixes" PR. Landing them alongside the already-ready v1.2.0 (PR #17 T21 + PR #18 home-reject) would inflate scope; sequencing them as v1.3.x keeps per-release review quality high. Priority is HIGH — this is the next PR to open after v1.2.0 ships.
+
+**Revisit trigger:** Immediate — schedule T22 + T23 as the next PR after v1.2.0 publish.
+
+---
+
 ## `ask({ thinkingBudget })` — Gemini 3 Pro hangs on low values with cached content
 
 **Source:** Smoke testing the `ask({ thinkingBudget })` PR, April 2026.

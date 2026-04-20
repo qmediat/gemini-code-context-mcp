@@ -329,3 +329,56 @@ Today we call `generateContent` (non-streaming) — single round-trip, no signal
 **Blocked on:** nothing. Can ship any time after v1.2.
 
 **Open question:** should `THINKING_LEVEL_RESERVE` live in a `src/tools/shared/thinking.ts` helper (DRY + a home for T19/T20 common utilities), or stay on `ask.tool.ts` as `export const` and get imported by `code.tool.ts`? Prefer the shared module if T19 ships first (so the timeout helper has somewhere to live).
+
+---
+
+## T22. Client-side TPM throttle (Gemini per-minute quota preflight)
+
+**Source:** 2026-04-20 session — empirical observation during PR #17 three-way code review. The Gemini agent attempt hit `429 RESOURCE_EXHAUSTED` on `generate_content_paid_tier_input_token_count` with `quotaValue: 100000` (tokens/minute) TWICE in succession, aborting the review after a cumulative ~10 minutes of retry waits. Full empirical dump in the gitignored `.claude/local-gemini-rate-limits.md` (not committed — per-key observations).
+
+**Why:** Google enforces a per-minute input-token quota (paid Tier 1 Gemini 3 Pro: 100_000 tokens/minute). Our MCP currently has **zero client-side preflight** against this — we discover the limit only when Gemini returns 429, at which point the call is already wasted (we still pay for the failed generate-content API invocation per `@google/genai` d.ts:1425-1427 disclaimer). Effect on UX: code-review workflows that make 2-3 back-to-back `ask`/`code` calls against a workspace with ~108k cached tokens saturate the minute-window on the very first follow-up call. Review aborts, user waits 60 s, retries, possibly 429s again.
+
+Empirically confirmed aggregation quirk: `gemini-pro-latest` (our `latest-pro` alias target) **shares a quota bucket with `gemini-3-pro-image`** server-side — 429s on pro-text requests report `quotaDimensions.model: "gemini-3-pro-image"` even though that's not the model we asked for. This is Google's internal accounting, not our resolver's bug.
+
+**Scope:**
+- New env var `GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT` (default `80_000`, `0` disables). 80k leaves ~20 % headroom under the observed Tier 1 100k limit for clock-skew and Google's own accounting noise.
+- `src/tools/shared/throttle.ts` (or extend `shared/thinking.ts`) — keep a sliding 60-second window of recent input-token usage per `resolvedModel`. Tracked in-memory; survives nothing; cleared on server restart. `shouldDelay(model, estimatedInputTokens)` returns the delay in ms required before the call would fit under the limit (or `0` if it fits now).
+- `ask.tool.ts` + `code.tool.ts` call `shouldDelay` after the budget reservation but before the `generateContent` call. If >0, emit a progress message (`"throttle: waiting 23s for TPM window"`) and `setTimeout` before proceeding. On the actual response, append `usage.inputTokens` (cached + uncached) to the window.
+- Respect `retryInfo.retryDelay` from any 429 that fires DESPITE preflight — Google's hint is more accurate than our clock; prefer it.
+- Track different models in separate windows (empirically `latest-pro` vs `latest-flash` use different buckets — no reason to block flash when pro is saturated).
+- New unit tests in `test/unit/throttle.test.ts` with fake timers.
+
+**Sizing:** ~4 hours — throttle state, tool integration in two files, test harness with fake timers, env-var docs. Blocker for heavy-review workflows; without this the MCP is effectively single-shot for pro calls with a big cached context.
+
+**Blocked on:** nothing. Ships cleanest alongside T23 in the same PR (both are "make the MCP usable for back-to-back reviews" fixes), or as a standalone v1.3.x if T19's timeout arrives first (the throttle's delay-before-generate is conceptually orthogonal to the timeout-after-generate).
+
+**Do NOT include in this PR:**
+- Any change to the daily-budget reservation logic — that's a $ cap, TPM throttle is a rate cap; different constraints, different code paths.
+- Cross-process throttle coordination — in-memory only for v1. Two MCP servers on the same key sharing a TPM pool is T22b.
+
+---
+
+## T23. Surface tool response text as a first-class structured field (wire-format fix)
+
+**Source:** 2026-04-20 session — empirical observation during PR #17 Gemini review retries. Three separate agent attempts reported `"API success but content[0].text not surfaced to sub-agent"` despite Gemini returning full review text in the MCP response. Root cause traced to how Claude Code (and likely other MCP hosts) parse tool results when `structuredContent` is present.
+
+**Why:** `src/tools/registry.ts:51` `textResult(text, structured)` returns the MCP-spec-compliant shape `{content: [{type: 'text', text}], structuredContent: {...}}`. Claude Code's tool-result parser — both for the main conversation UI and for sub-agent tool-use results — consumes **only** `structuredContent` when it's present, treating `content[]` as display-only noise. Effect: our reviewer output gets GENERATED and billed (we count tokens, pay for thinking), but the consumer cannot programmatically read the text. This broke the coderev orchestration pattern three times in one session — each agent got "ok with no extractable findings" because the text was unreachable.
+
+Matters more than it looks: the MCP is **fundamentally useless for code review** while this holds, because every reviewer workflow depends on the reviewer's agent being able to read the answer text to write the review file or emit the `top3` JSON. Users can call `ask`/`code` directly in the main conversation and see the text (because Claude Code DOES render `content[0]` in the main UI) — but any workflow that hands off through a sub-agent silently loses the response.
+
+**Scope:**
+- Add `responseText: text` as a first-class field in the `structuredContent` object emitted by `textResult()`. Canonical location both hosts and sub-agents can rely on; zero interpretation ambiguity.
+- Keep existing `content: [{type: 'text', text}]` — required for MCP spec compliance and for hosts that DO render it (main conversation UI). Duplicating a few-KB string across both fields costs essentially nothing vs losing the whole response.
+- `ask.tool.ts` metadata object: already spread into `textResult`'s `structured` arg — just ensure `text` is available where `textResult` can copy it. Identical for `code.tool.ts`, `reindex.tool.ts`, `status.tool.ts`, `clear.tool.ts`.
+- Update `test/unit/tool-input-schema.test.ts` — add an assertion that every tool's sample response includes `structuredContent.responseText` matching `content[0].text`.
+- Document in `docs/how-caching-works.md` (or a new `docs/wire-format.md`) that MCP clients consuming structured content should prefer `structuredContent.responseText` for the primary narrative response; `content[]` is rendered by UI hosts but not all consumers read it.
+
+**Sizing:** ~2 hours — small change in `registry.ts`, echo check in each tool, one new test, a doc paragraph. Easy to verify: re-run the PR #17 coderev after the fix and watch agents successfully extract review text.
+
+**Blocked on:** nothing. Ship ASAP — this is blocking code-review workflows today. Good candidate to pair with T22 in a "reviewer-workflow fixes" PR.
+
+**Do NOT include in this PR:**
+- Redesigning the tool-result schema — the fix is purely additive; the current shape stays valid.
+- Changes to non-text-generating tools (`reindex`, `clear`) — their existing structured responses are already the primary payload, no text response to duplicate.
+
+---

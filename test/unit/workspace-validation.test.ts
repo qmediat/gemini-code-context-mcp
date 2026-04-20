@@ -129,4 +129,76 @@ describe('validateWorkspacePath', () => {
       expect(() => validateWorkspacePath(link)).not.toThrow();
     });
   });
+
+  describe("refuses the user's home directory as a workspace", () => {
+    // The canonical MCP launch pattern (this repo's own README recommends
+    // it, and `~/.claude.json` installs use it) sets cwd=$HOME to sidestep
+    // an npx-in-same-repo conflict. A tool call that omits `workspace`
+    // then defaults to `process.cwd() === $HOME` and would pass the
+    // cwd-ancestry check, letting the scanner walk Desktop / Documents /
+    // Downloads / .Trash / everything. The home-reject guard prevents
+    // this regardless of cwd.
+
+    const originalHome = process.env.HOME;
+
+    afterAll(() => {
+      if (originalHome === undefined) {
+        // biome-ignore lint/performance/noDelete: setting to `undefined` stringifies in env; delete is the correct unset.
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = originalHome;
+      }
+    });
+
+    it('rejects when workspace resolves to os.homedir()', () => {
+      // `os.homedir()` reads HOME at call time on POSIX — point it at a real
+      // tmpdir path so `realpathSync` resolves without touching the
+      // developer's actual home directory.
+      const fakeHome = mkdtempSync(join(tmpdir(), 'gcctx-fake-home-'));
+      process.env.HOME = fakeHome;
+
+      expect(() => validateWorkspacePath(fakeHome)).toThrow(WorkspaceValidationError);
+      expect(() => validateWorkspacePath(fakeHome)).toThrow(/home directory/i);
+      expect(() => validateWorkspacePath(fakeHome)).toThrow(/Pass 'workspace' explicitly/);
+    });
+
+    it('rejects even when $HOME is itself a workspace-marker root', () => {
+      // Defense in depth: if the user (or their dotfile repo) keeps a
+      // `.git` inside $HOME, the marker check would otherwise green-light
+      // scanning the whole home directory. The home-reject guard fires
+      // BEFORE the marker check to block this.
+      const fakeHome = mkdtempSync(join(tmpdir(), 'gcctx-fake-home-marker-'));
+      mkdirSync(join(fakeHome, '.git'));
+      process.env.HOME = fakeHome;
+
+      expect(() => validateWorkspacePath(fakeHome)).toThrow(/home directory/i);
+    });
+
+    it('accepts a subdirectory of home (real project roots still work)', () => {
+      // The guard MUST NOT overreach — users legitimately keep code at
+      // `$HOME/code/my-project`, `$HOME/src/foo`, etc. Only $HOME itself
+      // is refused.
+      const fakeHome = mkdtempSync(join(tmpdir(), 'gcctx-home-sub-'));
+      const project = join(fakeHome, 'code', 'my-project');
+      mkdirSync(project, { recursive: true });
+      mkdirSync(join(project, '.git'));
+      process.env.HOME = fakeHome;
+
+      expect(() => validateWorkspacePath(project)).not.toThrow();
+    });
+
+    it('rejects via realpath even when the input path is a symlink to home', () => {
+      // Symlink bypass attempt: point a path-that-looks-innocent at $HOME.
+      // Without canonicalisation, the literal string comparison would miss;
+      // with `realpathSync`, the guard catches it.
+      const fakeHome = mkdtempSync(join(tmpdir(), 'gcctx-home-symlink-'));
+      process.env.HOME = fakeHome;
+
+      const sneaky = mkdtempSync(join(tmpdir(), 'gcctx-sneaky-'));
+      const homeLink = join(sneaky, 'looks-like-a-repo');
+      symlinkSync(fakeHome, homeLink);
+
+      expect(() => validateWorkspacePath(homeLink)).toThrow(/home directory/i);
+    });
+  });
 });
