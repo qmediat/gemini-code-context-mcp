@@ -6,6 +6,34 @@ Entries marked **WATCH** are not actively painful today but would become so unde
 
 ---
 
+## `ask({ thinkingBudget })` — Gemini 3 Pro hangs on low values with cached content
+
+**Source:** Smoke testing the `ask({ thinkingBudget })` PR, April 2026.
+
+**Status:** Default path sidesteps the issue (we OMIT `thinkingBudget` on the wire when the caller didn't supply one, letting Gemini use its native HIGH-dynamic default — Google's recommended approach per ai.google.dev/gemini-api/docs/gemini-3). The hang is still reachable if a caller explicitly passes a low positive `thinkingBudget`; schema description warns about this. No client-side timeout guard in v1.1.
+
+**What is the issue?** Empirically reproduced against `gemini-pro-latest` (Gemini 3 Pro) using the MCP `ask` tool with an active Context Cache hit:
+
+- `thinkingBudget: -1` (dynamic) — responds in ~10 s ✅
+- `thinkingBudget: 4096` — responds in ~14 s ✅
+- `thinkingBudget: 256` — **request hangs with no response**, no `400`, no `429`, no progress. Only resolved by SIGTERM at 90 s. ❌
+- `thinkingBudget: 0` — Gemini returns `400 INVALID_ARGUMENT: "Budget 0 is invalid. This model only works in thinking mode."` ✅ (graceful)
+
+Root cause is on Google's side: Gemini 3 Pro is a "thinking-only" model with an undocumented minimum thinking budget, and the API fails to reject requests below that minimum — it just stalls. The behaviour does not reproduce on `gemini-2.5-pro` (which honours any non-zero budget) or on fresh cache builds (only `cachedContent + low thinkingBudget` together trip it). We cannot observe the minimum from the model registry: `supportsThinking: true` does not imply "low budgets are fine", and `thinkingTokenLimit` is not exposed.
+
+**Impact today:** Any caller who explicitly passes `thinkingBudget` below Gemini 3 Pro's internal floor experiences a 90-180 s hang that looks like a server issue on our side. `-1` (the default) and values ≥1024 are unaffected. Most users never set the knob — default-path users are unaffected.
+
+**Why we're not fixing fully in v1.1:**
+1. We don't know the true minimum — it could change model-by-model and release-to-release. A hard-coded floor (e.g. "clamp `0 < N < 1024` up to 1024") would be brittle and would surprise callers who intended `256` on a 2.5 model.
+2. A client-side `AbortController` timeout (e.g. 120 s per `generateContent` call) would convert the hang into a clean error, but the same timeout would terminate legitimately long thinking sessions on complex prompts (dynamic thinking can legitimately run 30-90 s on intricate questions). Getting the threshold right needs real usage telemetry.
+3. The default path (omit `thinkingBudget`) already avoids the hang entirely — explicit budgets are opt-in only. Schema description warns callers about the Gemini 3 caveat. v1.2 will add first-class `thinkingLevel` (LOW/MEDIUM/HIGH) support, which is the discrete-tier API Google recommends on Gemini 3 and has no analogue to this edge case.
+
+**Revisit trigger:** (a) user reports of `ask` hanging with explicit `thinkingBudget` values, or (b) Gemini publishes the per-model thinking minimums in the model registry. At that point we can add either a registry-driven floor or an adaptive timeout.
+
+**Tracking:** `docs/FOLLOW-UP-PRS.md` — add a "gemini thinking budget timeout guard" item when concrete numbers are available.
+
+---
+
 ## TTL watcher — multi-instance coordination
 
 **Source:** Grok code review, April 2026 — "Stale workspace snapshot race across multiple MCP instances".

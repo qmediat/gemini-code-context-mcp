@@ -37,8 +37,8 @@ Every tool accepts runtime overrides that beat the defaults:
 
 - `ask({ model: "latest-flash" })` — force a cheaper model for this one question
 - `ask({ noCache: true })` — bypass the context cache and send files inline
-- `ask({ thinkingBudget: 0 })` — disable reasoning for a shallow lookup-style question (cheapest path; default is `-1` = dynamic / maximum effort)
-- `ask({ thinkingBudget: 8000 })` — cap reasoning at 8k tokens for a cost-bounded deep-dive
+- `ask({ thinkingBudget: 0 })` — disable reasoning for a shallow lookup-style question (rejected by Gemini 3 Pro with 400; fine on Gemini 2.5 / Flash)
+- `ask({ thinkingBudget: 8000 })` — explicit cap; use on Gemini 2.5 for cost-bounded deep-dives. On Gemini 3 Pro prefer omitting the param — that triggers the model's HIGH-dynamic default, which is Google's recommended path
 - `code({ thinkingBudget: 32000, codeExecution: true })` — harder problem, let Gemini verify with Python
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
 

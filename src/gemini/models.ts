@@ -12,51 +12,47 @@ import type { ResolvedModel } from '../types.js';
 import { logger } from '../utils/logger.js';
 import { type ModelInfo, listAvailableModels } from './model-registry.js';
 
+/**
+ * Substrings in a model ID that disqualify it as a general-purpose text-gen
+ * target for our `ask` / `code` tools. The list covers:
+ *
+ *  - Modality add-ons that share `pro`/`flash` tokens with text models
+ *    (`image`, `tts`, `vision`, `audio`) — these fail on arbitrary prompts.
+ *  - Non-text-gen Gemini families whose IDs happen to contain `pro`:
+ *    `banana` (Google's "nano-banana" image-gen family), `lyria` (music
+ *    generation), `research` (Deep Research — a specialised agent, not a
+ *    drop-in conversational model), and `customtools` (variant that requires
+ *    a `tools` param on every call and returns errors without one).
+ *
+ * Maintained as a single source of truth so every alias filters consistently.
+ * When Google ships a new non-text-gen family under a `pro`/`flash` name,
+ * add the disambiguating substring here — no per-alias edits needed.
+ */
+const NON_TEXT_GEN_MARKERS = [
+  'image',
+  'tts',
+  'vision',
+  'audio',
+  'banana',
+  'lyria',
+  'research',
+  'customtools',
+] as const;
+
+function isTextGenModel(m: ModelInfo): boolean {
+  return !NON_TEXT_GEN_MARKERS.some((marker) => m.id.includes(marker));
+}
+
 const ALIASES = {
   'latest-pro': (models: ModelInfo[]): ModelInfo | undefined =>
-    models.find(
-      (m) =>
-        m.id.includes('pro') &&
-        !m.id.includes('image') &&
-        !m.id.includes('tts') &&
-        !m.id.includes('vision') &&
-        !m.id.includes('audio'),
-    ),
+    models.find((m) => m.id.includes('pro') && isTextGenModel(m)),
   'latest-pro-thinking': (models: ModelInfo[]): ModelInfo | undefined =>
-    models.find(
-      (m) =>
-        m.id.includes('pro') &&
-        m.supportsThinking &&
-        !m.id.includes('image') &&
-        !m.id.includes('tts'),
-    ) ??
-    models.find(
-      (m) =>
-        m.id.includes('pro') &&
-        !m.id.includes('image') &&
-        !m.id.includes('tts') &&
-        !m.id.includes('vision') &&
-        !m.id.includes('audio'),
-    ),
+    models.find((m) => m.id.includes('pro') && m.supportsThinking && isTextGenModel(m)) ??
+    models.find((m) => m.id.includes('pro') && isTextGenModel(m)),
   'latest-flash': (models: ModelInfo[]): ModelInfo | undefined =>
-    models.find(
-      (m) =>
-        m.id.includes('flash') &&
-        !m.id.includes('image') &&
-        !m.id.includes('tts') &&
-        !m.id.includes('lite') &&
-        !m.id.includes('vision') &&
-        !m.id.includes('audio'),
-    ),
+    models.find((m) => m.id.includes('flash') && !m.id.includes('lite') && isTextGenModel(m)),
   'latest-lite': (models: ModelInfo[]): ModelInfo | undefined =>
-    models.find(
-      (m) =>
-        m.id.includes('lite') &&
-        !m.id.includes('image') &&
-        !m.id.includes('tts') &&
-        !m.id.includes('vision') &&
-        !m.id.includes('audio'),
-    ),
+    models.find((m) => m.id.includes('lite') && isTextGenModel(m)),
 } as const;
 
 export type Alias = keyof typeof ALIASES;

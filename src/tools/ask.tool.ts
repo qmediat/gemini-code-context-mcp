@@ -37,14 +37,18 @@ const SYSTEM_INSTRUCTION_Q_AND_A =
 const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
 
 /**
- * Gemini's `thinkingConfig.thinkingBudget` sentinel for *dynamic* reasoning:
- * the model picks a budget per request, up to its own thinking-token limit.
- * We make this the default for `ask` so deep questions get deep reasoning
- * without hard-coding a one-size-fits-all number. Users who want to bound
- * the cost (or disable thinking entirely with `0`) pass `thinkingBudget`
- * explicitly.
+ * Sentinel value in our internal normalisation for "user did not pass
+ * thinkingBudget". We translate this into an OMITTED `thinkingBudget`
+ * field on the wire — Gemini then uses each model's native default, which
+ * per Google's Gemini 3 guide (https://ai.google.dev/gemini-api/docs/gemini-3)
+ * is HIGH-dynamic on Gemini 3 Pro. Google flags explicit `thinkingBudget`
+ * as the "legacy" path on Gemini 3 ("may result in unexpected performance"),
+ * and we empirically observed Gemini 3 Pro hanging on low positive budgets
+ * with cached content active (see docs/KNOWN-DEFICITS.md). Omitting the
+ * field sidesteps both issues while still letting power users opt into
+ * explicit budgets on Gemini 2.5 or for cost-bounded deep-dives.
  */
-const ASK_DEFAULT_THINKING_BUDGET = -1;
+const THINKING_BUDGET_MODEL_DEFAULT = null;
 
 export const askInputSchema = z.object({
   prompt: z.string().min(1).describe('The question or analysis request.'),
@@ -74,7 +78,7 @@ export const askInputSchema = z.object({
     .max(65_536)
     .optional()
     .describe(
-      "Reasoning tokens Gemini is allowed to spend before answering. `-1` (default) = dynamic: the model picks per request for maximum effort. `0` = disable thinking (cheapest, lowest quality). A positive integer caps thinking at that many tokens — use this to bound cost on long sessions. Omit to keep the default 'max-effort auto' mode.",
+      "Explicit reasoning-token cap. OMIT to use each model's native default — recommended, and the only path Google supports without caveats on Gemini 3 family models (HIGH dynamic on Gemini 3 Pro). Pass a value only when you need a specific cap: `-1` = legacy dynamic (Gemini 2.5 and older), `0` = disable thinking (rejected by Gemini 3 Pro with 400 'This model only works in thinking mode'), positive integer = fixed cap. CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang without a response — use `-1` or ≥4096 if you must bound it there, or omit and let the model use its HIGH-dynamic default.",
     ),
 });
 
@@ -131,29 +135,33 @@ export const askTool: ToolDefinition<AskInput> = {
           ? Math.min(ASK_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
           : ASK_MAX_OUTPUT_TOKENS_DEFAULT;
 
-      // Normalize thinkingBudget:
-      //   undefined → -1 (dynamic / default "max effort")
-      //   -1        → -1 (explicit dynamic — identical to default)
-      //    0        →  0 (thinking disabled — for flash / cost-sensitive use)
-      //    N > 0    → clamp to [0, maxOutputTokens - 1024]. Gemini treats the
-      //              thinking pool as carved out of the candidate-output
-      //              allowance, so reserving ≥1024 tokens for the answer
-      //              itself avoids 400 errors when users pass a budget equal
-      //              to (or greater than) maxOutputTokens.
-      const rawThinkingBudget = input.thinkingBudget ?? ASK_DEFAULT_THINKING_BUDGET;
-      const effectiveThinkingBudget =
-        rawThinkingBudget === -1
-          ? -1
-          : rawThinkingBudget > 0
-            ? Math.max(0, Math.min(rawThinkingBudget, maxOutputTokens - 1024))
-            : 0;
+      // Normalise thinkingBudget:
+      //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)
+      //   -1        → -1  (explicit legacy dynamic; kept for Gemini 2.5 and
+      //                    power-users who want to force the legacy path)
+      //    0        →  0  (thinking disabled; Gemini 3 Pro will 400 here)
+      //    N > 0    → clamp to [0, maxOutputTokens - 1024] — the thinking
+      //              pool is carved out of the candidate-output allowance,
+      //              so reserving ≥1024 tokens for the answer prevents 400s
+      //              when a caller passes N ≥ maxOutputTokens.
+      const rawThinkingBudget = input.thinkingBudget;
+      const effectiveThinkingBudget: number | null =
+        rawThinkingBudget === undefined
+          ? THINKING_BUDGET_MODEL_DEFAULT
+          : rawThinkingBudget === -1
+            ? -1
+            : rawThinkingBudget > 0
+              ? Math.max(0, Math.min(rawThinkingBudget, maxOutputTokens - 1024))
+              : 0;
 
-      // Conservative upper bound for cost estimation. In dynamic mode we
-      // cannot know how many thinking tokens Gemini will actually consume,
-      // so we reserve as if it used the full available headroom — the
-      // reservation stays a TRUE upper bound even under worst-case thinking.
+      // Conservative upper bound for cost estimation. Gemini 3 Pro always
+      // spends thinking tokens (cannot be disabled per Google's docs), so we
+      // reserve dynamic-thinking headroom even when the user hasn't opted in
+      // — keeps `dailyBudgetUsd` a TRUE upper bound regardless of which
+      // reasoning tier the model picks. When the user explicitly passes a
+      // positive N, we reserve only that much.
       const thinkingTokensForEstimate =
-        effectiveThinkingBudget === -1
+        effectiveThinkingBudget === null || effectiveThinkingBudget === -1
           ? Math.max(0, maxOutputTokens - 1024)
           : effectiveThinkingBudget;
 
@@ -207,9 +215,11 @@ export const askTool: ToolDefinition<AskInput> = {
       });
 
       emitter.emit(
-        effectiveThinkingBudget === -1
-          ? 'generating response (thinking=dynamic)…'
-          : `generating response (thinking=${effectiveThinkingBudget})…`,
+        effectiveThinkingBudget === null
+          ? 'generating response (thinking=model-default)…'
+          : effectiveThinkingBudget === -1
+            ? 'generating response (thinking=dynamic)…'
+            : `generating response (thinking=${effectiveThinkingBudget})…`,
       );
       // Gemini rejects `generateContent({cachedContent, systemInstruction})` with 400:
       // "CachedContent can not be used with GenerateContent request setting
@@ -219,28 +229,24 @@ export const askTool: ToolDefinition<AskInput> = {
       // OMIT it on the generate call when a cached context is active.
       // `thinkingConfig` is NOT one of the forbidden fields — it is a
       // per-request reasoning control and travels with every call regardless
-      // of cache state. `includeThoughts: true` surfaces Gemini's thought
-      // summary in the response parts so the caller can inspect reasoning.
+      // of cache state. We always set `includeThoughts: true` so callers see
+      // Gemini's reasoning digest in the response; `thinkingBudget` is only
+      // included when the caller explicitly asked for one (omitting it is
+      // the recommended path on Gemini 3 per Google's own guide).
       // `maxOutputTokens` is set on every generateContent call so the budget
       // reservation's `expectedOutputTokens` (derived from the same value) is
       // a true upper bound — without this cap, a runaway response could
       // exceed the reserved estimate and silently overshoot `dailyBudgetUsd`.
+      const thinkingConfig =
+        effectiveThinkingBudget === null
+          ? { includeThoughts: true }
+          : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
       const buildConfig = (cacheId: string | null): GenerateContentConfig =>
         cacheId
-          ? {
-              cachedContent: cacheId,
-              thinkingConfig: {
-                thinkingBudget: effectiveThinkingBudget,
-                includeThoughts: true,
-              },
-              maxOutputTokens,
-            }
+          ? { cachedContent: cacheId, thinkingConfig, maxOutputTokens }
           : {
               systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
-              thinkingConfig: {
-                thinkingBudget: effectiveThinkingBudget,
-                includeThoughts: true,
-              },
+              thinkingConfig,
               maxOutputTokens,
             };
       const buildContents = (
