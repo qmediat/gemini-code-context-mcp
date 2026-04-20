@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ask({ thinkingBudget })` parameter** — integer in `[-1, 65_536]`. `-1` (the new default) enables **dynamic thinking**: Gemini picks its own reasoning budget per request, up to its model limit, so `ask` gets the strongest reasoning available out of the box. `0` disables thinking (cheapest, shallow-lookup mode). A positive integer caps reasoning at that many tokens for cost-bounded deep-dives. Mirrors the knob `code` already exposed; closes the gap where `ask` had no way to control thinking at all.
+- **Thinking summary surfaced on the MCP response** — when the model emits parts flagged `thought: true`, `ask` now includes a trimmed (~1.2 KB) `thinkingSummary` field in its structured metadata so callers can inspect *why* an answer was given. Matches `code`'s behaviour.
+
+### Changed
+
+- **Default model is now `latest-pro-thinking`** (was `latest-pro`). The alias resolver already preferred the newest Pro-class model with `supportsThinking: true`, but the server default didn't opt into it — so `ask` landed on non-thinking models unless callers passed `model: "latest-pro-thinking"` explicitly. New default means `ask` and `code` both reason at full strength out of the box. Override via `GEMINI_CODE_CONTEXT_DEFAULT_MODEL=latest-pro` if you need the non-thinking variant, or set a flash alias for cost-sensitive workloads.
+- **Budget reservation is thinking-aware** — `ask` now passes `thinkingTokens` into `estimatePreCallCostUsd`, mirroring `code`. Dynamic-mode (`thinkingBudget: -1`) reservations conservatively reserve the full `maxOutputTokens - 1024` as reasoning headroom, so `GEMINI_DAILY_BUDGET_USD` stays a TRUE upper bound even under worst-case reasoning load. Without this, a high-thinking call could silently overshoot the cap; now it fails fast with the standard budget-cap message.
+
 ## [1.0.3] — 2026-04-19
 
 Security + cost-correctness release. Closes a HIGH-severity prompt-injection vector that let a malicious MCP client exfiltrate local files via the `workspace` argument, and a MEDIUM-severity TOCTOU race that let concurrent tool calls collectively overshoot `GEMINI_DAILY_BUDGET_USD`. Also bundles drift-guards and hardening surfaced by a full 3-way code review (GPT, Gemini, Grok) plus three Copilot review rounds. No breaking changes — all existing workspace paths under the MCP host's cwd continue to work without any config.

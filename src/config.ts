@@ -41,8 +41,12 @@ function readFloatEnv(name: string, fallback: number): number {
 export function loadConfig(): Config {
   const auth = resolveAuth();
 
+  // Default alias resolves to the newest Pro-class model that advertises
+  // `supportsThinking: true`. This gives `ask`/`code` the strongest available
+  // reasoning out of the box — users trading quality for cost can override via
+  // `GEMINI_CODE_CONTEXT_DEFAULT_MODEL=latest-pro` (or a literal model ID).
   const defaultModel =
-    process.env.GEMINI_CODE_CONTEXT_DEFAULT_MODEL ?? auth.defaultModel ?? 'latest-pro';
+    process.env.GEMINI_CODE_CONTEXT_DEFAULT_MODEL ?? auth.defaultModel ?? 'latest-pro-thinking';
 
   const dailyBudget = readFloatEnv(
     'GEMINI_DAILY_BUDGET_USD',
