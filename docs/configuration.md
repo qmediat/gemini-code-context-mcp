@@ -19,7 +19,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_USE_VERTEX` | `false` | Set `true` + `GOOGLE_CLOUD_PROJECT` to use Vertex AI |
 | `GOOGLE_CLOUD_PROJECT` | — | GCP project for Vertex |
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Region for Vertex |
-| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro` | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID |
+| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID. Default picks the newest Pro model with reasoning support; override to `latest-pro` if you want non-thinking variants, or to a flash alias for cost-sensitive workloads. |
 | `GEMINI_DAILY_BUDGET_USD` | unlimited | Hard cap; refuses calls over the cap until UTC midnight |
 | `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` | `3600` | Context Cache TTL (Gemini enforces ≥ 60 s) |
 | `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS` | `1024` | Minimum estimated tokens required before attempting `caches.create`. Below this we skip the cache build and use inline parts. Gemini currently enforces 1024; expose this knob so operators can adjust without a patch release if Google changes the floor. |
@@ -37,6 +37,8 @@ Every tool accepts runtime overrides that beat the defaults:
 
 - `ask({ model: "latest-flash" })` — force a cheaper model for this one question
 - `ask({ noCache: true })` — bypass the context cache and send files inline
+- `ask({ thinkingBudget: 0 })` — disable reasoning for a shallow lookup-style question (rejected by Gemini 3 Pro with 400; fine on Gemini 2.5 / Flash)
+- `ask({ thinkingBudget: 8000 })` — explicit cap; use on Gemini 2.5 for cost-bounded deep-dives. On Gemini 3 Pro prefer omitting the param — that triggers the model's HIGH-dynamic default, which is Google's recommended path
 - `code({ thinkingBudget: 32000, codeExecution: true })` — harder problem, let Gemini verify with Python
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
 

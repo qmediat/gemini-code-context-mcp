@@ -36,6 +36,20 @@ const SYSTEM_INSTRUCTION_Q_AND_A =
  */
 const ASK_MAX_OUTPUT_TOKENS_DEFAULT = 8192;
 
+/**
+ * Sentinel value in our internal normalisation for "user did not pass
+ * thinkingBudget". We translate this into an OMITTED `thinkingBudget`
+ * field on the wire — Gemini then uses each model's native default, which
+ * per Google's Gemini 3 guide (https://ai.google.dev/gemini-api/docs/gemini-3)
+ * is HIGH-dynamic on Gemini 3 Pro. Google flags explicit `thinkingBudget`
+ * as the "legacy" path on Gemini 3 ("may result in unexpected performance"),
+ * and we empirically observed Gemini 3 Pro hanging on low positive budgets
+ * with cached content active (see docs/KNOWN-DEFICITS.md). Omitting the
+ * field sidesteps both issues while still letting power users opt into
+ * explicit budgets on Gemini 2.5 or for cost-bounded deep-dives.
+ */
+const THINKING_BUDGET_MODEL_DEFAULT = null;
+
 export const askInputSchema = z.object({
   prompt: z.string().min(1).describe('The question or analysis request.'),
   workspace: z
@@ -57,6 +71,15 @@ export const askInputSchema = z.object({
     .boolean()
     .optional()
     .describe('Skip the context cache and embed files inline (slower, more expensive).'),
+  thinkingBudget: z
+    .number()
+    .int()
+    .min(-1)
+    .max(65_536)
+    .optional()
+    .describe(
+      "Explicit reasoning-token cap. OMIT to use each model's native default — recommended, and the only path Google supports without caveats on Gemini 3 family models (HIGH dynamic on Gemini 3 Pro). Pass a value only when you need a specific cap: `-1` = legacy dynamic (Gemini 2.5 and older), `0` = disable thinking (rejected by Gemini 3 Pro with 400 'This model only works in thinking mode'), positive integer = fixed cap. CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang without a response — use `-1` or ≥4096 if you must bound it there, or omit and let the model use its HIGH-dynamic default.",
+    ),
 });
 
 export type AskInput = z.infer<typeof askInputSchema>;
@@ -112,6 +135,36 @@ export const askTool: ToolDefinition<AskInput> = {
           ? Math.min(ASK_MAX_OUTPUT_TOKENS_DEFAULT, resolved.outputTokenLimit)
           : ASK_MAX_OUTPUT_TOKENS_DEFAULT;
 
+      // Normalise thinkingBudget:
+      //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)
+      //   -1        → -1  (explicit legacy dynamic; kept for Gemini 2.5 and
+      //                    power-users who want to force the legacy path)
+      //    0        →  0  (thinking disabled; Gemini 3 Pro will 400 here)
+      //    N > 0    → clamp to [0, maxOutputTokens - 1024] — the thinking
+      //              pool is carved out of the candidate-output allowance,
+      //              so reserving ≥1024 tokens for the answer prevents 400s
+      //              when a caller passes N ≥ maxOutputTokens.
+      const rawThinkingBudget = input.thinkingBudget;
+      const effectiveThinkingBudget: number | null =
+        rawThinkingBudget === undefined
+          ? THINKING_BUDGET_MODEL_DEFAULT
+          : rawThinkingBudget === -1
+            ? -1
+            : rawThinkingBudget > 0
+              ? Math.max(0, Math.min(rawThinkingBudget, maxOutputTokens - 1024))
+              : 0;
+
+      // Conservative upper bound for cost estimation. Gemini 3 Pro always
+      // spends thinking tokens (cannot be disabled per Google's docs), so we
+      // reserve dynamic-thinking headroom even when the user hasn't opted in
+      // — keeps `dailyBudgetUsd` a TRUE upper bound regardless of which
+      // reasoning tier the model picks. When the user explicitly passes a
+      // positive N, we reserve only that much.
+      const thinkingTokensForEstimate =
+        effectiveThinkingBudget === null || effectiveThinkingBudget === -1
+          ? Math.max(0, maxOutputTokens - 1024)
+          : effectiveThinkingBudget;
+
       // Atomic budget reservation. Happens AFTER scan (so the estimate is
       // accurate) but BEFORE any billable upload or generateContent call.
       // Concurrent tool calls cannot all pass a pre-check and then
@@ -124,6 +177,7 @@ export const askTool: ToolDefinition<AskInput> = {
           workspaceBytes,
           promptChars: input.prompt.length,
           expectedOutputTokens: maxOutputTokens,
+          thinkingTokens: thinkingTokensForEstimate,
         });
         const reserve = ctx.manifest.reserveBudget({
           workspaceRoot,
@@ -160,21 +214,41 @@ export const askTool: ToolDefinition<AskInput> = {
         allowCaching: !input.noCache && scan.files.length > 0,
       });
 
-      emitter.emit('generating response…');
+      emitter.emit(
+        effectiveThinkingBudget === null
+          ? 'generating response (thinking=model-default)…'
+          : effectiveThinkingBudget === -1
+            ? 'generating response (thinking=dynamic)…'
+            : `generating response (thinking=${effectiveThinkingBudget})…`,
+      );
       // Gemini rejects `generateContent({cachedContent, systemInstruction})` with 400:
       // "CachedContent can not be used with GenerateContent request setting
       //  system_instruction, tools or tool_config. Move those values to CachedContent."
       // The system instruction was already baked into the cache at build time
       // (see cache-manager.ts:322 `cacheConfig.systemInstruction`), so we must
       // OMIT it on the generate call when a cached context is active.
+      // `thinkingConfig` is NOT one of the forbidden fields — it is a
+      // per-request reasoning control and travels with every call regardless
+      // of cache state. We always set `includeThoughts: true` so callers see
+      // Gemini's reasoning digest in the response; `thinkingBudget` is only
+      // included when the caller explicitly asked for one (omitting it is
+      // the recommended path on Gemini 3 per Google's own guide).
       // `maxOutputTokens` is set on every generateContent call so the budget
       // reservation's `expectedOutputTokens` (derived from the same value) is
       // a true upper bound — without this cap, a runaway response could
       // exceed the reserved estimate and silently overshoot `dailyBudgetUsd`.
+      const thinkingConfig =
+        effectiveThinkingBudget === null
+          ? { includeThoughts: true }
+          : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
       const buildConfig = (cacheId: string | null): GenerateContentConfig =>
         cacheId
-          ? { cachedContent: cacheId, maxOutputTokens }
-          : { systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A, maxOutputTokens };
+          ? { cachedContent: cacheId, thinkingConfig, maxOutputTokens }
+          : {
+              systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
+              thinkingConfig,
+              maxOutputTokens,
+            };
       const buildContents = (
         cacheId: string | null,
         inline: typeof ctxPrep.inlineContents,
@@ -249,6 +323,23 @@ export const askTool: ToolDefinition<AskInput> = {
       }
 
       const text = response.text ?? '';
+
+      // Extract Gemini's thinking summary when `includeThoughts: true` is set.
+      // Parts flagged `thought: true` carry the model's internal reasoning
+      // digest — useful for the caller to see *why* an answer was given.
+      // We cap the joined summary at 1200 chars so it never dominates the
+      // MCP response payload (matches `code.tool.ts` behaviour).
+      const thoughtTexts: string[] = [];
+      for (const cand of response.candidates ?? []) {
+        for (const part of cand.content?.parts ?? []) {
+          if (part.thought === true && typeof part.text === 'string') {
+            thoughtTexts.push(part.text);
+          }
+        }
+      }
+      const thinkingSummary =
+        thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
+
       const usage = response.usageMetadata;
       const cached =
         typeof usage?.cachedContentTokenCount === 'number' ? usage.cachedContentTokenCount : 0;
@@ -308,11 +399,12 @@ export const askTool: ToolDefinition<AskInput> = {
         );
       }
 
-      const metadata = {
+      const metadata: Record<string, unknown> = {
         resolvedModel: resolved.resolved,
         requestedModel: resolved.requested,
         fallbackApplied: resolved.fallbackApplied,
         contextWindow: resolved.inputTokenLimit,
+        thinkingBudget: effectiveThinkingBudget,
         cachedTokens: cached,
         uncachedTokens: uncached,
         outputTokens: output,
@@ -331,6 +423,7 @@ export const askTool: ToolDefinition<AskInput> = {
         workspaceTruncated: scan.truncated,
         maxFilesCap: ctx.config.maxFilesPerWorkspace,
         durationMs,
+        ...(thinkingSummary ? { thinkingSummary } : {}),
       };
 
       return textResult(text, metadata);

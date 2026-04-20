@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Model-alias resolution no longer picks up Google's non-text-gen `pro` families.** `nano-banana-pro-preview` (image generation) and `lyria-3-pro-preview` (music generation) both share the `pro` substring our `latest-pro` / `latest-pro-thinking` aliases matched on, and the live registry returns them *before* `gemini-pro-latest`. Pre-fix: `.find()` grabbed banana first, so every `ask`/`code` call resolved to an image-gen model — image-tier pricing (~10× text rates), 128k input cap, and hitting the `gemini-3-pro-image` quota after three calls. The exclude list now filters `banana`, `lyria`, `research` (Deep Research is a specialised agent, not a drop-in conversational model), and `customtools` (variant that errors without a `tools` param) across all four aliases. Existing `image`/`tts`/`vision`/`audio` filters kept. Extracted into a single `NON_TEXT_GEN_MARKERS` source of truth so future Google families land in one edit.
+
+### Added
+
+- **`ask({ thinkingBudget })` parameter** — optional integer in `[-1, 65_536]`. OMIT it (the default) to let each model use its native thinking tier — the recommended path, and the only one Google supports without caveats on Gemini 3 (which defaults to HIGH dynamic thinking on Pro). Pass an explicit value only when you need a specific cap: `-1` = legacy dynamic (Gemini 2.5 and older), `0` = disable thinking (rejected by Gemini 3 Pro), positive integer = fixed cap. Per Google's Gemini 3 guide, explicit `thinkingBudget` is "legacy" on the 3 family and "may result in unexpected performance"; our implementation therefore omits the field on the wire when the caller didn't supply one, sidestepping empirical hangs we reproduced on Gemini 3 Pro + cached content at low positive budgets (see `docs/KNOWN-DEFICITS.md`). Mirrors the knob `code` already exposed; closes the gap where `ask` had no way to control thinking at all.
+- **Thinking summary surfaced on the MCP response** — `ask` always sets `includeThoughts: true` on the Gemini request, so when the model emits parts flagged `thought: true` we include a trimmed (~1.2 KB) `thinkingSummary` field in structured metadata. Works with or without an explicit `thinkingBudget`.
+
+### Changed
+
+- **Default model is now `latest-pro-thinking`** (was `latest-pro`). The alias resolver already preferred the newest Pro-class model with `supportsThinking: true`, but the server default didn't opt into it — so `ask` landed on non-thinking models unless callers passed `model: "latest-pro-thinking"` explicitly. New default means `ask` and `code` both reason at full strength out of the box. Override via `GEMINI_CODE_CONTEXT_DEFAULT_MODEL=latest-pro` if you need the non-thinking variant, or set a flash alias for cost-sensitive workloads.
+- **Budget reservation is thinking-aware** — `ask` now passes `thinkingTokens` into `estimatePreCallCostUsd`, mirroring `code`. Because Gemini 3 Pro always spends thinking tokens (cannot be disabled per Google's docs), reservations for callers who omit `thinkingBudget` still reserve the full `maxOutputTokens - 1024` as reasoning headroom — so `GEMINI_DAILY_BUDGET_USD` stays a TRUE upper bound regardless of which thinking tier the model picks. Without this, a high-thinking call could silently overshoot the cap; now it fails fast with the standard budget-cap message.
+
 ## [1.0.3] — 2026-04-19
 
 Security + cost-correctness release. Closes a HIGH-severity prompt-injection vector that let a malicious MCP client exfiltrate local files via the `workspace` argument, and a MEDIUM-severity TOCTOU race that let concurrent tool calls collectively overshoot `GEMINI_DAILY_BUDGET_USD`. Also bundles drift-guards and hardening surfaced by a full 3-way code review (GPT, Gemini, Grok) plus three Copilot review rounds. No breaking changes — all existing workspace paths under the MCP host's cwd continue to work without any config.
