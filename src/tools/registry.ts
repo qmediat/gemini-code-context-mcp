@@ -101,7 +101,7 @@ export function textResult(text: string, structured?: Record<string, unknown>): 
   };
 }
 
-export function errorResult(message: string): TextToolResult {
+export function errorResult(message: string, extra?: Record<string, unknown>): TextToolResult {
   return {
     content: [{ type: 'text', text: message }],
     // Mirror the error text under `responseText` for the same reason
@@ -109,7 +109,13 @@ export function errorResult(message: string): TextToolResult {
     // `structuredContent` only, so without this the failure message is
     // invisible to any orchestration that makes decisions on error text.
     // `isError: true` still signals failure; `responseText` carries detail.
-    structuredContent: { [RESPONSE_TEXT_KEY]: message },
+    //
+    // Extra fields (e.g. `errorCode` from DebugError) are spread so the
+    // subagent can reason structurally about the failure class instead of
+    // regexing `message`. The canonical `responseText` key is written LAST
+    // so a pathological caller passing it in `extra` can't silently
+    // clobber the user-facing message.
+    structuredContent: { ...(extra ?? {}), [RESPONSE_TEXT_KEY]: message },
     isError: true,
   };
 }

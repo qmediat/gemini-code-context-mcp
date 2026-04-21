@@ -81,4 +81,54 @@ describe('workspace scanner', () => {
     const second = await scanWorkspace(root, { maxFiles: 100, maxFileSizeBytes: 100_000 });
     expect(first.filesHash).not.toBe(second.filesHash);
   });
+
+  // v1.4.2 — excludeGlobs pattern normalization (Fix A). Pre-fix these all
+  // fell through to excludeDirs as literal strings and silently matched nothing.
+  it('skips tsconfig.tsbuildinfo by default (Fix B: default excluded extension)', async () => {
+    writeFileSync(join(root, 'tsconfig.tsbuildinfo'), 'x'.repeat(200));
+    writeFileSync(join(root, 'index.ts'), 'export const a = 1;');
+
+    const result = await scanWorkspace(root, { maxFiles: 100, maxFileSizeBytes: 100_000 });
+    expect(result.files.map((f) => f.relpath)).toEqual(['index.ts']);
+  });
+
+  it('excludeGlobs `*.ext` pattern drops matching files (Fix A)', async () => {
+    writeFileSync(join(root, 'build.log'), 'log content');
+    writeFileSync(join(root, 'index.ts'), 'export const a = 1;');
+
+    const result = await scanWorkspace(root, {
+      maxFiles: 100,
+      maxFileSizeBytes: 100_000,
+      excludeGlobs: ['*.log'],
+      includeGlobs: ['.log'], // deliberately contradictory — exclude wins
+    });
+    expect(result.files.map((f) => f.relpath)).toEqual(['index.ts']);
+  });
+
+  it('excludeGlobs literal filename drops the specific file (Fix A)', async () => {
+    writeFileSync(join(root, 'pr27-diff.txt'), 'diff');
+    writeFileSync(join(root, 'keep.txt'), 'other');
+
+    const result = await scanWorkspace(root, {
+      maxFiles: 100,
+      maxFileSizeBytes: 100_000,
+      excludeGlobs: ['pr27-diff.txt'],
+    });
+    const paths = result.files.map((f) => f.relpath).sort();
+    expect(paths).toEqual(['keep.txt']);
+  });
+
+  it('excludeGlobs path-prefix works after POSIX normalisation (Fix A)', async () => {
+    mkdirSync(join(root, 'src', 'lib', 'db', 'migrations', 'meta'), { recursive: true });
+    writeFileSync(join(root, 'src', 'lib', 'db', 'migrations', 'meta', '0001_snapshot.json'), '{}');
+    writeFileSync(join(root, 'src', 'lib', 'db', 'schema.ts'), 'export const s = {};');
+
+    const result = await scanWorkspace(root, {
+      maxFiles: 100,
+      maxFileSizeBytes: 100_000,
+      excludeGlobs: ['./src/lib/db/migrations/meta/'], // note leading ./ and trailing /
+    });
+    const paths = result.files.map((f) => f.relpath).sort();
+    expect(paths).toEqual(['src/lib/db/schema.ts']);
+  });
 });

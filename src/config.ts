@@ -46,6 +46,29 @@ export interface Config {
    * full rationale.
    */
   tpmThrottleLimit: number;
+  /**
+   * Pre-flight workspace size guard — fraction of the resolved model's
+   * `inputTokenLimit` that `estimatedInputTokens` (workspace bytes / 4 +
+   * prompt chars / 4) may fill before the tool fail-fasts with
+   * `WORKSPACE_TOO_LARGE`. Default `0.9` leaves ~10% headroom for the
+   * tokeniser drift against our `bytes/4` heuristic (known to underestimate
+   * on UTF-8 / CJK content — see `docs/FOLLOW-UP-PRS.md` T17).
+   *
+   * Clamped to `[0.5, 0.98]` defensively: a typo like `9` or `0.05` won't
+   * silently disable the guard (`> 1` semantic) nor make the tool
+   * effectively unusable (`≤ 0`). Operators on calm networks who trust
+   * the tokeniser can push to `0.95`; those on high-variance environments
+   * may drop to `0.8`.
+   *
+   * Empirically discovered v1.4.2 via debug-shadow trace on the RowrMail
+   * workspace (1.7M tokens vs a 1M context window): pre-fix MCP dispatched
+   * the request anyway, got Gemini `400 INVALID_ARGUMENT`, subagent
+   * interpreted as retryable → retry storm → `agent exhausted budget`.
+   * Cheap client-side preflight prevents the entire failure class.
+   *
+   * Set via `GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO`.
+   */
+  workspaceGuardRatio: number;
 }
 
 function readIntEnv(name: string, fallback: number): number {
@@ -98,6 +121,15 @@ export function loadConfig(): Config {
   const tpmThrottleRaw = readIntEnv('GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT', 80_000);
   const tpmThrottleLimit = tpmThrottleRaw >= 0 ? tpmThrottleRaw : 80_000;
 
+  // Workspace guard ratio: default 0.9, clamped to [0.5, 0.98]. A typo like
+  // `9` (intending 90% but missing the decimal) lands above 1.0 where it
+  // would silently disable the guard — clamp prevents that. Values below
+  // 0.5 would over-reject workspaces on normal models and are almost always
+  // a mis-copy; clamp floors them too. Falls back to 0.9 when env is unset
+  // or non-numeric.
+  const guardRaw = readFloatEnv('GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO', 0.9);
+  const workspaceGuardRatio = Math.min(0.98, Math.max(0.5, guardRaw));
+
   return {
     auth,
     defaultModel,
@@ -108,6 +140,7 @@ export function loadConfig(): Config {
     maxFileSizeBytes: readIntEnv('GEMINI_CODE_CONTEXT_MAX_FILE_SIZE', 1_000_000),
     telemetryEnabled: readBoolEnv('GEMINI_CODE_CONTEXT_TELEMETRY'),
     tpmThrottleLimit,
+    workspaceGuardRatio,
     forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
   };
 }

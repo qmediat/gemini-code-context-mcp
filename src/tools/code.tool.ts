@@ -98,8 +98,16 @@ export const codeInputSchema = z
       .describe(
         "Per-call opt-in cap on response length (tokens). OMIT for auto — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value to bound a specific call (e.g. `maxOutputTokens: 16384` for a tight code-review summary). Values larger than the resolved model's limit are clamped. Operators who want EVERY call at full model capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level — that env override is still beaten by this per-call field.",
       ),
-    includeGlobs: z.array(z.string()).optional(),
-    excludeGlobs: z.array(z.string()).optional(),
+    includeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe('Additional file extensions or filenames to include.'),
+    excludeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Additional patterns to exclude. Supports three shapes: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`), (2) literal filenames (`pr27-diff.txt`, `foo.bar.baz`), (3) extension globs (`*.tsbuildinfo`, `.map`). Paths are POSIX-normalised (backslashes → `/`, leading `./` and trailing `/` stripped). No mid-string `*` / `**` / `?` — split into dir + extension patterns if needed.',
+      ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
     message:
@@ -161,517 +169,552 @@ export const codeTool: ToolDefinition<CodeInput> = {
   async execute(input, ctx) {
     const started = Date.now();
     const workspaceRoot = resolve(input.workspace ?? process.cwd());
-    const modelRequest = input.model ?? 'latest-pro-thinking';
-    const expectEdits = input.expectEdits ?? true;
-    const codeExecution = input.codeExecution ?? false;
+    return executeCodeBody(input, ctx, workspaceRoot, started);
+  },
+};
 
-    // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel` are
-    // never both set. `usingThinkingLevel` is a single source of truth for
-    // the "is the caller driving reasoning via the discrete-tier knob?"
-    // predicate — used by the cost estimate, the emitter message, and the
-    // thinkingConfig shape below.
-    const usingThinkingLevel = input.thinkingLevel !== undefined;
+async function executeCodeBody(
+  input: CodeInput,
+  ctx: Parameters<typeof codeTool.execute>[1],
+  workspaceRoot: string,
+  started: number,
+): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
+  const modelRequest = input.model ?? 'latest-pro-thinking';
+  const expectEdits = input.expectEdits ?? true;
+  const codeExecution = input.codeExecution ?? false;
 
-    // `code` keeps its pre-existing default of 16_384 for the `thinkingBudget`
-    // path (strong reasoning for coding out of the box — coding tasks
-    // genuinely benefit from it and callers rarely want to disable thinking).
-    // When the caller uses `thinkingLevel` instead, `thinkingBudget` stays
-    // undefined and we take the level branch below.
-    const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
+  // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel` are
+  // never both set. `usingThinkingLevel` is a single source of truth for
+  // the "is the caller driving reasoning via the discrete-tier knob?"
+  // predicate — used by the cost estimate, the emitter message, and the
+  // thinkingConfig shape below.
+  const usingThinkingLevel = input.thinkingLevel !== undefined;
 
-    let reservationId: number | null = null;
-    // `-1` signals "no reservation held". Mirror of ask.tool.ts.
-    let throttleReservationId = -1;
-    // Canonical resolved-model string for retry-hint seeding (T22a).
-    // See ask.tool.ts for rationale.
-    let resolvedModelKey: string | null = null;
-    const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
+  // `code` keeps its pre-existing default of 16_384 for the `thinkingBudget`
+  // path (strong reasoning for coding out of the box — coding tasks
+  // genuinely benefit from it and callers rarely want to disable thinking).
+  // When the caller uses `thinkingLevel` instead, `thinkingBudget` stays
+  // undefined and we take the level branch below.
+  const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
+
+  let reservationId: number | null = null;
+  // `-1` signals "no reservation held". Mirror of ask.tool.ts.
+  let throttleReservationId = -1;
+  // Canonical resolved-model string for retry-hint seeding (T22a).
+  // See ask.tool.ts for rationale.
+  let resolvedModelKey: string | null = null;
+  const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
+  try {
+    // Workspace validation inside try → reported as a regular tool error
+    // (errorResult, "code failed: …") rather than an unhandled exception
+    // surfaced by the server-level handler.
     try {
-      // Workspace validation inside try → reported as a regular tool error
-      // (errorResult, "code failed: …") rather than an unhandled exception
-      // surfaced by the server-level handler.
-      try {
-        validateWorkspacePath(workspaceRoot);
-      } catch (err) {
-        if (err instanceof WorkspaceValidationError) {
-          return errorResult(`code: ${err.message}`);
-        }
-        throw err;
+      validateWorkspacePath(workspaceRoot);
+    } catch (err) {
+      if (err instanceof WorkspaceValidationError) {
+        return errorResult(`code: ${err.message}`);
       }
+      throw err;
+    }
 
-      emitter.emit(`resolving model '${modelRequest}'…`);
-      // `code` is strictly text-reasoning — coding tasks genuinely benefit
-      // from reasoning tokens, and dispatching to fast/lite tiers would
-      // degrade output quality without meaningful cost savings. Crucially:
-      // this category gate prevents image-gen / audio-gen / agent models
-      // (which may share `pro` tokens with text models in Google's registry)
-      // from reaching `generateContent` with a code-review prompt — the
-      // primary motivation for the v1.4.0 taxonomy work.
-      const resolved = await resolveModel(modelRequest, ctx.client, {
-        requiredCategory: ['text-reasoning'],
-      });
-      resolvedModelKey = resolved.resolved;
+    emitter.emit(`resolving model '${modelRequest}'…`);
+    // `code` is strictly text-reasoning — coding tasks genuinely benefit
+    // from reasoning tokens, and dispatching to fast/lite tiers would
+    // degrade output quality without meaningful cost savings. Crucially:
+    // this category gate prevents image-gen / audio-gen / agent models
+    // (which may share `pro` tokens with text models in Google's registry)
+    // from reaching `generateContent` with a code-review prompt — the
+    // primary motivation for the v1.4.0 taxonomy work.
+    const resolved = await resolveModel(modelRequest, ctx.client, {
+      requiredCategory: ['text-reasoning'],
+    });
+    resolvedModelKey = resolved.resolved;
 
-      emitter.emit(`scanning workspace ${workspaceRoot}…`);
-      const scan = await scanWorkspace(workspaceRoot, {
-        ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
-        ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
-        maxFiles: ctx.config.maxFilesPerWorkspace,
-        maxFileSizeBytes: ctx.config.maxFileSizeBytes,
-      });
+    emitter.emit(`scanning workspace ${workspaceRoot}…`);
+    const scan = await scanWorkspace(workspaceRoot, {
+      ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
+      ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
+      maxFiles: ctx.config.maxFilesPerWorkspace,
+      maxFileSizeBytes: ctx.config.maxFileSizeBytes,
+    });
 
-      // Output-cap strategy (v1.4.0) — see ask.tool.ts for full rationale
-      // of the three-layer precedence. Summary: input.maxOutputTokens
-      // (per-call) > ctx.config.forceMaxOutputTokens (MCP-host env) >
-      // auto (omit from wire; Gemini uses model-default). Code review
-      // commonly produces long OLD/NEW diff blocks, so operators doing
-      // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
-      // to pin every call at the model's full 65,536-token capacity.
-      const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
-      const modelOutputLimit =
-        typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
-          ? resolved.outputTokenLimit
-          : CODE_MAX_OUTPUT_TOKENS_FALLBACK;
-      const wireMaxOutputTokens: number | undefined =
-        input.maxOutputTokens !== undefined
-          ? Math.min(input.maxOutputTokens, modelOutputLimit)
-          : ctx.config.forceMaxOutputTokens
-            ? modelOutputLimit
-            : undefined;
-      // Effective cap for thinking-budget clamp and budget reservation.
-      // When auto (neither override set), Gemini's model-default equals
-      // modelOutputLimit per Google docs, so using the limit as worst-case
-      // keeps the daily $ cap a true upper bound.
-      const effectiveOutputCap = wireMaxOutputTokens ?? modelOutputLimit;
+    // Output-cap strategy (v1.4.0) — see ask.tool.ts for full rationale
+    // of the three-layer precedence. Summary: input.maxOutputTokens
+    // (per-call) > ctx.config.forceMaxOutputTokens (MCP-host env) >
+    // auto (omit from wire; Gemini uses model-default). Code review
+    // commonly produces long OLD/NEW diff blocks, so operators doing
+    // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
+    // to pin every call at the model's full 65,536-token capacity.
+    const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
+    const modelOutputLimit =
+      typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
+        ? resolved.outputTokenLimit
+        : CODE_MAX_OUTPUT_TOKENS_FALLBACK;
+    const wireMaxOutputTokens: number | undefined =
+      input.maxOutputTokens !== undefined
+        ? Math.min(input.maxOutputTokens, modelOutputLimit)
+        : ctx.config.forceMaxOutputTokens
+          ? modelOutputLimit
+          : undefined;
+    // Effective cap for thinking-budget clamp and budget reservation.
+    // When auto (neither override set), Gemini's model-default equals
+    // modelOutputLimit per Google docs, so using the limit as worst-case
+    // keeps the daily $ cap a true upper bound.
+    const effectiveOutputCap = wireMaxOutputTokens ?? modelOutputLimit;
 
-      // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
-      // is carved out of the candidate-output allowance). The hard cap above
-      // may clamp maxOutputTokens as low as the model's `outputTokenLimit`
-      // (e.g. 8_192 on Flash-lite). Clamp the effective thinkingBudget so
-      // the generateContent call never 400s on this invariant; reserve at
-      // least 1_024 tokens for the actual completion.
-      //
-      // Only meaningful on the thinkingBudget path — when the caller uses
-      // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
-      // value is ignored by the thinkingConfig builder below.
-      //
-      // Early-reject when the caller's per-call `maxOutputTokens` can't fit
-      // an explicit positive `thinkingBudget` + 1024-token answer reserve.
-      // Silently clamping to 0 would make Gemini 3 Pro 400 on a
-      // "thinking disabled" error and obscure the real mismatch (PR #22
-      // round-3 review finding #C).
-      if (
-        input.thinkingBudget !== undefined &&
-        input.thinkingBudget > 0 &&
-        input.maxOutputTokens !== undefined &&
-        effectiveOutputCap < input.thinkingBudget + 1024
-      ) {
-        return errorResult(
-          `code: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
-        );
-      }
-      const effectiveThinkingBudget =
-        thinkingBudget !== undefined && thinkingBudget > 0
-          ? Math.max(0, Math.min(thinkingBudget, effectiveOutputCap - 1024))
-          : 0;
-
-      // Cost-estimate thinking-token reserve — tier-aware when the caller
-      // uses `thinkingLevel`, exact-on-the-budget when they use
-      // `thinkingBudget`. Mirror of `ask.tool.ts` logic; see
-      // `THINKING_LEVEL_RESERVE` in `shared/thinking.ts` for the rationale
-      // behind the per-tier numbers and why HIGH falls through to the
-      // dynamic cap.
-      //
-      // Defensive clamp: tier reserves (MINIMAL=512, LOW=2048, MEDIUM=4096)
-      // are fixed constants, but `maxOutputTokens` can be clamped down to a
-      // resolved model's `outputTokenLimit`. A future small-cap model (say
-      // `outputTokenLimit: 4000`) would let MEDIUM's 4096 exceed the
-      // available headroom and over-estimate the budget reservation. Clamp
-      // every tier's reserve against the dynamic headroom so the upper
-      // bound stays coherent across model rollouts (PR #17 self-review F2).
-      const thinkingHeadroom = Math.max(0, effectiveOutputCap - 1024);
-      const thinkingTokensForEstimate =
-        input.thinkingLevel !== undefined
-          ? Math.min(
-              THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? thinkingHeadroom,
-              thinkingHeadroom,
-            )
-          : effectiveThinkingBudget;
-
-      // Shared input-token fingerprint for budget + TPM throttle (see
-      // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
-      // used by `estimatePreCallCostUsd`).
-      const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-      const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
-
-      // Atomic budget reservation — see ask.tool.ts for the full rationale.
-      // Estimate includes the thinking budget (billed as output tokens on Pro)
-      // PLUS the candidate output cap.
-      if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-        const estimateUsd = estimatePreCallCostUsd({
-          model: resolved.resolved,
-          workspaceBytes,
-          promptChars: input.task.length,
-          expectedOutputTokens: effectiveOutputCap,
-          thinkingTokens: thinkingTokensForEstimate,
-        });
-        const reserve = ctx.manifest.reserveBudget({
-          workspaceRoot,
-          toolName: 'code',
-          model: resolved.resolved,
-          estimatedCostMicros: toMicrosUsd(estimateUsd),
-          dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
-          nowMs: Date.now(),
-        });
-        if ('rejected' in reserve) {
-          const spentUsd = reserve.spentMicros / 1_000_000;
-          return errorResult(
-            `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          );
-        }
-        reservationId = reserve.id;
-      }
-
-      const systemPromptHash = createHash('sha256')
-        .update(SYSTEM_INSTRUCTION_CODE)
-        .digest('hex')
-        .slice(0, 16);
-
-      const ctxPrep = await prepareContext({
-        client: ctx.client,
-        manifest: ctx.manifest,
-        scan,
-        model: resolved,
-        systemPromptHash,
-        systemInstruction: SYSTEM_INSTRUCTION_CODE,
-        ttlSeconds: ctx.config.cacheTtlSeconds,
-        cacheMinTokens: ctx.config.cacheMinTokens,
-        emitter,
-        // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
-        // which Gemini rejects together with cachedContent. Force inline path
-        // when codeExecution is requested so we have actual inline file parts
-        // to embed alongside the prompt.
-        allowCaching: scan.files.length > 0 && !codeExecution,
-      });
-
-      // TPM throttle — placed AFTER `prepareContext`, immediately before
-      // `generateContent`, so the reservation's `tsMs` accurately reflects
-      // when tokens hit Gemini's quota counter. See ask.tool.ts for the
-      // full rationale and the cold-cache-timing concern it fixes.
-      //
-      // Extracted into a helper so the stale-cache retry branch can
-      // cancel-and-re-reserve with an accurate tsMs rather than reusing a
-      // stale reservation.
-      const reserveForDispatch = async (): Promise<void> => {
-        if (ctx.config.tpmThrottleLimit <= 0) return;
-        const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
-        throttleReservationId = reservation.releaseId;
-        if (reservation.delayMs > 0) {
-          emitter.emit(
-            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
-          );
-          await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
-        }
-      };
-      await reserveForDispatch();
-
-      const userPrompt = expectEdits
-        ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
-        : input.task;
-
-      const thinkingDescription = usingThinkingLevel
-        ? `thinking-level=${input.thinkingLevel}`
-        : `thinking=${effectiveThinkingBudget}`;
-      emitter.emit(
-        codeExecution
-          ? `generating with ${thinkingDescription} + codeExecution…`
-          : `generating with ${thinkingDescription}…`,
+    // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
+    // is carved out of the candidate-output allowance). The hard cap above
+    // may clamp maxOutputTokens as low as the model's `outputTokenLimit`
+    // (e.g. 8_192 on Flash-lite). Clamp the effective thinkingBudget so
+    // the generateContent call never 400s on this invariant; reserve at
+    // least 1_024 tokens for the actual completion.
+    //
+    // Only meaningful on the thinkingBudget path — when the caller uses
+    // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
+    // value is ignored by the thinkingConfig builder below.
+    //
+    // Early-reject when the caller's per-call `maxOutputTokens` can't fit
+    // an explicit positive `thinkingBudget` + 1024-token answer reserve.
+    // Silently clamping to 0 would make Gemini 3 Pro 400 on a
+    // "thinking disabled" error and obscure the real mismatch (PR #22
+    // round-3 review finding #C).
+    if (
+      input.thinkingBudget !== undefined &&
+      input.thinkingBudget > 0 &&
+      input.maxOutputTokens !== undefined &&
+      effectiveOutputCap < input.thinkingBudget + 1024
+    ) {
+      return errorResult(
+        `code: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
       );
+    }
+    const effectiveThinkingBudget =
+      thinkingBudget !== undefined && thinkingBudget > 0
+        ? Math.max(0, Math.min(thinkingBudget, effectiveOutputCap - 1024))
+        : 0;
 
-      // Two mutually-exclusive reasoning-control paths (enforced by schema
-      // `.refine()`):
-      //   a) `thinkingLevel` set → cast to the SDK enum and pass through.
-      //      Google's recommended path on Gemini 3. Rejected by Gemini 2.5.
-      //      Cast rather than runtime enum-object lookup so a future SDK
-      //      rename surfaces as a Gemini 400, not a silent `undefined`.
-      //   b) `thinkingBudget` path (default 16_384, clamped above) → pass
-      //      `thinkingBudget` as before.
-      // `includeThoughts: true` is unconditional so `thinkingSummary`
-      // extraction below always has material to find.
-      const thinkingConfig: ThinkingConfig = usingThinkingLevel
-        ? {
-            thinkingLevel: input.thinkingLevel as ThinkingLevel,
-            includeThoughts: true,
-          }
-        : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
+    // Cost-estimate thinking-token reserve — tier-aware when the caller
+    // uses `thinkingLevel`, exact-on-the-budget when they use
+    // `thinkingBudget`. Mirror of `ask.tool.ts` logic; see
+    // `THINKING_LEVEL_RESERVE` in `shared/thinking.ts` for the rationale
+    // behind the per-tier numbers and why HIGH falls through to the
+    // dynamic cap.
+    //
+    // Defensive clamp: tier reserves (MINIMAL=512, LOW=2048, MEDIUM=4096)
+    // are fixed constants, but `maxOutputTokens` can be clamped down to a
+    // resolved model's `outputTokenLimit`. A future small-cap model (say
+    // `outputTokenLimit: 4000`) would let MEDIUM's 4096 exceed the
+    // available headroom and over-estimate the budget reservation. Clamp
+    // every tier's reserve against the dynamic headroom so the upper
+    // bound stays coherent across model rollouts (PR #17 self-review F2).
+    const thinkingHeadroom = Math.max(0, effectiveOutputCap - 1024);
+    const thinkingTokensForEstimate =
+      input.thinkingLevel !== undefined
+        ? Math.min(
+            THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? thinkingHeadroom,
+            thinkingHeadroom,
+          )
+        : effectiveThinkingBudget;
 
-      // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
-      // with 400. System instruction is baked into the cache at build time; tools
-      // (codeExecution) cannot be combined with a cache built without them. When
-      // codeExecution is requested AND a cache is active, we can't use both — in that
-      // case we bypass the cache so the user's explicit codeExecution request wins.
-      const canUseCache = (cacheId: string | null): boolean => cacheId !== null && !codeExecution;
-      if (ctxPrep.cacheId && codeExecution) {
-        logger.warn(
-          'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
+    // Shared input-token fingerprint for budget + TPM throttle (see
+    // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
+    // used by `estimatePreCallCostUsd`).
+    const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+    const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
+
+    // v1.4.2 preflight — mirror of ask.tool.ts guard. See there for rationale.
+    const contextWindow = resolved.inputTokenLimit;
+    if (typeof contextWindow === 'number' && contextWindow > 0) {
+      const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
+      if (estimatedInputTokens > threshold) {
+        const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
+        return errorResult(
+          `Workspace too large for eager \`code\`: ~${estimatedInputTokens.toLocaleString()} input tokens exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
+          {
+            errorCode: 'WORKSPACE_TOO_LARGE',
+            retryable: false,
+            estimatedInputTokens,
+            contextWindowTokens: contextWindow,
+            thresholdTokens: threshold,
+            guardRatio: ctx.config.workspaceGuardRatio,
+            resolvedModel: resolved.resolved,
+            filesIndexed: scan.files.length,
+          },
         );
       }
-      const buildConfig = (cacheId: string | null): GenerateContentConfig => {
-        const maxOutputField =
-          wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
-        if (canUseCache(cacheId) && cacheId) {
-          // With cache: system_instruction is baked in; thinkingConfig remains OK.
-          // `maxOutputTokens` only emitted when the caller set it explicitly
-          // or `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` — otherwise omit
-          // and Gemini uses its model-default.
-          return {
-            cachedContent: cacheId,
-            thinkingConfig,
-            ...maxOutputField,
-          };
+    } else {
+      logger.warn(
+        `code: resolved model ${resolved.resolved} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
+      );
+    }
+
+    // Atomic budget reservation — see ask.tool.ts for the full rationale.
+    // Estimate includes the thinking budget (billed as output tokens on Pro)
+    // PLUS the candidate output cap.
+    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
+      const estimateUsd = estimatePreCallCostUsd({
+        model: resolved.resolved,
+        workspaceBytes,
+        promptChars: input.task.length,
+        expectedOutputTokens: effectiveOutputCap,
+        thinkingTokens: thinkingTokensForEstimate,
+      });
+      const reserve = ctx.manifest.reserveBudget({
+        workspaceRoot,
+        toolName: 'code',
+        model: resolved.resolved,
+        estimatedCostMicros: toMicrosUsd(estimateUsd),
+        dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+        nowMs: Date.now(),
+      });
+      if ('rejected' in reserve) {
+        const spentUsd = reserve.spentMicros / 1_000_000;
+        return errorResult(
+          `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
+          { errorCode: 'BUDGET_REJECT', retryable: false },
+        );
+      }
+      reservationId = reserve.id;
+    }
+
+    const systemPromptHash = createHash('sha256')
+      .update(SYSTEM_INSTRUCTION_CODE)
+      .digest('hex')
+      .slice(0, 16);
+
+    const ctxPrep = await prepareContext({
+      client: ctx.client,
+      manifest: ctx.manifest,
+      scan,
+      model: resolved,
+      systemPromptHash,
+      systemInstruction: SYSTEM_INSTRUCTION_CODE,
+      ttlSeconds: ctx.config.cacheTtlSeconds,
+      cacheMinTokens: ctx.config.cacheMinTokens,
+      emitter,
+      // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
+      // which Gemini rejects together with cachedContent. Force inline path
+      // when codeExecution is requested so we have actual inline file parts
+      // to embed alongside the prompt.
+      allowCaching: scan.files.length > 0 && !codeExecution,
+    });
+
+    // TPM throttle — placed AFTER `prepareContext`, immediately before
+    // `generateContent`, so the reservation's `tsMs` accurately reflects
+    // when tokens hit Gemini's quota counter. See ask.tool.ts for the
+    // full rationale and the cold-cache-timing concern it fixes.
+    //
+    // Extracted into a helper so the stale-cache retry branch can
+    // cancel-and-re-reserve with an accurate tsMs rather than reusing a
+    // stale reservation.
+    const reserveForDispatch = async (): Promise<void> => {
+      if (ctx.config.tpmThrottleLimit <= 0) return;
+      const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
+      throttleReservationId = reservation.releaseId;
+      if (reservation.delayMs > 0) {
+        emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
+        await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+      }
+    };
+    await reserveForDispatch();
+
+    const userPrompt = expectEdits
+      ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
+      : input.task;
+
+    const thinkingDescription = usingThinkingLevel
+      ? `thinking-level=${input.thinkingLevel}`
+      : `thinking=${effectiveThinkingBudget}`;
+    emitter.emit(
+      codeExecution
+        ? `generating with ${thinkingDescription} + codeExecution…`
+        : `generating with ${thinkingDescription}…`,
+    );
+
+    // Two mutually-exclusive reasoning-control paths (enforced by schema
+    // `.refine()`):
+    //   a) `thinkingLevel` set → cast to the SDK enum and pass through.
+    //      Google's recommended path on Gemini 3. Rejected by Gemini 2.5.
+    //      Cast rather than runtime enum-object lookup so a future SDK
+    //      rename surfaces as a Gemini 400, not a silent `undefined`.
+    //   b) `thinkingBudget` path (default 16_384, clamped above) → pass
+    //      `thinkingBudget` as before.
+    // `includeThoughts: true` is unconditional so `thinkingSummary`
+    // extraction below always has material to find.
+    const thinkingConfig: ThinkingConfig = usingThinkingLevel
+      ? {
+          thinkingLevel: input.thinkingLevel as ThinkingLevel,
+          includeThoughts: true,
         }
-        // Without cache (or cache bypassed for codeExecution): pass full config.
+      : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
+
+    // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
+    // with 400. System instruction is baked into the cache at build time; tools
+    // (codeExecution) cannot be combined with a cache built without them. When
+    // codeExecution is requested AND a cache is active, we can't use both — in that
+    // case we bypass the cache so the user's explicit codeExecution request wins.
+    const canUseCache = (cacheId: string | null): boolean => cacheId !== null && !codeExecution;
+    if (ctxPrep.cacheId && codeExecution) {
+      logger.warn(
+        'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
+      );
+    }
+    const buildConfig = (cacheId: string | null): GenerateContentConfig => {
+      const maxOutputField =
+        wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
+      if (canUseCache(cacheId) && cacheId) {
+        // With cache: system_instruction is baked in; thinkingConfig remains OK.
+        // `maxOutputTokens` only emitted when the caller set it explicitly
+        // or `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` — otherwise omit
+        // and Gemini uses its model-default.
         return {
-          systemInstruction: SYSTEM_INSTRUCTION_CODE,
+          cachedContent: cacheId,
           thinkingConfig,
           ...maxOutputField,
-          ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
         };
+      }
+      // Without cache (or cache bypassed for codeExecution): pass full config.
+      return {
+        systemInstruction: SYSTEM_INSTRUCTION_CODE,
+        thinkingConfig,
+        ...maxOutputField,
+        ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
       };
-      const buildContents = (
-        cacheId: string | null,
-        inline: typeof ctxPrep.inlineContents,
-      ): string | Content[] =>
-        canUseCache(cacheId)
-          ? userPrompt
-          : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
+    };
+    const buildContents = (
+      cacheId: string | null,
+      inline: typeof ctxPrep.inlineContents,
+    ): string | Content[] =>
+      canUseCache(cacheId)
+        ? userPrompt
+        : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
 
-      let activePrep = ctxPrep;
-      let retriedOnStaleCache = false;
-      let response: GenerateContentResponse;
-      try {
-        response = await ctx.client.models.generateContent({
-          model: resolved.resolved,
-          contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
-          config: buildConfig(activePrep.cacheId),
-        });
-      } catch (err) {
-        if (activePrep.cacheId && isStaleCacheError(err)) {
-          logger.warn(
-            `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
-          );
-          try {
-            // Reset cache pointer only — preserve `files` rows so the rebuild
-            // reuses uploaded files via content-hash dedup instead of double-
-            // uploading. The Gemini-side cache is already dead.
-            markCacheStale({ manifest: ctx.manifest, workspaceRoot });
-            const rebuilt = await prepareContext({
-              client: ctx.client,
-              manifest: ctx.manifest,
-              scan,
-              model: resolved,
-              systemPromptHash,
-              systemInstruction: SYSTEM_INSTRUCTION_CODE,
-              ttlSeconds: ctx.config.cacheTtlSeconds,
-              cacheMinTokens: ctx.config.cacheMinTokens,
-              emitter,
-              allowCaching: scan.files.length > 0 && !codeExecution,
-            });
-            // Cancel stale reservation (tsMs was stamped before first
-            // dispatch, now seconds old after rebuild) and re-reserve so
-            // the retry's tsMs matches actual dispatch time. Mirror of
-            // ask.tool.ts — see rationale there.
-            if (throttleReservationId !== -1) {
-              ctx.throttle.cancel(throttleReservationId);
-              throttleReservationId = -1;
-            }
-            await reserveForDispatch();
-            response = await ctx.client.models.generateContent({
-              model: resolved.resolved,
-              contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-              config: buildConfig(rebuilt.cacheId),
-            });
-            activePrep = rebuilt;
-            retriedOnStaleCache = true;
-          } catch (retryErr) {
-            throw new Error(
-              `code retry after stale cache failed: ${
-                retryErr instanceof Error ? retryErr.message : String(retryErr)
-              }`,
-              { cause: err },
-            );
-          }
-        } else {
-          throw err;
-        }
-      }
-
-      if (activePrep.cacheId) {
-        ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
-      }
-
-      const text = response.text ?? '';
-      const edits = expectEdits ? parseEdits(text) : [];
-      const codeBlocks = parseCodeBlocks(text);
-
-      // Extract code_execution tool artifacts + Gemini's thinking summary if present.
-      const executedCode: string[] = [];
-      const executionOutput: string[] = [];
-      const thoughtTexts: string[] = [];
-      const candidates = response.candidates ?? [];
-      for (const cand of candidates) {
-        const parts = cand.content?.parts ?? [];
-        for (const part of parts) {
-          if (part.executableCode?.code) executedCode.push(part.executableCode.code);
-          if (part.codeExecutionResult?.output)
-            executionOutput.push(part.codeExecutionResult.output);
-          // `thinkingConfig: { includeThoughts: true }` returns thinking as parts
-          // flagged with `thought: true`. Cap the summary to avoid overwhelming the MCP response.
-          if (part.thought === true && typeof part.text === 'string') {
-            thoughtTexts.push(part.text);
-          }
-        }
-      }
-      const thinkingSummary =
-        thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
-
-      const usage = response.usageMetadata;
-      const cached =
-        typeof usage?.cachedContentTokenCount === 'number' ? usage.cachedContentTokenCount : 0;
-      const inputTotal = typeof usage?.promptTokenCount === 'number' ? usage.promptTokenCount : 0;
-      const uncached = Math.max(0, inputTotal - cached);
-      const output =
-        typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0;
-      const thinking = typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0;
-
-      // Finalise TPM throttle reservation with actual input tokens
-      // (cached + uncached — both count toward Gemini's per-minute quota).
-      if (throttleReservationId !== -1) {
-        ctx.throttle.release(throttleReservationId, inputTotal);
-        throttleReservationId = -1;
-      }
-
-      const cost = estimateCostUsd({
+    let activePrep = ctxPrep;
+    let retriedOnStaleCache = false;
+    let response: GenerateContentResponse;
+    try {
+      response = await ctx.client.models.generateContent({
         model: resolved.resolved,
-        uncachedInputTokens: uncached,
-        cachedInputTokens: cached,
-        outputTokens: output,
-        thinkingTokens: thinking,
+        contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
+        config: buildConfig(activePrep.cacheId),
       });
-      const costMicros = toMicrosUsd(cost);
-
-      const durationMs = Date.now() - started;
-      if (reservationId !== null) {
-        // Defensive: if `finalize` throws (disk full / lock contention), keep
-        // the reservation row so we don't lose all record of this billable
-        // call. Drop `reservationId` either way so the outer catch doesn't
-        // touch it.
+    } catch (err) {
+      if (activePrep.cacheId && isStaleCacheError(err)) {
+        logger.warn(
+          `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
+        );
         try {
-          ctx.manifest.finalizeBudgetReservation(reservationId, {
-            cachedTokens: cached,
-            uncachedTokens: uncached,
-            costUsdMicro: costMicros,
-            durationMs,
+          // Reset cache pointer only — preserve `files` rows so the rebuild
+          // reuses uploaded files via content-hash dedup instead of double-
+          // uploading. The Gemini-side cache is already dead.
+          markCacheStale({ manifest: ctx.manifest, workspaceRoot });
+          const rebuilt = await prepareContext({
+            client: ctx.client,
+            manifest: ctx.manifest,
+            scan,
+            model: resolved,
+            systemPromptHash,
+            systemInstruction: SYSTEM_INSTRUCTION_CODE,
+            ttlSeconds: ctx.config.cacheTtlSeconds,
+            cacheMinTokens: ctx.config.cacheMinTokens,
+            emitter,
+            allowCaching: scan.files.length > 0 && !codeExecution,
           });
-        } catch (finalizeErr) {
-          logger.error(
-            `code: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
+          // Cancel stale reservation (tsMs was stamped before first
+          // dispatch, now seconds old after rebuild) and re-reserve so
+          // the retry's tsMs matches actual dispatch time. Mirror of
+          // ask.tool.ts — see rationale there.
+          if (throttleReservationId !== -1) {
+            ctx.throttle.cancel(throttleReservationId);
+            throttleReservationId = -1;
+          }
+          await reserveForDispatch();
+          response = await ctx.client.models.generateContent({
+            model: resolved.resolved,
+            contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
+            config: buildConfig(rebuilt.cacheId),
+          });
+          activePrep = rebuilt;
+          retriedOnStaleCache = true;
+        } catch (retryErr) {
+          throw new Error(
+            `code retry after stale cache failed: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`,
+            { cause: err },
           );
         }
-        reservationId = null;
       } else {
-        ctx.manifest.insertUsageMetric({
-          workspaceRoot,
-          toolName: 'code',
-          model: resolved.resolved,
+        throw err;
+      }
+    }
+
+    if (activePrep.cacheId) {
+      ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
+    }
+
+    const text = response.text ?? '';
+    const edits = expectEdits ? parseEdits(text) : [];
+    const codeBlocks = parseCodeBlocks(text);
+
+    // Extract code_execution tool artifacts + Gemini's thinking summary if present.
+    const executedCode: string[] = [];
+    const executionOutput: string[] = [];
+    const thoughtTexts: string[] = [];
+    const candidates = response.candidates ?? [];
+    for (const cand of candidates) {
+      const parts = cand.content?.parts ?? [];
+      for (const part of parts) {
+        if (part.executableCode?.code) executedCode.push(part.executableCode.code);
+        if (part.codeExecutionResult?.output) executionOutput.push(part.codeExecutionResult.output);
+        // `thinkingConfig: { includeThoughts: true }` returns thinking as parts
+        // flagged with `thought: true`. Cap the summary to avoid overwhelming the MCP response.
+        if (part.thought === true && typeof part.text === 'string') {
+          thoughtTexts.push(part.text);
+        }
+      }
+    }
+    const thinkingSummary = thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
+
+    const usage = response.usageMetadata;
+    const cached =
+      typeof usage?.cachedContentTokenCount === 'number' ? usage.cachedContentTokenCount : 0;
+    const inputTotal = typeof usage?.promptTokenCount === 'number' ? usage.promptTokenCount : 0;
+    const uncached = Math.max(0, inputTotal - cached);
+    const output = typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0;
+    const thinking = typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0;
+
+    // Finalise TPM throttle reservation with actual input tokens
+    // (cached + uncached — both count toward Gemini's per-minute quota).
+    if (throttleReservationId !== -1) {
+      ctx.throttle.release(throttleReservationId, inputTotal);
+      throttleReservationId = -1;
+    }
+
+    const cost = estimateCostUsd({
+      model: resolved.resolved,
+      uncachedInputTokens: uncached,
+      cachedInputTokens: cached,
+      outputTokens: output,
+      thinkingTokens: thinking,
+    });
+    const costMicros = toMicrosUsd(cost);
+
+    const durationMs = Date.now() - started;
+    if (reservationId !== null) {
+      // Defensive: if `finalize` throws (disk full / lock contention), keep
+      // the reservation row so we don't lose all record of this billable
+      // call. Drop `reservationId` either way so the outer catch doesn't
+      // touch it.
+      try {
+        ctx.manifest.finalizeBudgetReservation(reservationId, {
           cachedTokens: cached,
           uncachedTokens: uncached,
           costUsdMicro: costMicros,
           durationMs,
-          occurredAt: Date.now(),
         });
-      }
-
-      if (scan.truncated) {
-        logger.warn(
-          `workspace ${workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,
+      } catch (finalizeErr) {
+        logger.error(
+          `code: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
         );
       }
-
-      const structured: Record<string, unknown> = {
-        resolvedModel: resolved.resolved,
-        requestedModel: resolved.requested,
-        modelCategory: resolved.category,
-        modelCostTier: resolved.capabilities.costTier,
-        contextWindow: resolved.inputTokenLimit,
-        // `thinkingBudget` echoes the clamped value actually sent on the
-        // wire; it's only meaningful on the budget path. On the
-        // `thinkingLevel` path nothing is sent for `thinkingBudget`, so we
-        // emit `null` (not `0`) — `0` is the wire sentinel for "thinking
-        // disabled" and reporting it here for a level-path call would lie
-        // to downstream audit / dashboard consumers (PR #17 self-review F1,
-        // 3-reviewer consensus: GPT + Copilot + Self). Matches `ask.tool.ts`.
-        thinkingBudget: usingThinkingLevel ? null : effectiveThinkingBudget,
-        thinkingLevel: input.thinkingLevel ?? null,
-        codeExecutionUsed: codeExecution,
-        cacheHit: activePrep.reused,
-        cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
-        retriedOnStaleCache,
+      reservationId = null;
+    } else {
+      ctx.manifest.insertUsageMetric({
+        workspaceRoot,
+        toolName: 'code',
+        model: resolved.resolved,
         cachedTokens: cached,
         uncachedTokens: uncached,
-        thinkingTokens: thinking,
-        outputTokens: output,
-        costEstimateUsd: Math.round(cost * 10000) / 10000,
+        costUsdMicro: costMicros,
         durationMs,
-        edits: edits.map((e) => ({
-          file: e.file,
-          oldPreview: e.old.slice(0, 120),
-          newPreview: e.new.slice(0, 120),
-        })),
-        editCount: edits.length,
-        codeBlocks: codeBlocks.map((b) => ({ lang: b.lang, length: b.content.length })),
-        workspaceTruncated: scan.truncated,
-        maxFilesCap: ctx.config.maxFilesPerWorkspace,
-        filesIndexed: scan.files.length,
-        filesUploadFailed: activePrep.uploaded.failedCount,
-        ...(activePrep.uploaded.failedCount > 0
-          ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
-          : {}),
-        inlineOnly: activePrep.inlineOnly,
-        ...(thinkingSummary ? { thinkingSummary } : {}),
-        ...(executedCode.length > 0 ? { executedCode } : {}),
-        ...(executionOutput.length > 0 ? { executionOutput } : {}),
-      };
-
-      return textResult(text, structured);
-    } catch (err) {
-      logger.error(`code failed: ${String(err)}`);
-      // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
-      // bodies, gated on `isGemini429` (ApiError instance + status===429)
-      // to prevent hint-poisoning. Mirror of ask.tool.ts — see there for
-      // full rationale.
-      const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
-      if (retryDelayMs !== null && resolvedModelKey !== null) {
-        ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
-      }
-      if (reservationId !== null) {
-        try {
-          ctx.manifest.cancelBudgetReservation(reservationId);
-        } catch (cancelErr) {
-          logger.error(
-            `code: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
-          );
-        }
-        reservationId = null;
-      }
-      // Drop TPM reservation on failure — mirror of ask.tool.ts rationale.
-      if (throttleReservationId !== -1) {
-        ctx.throttle.cancel(throttleReservationId);
-        throttleReservationId = -1;
-      }
-      return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      emitter.stop();
+        occurredAt: Date.now(),
+      });
     }
-  },
-};
+
+    if (scan.truncated) {
+      logger.warn(
+        `workspace ${workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,
+      );
+    }
+
+    const structured: Record<string, unknown> = {
+      resolvedModel: resolved.resolved,
+      requestedModel: resolved.requested,
+      modelCategory: resolved.category,
+      modelCostTier: resolved.capabilities.costTier,
+      contextWindow: resolved.inputTokenLimit,
+      // `thinkingBudget` echoes the clamped value actually sent on the
+      // wire; it's only meaningful on the budget path. On the
+      // `thinkingLevel` path nothing is sent for `thinkingBudget`, so we
+      // emit `null` (not `0`) — `0` is the wire sentinel for "thinking
+      // disabled" and reporting it here for a level-path call would lie
+      // to downstream audit / dashboard consumers (PR #17 self-review F1,
+      // 3-reviewer consensus: GPT + Copilot + Self). Matches `ask.tool.ts`.
+      thinkingBudget: usingThinkingLevel ? null : effectiveThinkingBudget,
+      thinkingLevel: input.thinkingLevel ?? null,
+      codeExecutionUsed: codeExecution,
+      cacheHit: activePrep.reused,
+      cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
+      retriedOnStaleCache,
+      cachedTokens: cached,
+      uncachedTokens: uncached,
+      thinkingTokens: thinking,
+      outputTokens: output,
+      costEstimateUsd: Math.round(cost * 10000) / 10000,
+      durationMs,
+      edits: edits.map((e) => ({
+        file: e.file,
+        oldPreview: e.old.slice(0, 120),
+        newPreview: e.new.slice(0, 120),
+      })),
+      editCount: edits.length,
+      codeBlocks: codeBlocks.map((b) => ({ lang: b.lang, length: b.content.length })),
+      workspaceTruncated: scan.truncated,
+      maxFilesCap: ctx.config.maxFilesPerWorkspace,
+      filesIndexed: scan.files.length,
+      filesUploadFailed: activePrep.uploaded.failedCount,
+      ...(activePrep.uploaded.failedCount > 0
+        ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
+        : {}),
+      inlineOnly: activePrep.inlineOnly,
+      ...(thinkingSummary ? { thinkingSummary } : {}),
+      ...(executedCode.length > 0 ? { executedCode } : {}),
+      ...(executionOutput.length > 0 ? { executionOutput } : {}),
+    };
+
+    return textResult(text, structured);
+  } catch (err) {
+    logger.error(`code failed: ${String(err)}`);
+    // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
+    // bodies, gated on `isGemini429` (ApiError instance + status===429)
+    // to prevent hint-poisoning. Mirror of ask.tool.ts — see there for
+    // full rationale.
+    const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
+    if (retryDelayMs !== null && resolvedModelKey !== null) {
+      ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
+    }
+    if (reservationId !== null) {
+      try {
+        ctx.manifest.cancelBudgetReservation(reservationId);
+      } catch (cancelErr) {
+        logger.error(
+          `code: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
+        );
+      }
+      reservationId = null;
+    }
+    // Drop TPM reservation on failure — mirror of ask.tool.ts rationale.
+    if (throttleReservationId !== -1) {
+      ctx.throttle.cancel(throttleReservationId);
+      throttleReservationId = -1;
+    }
+    const httpStatus = (err as { status?: number }).status;
+    return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
+      errorCode: 'UNKNOWN',
+      ...(httpStatus !== undefined ? { httpStatus } : {}),
+    });
+  } finally {
+    emitter.stop();
+  }
+}

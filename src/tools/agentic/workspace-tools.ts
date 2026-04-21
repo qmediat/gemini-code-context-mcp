@@ -1,0 +1,464 @@
+/**
+ * Executor functions for the four Gemini function-call tools used by
+ * `ask_agentic`. Each executor takes a workspace-rooted sandbox (from
+ * `./sandbox.ts`) and returns a JSON-serialisable result payload, or
+ * throws `SandboxError` on security violations / missing files.
+ *
+ * Hard size limits applied unconditionally (Codex PR2 review critical):
+ *   - Per-file read:  ≤ 200 000 bytes returned (files over that get
+ *     head-truncated and the response carries `truncated: true` + size
+ *     metadata so the model can reason about the gap).
+ *   - Per-call response JSON:  ≤ 500 000 bytes (rows / matches / entries
+ *     truncated to fit, response carries `truncated: true`).
+ *
+ * These limits protect the per-iteration token budget from a single
+ * minified bundle or a massive `list_directory` burning 100k output
+ * tokens on one call.
+ */
+
+import type { Dirent } from 'node:fs';
+import { readFile, readdir, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+import {
+  DEFAULT_EXCLUDE_DIRS,
+  DEFAULT_EXCLUDE_FILE_NAMES,
+  DEFAULT_INCLUDE_EXTENSIONS,
+} from '../../indexer/globs.js';
+import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
+
+/** Hard upper bound on any single `read_file` response body. Bigger files
+ * get head-truncated + flagged — never fully expanded into the iteration.
+ *
+ * 200k bytes ≈ 50k tokens on source code — roughly 5% of a 1M context
+ * window, i.e. small enough that one errant read won't derail a 20-
+ * iteration budget, but large enough for practically every real source
+ * file (the handful of exceptions are generated bundles we already
+ * exclude via extension / default denylist). Adjustable via env if a
+ * repo has legitimately massive generated code.
+ */
+const MAX_READ_BYTES = 200_000;
+
+/** Hard upper bound on any single tool response JSON. Bounds what comes
+ * back from `list_directory` / `find_files` / `grep`. 500k bytes is ~125k
+ * tokens worst-case — still a lot, but keeps one bad response from
+ * blowing the iteration budget. */
+const MAX_RESPONSE_BYTES = 500_000;
+
+/** Max lines returned in one `read_file` when no explicit slice — forces
+ * the model to paginate very large source files. Used in addition to
+ * `MAX_READ_BYTES`: whichever limit hits first wins. */
+const DEFAULT_READ_LINE_LIMIT = 500;
+
+/** Cap on per-call `grep` matches. More = ask again with narrower pattern. */
+const MAX_GREP_MATCHES = 100;
+
+/** Cap on directory entries returned by `list_directory` per call. */
+const MAX_LIST_ENTRIES = 200;
+
+/** Cap on `find_files` matches per call. */
+const MAX_FIND_MATCHES = 200;
+
+// ---------------------------------------------------------------------------
+// Small glob → RegExp converter.
+// Supports `*` (any-except-slash) and `**` (any incl. slash). No `?`, no
+// character classes, no `{a,b}` yet — matches the claim in the tool schema
+// description so the model doesn't burn iterations on unsupported patterns.
+// ---------------------------------------------------------------------------
+function globToRegExp(glob: string): RegExp {
+  // Escape regex metacharacters except our wildcards `*` and `/`.
+  const escaped = glob.replace(/[.+^$()|[\]{}\\]/g, '\\$&');
+  // `**` → `.*` ; `*` → `[^/]*`. Order matters: replace `**` BEFORE `*`.
+  const pattern = escaped.replace(/\*\*/g, '.*').replace(/(?<!\.)\*/g, '[^/]*');
+  return new RegExp(`^${pattern}$`);
+}
+
+// ---------------------------------------------------------------------------
+// list_directory
+// ---------------------------------------------------------------------------
+
+export interface DirEntry {
+  relpath: string;
+  type: 'file' | 'dir';
+  size?: number;
+}
+
+export interface ListDirectoryResult {
+  path: string;
+  entries: DirEntry[];
+  truncated: boolean;
+  totalEntries: number;
+}
+
+/**
+ * List immediate children of `relPath` (non-recursive). Default-excluded
+ * dirs and denylisted filenames are silently omitted; the model sees only
+ * paths it is allowed to ask for via `read_file` / `grep`.
+ */
+export async function listDirectoryExecutor(
+  workspaceRoot: string,
+  relPath: string,
+): Promise<ListDirectoryResult> {
+  const target = await resolveInsideWorkspace(workspaceRoot, relPath);
+  let rawEntries: Dirent<string>[];
+  try {
+    rawEntries = await readdir(target.absolutePath, { withFileTypes: true, encoding: 'utf8' });
+  } catch (err) {
+    throw new SandboxError('NOT_FOUND', `cannot list: ${String(err)}`, relPath);
+  }
+
+  const entries: DirEntry[] = [];
+  let totalEntries = 0;
+  for (const entry of rawEntries) {
+    const isFile = entry.isFile();
+    const isDir = entry.isDirectory();
+    if (!isFile && !isDir) continue; // skip symlinks / sockets / fifos / etc.
+
+    // Skip excluded directories (user never gets to recurse into them).
+    if (isDir && DEFAULT_EXCLUDE_DIRS.includes(entry.name)) continue;
+    // Skip denylisted filenames.
+    if (isFile && DEFAULT_EXCLUDE_FILE_NAMES.includes(entry.name)) continue;
+
+    totalEntries += 1;
+    if (entries.length >= MAX_LIST_ENTRIES) continue; // count but don't push
+
+    const child: DirEntry = {
+      relpath: target.relpath ? `${target.relpath}/${entry.name}` : entry.name,
+      type: isDir ? 'dir' : 'file',
+    };
+    if (isFile) {
+      try {
+        const s = await stat(join(target.absolutePath, entry.name));
+        child.size = s.size;
+      } catch {
+        /* stat failure — omit size, still include entry */
+      }
+    }
+    entries.push(child);
+  }
+
+  return {
+    path: target.relpath || '.',
+    entries,
+    truncated: totalEntries > entries.length,
+    totalEntries,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// find_files
+// ---------------------------------------------------------------------------
+
+export interface FindFilesResult {
+  pattern: string;
+  matches: string[];
+  truncated: boolean;
+  totalMatches: number;
+}
+
+/**
+ * Recursive glob search inside the workspace. Respects default excludes +
+ * extension gating (same rules as the eager scanner, so the model never
+ * sees paths it couldn't `read_file` on anyway — avoids a foot-gun where
+ * the model tries to open a secret it saw in a `find_files` response).
+ */
+export async function findFilesExecutor(
+  workspaceRoot: string,
+  pattern: string,
+): Promise<FindFilesResult> {
+  if (typeof pattern !== 'string' || pattern.trim().length === 0) {
+    throw new SandboxError('PATH_TRAVERSAL', 'pattern is empty', pattern);
+  }
+  const regex = globToRegExp(pattern.trim());
+
+  const matches: string[] = [];
+  let totalMatches = 0;
+
+  async function walk(currentAbs: string, currentRel: string): Promise<void> {
+    let entries: Dirent<string>[];
+    try {
+      entries = await readdir(currentAbs, { withFileTypes: true, encoding: 'utf8' });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (DEFAULT_EXCLUDE_DIRS.includes(entry.name)) continue;
+        await walk(
+          join(currentAbs, entry.name),
+          currentRel ? `${currentRel}/${entry.name}` : entry.name,
+        );
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (DEFAULT_EXCLUDE_FILE_NAMES.includes(entry.name)) continue;
+
+      const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+
+      // Only surface paths with at least one include-ext match — otherwise
+      // binary / generated files slip through find_files into the model's
+      // conversation even though `read_file` would reject them.
+      const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
+        if (ext.startsWith('.')) return entry.name.endsWith(ext);
+        return entry.name === ext;
+      });
+      if (!hasIncludeExt) continue;
+
+      if (!regex.test(rel)) continue;
+      totalMatches += 1;
+      if (matches.length < MAX_FIND_MATCHES) matches.push(rel);
+    }
+  }
+
+  await walk(workspaceRoot, '');
+
+  return {
+    pattern,
+    matches,
+    truncated: totalMatches > matches.length,
+    totalMatches,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// read_file
+// ---------------------------------------------------------------------------
+
+export interface ReadFileResult {
+  relpath: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  truncated: boolean;
+  truncationReason?: 'max_lines' | 'max_bytes';
+  totalBytes: number;
+}
+
+/**
+ * Read a file with bounded bytes + lines. Every response includes enough
+ * metadata (`totalLines`, `totalBytes`, `truncated`, `truncationReason`) for
+ * the model to request the next slice intelligently.
+ *
+ * Slicing semantics:
+ *   - `startLine` / `endLine` are 1-indexed inclusive ranges when given.
+ *   - Omit both → return the first `DEFAULT_READ_LINE_LIMIT` lines, up to
+ *     `MAX_READ_BYTES`, whichever hits first.
+ */
+export async function readFileExecutor(
+  workspaceRoot: string,
+  relPath: string,
+  startLine?: number,
+  endLine?: number,
+): Promise<ReadFileResult> {
+  const target = await resolveInsideWorkspace(workspaceRoot, relPath);
+
+  // Extension gate — mirror of `DEFAULT_INCLUDE_EXTENSIONS` + block things
+  // that clearly aren't analyzable text. Avoid leaking binary blobs.
+  const lowerBase = target.relpath.toLowerCase();
+  const nameOnly = lowerBase.substring(lowerBase.lastIndexOf('/') + 1);
+  const looksLikeSource = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
+    if (ext.startsWith('.')) return lowerBase.endsWith(ext);
+    return nameOnly === ext.toLowerCase();
+  });
+  if (!looksLikeSource) {
+    throw new SandboxError(
+      'EXCLUDED_DIR',
+      `file extension not in allowed source set: ${target.relpath}`,
+      relPath,
+    );
+  }
+
+  let buffer: Buffer;
+  let totalBytes: number;
+  try {
+    buffer = await readFile(target.absolutePath);
+    totalBytes = buffer.byteLength;
+  } catch (err) {
+    throw new SandboxError('NOT_FOUND', `read failed: ${String(err)}`, relPath);
+  }
+
+  const fullText = buffer.toString('utf8');
+  const allLines = fullText.split('\n');
+  const totalLines = allLines.length;
+
+  // Clamp slice bounds defensively. Accept only finite positive ints.
+  const sliceStart =
+    typeof startLine === 'number' && Number.isFinite(startLine) && startLine >= 1
+      ? Math.floor(startLine)
+      : 1;
+  const rawEnd =
+    typeof endLine === 'number' && Number.isFinite(endLine) && endLine >= sliceStart
+      ? Math.floor(endLine)
+      : sliceStart + DEFAULT_READ_LINE_LIMIT - 1;
+  const sliceEnd = Math.min(totalLines, rawEnd);
+
+  const slice = allLines.slice(sliceStart - 1, sliceEnd);
+  let content = slice.join('\n');
+
+  let truncated = sliceEnd < totalLines;
+  let truncationReason: ReadFileResult['truncationReason'] | undefined = truncated
+    ? 'max_lines'
+    : undefined;
+
+  if (Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
+    // Byte-cap kicks in — trim the tail. Slice bytes, not characters, to
+    // match the limit exactly; then re-decode, which may chop a mid-rune.
+    // Back off to the last newline to avoid emitting a partial line.
+    const cappedBuf = Buffer.from(content, 'utf8').subarray(0, MAX_READ_BYTES);
+    const cappedText = cappedBuf.toString('utf8');
+    const lastNewline = cappedText.lastIndexOf('\n');
+    content = lastNewline > 0 ? cappedText.slice(0, lastNewline) : cappedText;
+    truncated = true;
+    truncationReason = 'max_bytes';
+  }
+
+  return {
+    relpath: target.relpath,
+    content,
+    startLine: sliceStart,
+    endLine: sliceStart + content.split('\n').length - 1,
+    totalLines,
+    truncated,
+    ...(truncationReason ? { truncationReason } : {}),
+    totalBytes,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// grep
+// ---------------------------------------------------------------------------
+
+export interface GrepMatch {
+  relpath: string;
+  line: number;
+  text: string;
+}
+
+export interface GrepResult {
+  pattern: string;
+  pathPrefix: string | null;
+  matches: GrepMatch[];
+  truncated: boolean;
+  totalMatches: number;
+}
+
+/**
+ * Recursive regex search. Supports a basic anchored `pathPrefix` so the
+ * model can scope to a subtree. Pattern is compiled as JS RegExp — the
+ * model can use standard metacharacters.
+ *
+ * Hard caps:
+ *   - `MAX_GREP_MATCHES` matches returned
+ *   - each match line truncated to 500 chars (guard against minified
+ *     lines flooding the payload)
+ */
+export async function grepExecutor(
+  workspaceRoot: string,
+  pattern: string,
+  pathPrefix?: string,
+): Promise<GrepResult> {
+  if (typeof pattern !== 'string' || pattern.length === 0) {
+    throw new SandboxError('PATH_TRAVERSAL', 'grep pattern is empty', pattern);
+  }
+  let regex: RegExp;
+  try {
+    regex = new RegExp(pattern);
+  } catch (err) {
+    throw new SandboxError('PATH_TRAVERSAL', `invalid regex: ${String(err)}`, pattern);
+  }
+
+  const matches: GrepMatch[] = [];
+  let totalMatches = 0;
+  let respBytes = 0;
+
+  // Determine starting directory. When `pathPrefix` is given, validate it
+  // sits inside the workspace (reuse same sandbox logic as read_file).
+  let startAbs = workspaceRoot;
+  let startRel = '';
+  if (typeof pathPrefix === 'string' && pathPrefix.trim().length > 0) {
+    const resolved = await resolveInsideWorkspace(workspaceRoot, pathPrefix);
+    startAbs = resolved.absolutePath;
+    startRel = resolved.relpath;
+  }
+
+  async function walk(currentAbs: string, currentRel: string): Promise<void> {
+    if (respBytes >= MAX_RESPONSE_BYTES) return;
+    let entries: Dirent<string>[];
+    try {
+      entries = await readdir(currentAbs, { withFileTypes: true, encoding: 'utf8' });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (respBytes >= MAX_RESPONSE_BYTES) return;
+      if (entry.isDirectory()) {
+        if (DEFAULT_EXCLUDE_DIRS.includes(entry.name)) continue;
+        await walk(
+          join(currentAbs, entry.name),
+          currentRel ? `${currentRel}/${entry.name}` : entry.name,
+        );
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (DEFAULT_EXCLUDE_FILE_NAMES.includes(entry.name)) continue;
+
+      const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+      const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
+        if (ext.startsWith('.')) return entry.name.endsWith(ext);
+        return entry.name === ext;
+      });
+      if (!hasIncludeExt) continue;
+
+      // Read full file (bounded by MAX_READ_BYTES via soft stat check).
+      const absFile = join(currentAbs, entry.name);
+      let fileSize = 0;
+      try {
+        fileSize = (await stat(absFile)).size;
+      } catch {
+        continue;
+      }
+      if (fileSize > 5 * MAX_READ_BYTES) continue; // skip large files in grep
+
+      let text: string;
+      try {
+        text = await readFile(absFile, 'utf8');
+      } catch {
+        continue;
+      }
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line === undefined) continue;
+        if (!regex.test(line)) continue;
+        totalMatches += 1;
+        if (matches.length >= MAX_GREP_MATCHES) continue;
+        // Cap line length in the payload to 500 chars — minified files
+        // can have multi-megabyte single lines.
+        const trimmed = line.length > 500 ? `${line.slice(0, 500)}…` : line;
+        const match: GrepMatch = { relpath: rel, line: i + 1, text: trimmed };
+        matches.push(match);
+        respBytes += match.text.length + match.relpath.length + 32;
+      }
+    }
+  }
+
+  await walk(startAbs, startRel);
+
+  return {
+    pattern,
+    pathPrefix: pathPrefix ?? null,
+    matches,
+    truncated: totalMatches > matches.length || respBytes >= MAX_RESPONSE_BYTES,
+    totalMatches,
+  };
+}
+
+/** Export knobs for tests to reference without re-declaring numeric values. */
+export const AGENTIC_LIMITS = Object.freeze({
+  MAX_READ_BYTES,
+  MAX_RESPONSE_BYTES,
+  DEFAULT_READ_LINE_LIMIT,
+  MAX_GREP_MATCHES,
+  MAX_LIST_ENTRIES,
+  MAX_FIND_MATCHES,
+} as const);
