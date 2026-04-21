@@ -363,4 +363,134 @@ describe('grepExecutor', () => {
     // Match not found (walk aborted before reaching it); truncated=true.
     expect(res.truncated).toBe(true);
   });
+
+  // --- PR #24 round-3 review regressions ---
+
+  it('R3#8: empty pattern throws INVALID_INPUT (not PATH_TRAVERSAL)', async () => {
+    try {
+      await grepExecutor(root, '');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('INVALID_INPUT');
+    }
+  });
+
+  it('R3#8: invalid regex throws INVALID_INPUT (not PATH_TRAVERSAL)', async () => {
+    try {
+      await grepExecutor(root, '[unclosed');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('INVALID_INPUT');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #24 round-3 globToRegExp + case-insensitive regressions
+// ---------------------------------------------------------------------------
+describe('round-3: globToRegExp via findFilesExecutor', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-r3-')));
+    writeFileSync(join(root, 'README.md'), 'root readme');
+    writeFileSync(join(root, 'index.ts'), 'root index');
+    mkdirSync(join(root, 'src', 'components'), { recursive: true });
+    writeFileSync(join(root, 'src', 'index.ts'), 'src index');
+    writeFileSync(join(root, 'src', 'components', 'index.ts'), 'nested index');
+    writeFileSync(join(root, 'src', 'README.md'), 'src readme');
+  });
+
+  it('R3#1: `README.*` matches README.md (was silently empty in pre-fix)', async () => {
+    const res = await findFilesExecutor(root, 'README.*');
+    expect(res.matches.sort()).toEqual(['README.md']);
+  });
+
+  it('R3#1: `**/index.*` matches root AND nested index files', async () => {
+    const res = await findFilesExecutor(root, '**/index.*');
+    expect(res.matches.sort()).toEqual(['index.ts', 'src/components/index.ts', 'src/index.ts']);
+  });
+
+  it('R3#1: `**/*.ts` matches a root-level .ts (dir-boundary expansion)', async () => {
+    const res = await findFilesExecutor(root, '**/*.ts');
+    expect(res.matches).toContain('index.ts');
+    expect(res.matches).toContain('src/index.ts');
+    expect(res.matches).toContain('src/components/index.ts');
+  });
+
+  it('R3#1: `src/**/index.*` anchors to src/ prefix and matches nested', async () => {
+    const res = await findFilesExecutor(root, 'src/**/index.*');
+    expect(res.matches.sort()).toEqual(['src/components/index.ts', 'src/index.ts']);
+  });
+});
+
+describe('round-3: case-insensitive default excludes', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-r3-ci-')));
+  });
+
+  it('R3#2: rejects uppercase `PACKAGE-LOCK.JSON` via default-exclude filename', async () => {
+    writeFileSync(join(root, 'PACKAGE-LOCK.JSON'), '{}');
+    try {
+      await resolveInsideWorkspace(root, 'PACKAGE-LOCK.JSON');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILENAME');
+    }
+  });
+
+  it('R3#2: rejects mixed-case `Node_Modules/foo.js` via default-exclude dir', async () => {
+    mkdirSync(join(root, 'Node_Modules'), { recursive: true });
+    writeFileSync(join(root, 'Node_Modules', 'foo.js'), 'x');
+    try {
+      await resolveInsideWorkspace(root, 'Node_Modules/foo.js');
+      throw new Error('should have thrown');
+    } catch (err) {
+      // Not a secret dir — plain chaff, routed to EXCLUDED_DIR.
+      expect((err as { code?: string }).code).toBe('EXCLUDED_DIR');
+    }
+  });
+
+  it('R3#7: `.SSH/` is SECRET_DENYLIST, not EXCLUDED_DIR', async () => {
+    mkdirSync(join(root, '.SSH'), { recursive: true });
+    writeFileSync(join(root, '.SSH', 'id_rsa'), 'private');
+    try {
+      await resolveInsideWorkspace(root, '.SSH/id_rsa');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('SECRET_DENYLIST');
+    }
+  });
+
+  it('R3#7: plain chaff dir `.git/` maps to EXCLUDED_DIR (not SECRET_DENYLIST)', async () => {
+    mkdirSync(join(root, '.git'), { recursive: true });
+    writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/main');
+    try {
+      await resolveInsideWorkspace(root, '.git/HEAD');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('EXCLUDED_DIR');
+    }
+  });
+});
+
+describe('round-3: readFileExecutor UTF-8 trailing strip for no-newline files', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-r3-utf-')));
+  });
+
+  it('R3#6: no-newline file truncated mid-multibyte rune strips trailing FFFD', async () => {
+    // Build a single long line (no `\n`) over the byte-cap that splits
+    // a 4-byte emoji at the tail after byte truncation.
+    const emoji = '😀';
+    const line = `const x = '${emoji.repeat(60_000)}';`;
+    writeFileSync(join(root, 'single-line.ts'), line);
+    const res = await readFileExecutor(root, 'single-line.ts');
+    expect(res.truncated).toBe(true);
+    expect(res.content.endsWith('\uFFFD')).toBe(false);
+  });
 });

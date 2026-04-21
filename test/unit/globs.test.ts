@@ -18,8 +18,17 @@ describe('normalizeExcludeGlob', () => {
     });
   });
 
-  it('routes bare `.ext` (no slash) to extension bucket', () => {
-    expect(normalizeExcludeGlob('.map')).toEqual({ kind: 'extension', value: '.map' });
+  it('routes bare `.name` (no slash) to filename bucket (PR #24 round-3)', () => {
+    // Round-3 fix: bare dotfile literals like `.env`, `.map`, `.tsbuildinfo`
+    // now route to filename bucket for exact-match semantics. Users who
+    // genuinely want extension semantics must write `*.ext`. This avoids
+    // over-matching: pre-fix `.env` excluded `staging.env` via endsWith().
+    expect(normalizeExcludeGlob('.map')).toEqual({ kind: 'filename', value: '.map' });
+    expect(normalizeExcludeGlob('.env')).toEqual({ kind: 'filename', value: '.env' });
+    expect(normalizeExcludeGlob('.tsbuildinfo')).toEqual({
+      kind: 'filename',
+      value: '.tsbuildinfo',
+    });
   });
 
   it('routes literal filename (no slash, has dot) to filename bucket', () => {
@@ -87,12 +96,14 @@ describe('normalizeExcludeGlob', () => {
     expect(normalizeExcludeGlob('vendor\\')).toEqual({ kind: 'dir', value: 'vendor' });
   });
 
-  it('F#8: bare dot-names WITHOUT trailing slash still map to extension (unchanged)', () => {
-    // User writing `.map` or `.tsbuildinfo` meant an extension. Only
-    // trailing slash flips the intent to "directory".
-    expect(normalizeExcludeGlob('.map')).toEqual({ kind: 'extension', value: '.map' });
+  it('F#8 + round-3: bare dot-names map to FILENAME bucket (exact-match)', () => {
+    // Post-round-3: bare dotfile literals like `.map` / `.tsbuildinfo` map
+    // to filename for exact-match semantics. Pre-v1.5.0-round-3 they mapped
+    // to extension (endsWith) and over-matched (`.env` would exclude
+    // `staging.env`). Users who want extension semantics write `*.ext`.
+    expect(normalizeExcludeGlob('.map')).toEqual({ kind: 'filename', value: '.map' });
     expect(normalizeExcludeGlob('.tsbuildinfo')).toEqual({
-      kind: 'extension',
+      kind: 'filename',
       value: '.tsbuildinfo',
     });
   });

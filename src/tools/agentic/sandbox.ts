@@ -23,7 +23,7 @@
 
 import { realpath } from 'node:fs/promises';
 import { basename, sep as pathSep, relative, resolve } from 'node:path';
-import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILE_NAMES } from '../../indexer/globs.js';
+import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILE_NAMES_LOWER } from '../../indexer/globs.js';
 
 /** Filename-basename entries that NEVER leak through `read_file`. Even when
  * the path resolves safely under the workspace root, any of these basenames
@@ -84,7 +84,57 @@ export type SandboxErrorCode =
   | 'NON_SOURCE_FILE'
   | 'NOT_A_DIRECTORY'
   | 'NOT_FOUND'
-  | 'NOT_INSIDE_ROOT';
+  | 'NOT_INSIDE_ROOT'
+  | 'INVALID_INPUT';
+
+/**
+ * Directories that carry sensitive material and should trip the
+ * `SECRET_DENYLIST` error code (not the generic `EXCLUDED_DIR`). The
+ * distinction matters for observability: a downstream audit log tracing
+ * "model tried to read secrets" vs. "model tried to read a generated
+ * dist file" can filter on the error code. Functionally both are
+ * rejected, so security posture is identical.
+ *
+ * Introduced in PR #24 round-3 self-review finding #7.
+ */
+const SECRET_EXCLUDE_DIRS: ReadonlySet<string> = new Set(
+  [
+    '.ssh',
+    '.aws',
+    '.gnupg',
+    '.gpg',
+    '.kube',
+    '.docker',
+    '.1password',
+    '.pki',
+    '.gcloud',
+    '.azure',
+    '.config/gcloud',
+    '.config/azure',
+    'Keychains',
+  ].map((s) => s.toLowerCase()),
+);
+
+// ---------------------------------------------------------------------------
+// Path-compare helpers (declared at the top of the file so no function is
+// referenced before its declaration in source order — a defensive tidy-up
+// after PR #24 round-3 review flagged the hoisting-dependent layout. JS
+// `function` declarations are hoisted to the enclosing scope, so the
+// previous order worked at runtime — but a future refactor replacing
+// `function` with `const arrow` would introduce a TDZ crash. Putting them
+// BEFORE `resolveInsideWorkspace` removes that footgun.
+// ---------------------------------------------------------------------------
+
+function isInside(root: string, candidate: string): boolean {
+  if (candidate === root) return true;
+  // Compare with the native separator so Windows behaves correctly; the
+  // caller's relpath is converted to POSIX *after* this structural check.
+  return candidate.startsWith(`${root}${pathSep}`);
+}
+
+function toPosix(p: string): string {
+  return pathSep === '/' ? p : p.split(pathSep).join('/');
+}
 
 export class SandboxError extends Error {
   readonly code: SandboxErrorCode;
@@ -228,22 +278,44 @@ export async function resolveInsideWorkspace(
   // but we reuse the table rather than the function to skip the MatchConfig
   // plumbing (we already know we're inside the jail, so only dir-name
   // matching matters here).
+  //
+  // Case-insensitive matching (PR #24 round-3 #2): we compare against the
+  // lowercased relative path + lowercased dir entries so macOS APFS /
+  // Windows NTFS (case-insensitive by default) don't let a file named
+  // `NODE_MODULES/foo.js` slip past a strict-case check.
+  //
+  // `SECRET_EXCLUDE_DIRS` wins before the generic list so `.ssh/id_ed25519`
+  // yields `SECRET_DENYLIST` (not `EXCLUDED_DIR`) — distinguishes "user
+  // tried to exfiltrate" from "this dir is just boring build output" in
+  // observability. Functionally both are blocked.
+  const relLower = rel.toLowerCase();
   for (const dir of DEFAULT_EXCLUDE_DIRS) {
-    if (rel === dir) {
-      throw new SandboxError('EXCLUDED_DIR', `path is an excluded directory: ${dir}`, relOrAbs);
-    }
-    if (rel.startsWith(`${dir}/`) || rel.includes(`/${dir}/`)) {
-      throw new SandboxError('EXCLUDED_DIR', `path is inside excluded directory: ${dir}`, relOrAbs);
-    }
+    const dirLower = dir.toLowerCase();
+    const isHit =
+      relLower === dirLower ||
+      relLower.startsWith(`${dirLower}/`) ||
+      relLower.includes(`/${dirLower}/`);
+    if (!isHit) continue;
+    const code: SandboxErrorCode = SECRET_EXCLUDE_DIRS.has(dirLower)
+      ? 'SECRET_DENYLIST'
+      : 'EXCLUDED_DIR';
+    const detail =
+      code === 'SECRET_DENYLIST'
+        ? `path is inside a secret-bearing directory: ${dir}`
+        : relLower === dirLower
+          ? `path is an excluded directory: ${dir}`
+          : `path is inside excluded directory: ${dir}`;
+    throw new SandboxError(code, detail, relOrAbs);
   }
   // And one more pass over DEFAULT_EXCLUDE_FILE_NAMES — lockfiles,
   // tsconfig.tsbuildinfo, etc. — they were uninteresting even in the
   // eager path, and definitely shouldn't cost agentic iterations.
-  // Uses `EXCLUDED_FILENAME` (distinct from `EXCLUDED_DIR`) so the
-  // calling model can tell "this is a blacklisted filename" from
-  // "this is a blacklisted directory" in the `functionResponse.error`
-  // payload (PR #24 review by Grok).
-  if (DEFAULT_EXCLUDE_FILE_NAMES.includes(base)) {
+  // Uses the lowercased `Set` so mis-cased files (e.g. `PACKAGE-LOCK.JSON`
+  // on case-insensitive FS) still match. Uses `EXCLUDED_FILENAME`
+  // (distinct from `EXCLUDED_DIR`) so the calling model can tell
+  // "this is a blacklisted filename" from "this is a blacklisted
+  // directory" in the `functionResponse.error` payload.
+  if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(lowerBase)) {
     throw new SandboxError(
       'EXCLUDED_FILENAME',
       `filename on default exclude list: ${base}`,
@@ -252,15 +324,4 @@ export async function resolveInsideWorkspace(
   }
 
   return { absolutePath: resolved, relpath: rel };
-}
-
-function isInside(root: string, candidate: string): boolean {
-  if (candidate === root) return true;
-  // Compare with the native separator so Windows behaves correctly; the
-  // caller's relpath is converted to POSIX *after* this structural check.
-  return candidate.startsWith(`${root}${pathSep}`);
-}
-
-function toPosix(p: string): string {
-  return pathSep === '/' ? p : p.split(pathSep).join('/');
 }

@@ -286,6 +286,6 @@ describe('workspaceGuardRatio env clamping', () => {
     const config = loadConfig();
     expect(config.workspaceGuardRatio).toBeLessThanOrEqual(0.98);
     expect(config.workspaceGuardRatio).toBeGreaterThanOrEqual(0.5);
-    process.env.GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO = undefined;
+    Reflect.deleteProperty(process.env, 'GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO');
   });
 });

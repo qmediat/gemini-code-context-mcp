@@ -48,7 +48,7 @@ import {
 import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
-import { SandboxError, resolveWorkspaceRoot } from './agentic/sandbox.js';
+import { SandboxError, resolveInsideWorkspace, resolveWorkspaceRoot } from './agentic/sandbox.js';
 import {
   findFilesExecutor,
   grepExecutor,
@@ -791,21 +791,28 @@ async function runAgenticIteration(args: {
     const fcArgs = (fc.args ?? {}) as Record<string, unknown>;
     callSignatures.push({ name, args: fcArgs });
 
-    // Short-circuit cap on distinct files read — no point dispatching if
-    // the request is for a new file past the limit. Canonical tracking by
-    // `filesReadSet` happens AFTER dispatch (in the merge loop) using the
-    // sandbox-resolved `relpath`, not the raw input, so path aliases
-    // (`./a.ts`, `a.ts`, `sub/../a.ts`) all count as one. PR #24 review
-    // by GPT + Grok.
+    // Short-circuit cap on distinct files read — canonical check.
+    // `filesReadSet` is keyed on the sandbox-resolved `relpath`, not the
+    // raw input, so path aliases (`./a.ts`, `a.ts`, `sub/../a.ts`) must
+    // be resolved here too before comparing — otherwise the pre-dispatch
+    // gate rejects legitimate re-reads at cap boundary. PR #24 round-3
+    // review by GPT, Gemini, and self-review. Resolving is async (one
+    // `realpath` call), but the loop is already `async` and the downstream
+    // `dispatchToolCallsParallel` is also awaited, so the added await
+    // doesn't serialise anything new.
     if (name === 'read_file' && filesReadSet.size >= maxFilesRead) {
-      // Pre-dispatch best-effort path comparison — if the raw request
-      // path IS already in the set (trivial dup), skip dispatch and reuse
-      // the existing count. If it's not, allow dispatch — canonical
-      // merge will catch duplicates post-resolve. This keeps the cap
-      // from being bypassed via aliases AND avoids rejecting legitimate
-      // first-time reads just because the size matches the cap.
       const reqPath = typeof fcArgs.path === 'string' ? fcArgs.path : '';
-      if (!filesReadSet.has(reqPath)) {
+      let canonicalRel: string | null = null;
+      try {
+        const r = await resolveInsideWorkspace(workspaceRoot, reqPath);
+        canonicalRel = r.relpath;
+      } catch {
+        /* resolve failed — let dispatch produce the real SandboxError
+         * (PATH_TRAVERSAL / NOT_FOUND etc.). That way the model gets a
+         * useful error shape, not a stale-cap-fire. */
+      }
+      const alreadyRead = canonicalRel !== null && filesReadSet.has(canonicalRel);
+      if (!alreadyRead) {
         responseParts[i] = {
           functionResponse: {
             ...(fc.id ? { id: fc.id } : {}),

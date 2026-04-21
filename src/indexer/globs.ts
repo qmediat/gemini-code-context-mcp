@@ -241,6 +241,25 @@ export const DEFAULT_EXCLUDE_FILE_NAMES: readonly string[] = [
  */
 export const DEFAULT_EXCLUDE_EXTENSIONS: readonly string[] = ['.tsbuildinfo'];
 
+/**
+ * Lowercased `Set`s for O(1) case-insensitive lookup on macOS APFS and
+ * Windows NTFS — both default to case-insensitive, so a file stored as
+ * `PACKAGE-LOCK.JSON` resolves to the same inode as `package-lock.json`
+ * but used to slip past a strict-equality `.includes(base)` check.
+ *
+ * Introduced in PR #24 round-3 after three reviewers (Grok, Copilot,
+ * self-review) noted that round-2's secret-denylist lowercasing only
+ * covered `AGENTIC_SECRET_BASENAMES`; the generic exclude lists kept
+ * strict comparisons, so lockfiles / build caches with any non-canonical
+ * casing on case-insensitive FS slipped through filtering.
+ */
+export const DEFAULT_EXCLUDE_FILE_NAMES_LOWER: ReadonlySet<string> = new Set(
+  DEFAULT_EXCLUDE_FILE_NAMES.map((s) => s.toLowerCase()),
+);
+export const DEFAULT_EXCLUDE_DIRS_LOWER: ReadonlySet<string> = new Set(
+  DEFAULT_EXCLUDE_DIRS.map((s) => s.toLowerCase()),
+);
+
 export interface MatchConfig {
   includeExtensions: readonly string[];
   excludeDirs: readonly string[];
@@ -332,21 +351,32 @@ export function normalizeExcludeGlob(pattern: string): ExcludeBucket | null {
     return { kind: 'dir', value: cleaned };
   }
 
-  // Extension bucket: `*.ext` or bare `.ext` (no slash — `src/.env` is a
-  // path, not an extension).
+  // Extension bucket: explicit `*.ext` only. Bare `.env` / `.npmrc` /
+  // `.tsbuildinfo` used to fall here too, but that produced over-matching
+  // on `endsWith(.env)` — e.g. user `excludeGlobs: [".env"]` would also
+  // exclude `staging.env`, `config.example.env`, etc. PR #24 round-3
+  // review by Grok + self-review PARTIAL: if the user wanted the extension
+  // bucket they can write `*.env`; a bare dotfile literal is clearer as
+  // a filename (exact-match).
   if (cleaned.startsWith('*.')) {
     return { kind: 'extension', value: `.${cleaned.slice(2)}` };
   }
-  if (cleaned.startsWith('.') && !cleaned.includes('/')) {
-    return { kind: 'extension', value: cleaned };
-  }
 
-  // Filename bucket: no separators, no wildcards, has a dot (so callers
-  // writing `Dockerfile` or `Makefile` fall through to dir — preserves
-  // prior behaviour where bare names matched `DEFAULT_EXCLUDE_DIRS`
-  // basename-style entries).
-  if (!cleaned.includes('/') && !cleaned.includes('*') && cleaned.includes('.')) {
-    return { kind: 'filename', value: cleaned };
+  // Filename bucket: no separators, no wildcards. Covers both:
+  //   - classic filenames with dot (`pr27-diff.txt`, `package-lock.json`)
+  //   - dot-prefixed literals (`.env`, `.npmrc`, `.tsbuildinfo`)
+  // For callers who want extension semantics on a dot-prefixed pattern,
+  // use `*.env` / `*.tsbuildinfo` — explicit and unambiguous.
+  if (!cleaned.includes('/') && !cleaned.includes('*')) {
+    // Sub-heuristic: a bare name without a dot (`Dockerfile`, `Makefile`,
+    // `LICENSE`) could be either a filename or a dir — directories called
+    // `Dockerfile` are extraordinarily rare, but pre-v1.5.0 these patterns
+    // were force-routed to `excludeDirs`. Preserve that behaviour so we
+    // don't silently break users upgrading from v1.4.x. Filename bucket
+    // requires a dot OR a leading dot (dotfile).
+    if (cleaned.includes('.') || cleaned.startsWith('.')) {
+      return { kind: 'filename', value: cleaned };
+    }
   }
 
   // Everything else → directory (bare dir name, or path-with-slash).

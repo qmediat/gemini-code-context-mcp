@@ -5,23 +5,26 @@
  * throws `SandboxError` on security violations / missing files.
  *
  * Hard size limits applied unconditionally (Codex PR2 review critical):
- *   - Per-file read:  ≤ 200 000 bytes returned (files over that get
- *     head-truncated and the response carries `truncated: true` + size
+ *   - `read_file` per-file:     ≤ 200 000 bytes returned (files over that
+ *     get head-truncated and the response carries `truncated: true` + size
  *     metadata so the model can reason about the gap).
- *   - Per-call response JSON:  ≤ 500 000 bytes (rows / matches / entries
+ *   - `grep` per-call response: ≤ 500 000 bytes of JSON body (matches
  *     truncated to fit, response carries `truncated: true`).
+ *   - `list_directory` / `find_files`: capped by entry count (`MAX_LIST_ENTRIES`
+ *     / `MAX_FIND_MATCHES`, both small integers) rather than a byte budget —
+ *     each entry is a short record so the resulting JSON is bounded well
+ *     under any per-call ceiling.
  *
- * These limits protect the per-iteration token budget from a single
- * minified bundle or a massive `list_directory` burning 100k output
- * tokens on one call.
+ * Together these protect the per-iteration token budget from a single
+ * minified bundle or a massive listing burning output tokens on one call.
  */
 
 import type { Dirent } from 'node:fs';
 import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  DEFAULT_EXCLUDE_DIRS,
-  DEFAULT_EXCLUDE_FILE_NAMES,
+  DEFAULT_EXCLUDE_DIRS_LOWER,
+  DEFAULT_EXCLUDE_FILE_NAMES_LOWER,
   DEFAULT_INCLUDE_EXTENSIONS,
 } from '../../indexer/globs.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
@@ -69,15 +72,39 @@ const MAX_WALK_DEPTH = 20;
 
 // ---------------------------------------------------------------------------
 // Small glob → RegExp converter.
-// Supports `*` (any-except-slash) and `**` (any incl. slash). No `?`, no
-// character classes, no `{a,b}` yet — matches the claim in the tool schema
-// description so the model doesn't burn iterations on unsupported patterns.
+// Supports `*` (any-except-slash), `**/` (zero-or-more dirs), and `**` (any
+// incl. slash). No `?`, no character classes, no `{a,b}` yet — matches the
+// claim in the tool schema description so the model doesn't burn iterations
+// on unsupported patterns.
+//
+// Implementation uses Private-Use-Area sentinel characters (\uE000 / \uE001)
+// to separate the `**`/`**\/` replacement from the single-`*` replacement,
+// avoiding the lookbehind approach that v1.5.0 initially shipped with. That
+// earlier version used `(?<!\.)\*` to "protect" escaped dots, but inadvertently
+// blocked the `*` replacement whenever it was preceded by ANY escaped dot
+// in the pattern — so `index.*`, `README.*`, `src/**/index.*` silently
+// matched nothing. Sentinel-based transform was empirically verified
+// against all affected patterns during PR #24 round-2 review (Grok P0,
+// GPT P1, Gemini P1, Copilot P1, self-review P0).
+//
+// PUA codepoints are chosen over ASCII control chars (\u0001/\u0002) so the
+// Biome `noControlCharactersInRegex` lint stays happy; they're equivalently
+// safe because glob input from the Gemini tool-call arguments is plain text
+// and can't contain these codepoints organically.
+//
+// Also handles `**/` specifically so that `**/*.ts` matches BOTH
+// `index.ts` (root) and `src/index.ts` (nested). The earlier version's
+// `**` → `.*` transform required at least one separator, silently
+// skipping root-level matches.
 // ---------------------------------------------------------------------------
 function globToRegExp(glob: string): RegExp {
-  // Escape regex metacharacters except our wildcards `*` and `/`.
   const escaped = glob.replace(/[.+^$()|[\]{}\\]/g, '\\$&');
-  // `**` → `.*` ; `*` → `[^/]*`. Order matters: replace `**` BEFORE `*`.
-  const pattern = escaped.replace(/\*\*/g, '.*').replace(/(?<!\.)\*/g, '[^/]*');
+  const pattern = escaped
+    .replace(/\*\*\//g, '\uE000') // sentinel: `**/` → zero-or-more dirs
+    .replace(/\*\*/g, '\uE001') // sentinel: bare `**` → any incl. slash
+    .replace(/\*/g, '[^/]*') // single `*` → no-slash segment
+    .replace(/\uE000/g, '(?:.*/)?') // dir-boundary expansion
+    .replace(/\uE001/g, '.*'); // bare globstar
   return new RegExp(`^${pattern}$`);
 }
 
@@ -123,9 +150,9 @@ export async function listDirectoryExecutor(
     if (!isFile && !isDir) continue; // skip symlinks / sockets / fifos / etc.
 
     // Skip excluded directories (user never gets to recurse into them).
-    if (isDir && DEFAULT_EXCLUDE_DIRS.includes(entry.name)) continue;
+    if (isDir && DEFAULT_EXCLUDE_DIRS_LOWER.has(entry.name.toLowerCase())) continue;
     // Skip denylisted filenames.
-    if (isFile && DEFAULT_EXCLUDE_FILE_NAMES.includes(entry.name)) continue;
+    if (isFile && DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
 
     totalEntries += 1;
     if (entries.length >= MAX_LIST_ENTRIES) continue; // count but don't push
@@ -175,7 +202,7 @@ export async function findFilesExecutor(
   pattern: string,
 ): Promise<FindFilesResult> {
   if (typeof pattern !== 'string' || pattern.trim().length === 0) {
-    throw new SandboxError('PATH_TRAVERSAL', 'pattern is empty', pattern);
+    throw new SandboxError('INVALID_INPUT', 'pattern is empty', pattern);
   }
   const regex = globToRegExp(pattern.trim());
 
@@ -208,7 +235,7 @@ export async function findFilesExecutor(
     }
     for (const entry of entries) {
       if (entry.isDirectory()) {
-        if (DEFAULT_EXCLUDE_DIRS.includes(entry.name)) continue;
+        if (DEFAULT_EXCLUDE_DIRS_LOWER.has(entry.name.toLowerCase())) continue;
         await walk(
           join(currentAbs, entry.name),
           currentRel ? `${currentRel}/${entry.name}` : entry.name,
@@ -217,7 +244,7 @@ export async function findFilesExecutor(
         continue;
       }
       if (!entry.isFile()) continue;
-      if (DEFAULT_EXCLUDE_FILE_NAMES.includes(entry.name)) continue;
+      if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
 
       const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
 
@@ -307,9 +334,17 @@ export async function readFileExecutor(
   }
   const HARD_FILE_SIZE_LIMIT = 5 * MAX_READ_BYTES; // 1MB
   if (totalBytes > HARD_FILE_SIZE_LIMIT) {
+    // NOTE: the startLine/endLine slicing logic further below is gated on
+    // a successful `readFile` of the full content. For files over this
+    // hard cap we can't safely load the buffer at all (OOM risk), so we
+    // DON'T offer slicing as a workaround here — the message explicitly
+    // steers the model toward `grep` (which has its own streaming path)
+    // or skipping the file. Honest message vs. pre-round-3 wording that
+    // suggested slicing but never delivered. Reported in PR #24 round-3
+    // review by GPT.
     return {
       relpath: target.relpath,
-      content: `[file too large to inline: ${totalBytes} bytes > ${HARD_FILE_SIZE_LIMIT} byte cap. Use grep or a tighter startLine/endLine slice, or skip this file.]`,
+      content: `[file too large to inline: ${totalBytes} bytes > ${HARD_FILE_SIZE_LIMIT} byte cap. Use \`grep\` with a narrow pattern, or skip this file. Slicing via startLine/endLine is not supported at this size.]`,
       startLine: 1,
       endLine: 0,
       totalLines: 0,
@@ -361,7 +396,17 @@ export async function readFileExecutor(
     const decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
     const cappedText = decoder.decode(cappedBuf);
     const lastNewline = cappedText.lastIndexOf('\n');
-    content = lastNewline > 0 ? cappedText.slice(0, lastNewline) : cappedText;
+    // Two truncation paths:
+    //   - If there's a newline in the capped region, drop everything after
+    //     the last newline — that naturally trims any mid-rune replacement
+    //     character that landed on the tail.
+    //   - If there's NO newline (realistic for single-line minified
+    //     content at 200 KB), the fallback used to keep the raw decoded
+    //     text including a trailing U+FFFD. Strip trailing replacements
+    //     explicitly. Reported in PR #24 round-3 review by Gemini +
+    //     self-review.
+    content =
+      lastNewline > 0 ? cappedText.slice(0, lastNewline) : cappedText.replace(/\uFFFD+$/, '');
     truncated = true;
     truncationReason = 'max_bytes';
   }
@@ -412,13 +457,13 @@ export async function grepExecutor(
   pathPrefix?: string,
 ): Promise<GrepResult> {
   if (typeof pattern !== 'string' || pattern.length === 0) {
-    throw new SandboxError('PATH_TRAVERSAL', 'grep pattern is empty', pattern);
+    throw new SandboxError('INVALID_INPUT', 'grep pattern is empty', pattern);
   }
   let regex: RegExp;
   try {
     regex = new RegExp(pattern);
   } catch (err) {
-    throw new SandboxError('PATH_TRAVERSAL', `invalid regex: ${String(err)}`, pattern);
+    throw new SandboxError('INVALID_INPUT', `invalid regex: ${String(err)}`, pattern);
   }
 
   const matches: GrepMatch[] = [];
@@ -480,7 +525,7 @@ export async function grepExecutor(
     for (const entry of entries) {
       if (respBytes >= MAX_RESPONSE_BYTES) return;
       if (entry.isDirectory()) {
-        if (DEFAULT_EXCLUDE_DIRS.includes(entry.name)) continue;
+        if (DEFAULT_EXCLUDE_DIRS_LOWER.has(entry.name.toLowerCase())) continue;
         await walk(
           join(currentAbs, entry.name),
           currentRel ? `${currentRel}/${entry.name}` : entry.name,
@@ -489,7 +534,7 @@ export async function grepExecutor(
         continue;
       }
       if (!entry.isFile()) continue;
-      if (DEFAULT_EXCLUDE_FILE_NAMES.includes(entry.name)) continue;
+      if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
 
       const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
       const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
