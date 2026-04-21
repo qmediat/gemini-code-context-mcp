@@ -82,7 +82,7 @@ describe('workspace scanner', () => {
     expect(first.filesHash).not.toBe(second.filesHash);
   });
 
-  // v1.4.2 — excludeGlobs pattern normalization (Fix A). Pre-fix these all
+  // v1.5.0 — excludeGlobs pattern normalization (Fix A). Pre-fix these all
   // fell through to excludeDirs as literal strings and silently matched nothing.
   it('skips tsconfig.tsbuildinfo by default (Fix B: default excluded extension)', async () => {
     writeFileSync(join(root, 'tsconfig.tsbuildinfo'), 'x'.repeat(200));

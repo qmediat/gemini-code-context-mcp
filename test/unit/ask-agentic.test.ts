@@ -75,38 +75,56 @@ function buildResponse(scripted: ScriptedResponse): {
 
 function buildCtx(args: {
   script: ScriptedResponse[];
-}): { ctx: ToolContext; generateContent: ReturnType<typeof vi.fn> } {
+  dailyBudgetUsd?: number;
+  tpmThrottleLimit?: number;
+}): {
+  ctx: ToolContext;
+  generateContent: ReturnType<typeof vi.fn>;
+  manifest: { reserveBudget: ReturnType<typeof vi.fn>; [k: string]: ReturnType<typeof vi.fn> };
+  throttle: { reserve: ReturnType<typeof vi.fn>; [k: string]: ReturnType<typeof vi.fn> };
+} {
   const generateContent = vi.fn();
   for (const s of args.script) {
     generateContent.mockResolvedValueOnce(buildResponse(s));
   }
 
+  // Budget-enforced scenarios get a real-ish reserveBudget that accepts by
+  // default; tests override via `.mockReturnValueOnce({rejected:true,...})`
+  // to exercise rejection. Returning `{ id: N }` is the success shape.
+  const manifest = {
+    reserveBudget: vi.fn().mockReturnValue({ id: 1 }),
+    finalizeBudgetReservation: vi.fn(),
+    cancelBudgetReservation: vi.fn(),
+    insertUsageMetric: vi.fn(),
+  };
+  const throttle = {
+    reserve: vi.fn().mockReturnValue({ delayMs: 0, releaseId: 1 }),
+    release: vi.fn(),
+    cancel: vi.fn(),
+    shouldDelay: vi.fn(() => 0),
+    recordRetryHint: vi.fn(),
+  };
+
   const ctx = {
     server: {} as ToolContext['server'],
     config: {
-      dailyBudgetUsd: Number.POSITIVE_INFINITY,
+      dailyBudgetUsd: args.dailyBudgetUsd ?? Number.POSITIVE_INFINITY,
       maxFilesPerWorkspace: 2_000,
       maxFileSizeBytes: 1_000_000,
       cacheTtlSeconds: 3_600,
       cacheMinTokens: 1_024,
-      tpmThrottleLimit: 0,
+      tpmThrottleLimit: args.tpmThrottleLimit ?? 0,
       forceMaxOutputTokens: false,
       workspaceGuardRatio: 0.9,
       defaultModel: 'latest-pro-thinking',
     } as ToolContext['config'],
     client: { models: { generateContent } } as unknown as ToolContext['client'],
-    manifest: {} as ToolContext['manifest'],
+    manifest: manifest as unknown as ToolContext['manifest'],
     ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
-    throttle: {
-      reserve: vi.fn(),
-      release: vi.fn(),
-      cancel: vi.fn(),
-      shouldDelay: vi.fn(() => 0),
-      recordRetryHint: vi.fn(),
-    } as unknown as ToolContext['throttle'],
+    throttle: throttle as unknown as ToolContext['throttle'],
   };
-  return { ctx, generateContent };
+  return { ctx, generateContent, manifest, throttle };
 }
 
 beforeEach(() => {
@@ -323,5 +341,162 @@ describe('ask_agentic loop — sandbox integration', () => {
     const result = await askAgenticTool.execute({ prompt: 'try env', workspace: root }, ctx);
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent?.iterations).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression coverage for v1.5.0 code review findings (#1-21 from PR #24)
+// ---------------------------------------------------------------------------
+
+describe('PR #24 review regressions — ID-less & alias & budget', () => {
+  it('F#3: two same-name parallel calls without `id` return both responses (positional pairing)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'A contents');
+    writeFileSync(join(root, 'b.ts'), 'B contents');
+
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        // Both reads in one turn, BOTH without `id`. Pre-fix code dropped
+        // the second because `.find()` matched the first by name.
+        {
+          functionCalls: [
+            { name: 'read_file', args: { path: 'a.ts' } },
+            { name: 'read_file', args: { path: 'b.ts' } },
+          ],
+        },
+        { text: 'Done.' },
+      ],
+    });
+
+    const result = await askAgenticTool.execute({ prompt: 'both', workspace: root }, ctx);
+    expect(result.isError).toBeUndefined();
+    // The second turn sent back to Gemini must contain BOTH function
+    // responses, positionally aligned with BOTH function calls.
+    const secondCall = generateContent.mock.calls[1]?.[0];
+    const userTurn = (
+      secondCall?.contents as Array<{
+        role: string;
+        parts: Array<{ functionResponse?: { name?: string } }>;
+      }>
+    ).findLast?.((c) => c.role === 'user' && c.parts.some((p) => p.functionResponse));
+    const functionResponses = userTurn?.parts.filter((p) => p.functionResponse) ?? [];
+    expect(functionResponses.length).toBe(2);
+    // Both responses should be read_file (not dropped/collapsed).
+    expect(functionResponses.every((p) => p.functionResponse?.name === 'read_file')).toBe(true);
+  });
+
+  it('F#4: alias paths count as ONE against maxFilesRead via canonical relpath', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'A');
+
+    // Three reads all resolving to `a.ts`. maxFilesRead=1 must still
+    // permit them all (canonical set counts 1 distinct file).
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'read_file', args: { path: './a.ts' } }] },
+        { functionCalls: [{ name: 'read_file', args: { path: 'sub/../a.ts' } }] },
+        { text: 'Read one file three times.' },
+      ],
+    });
+
+    // Create `sub` dir for the third alias to normalise through.
+    mkdirSync(join(root, 'sub'), { recursive: true });
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'aliases', workspace: root, maxFilesRead: 1 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    // filesRead counts CANONICAL distinct paths — one, not three.
+    expect(result.structuredContent?.filesRead).toBe(1);
+  });
+});
+
+describe('PR #24 review regressions — budget/throttle integration (F#1)', () => {
+  it('agentic reserves, finalises, and respects per-iteration budget', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'A');
+
+    const { ctx, manifest, throttle } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { text: 'Done.' },
+      ],
+      dailyBudgetUsd: 10,
+      tpmThrottleLimit: 80_000,
+    });
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+    expect(result.isError).toBeUndefined();
+    // 2 iterations → 2 reservations, 2 finalisations, 0 cancellations.
+    expect(manifest.reserveBudget).toHaveBeenCalledTimes(2);
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(2);
+    expect(manifest.cancelBudgetReservation).not.toHaveBeenCalled();
+    // Same for throttle.
+    expect(throttle.reserve).toHaveBeenCalledTimes(2);
+    expect(throttle.release).toHaveBeenCalledTimes(2);
+  });
+
+  it('agentic returns BUDGET_REJECT when reserveBudget rejects', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'A');
+
+    const { ctx, manifest, generateContent } = buildCtx({
+      script: [{ text: 'unused — we reject before dispatch.' }],
+      dailyBudgetUsd: 0.0001,
+    });
+    manifest.reserveBudget.mockReturnValueOnce({
+      rejected: true,
+      spentMicros: 1000,
+      capMicros: 100,
+      estimateMicros: 50000,
+    });
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('BUDGET_REJECT');
+    // Must NOT have called generateContent if reservation rejected.
+    expect(generateContent).not.toHaveBeenCalled();
+  });
+});
+
+describe('PR #24 review regressions — compat guards & final-text (F#6, F#9)', () => {
+  it('F#6: rejects locally when thinkingBudget + reserve exceeds maxOutputTokens', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    const result = await askAgenticTool.execute(
+      {
+        prompt: 'q',
+        workspace: root,
+        thinkingBudget: 60_000,
+        maxOutputTokens: 1000, // 60000 + 1024 > 1000 → local reject
+      },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(String(result.content[0]?.text)).toContain('thinkingBudget');
+    expect(generateContent).not.toHaveBeenCalled();
+  });
+
+  it('F#9: returns finalText even when cumulative budget trips on the answering iteration', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx } = buildCtx({
+      script: [
+        // Single iteration with a huge prompt-token report + final answer.
+        { text: 'The answer is 42.', promptTokenCount: 200_000 },
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxTotalInputTokens: 100_000 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]?.text).toContain('42');
+    expect(result.structuredContent?.overBudget).toBe(true);
   });
 });

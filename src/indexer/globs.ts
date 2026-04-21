@@ -226,7 +226,7 @@ export const DEFAULT_EXCLUDE_FILE_NAMES: readonly string[] = [
  *   - `.tsbuildinfo` — TypeScript incremental build cache; generated,
  *     enormous (6-figure tokens on mid-size projects), zero analytical
  *     value. Empirically observed at 158k tokens on a single file in the
- *     RowrMail workspace that triggered the v1.4.2 fix.
+ *     a large workspace that triggered the v1.5.0 fix.
  *
  * Explicitly NOT here:
  *   - `.map` / `.min.js` / `.min.css` — in some diagnostic / legacy-bundle
@@ -282,9 +282,9 @@ function normalizeIncludeGlob(pattern: string): string {
 /**
  * Classification for a caller-supplied `excludeGlobs` pattern. Mirror of the
  * existing `normalizeIncludeGlob` heuristic so `excludeGlobs` and
- * `includeGlobs` share one semantic model — a consistency gap prior to v1.4.2
+ * `includeGlobs` share one semantic model — a consistency gap prior to v1.5.0
  * caused user patterns like `*.tsbuildinfo` to be silently treated as
- * directory names, matching nothing. Empirically observed on RowrMail
+ * directory names, matching nothing. Empirically observed on a mid-size project
  * workspace (1.7M tokens) where 40 aggressive excludes reduced file count
  * by just one — see `docs/FOLLOW-UP-PRS.md` for the trace evidence.
  *
@@ -308,6 +308,15 @@ type ExcludeBucket =
   | { kind: 'dir'; value: string };
 
 export function normalizeExcludeGlob(pattern: string): ExcludeBucket | null {
+  // Detect explicit dir intent BEFORE normalisation strips the signal.
+  // `dist/`, `src\\vendor/`, `.vercel/` — trailing separator means the user
+  // said "this is a directory". Without this pre-check the dot-prefix
+  // branch below would misclassify `.vercel/` as an extension (strip
+  // trailing `/` → `.vercel` → `startsWith('.')` → extension bucket),
+  // silently leaving `.vercel/`, `.next/`, `.turbo/` etc. indexable.
+  // Regression reported in PR #24 review by Gemini and Grok.
+  const hadTrailingSlash = /[\\/]+$/.test(pattern.trim());
+
   // Normalise separators + strip filler so downstream heuristic sees a
   // canonical form. Order matters:
   //   1. Windows `\` → POSIX `/`
@@ -316,6 +325,12 @@ export function normalizeExcludeGlob(pattern: string): ExcludeBucket | null {
   //   4. Trim whitespace
   const cleaned = pattern.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').trim();
   if (cleaned.length === 0) return null;
+
+  // Pre-strip dir intent wins over any subsequent heuristic. `.vercel/` →
+  // dir bucket (the prefix dot would otherwise short-circuit into extension).
+  if (hadTrailingSlash) {
+    return { kind: 'dir', value: cleaned };
+  }
 
   // Extension bucket: `*.ext` or bare `.ext` (no slash — `src/.env` is a
   // path, not an extension).
@@ -350,7 +365,7 @@ export function defaultMatchConfig(
     extraExtsInclude.push(normalizeIncludeGlob(pattern));
   }
   // Route each excludeGlob to its semantic bucket (dir / filename / ext).
-  // Pre-v1.4.2: every pattern was force-pushed to excludeDirs, silently
+  // Pre-v1.5.0: every pattern was force-pushed to excludeDirs, silently
   // ignoring any that weren't literal dir basenames.
   for (const pattern of extra.excludeGlobs ?? []) {
     const bucket = normalizeExcludeGlob(pattern);

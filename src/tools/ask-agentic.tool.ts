@@ -45,6 +45,7 @@ import {
   WorkspaceValidationError,
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
+import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { SandboxError, resolveWorkspaceRoot } from './agentic/sandbox.js';
@@ -411,6 +412,26 @@ async function executeAskAgenticBody(
     const maxTotalInputTokens = input.maxTotalInputTokens ?? DEFAULT_MAX_TOTAL_INPUT_TOKENS;
     const maxFilesRead = input.maxFilesRead ?? DEFAULT_MAX_FILES_READ;
 
+    // Compatibility guard (mirror of ask.tool.ts): reject locally when
+    // thinkingBudget + answer-reserve > maxOutputTokens so the model
+    // never sees a 400 "thinking exceeds output budget" from Gemini.
+    // PR #24 review by GPT.
+    if (
+      typeof input.thinkingBudget === 'number' &&
+      input.thinkingBudget > 0 &&
+      typeof input.maxOutputTokens === 'number' &&
+      input.maxOutputTokens < input.thinkingBudget + 1024
+    ) {
+      return errorResult(
+        `ask_agentic: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${input.maxOutputTokens}). Raise maxOutputTokens to at least ${input.thinkingBudget + 1024}, or lower thinkingBudget.`,
+        {
+          errorCode: 'UNKNOWN',
+          retryable: false,
+          subReason: 'INVALID_THINKING_OUTPUT_COMBO',
+        },
+      );
+    }
+
     const thinkingConfig: ThinkingConfig | undefined = (() => {
       if (input.thinkingLevel !== undefined) {
         return {
@@ -442,17 +463,122 @@ async function executeAskAgenticBody(
 
     emitter.emit('starting agentic loop…');
 
+    // Conservative per-iteration cost estimate for the pre-iteration
+    // budget reservation. An agentic iter typically sends a few KB of
+    // prompt + accumulated tool responses + model thinking + short output.
+    // We over-estimate on purpose so `reserveBudget` atomicity catches
+    // overspend early rather than silently racing past the cap. PR #24
+    // review by Grok (P0: budget bypass on agentic path).
+    const PER_ITERATION_INPUT_TOKENS = 50_000;
+    const PER_ITERATION_OUTPUT_TOKENS =
+      typeof input.maxOutputTokens === 'number' ? input.maxOutputTokens : 4096;
+    const perIterationCostUsd = estimateCostUsd({
+      model: resolved.resolved,
+      uncachedInputTokens: PER_ITERATION_INPUT_TOKENS,
+      cachedInputTokens: 0,
+      outputTokens: PER_ITERATION_OUTPUT_TOKENS,
+      thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
+    });
+    const dailyBudgetEnforced = Number.isFinite(ctx.config.dailyBudgetUsd);
+    const tpmEnforced = ctx.config.tpmThrottleLimit > 0;
+
     while (iterations < maxIterations) {
       iterations += 1;
-      const iterResult = await runAgenticIteration({
-        ctx,
-        resolvedModel: resolved.resolved,
-        conversation,
-        baseConfig,
-        workspaceRoot,
-        filesReadSet,
-        maxFilesRead,
-      });
+
+      // Per-iteration budget reservation (mirrors ask.tool.ts). Each
+      // iteration is an independent generateContent billable, so each
+      // gets its own reservation/finalize pair. Budget ledger stays
+      // accurate across the full loop.
+      let reservationId: number | null = null;
+      if (dailyBudgetEnforced) {
+        const reserve = ctx.manifest.reserveBudget({
+          workspaceRoot,
+          toolName: 'ask_agentic',
+          model: resolved.resolved,
+          estimatedCostMicros: toMicrosUsd(perIterationCostUsd),
+          dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+          nowMs: Date.now(),
+        });
+        if ('rejected' in reserve) {
+          const spentUsd = reserve.spentMicros / 1_000_000;
+          return errorResult(
+            `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${perIterationCostUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise GEMINI_DAILY_BUDGET_USD.`,
+            {
+              errorCode: 'BUDGET_REJECT',
+              retryable: false,
+              iterations,
+              cumulativeInputTokens,
+            },
+          );
+        }
+        reservationId = reserve.id;
+      }
+
+      // Per-iteration TPM throttle reservation.
+      let throttleReservationId = -1;
+      if (tpmEnforced) {
+        const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
+        throttleReservationId = reservation.releaseId;
+        if (reservation.delayMs > 0) {
+          emitter.emit(
+            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
+          );
+          await new Promise<void>((r) => setTimeout(r, reservation.delayMs));
+        }
+      }
+
+      let iterResult: Awaited<ReturnType<typeof runAgenticIteration>>;
+      try {
+        iterResult = await runAgenticIteration({
+          ctx,
+          resolvedModel: resolved.resolved,
+          conversation,
+          baseConfig,
+          workspaceRoot,
+          filesReadSet,
+          maxFilesRead,
+        });
+      } catch (iterErr) {
+        // Release both reservations on failure before re-throwing.
+        if (reservationId !== null) {
+          try {
+            ctx.manifest.cancelBudgetReservation(reservationId);
+          } catch (cancelErr) {
+            logger.error(`ask_agentic: cancelBudgetReservation failed: ${String(cancelErr)}`);
+          }
+        }
+        if (throttleReservationId !== -1) {
+          ctx.throttle.cancel(throttleReservationId);
+        }
+        throw iterErr;
+      }
+
+      // Finalise budget reservation with actual cost from usage metadata.
+      if (reservationId !== null) {
+        const actualCost = estimateCostUsd({
+          model: resolved.resolved,
+          uncachedInputTokens: iterResult.usage.promptTokenCount,
+          cachedInputTokens: 0,
+          outputTokens: iterResult.usage.candidatesTokenCount,
+          thinkingTokens: iterResult.usage.thoughtsTokenCount,
+        });
+        try {
+          ctx.manifest.finalizeBudgetReservation(reservationId, {
+            cachedTokens: 0,
+            uncachedTokens: iterResult.usage.promptTokenCount,
+            costUsdMicro: toMicrosUsd(actualCost),
+            durationMs: 0,
+          });
+        } catch (finalizeErr) {
+          logger.error(
+            `ask_agentic: finalizeBudgetReservation failed for id=${reservationId}: ${String(finalizeErr)}`,
+          );
+        }
+      }
+      // Release TPM reservation with actual input tokens.
+      if (throttleReservationId !== -1) {
+        ctx.throttle.release(throttleReservationId, iterResult.usage.promptTokenCount);
+      }
 
       cumulativeInputTokens += iterResult.usage.promptTokenCount;
       cumulativeOutputTokens += iterResult.usage.candidatesTokenCount;
@@ -462,21 +588,13 @@ async function executeAskAgenticBody(
         `iter ${iterations}/${maxIterations}: ${iterResult.functionCallCount} tool calls, ${cumulativeInputTokens} in-tokens so far`,
       );
 
-      // Budget guard — after the iteration counts so we at least report
-      // the iteration that tipped over.
-      if (cumulativeInputTokens > maxTotalInputTokens) {
-        return errorResult(
-          `ask_agentic: cumulative input tokens (${cumulativeInputTokens.toLocaleString()}) exceeded budget (${maxTotalInputTokens.toLocaleString()}) after ${iterations} iterations. Increase maxTotalInputTokens, narrow your prompt, or lower thinkingLevel.`,
-          {
-            errorCode: 'UNKNOWN',
-            retryable: false,
-            subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED',
-            iterations,
-            cumulativeInputTokens,
-          },
-        );
-      }
-
+      // Final-text first, budget second: if the iteration produced an
+      // answer, return it even if the cumulative-token count ticked over
+      // `maxTotalInputTokens`. Operators already paid for those tokens;
+      // discarding a successful answer just because this iteration
+      // nudged the meter over is punitive UX. The budget guard below
+      // still blocks FUTURE iterations from spending beyond the cap.
+      // Reported in PR #24 review by Gemini.
       if (iterResult.finalText !== null) {
         return textResult(iterResult.finalText, {
           resolvedModel: resolved.resolved,
@@ -492,7 +610,24 @@ async function executeAskAgenticBody(
           filesReadList: [...filesReadSet].slice(0, 40),
           durationMs: Date.now() - started,
           thinkingSummary: iterResult.thinkingSummary,
+          overBudget: cumulativeInputTokens > maxTotalInputTokens,
         });
+      }
+
+      // Budget guard — runs AFTER the final-text check so a last-iteration
+      // answer is never discarded. If we're here, the model is still
+      // asking for tool calls; refuse to fund another round.
+      if (cumulativeInputTokens > maxTotalInputTokens) {
+        return errorResult(
+          `ask_agentic: cumulative input tokens (${cumulativeInputTokens.toLocaleString()}) exceeded budget (${maxTotalInputTokens.toLocaleString()}) after ${iterations} iterations. Increase maxTotalInputTokens, narrow your prompt, or lower thinkingLevel.`,
+          {
+            errorCode: 'UNKNOWN',
+            retryable: false,
+            subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED',
+            iterations,
+            cumulativeInputTokens,
+          },
+        );
       }
 
       // No-progress detection: if any single call signature has now been
@@ -631,39 +766,60 @@ async function runAgenticIteration(args: {
   // stay in the conversation.
   conversation.push({ role: 'model', parts });
 
-  // Dispatch + track files opened for the cap. A read_file call counts
-  // toward the cap EVEN IF it errors — otherwise a determined model could
-  // drain budget on path-traversal attempts.
+  // Dispatch — positional correlation between functionCallParts[i] and
+  // responseParts[i]. Function-call id is not always present (Gemini API
+  // marks it optional), so we MUST NOT use id / name for pairing: two
+  // parallel same-name calls without ids would then collide, dropping one
+  // response and crashing the next turn with Gemini 400 "call/response
+  // mismatch". Reported in PR #24 review by GPT + Gemini.
   const callSignatures: Array<{ name: string; args: Record<string, unknown> }> = [];
+  /** responseParts[i] corresponds to functionCallParts[i] — never resort,
+   * never dedupe. `null` until either short-circuited or filled after
+   * parallel dispatch. */
+  const responseParts: Array<Part | null> = new Array(functionCallParts.length).fill(null);
+  /** Indices that actually need dispatch, parallel-index-aligned with
+   * `toDispatch`. `toDispatch[k]` corresponds to
+   * `functionCallParts[dispatchIndexMap[k]]`. */
   const toDispatch: Array<{ name: string; args: Record<string, unknown> }> = [];
-  const responseParts: Part[] = [];
+  const dispatchIndexMap: number[] = [];
 
-  for (const part of functionCallParts) {
+  for (let i = 0; i < functionCallParts.length; i++) {
+    const part = functionCallParts[i];
+    if (!part) continue;
     const fc = part.functionCall;
     const name = fc.name ?? 'unknown';
     const fcArgs = (fc.args ?? {}) as Record<string, unknown>;
     callSignatures.push({ name, args: fcArgs });
 
     // Short-circuit cap on distinct files read — no point dispatching if
-    // the request is for a new file past the limit. Keep error recoverable.
-    if (name === 'read_file') {
+    // the request is for a new file past the limit. Canonical tracking by
+    // `filesReadSet` happens AFTER dispatch (in the merge loop) using the
+    // sandbox-resolved `relpath`, not the raw input, so path aliases
+    // (`./a.ts`, `a.ts`, `sub/../a.ts`) all count as one. PR #24 review
+    // by GPT + Grok.
+    if (name === 'read_file' && filesReadSet.size >= maxFilesRead) {
+      // Pre-dispatch best-effort path comparison — if the raw request
+      // path IS already in the set (trivial dup), skip dispatch and reuse
+      // the existing count. If it's not, allow dispatch — canonical
+      // merge will catch duplicates post-resolve. This keeps the cap
+      // from being bypassed via aliases AND avoids rejecting legitimate
+      // first-time reads just because the size matches the cap.
       const reqPath = typeof fcArgs.path === 'string' ? fcArgs.path : '';
-      const isNew = !filesReadSet.has(reqPath);
-      if (isNew && filesReadSet.size >= maxFilesRead) {
-        responseParts.push({
+      if (!filesReadSet.has(reqPath)) {
+        responseParts[i] = {
           functionResponse: {
             ...(fc.id ? { id: fc.id } : {}),
             name,
             response: {
-              error: `maxFilesRead (${maxFilesRead}) reached. Summarise with what you have already read.`,
+              error: `maxFilesRead (${maxFilesRead}) reached. Summarise with what you have already read, or ask a narrower question.`,
             },
           },
-        });
+        };
         continue;
       }
-      if (isNew) filesReadSet.add(reqPath);
     }
 
+    dispatchIndexMap.push(i);
     toDispatch.push({ name, args: fcArgs });
   }
 
@@ -673,32 +829,39 @@ async function runAgenticIteration(args: {
     toDispatch,
     TOOL_EXECUTION_CONCURRENCY,
   );
-  let dispatchedIdx = 0;
-  for (const part of functionCallParts) {
-    const fc = part.functionCall;
-    const name = fc.name ?? 'unknown';
-    // Skip ones we already short-circuited above.
-    const existingResp = responseParts.find(
-      (p) =>
-        p.functionResponse &&
-        p.functionResponse.name === name &&
-        (fc.id ? p.functionResponse.id === fc.id : true),
-    );
-    if (existingResp) continue;
 
-    const res = dispatched[dispatchedIdx];
-    dispatchedIdx += 1;
-    if (!res) continue;
-    responseParts.push({
+  // Merge dispatched results back into responseParts at their original
+  // positions. Canonicalise filesReadSet using the sandbox-resolved
+  // `relpath` field on successful read_file responses — this closes the
+  // alias-bypass on `maxFilesRead` because `./a.ts` and `a.ts` both yield
+  // `relpath: 'a.ts'` from `resolveInsideWorkspace`.
+  for (let k = 0; k < dispatched.length; k++) {
+    const res = dispatched[k];
+    const originalIdx = dispatchIndexMap[k];
+    if (res === undefined || originalIdx === undefined) continue;
+    const part = functionCallParts[originalIdx];
+    if (!part) continue;
+    const fc = part.functionCall;
+    responseParts[originalIdx] = {
       functionResponse: {
         ...(fc.id ? { id: fc.id } : {}),
         name: res.name,
         response: res.response,
       },
-    });
+    };
+    if (res.name === 'read_file' && !res.isError) {
+      const canonical = (res.response as { relpath?: string }).relpath;
+      if (typeof canonical === 'string' && canonical.length > 0) {
+        filesReadSet.add(canonical);
+      }
+    }
   }
 
-  conversation.push({ role: 'user', parts: responseParts });
+  // Filter out any remaining `null` slots — shouldn't happen in practice
+  // (every call gets either a short-circuit or a dispatched response), but
+  // defensive: skip nulls rather than sending a malformed turn to Gemini.
+  const finalResponseParts = responseParts.filter((p): p is Part => p !== null);
+  conversation.push({ role: 'user', parts: finalResponseParts });
 
   return {
     finalText: null,
@@ -709,13 +872,43 @@ async function runAgenticIteration(args: {
   };
 }
 
+/** Maximum recursion depth for `stableJson`. Function-call args in
+ * practice are flat `{path, startLine, endLine}` objects, so 10 levels
+ * is generous. Guards against stack overflow if a prompt-injected cache
+ * managed to smuggle a nested structure into the model's tool-call args. */
+const STABLE_JSON_MAX_DEPTH = 10;
+
 /** Stable-key JSON for comparing function-call signatures across
- * iterations. Sorted keys so `{a:1,b:2}` and `{b:2,a:1}` hash identical. */
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  const keys = Object.keys(value as Record<string, unknown>).sort();
-  return `{${keys
-    .map((k) => `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k])}`)
-    .join(',')}}`;
+ * iterations. Sorted keys so `{a:1,b:2}` and `{b:2,a:1}` hash identical.
+ *
+ * Hardening (PR #24 review by Grok): depth-limited + protected against
+ * circular references. The outer `JSON.stringify` would throw on a cycle,
+ * which we catch; but we also walk with our own depth counter because a
+ * deeply nested (non-cyclic) args tree can still blow the stack on the
+ * default V8 async-aware trampoline. On overflow or stringify error we
+ * fall back to a truncated `String(value)` so the no-progress detector
+ * still has SOME key rather than crashing the loop. */
+function stableJson(value: unknown, depth = 0): string {
+  if (depth > STABLE_JSON_MAX_DEPTH) return '"[depth-truncated]"';
+  if (value === null || typeof value !== 'object') {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return `"[unstringifiable:${typeof value}]"`;
+    }
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => stableJson(v, depth + 1)).join(',')}]`;
+  }
+  try {
+    const keys = Object.keys(value as Record<string, unknown>).sort();
+    return `{${keys
+      .map(
+        (k) =>
+          `${JSON.stringify(k)}:${stableJson((value as Record<string, unknown>)[k], depth + 1)}`,
+      )
+      .join(',')}}`;
+  } catch {
+    return `"[unstringifiable-object]"`;
+  }
 }

@@ -322,7 +322,7 @@ async function executeCodeBody(
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
     const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
 
-    // v1.4.2 preflight — mirror of ask.tool.ts guard. See there for rationale.
+    // v1.5.0 preflight — mirror of ask.tool.ts guard. See there for rationale.
     const contextWindow = resolved.inputTokenLimit;
     if (typeof contextWindow === 'number' && contextWindow > 0) {
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);

@@ -17,7 +17,7 @@
  */
 
 import type { Dirent } from 'node:fs';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   DEFAULT_EXCLUDE_DIRS,
@@ -57,6 +57,15 @@ const MAX_LIST_ENTRIES = 200;
 
 /** Cap on `find_files` matches per call. */
 const MAX_FIND_MATCHES = 200;
+
+/**
+ * Max recursion depth in `find_files` / `grep` walks. Protects against
+ * call-stack overflow on deep directory trees (generated code, malformed
+ * symlink loops) and bounds worst-case wall time. 20 levels comfortably
+ * covers real source repos (typical max depth 7-10) without false
+ * positives. Reported in PR #24 review by Grok.
+ */
+const MAX_WALK_DEPTH = 20;
 
 // ---------------------------------------------------------------------------
 // Small glob → RegExp converter.
@@ -172,8 +181,25 @@ export async function findFilesExecutor(
 
   const matches: string[] = [];
   let totalMatches = 0;
+  // Track real (symlink-resolved) paths we've walked so a directory loop
+  // (e.g. `dir/self -> dir`) does not cause infinite recursion.
+  const seenReal = new Set<string>();
+  let depthExceeded = false;
 
-  async function walk(currentAbs: string, currentRel: string): Promise<void> {
+  async function walk(currentAbs: string, currentRel: string, depth: number): Promise<void> {
+    if (depth > MAX_WALK_DEPTH) {
+      depthExceeded = true;
+      return;
+    }
+    // Guard against symlink loops via realpath memoisation.
+    try {
+      const real = await realpath(currentAbs);
+      if (seenReal.has(real)) return;
+      seenReal.add(real);
+    } catch {
+      // Unreadable parent — nothing to walk into.
+      return;
+    }
     let entries: Dirent<string>[];
     try {
       entries = await readdir(currentAbs, { withFileTypes: true, encoding: 'utf8' });
@@ -186,6 +212,7 @@ export async function findFilesExecutor(
         await walk(
           join(currentAbs, entry.name),
           currentRel ? `${currentRel}/${entry.name}` : entry.name,
+          depth + 1,
         );
         continue;
       }
@@ -209,12 +236,12 @@ export async function findFilesExecutor(
     }
   }
 
-  await walk(workspaceRoot, '');
+  await walk(workspaceRoot, '', 0);
 
   return {
     pattern,
     matches,
-    truncated: totalMatches > matches.length,
+    truncated: totalMatches > matches.length || depthExceeded,
     totalMatches,
   };
 }
@@ -262,17 +289,39 @@ export async function readFileExecutor(
   });
   if (!looksLikeSource) {
     throw new SandboxError(
-      'EXCLUDED_DIR',
+      'NON_SOURCE_FILE',
       `file extension not in allowed source set: ${target.relpath}`,
       relPath,
     );
   }
 
-  let buffer: Buffer;
+  // Stat first so we never allocate a >200MB Buffer for a minified bundle.
+  // Files larger than 5× MAX_READ_BYTES (1MB) get rejected with a
+  // metadata-only response so the model can skip them instead of DOSing
+  // the process. Reported in PR #24 review by GPT.
   let totalBytes: number;
   try {
+    totalBytes = (await stat(target.absolutePath)).size;
+  } catch (err) {
+    throw new SandboxError('NOT_FOUND', `stat failed: ${String(err)}`, relPath);
+  }
+  const HARD_FILE_SIZE_LIMIT = 5 * MAX_READ_BYTES; // 1MB
+  if (totalBytes > HARD_FILE_SIZE_LIMIT) {
+    return {
+      relpath: target.relpath,
+      content: `[file too large to inline: ${totalBytes} bytes > ${HARD_FILE_SIZE_LIMIT} byte cap. Use grep or a tighter startLine/endLine slice, or skip this file.]`,
+      startLine: 1,
+      endLine: 0,
+      totalLines: 0,
+      truncated: true,
+      truncationReason: 'max_bytes',
+      totalBytes,
+    };
+  }
+
+  let buffer: Buffer;
+  try {
     buffer = await readFile(target.absolutePath);
-    totalBytes = buffer.byteLength;
   } catch (err) {
     throw new SandboxError('NOT_FOUND', `read failed: ${String(err)}`, relPath);
   }
@@ -302,10 +351,15 @@ export async function readFileExecutor(
 
   if (Buffer.byteLength(content, 'utf8') > MAX_READ_BYTES) {
     // Byte-cap kicks in — trim the tail. Slice bytes, not characters, to
-    // match the limit exactly; then re-decode, which may chop a mid-rune.
-    // Back off to the last newline to avoid emitting a partial line.
+    // match the limit exactly; then re-decode with `TextDecoder` using
+    // `ignoreBOM` + `fatal: false` so a mid-rune cut produces a single
+    // replacement character instead of a malformed string. Back off to
+    // the last newline to avoid emitting a partial line — that naturally
+    // chops any trailing replacement char as well. Reported in PR #24
+    // review by Gemini and Grok.
     const cappedBuf = Buffer.from(content, 'utf8').subarray(0, MAX_READ_BYTES);
-    const cappedText = cappedBuf.toString('utf8');
+    const decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
+    const cappedText = decoder.decode(cappedBuf);
     const lastNewline = cappedText.lastIndexOf('\n');
     content = lastNewline > 0 ? cappedText.slice(0, lastNewline) : cappedText;
     truncated = true;
@@ -372,17 +426,51 @@ export async function grepExecutor(
   let respBytes = 0;
 
   // Determine starting directory. When `pathPrefix` is given, validate it
-  // sits inside the workspace (reuse same sandbox logic as read_file).
+  // sits inside the workspace (reuse same sandbox logic as read_file), AND
+  // ensure it's a directory — grep'ing a single file via `pathPrefix`
+  // would silently return zero matches (readdir throws ENOTDIR, caught by
+  // the walk) which misleads the model. Reported in PR #24 review by Gemini.
   let startAbs = workspaceRoot;
   let startRel = '';
   if (typeof pathPrefix === 'string' && pathPrefix.trim().length > 0) {
     const resolved = await resolveInsideWorkspace(workspaceRoot, pathPrefix);
+    try {
+      const s = await stat(resolved.absolutePath);
+      if (!s.isDirectory()) {
+        throw new SandboxError(
+          'NOT_A_DIRECTORY',
+          `pathPrefix must be a directory, got a file: ${resolved.relpath}. To search a single file, use read_file instead.`,
+          pathPrefix,
+        );
+      }
+    } catch (err) {
+      if (err instanceof SandboxError) throw err;
+      throw new SandboxError(
+        'NOT_FOUND',
+        `pathPrefix cannot be stat'd: ${String(err)}`,
+        pathPrefix,
+      );
+    }
     startAbs = resolved.absolutePath;
     startRel = resolved.relpath;
   }
 
-  async function walk(currentAbs: string, currentRel: string): Promise<void> {
+  const seenReal = new Set<string>();
+  let depthExceeded = false;
+
+  async function walk(currentAbs: string, currentRel: string, depth: number): Promise<void> {
     if (respBytes >= MAX_RESPONSE_BYTES) return;
+    if (depth > MAX_WALK_DEPTH) {
+      depthExceeded = true;
+      return;
+    }
+    try {
+      const real = await realpath(currentAbs);
+      if (seenReal.has(real)) return;
+      seenReal.add(real);
+    } catch {
+      return;
+    }
     let entries: Dirent<string>[];
     try {
       entries = await readdir(currentAbs, { withFileTypes: true, encoding: 'utf8' });
@@ -396,6 +484,7 @@ export async function grepExecutor(
         await walk(
           join(currentAbs, entry.name),
           currentRel ? `${currentRel}/${entry.name}` : entry.name,
+          depth + 1,
         );
         continue;
       }
@@ -437,18 +526,22 @@ export async function grepExecutor(
         const trimmed = line.length > 500 ? `${line.slice(0, 500)}…` : line;
         const match: GrepMatch = { relpath: rel, line: i + 1, text: trimmed };
         matches.push(match);
-        respBytes += match.text.length + match.relpath.length + 32;
+        // Use UTF-8 byte length (not .length which is UTF-16 code units)
+        // so the 500k cap holds on CJK / emoji-heavy matches. `+32` is
+        // the envelope overhead (JSON keys, quotes, line-number int).
+        respBytes +=
+          Buffer.byteLength(match.text, 'utf8') + Buffer.byteLength(match.relpath, 'utf8') + 32;
       }
     }
   }
 
-  await walk(startAbs, startRel);
+  await walk(startAbs, startRel, 0);
 
   return {
     pattern,
     pathPrefix: pathPrefix ?? null,
     matches,
-    truncated: totalMatches > matches.length || respBytes >= MAX_RESPONSE_BYTES,
+    truncated: totalMatches > matches.length || respBytes >= MAX_RESPONSE_BYTES || depthExceeded,
     totalMatches,
   };
 }

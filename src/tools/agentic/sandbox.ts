@@ -28,44 +28,68 @@ import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILE_NAMES } from '../../indexer/
 /** Filename-basename entries that NEVER leak through `read_file`. Even when
  * the path resolves safely under the workspace root, any of these basenames
  * is a hard reject — protects against secrets dropped into the project by
- * the user (`.env.local`) or by dev tooling (`credentials`). */
+ * the user (`.env.local`) or by dev tooling (`credentials`).
+ *
+ * Stored in lowercase so the lookup set works on case-insensitive
+ * filesystems (macOS APFS, Windows NTFS) where `.ENV` resolves to the same
+ * file as `.env`. The `Set` below is built at load time. */
 const AGENTIC_SECRET_BASENAMES: readonly string[] = [
   '.env',
   '.env.local',
   '.env.development',
   '.env.production',
   '.env.test',
+  '.env.staging',
   '.netrc',
   '.npmrc',
   '.pgpass',
   '.git-credentials',
+  '.htpasswd',
   'credentials',
+  'credentials.json',
   'secrets.json',
   'secrets.yaml',
   'secrets.yml',
+  'service-account.json',
 ];
 
+/** Lowercased `Set` for O(1) case-insensitive basename denylist lookup. */
+const AGENTIC_SECRET_BASENAMES_LOWER: ReadonlySet<string> = new Set(
+  AGENTIC_SECRET_BASENAMES.map((s) => s.toLowerCase()),
+);
+
 /** Extensions that frequently carry sensitive key material. Extra gate on
- * top of `AGENTIC_SECRET_BASENAMES`. */
+ * top of `AGENTIC_SECRET_BASENAMES`. Matched via `endsWith(lowerBase, ext)`. */
 const AGENTIC_SECRET_EXTENSIONS: readonly string[] = [
   '.pem',
   '.key',
   '.crt',
+  '.cer',
   '.p12',
   '.pfx',
+  '.p8',
   '.asc',
+  '.gpg',
   '.keystore',
+  '.jks',
+  '.ppk',
+  '.ovpn',
 ];
 
+export type SandboxErrorCode =
+  | 'PATH_TRAVERSAL'
+  | 'SECRET_DENYLIST'
+  | 'EXCLUDED_DIR'
+  | 'EXCLUDED_FILENAME'
+  | 'NON_SOURCE_FILE'
+  | 'NOT_A_DIRECTORY'
+  | 'NOT_FOUND'
+  | 'NOT_INSIDE_ROOT';
+
 export class SandboxError extends Error {
-  readonly code:
-    | 'PATH_TRAVERSAL'
-    | 'SECRET_DENYLIST'
-    | 'EXCLUDED_DIR'
-    | 'NOT_FOUND'
-    | 'NOT_INSIDE_ROOT';
+  readonly code: SandboxErrorCode;
   readonly requestedPath: string;
-  constructor(code: SandboxError['code'], message: string, requestedPath: string) {
+  constructor(code: SandboxErrorCode, message: string, requestedPath: string) {
     super(message);
     this.name = 'SandboxError';
     this.code = code;
@@ -174,16 +198,21 @@ export async function resolveInsideWorkspace(
   const rel = toPosix(relative(workspaceRoot, resolved));
 
   // Content denylist (Codex #4): secrets-by-basename + extension.
+  // Both checks are case-insensitive — macOS/APFS and Windows/NTFS are
+  // case-insensitive by default, so `.ENV` resolves to the same inode as
+  // `.env`. Comparing pre-lowercased protects against a file literally
+  // stored as `.ENV` (or `.Env.Local`, `CREDENTIALS`, …) bypassing the
+  // list. Extension check was already case-insensitive; basename check
+  // used to be strict-equal — bug reported in PR #24 review by Gemini.
   const base = basename(resolved);
-  if (AGENTIC_SECRET_BASENAMES.includes(base)) {
+  const lowerBase = base.toLowerCase();
+  if (AGENTIC_SECRET_BASENAMES_LOWER.has(lowerBase)) {
     throw new SandboxError(
       'SECRET_DENYLIST',
       `filename on secret-basename denylist: ${base}`,
       relOrAbs,
     );
   }
-  // Extension check is case-insensitive — some `.PEM` variants exist.
-  const lowerBase = base.toLowerCase();
   for (const ext of AGENTIC_SECRET_EXTENSIONS) {
     if (lowerBase.endsWith(ext)) {
       throw new SandboxError(
@@ -210,8 +239,16 @@ export async function resolveInsideWorkspace(
   // And one more pass over DEFAULT_EXCLUDE_FILE_NAMES — lockfiles,
   // tsconfig.tsbuildinfo, etc. — they were uninteresting even in the
   // eager path, and definitely shouldn't cost agentic iterations.
+  // Uses `EXCLUDED_FILENAME` (distinct from `EXCLUDED_DIR`) so the
+  // calling model can tell "this is a blacklisted filename" from
+  // "this is a blacklisted directory" in the `functionResponse.error`
+  // payload (PR #24 review by Grok).
   if (DEFAULT_EXCLUDE_FILE_NAMES.includes(base)) {
-    throw new SandboxError('EXCLUDED_DIR', `filename on default exclude list: ${base}`, relOrAbs);
+    throw new SandboxError(
+      'EXCLUDED_FILENAME',
+      `filename on default exclude list: ${base}`,
+      relOrAbs,
+    );
   }
 
   return { absolutePath: resolved, relpath: rel };

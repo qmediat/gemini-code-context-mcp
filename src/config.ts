@@ -60,7 +60,7 @@ export interface Config {
    * the tokeniser can push to `0.95`; those on high-variance environments
    * may drop to `0.8`.
    *
-   * Empirically discovered v1.4.2 via debug-shadow trace on the RowrMail
+   * Empirically discovered v1.5.0 via debug-shadow trace on the a mid-size project
    * workspace (1.7M tokens vs a 1M context window): pre-fix MCP dispatched
    * the request anyway, got Gemini `400 INVALID_ARGUMENT`, subagent
    * interpreted as retryable → retry storm → `agent exhausted budget`.

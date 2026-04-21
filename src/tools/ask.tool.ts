@@ -306,7 +306,7 @@ async function executeAskBody(
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
     const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4);
 
-    // v1.4.2 preflight — refuse immediately if the estimated input doesn't
+    // v1.5.0 preflight — refuse immediately if the estimated input doesn't
     // fit under the model's advertised `inputTokenLimit * workspaceGuardRatio`.
     // Before this guard we would dispatch the request, Gemini would reject
     // with `400 INVALID_ARGUMENT "exceeds maximum ..."`, and the calling

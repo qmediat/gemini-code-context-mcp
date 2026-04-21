@@ -1,11 +1,11 @@
 /**
- * Pre-flight workspace size guard (v1.4.2, `WORKSPACE_TOO_LARGE`).
+ * Pre-flight workspace size guard (v1.5.0, `WORKSPACE_TOO_LARGE`).
  *
  * Verifies both `ask` and `code` fail-fast with a structured error when the
  * estimated input tokens exceed `inputTokenLimit * workspaceGuardRatio`,
  * WITHOUT calling into `prepareContext` / `generateContent` / the throttle.
  *
- * Background: before v1.4.2, an oversized workspace (e.g. RowrMail 1.7M tokens
+ * Background: before v1.5.0, an oversized workspace (e.g. a mid-size project 1.7M tokens
  * vs Gemini 1M context) dispatched the request anyway. Gemini returned
  * `400 INVALID_ARGUMENT` whose message is indistinguishable from transient
  * 400s; the orchestrating sub-agent retried until it exhausted its
@@ -136,7 +136,7 @@ beforeEach(() => {
   mocks.isStaleCacheError.mockReturnValue(false);
 });
 
-describe('ask preflight workspace guard (v1.4.2)', () => {
+describe('ask preflight workspace guard (v1.5.0)', () => {
   it('blocks when estimated tokens exceed threshold, returns structured error', async () => {
     // Workspace: 4M bytes → ~1M tokens (bytes/4). Model: 1M input cap.
     // Threshold at 0.9 = 900k. 1M + prompt tokens ≫ 900k → blocked.
@@ -243,7 +243,7 @@ describe('ask preflight workspace guard (v1.4.2)', () => {
   });
 });
 
-describe('code preflight workspace guard (v1.4.2)', () => {
+describe('code preflight workspace guard (v1.5.0)', () => {
   it('blocks oversized workspace for `code` tool too, mirrors ask behaviour', async () => {
     mockScanOfBytes(4_000_000);
     mockModelWithLimit(1_048_576);

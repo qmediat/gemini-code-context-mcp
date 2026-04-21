@@ -69,6 +69,33 @@ describe('normalizeExcludeGlob', () => {
     expect(normalizeExcludeGlob('   ')).toBeNull();
     expect(normalizeExcludeGlob('./')).toBeNull();
   });
+
+  // --- PR #24 review regressions (F#8) ---
+
+  it('F#8: trailing-slash dot-dirs route to `dir` bucket (not extension)', () => {
+    // Pre-fix: `.vercel/` → strip `/` → starts with `.` → extension bucket.
+    // User intent "exclude the directory" was silently ignored.
+    expect(normalizeExcludeGlob('.vercel/')).toEqual({ kind: 'dir', value: '.vercel' });
+    expect(normalizeExcludeGlob('.next/')).toEqual({ kind: 'dir', value: '.next' });
+    expect(normalizeExcludeGlob('.turbo/')).toEqual({ kind: 'dir', value: '.turbo' });
+    expect(normalizeExcludeGlob('.serverless/')).toEqual({ kind: 'dir', value: '.serverless' });
+  });
+
+  it('F#8: trailing-slash non-dot dirs route to `dir` bucket too', () => {
+    expect(normalizeExcludeGlob('dist/')).toEqual({ kind: 'dir', value: 'dist' });
+    expect(normalizeExcludeGlob('build/')).toEqual({ kind: 'dir', value: 'build' });
+    expect(normalizeExcludeGlob('vendor\\')).toEqual({ kind: 'dir', value: 'vendor' });
+  });
+
+  it('F#8: bare dot-names WITHOUT trailing slash still map to extension (unchanged)', () => {
+    // User writing `.map` or `.tsbuildinfo` meant an extension. Only
+    // trailing slash flips the intent to "directory".
+    expect(normalizeExcludeGlob('.map')).toEqual({ kind: 'extension', value: '.map' });
+    expect(normalizeExcludeGlob('.tsbuildinfo')).toEqual({
+      kind: 'extension',
+      value: '.tsbuildinfo',
+    });
+  });
 });
 
 describe('defaultMatchConfig', () => {
@@ -96,7 +123,7 @@ describe('defaultMatchConfig', () => {
     );
   });
 
-  it('preserves pre-v1.4.2 backward compat for bare dir names', () => {
+  it('preserves pre-v1.5.0 backward compat for bare dir names', () => {
     const config = defaultMatchConfig({ excludeGlobs: ['node_modules'] });
     // Pre-fix behaviour: push to excludeDirs. Verified by the absence
     // of a new filename/extension classification for a plain dir name.

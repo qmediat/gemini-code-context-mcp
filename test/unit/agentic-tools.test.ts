@@ -101,6 +101,38 @@ describe('sandbox: resolveInsideWorkspace', () => {
       /does not exist/,
     );
   });
+
+  // --- PR #24 review regressions ---
+
+  it('F#7: rejects a basename on the secret denylist case-insensitively (`.ENV`)', async () => {
+    writeFileSync(join(root, '.ENV'), 'API_KEY=secret');
+    await expect(resolveInsideWorkspace(root, '.ENV')).rejects.toThrow(/secret-basename denylist/);
+  });
+
+  it('F#7/F#12: rejects new secret extensions (`.jks`, `.gpg`, `.ppk`)', async () => {
+    writeFileSync(join(root, 'keystore.jks'), 'bin');
+    writeFileSync(join(root, 'secrets.gpg'), 'bin');
+    writeFileSync(join(root, 'id_rsa.ppk'), 'bin');
+    await expect(resolveInsideWorkspace(root, 'keystore.jks')).rejects.toThrow(
+      /secret-extension denylist/,
+    );
+    await expect(resolveInsideWorkspace(root, 'secrets.gpg')).rejects.toThrow(
+      /secret-extension denylist/,
+    );
+    await expect(resolveInsideWorkspace(root, 'id_rsa.ppk')).rejects.toThrow(
+      /secret-extension denylist/,
+    );
+  });
+
+  it('F#18: filename-on-default-exclude throws `EXCLUDED_FILENAME` (not reused `EXCLUDED_DIR`)', async () => {
+    writeFileSync(join(root, 'package-lock.json'), '{}');
+    try {
+      await resolveInsideWorkspace(root, 'package-lock.json');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILENAME');
+    }
+  });
 });
 
 describe('listDirectoryExecutor', () => {
@@ -232,6 +264,31 @@ describe('readFileExecutor', () => {
     writeFileSync(join(root, '.env'), 'SECRET=x');
     await expect(readFileExecutor(root, '.env')).rejects.toThrow(SandboxError);
   });
+
+  // --- PR #24 review regressions ---
+
+  it('F#5: returns a metadata stub for files > 1MB instead of allocating full buffer', async () => {
+    const big = 'x'.repeat(1_200_000); // 1.2 MB — above HARD_FILE_SIZE_LIMIT (1MB = 5×200k)
+    writeFileSync(join(root, 'huge.ts'), big);
+    const res = await readFileExecutor(root, 'huge.ts');
+    expect(res.truncated).toBe(true);
+    expect(res.truncationReason).toBe('max_bytes');
+    expect(res.totalBytes).toBeGreaterThan(1_000_000);
+    expect(res.content).toContain('file too large to inline');
+  });
+
+  it('F#13: UTF-8 truncation does not leave a lone replacement character', async () => {
+    // Build a file whose byte-trimmed last line would split a 4-byte
+    // emoji mid-rune. After the last-newline backtrack there should be
+    // no U+FFFD in the returned content.
+    const emoji = '😀'; // 4 bytes in UTF-8
+    const line = `const x = '${emoji.repeat(50)}'; // line\n`;
+    const big = line.repeat(3000); // ~600k bytes — forces byte-cap path
+    writeFileSync(join(root, 'unicode.ts'), big);
+    const res = await readFileExecutor(root, 'unicode.ts', 1, 10_000);
+    expect(res.truncated).toBe(true);
+    expect(res.content.includes('\uFFFD')).toBe(false);
+  });
 });
 
 describe('grepExecutor', () => {
@@ -280,5 +337,30 @@ describe('grepExecutor', () => {
     expect(res.matches.length).toBeLessThanOrEqual(AGENTIC_LIMITS.MAX_GREP_MATCHES);
     expect(res.truncated).toBe(true);
     expect(res.totalMatches).toBeGreaterThan(AGENTIC_LIMITS.MAX_GREP_MATCHES);
+  });
+
+  // --- PR #24 review regressions ---
+
+  it('F#10: rejects `pathPrefix` that points at a file (not dir) with NOT_A_DIRECTORY', async () => {
+    try {
+      await grepExecutor(root, 'foo', 'src/a.ts');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('NOT_A_DIRECTORY');
+    }
+  });
+
+  it('F#11: aborts walk past MAX_WALK_DEPTH and flags truncated', async () => {
+    // Build a 25-level deep nested chain (MAX_WALK_DEPTH=20). Walk must
+    // stop before exhausting the stack and set `truncated: true`.
+    let cur = root;
+    for (let i = 0; i < 25; i++) {
+      cur = join(cur, `d${i}`);
+      mkdirSync(cur);
+    }
+    writeFileSync(join(cur, 'deep.ts'), 'const deepNeedle = 1;');
+    const res = await grepExecutor(root, 'deepNeedle');
+    // Match not found (walk aborted before reaching it); truncated=true.
+    expect(res.truncated).toBe(true);
   });
 });
