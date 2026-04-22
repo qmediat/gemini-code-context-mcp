@@ -1,31 +1,36 @@
 /**
  * Application-level retry for transient network failures around Gemini API calls.
  *
- * Why this exists (two-layer gap in the SDK):
+ * Why this exists:
  *
- * 1. `@google/genai` retries HTTP status errors (408/429/500/502/503/504) ONLY
- *    when the client is constructed with `httpOptions.retryOptions`. Without
- *    that option the SDK falls through to a naked `fetch()` with no retry.
- *    `createGeminiClient` enables `retryOptions`, which addresses the status-
- *    code path.
+ * The SDK ships an optional retry wrapper that triggers ONLY when the client
+ * is constructed with `httpOptions.retryOptions`. `createGeminiClient`
+ * INTENTIONALLY omits that option — see `src/gemini/client.ts` for the
+ * rationale (SDK retry replaces Gemini's informative `ApiError` body with
+ * `"Non-retryable exception Bad Request sending request"`, which strips the
+ * structured `INVALID_ARGUMENT` details callers and the integration smoke
+ * test depend on). In the current configuration HTTP status errors therefore
+ * surface verbatim from the SDK; 429 rate-limits are handled at the tool
+ * layer via `isGemini429` + `parseRetryDelayMs` (`src/tools/shared/throttle.ts`);
+ * other status codes propagate to the caller as-is.
  *
- * 2. That SDK retry path delegates to `p-retry` 4.6.2. Its `isNetworkError`
- *    whitelist only matches browser-era error strings (`"Failed to fetch"`,
- *    `"NetworkError when attempting to fetch resource."`,
- *    `"The Internet connection appears to be offline."`,
- *    `"Network request failed"`). A `TypeError` whose message is outside that
- *    whitelist is routed to `operation.stop()` → reject, zero retries. Node 18+
- *    undici emits `TypeError: fetch failed` for every pre-response failure
- *    (TCP reset, DNS blip, TLS handshake timeout, connection abort); the
- *    string is NOT in the whitelist, so the SDK path cannot retry it even
- *    with `retryOptions` enabled.
+ * Even IF the SDK's retry path were enabled, it could not cover Node 18+
+ * undici's `TypeError: fetch failed`. The SDK delegates to `p-retry` 4.6.2,
+ * whose `isNetworkError` whitelist only matches browser-era strings
+ * (`"Failed to fetch"`, `"NetworkError when attempting to fetch resource."`,
+ * `"The Internet connection appears to be offline."`, `"Network request failed"`).
+ * Any `TypeError` outside that whitelist — including undici's
+ * `"fetch failed"` emitted for every pre-response failure (TCP reset, DNS
+ * blip, TLS handshake timeout, connection abort) — is routed to
+ * `operation.stop()` → reject with zero retries.
  *
- * `withNetworkRetry` covers gap #2 by catching `TypeError: fetch failed` (and
- * common errno codes surfaced via `err.cause.code`) at the application layer
- * and retrying with exponential backoff. Non-transient errors (auth failures,
- * schema rejections, HTTP status errors — those already carry a numeric
- * `.status` handled by the SDK layer) propagate immediately so no retry budget
- * is spent on permanent failures.
+ * `withNetworkRetry` catches `TypeError: fetch failed` (and common errno
+ * codes surfaced via `err.cause.code`) at the application layer and retries
+ * with exponential backoff. Non-transient errors (auth failures, schema
+ * rejections, HTTP status errors — those carry a numeric `.status` that this
+ * module deliberately treats as permanent so no retry budget is wasted and
+ * no double-retry stacks with any future SDK-side retry we might opt into)
+ * propagate immediately.
  */
 
 export interface NetworkRetryOptions {
