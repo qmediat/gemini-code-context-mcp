@@ -41,6 +41,7 @@ import type {
 import { Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
+import { withNetworkRetry } from '../gemini/retry.js';
 import {
   WorkspaceValidationError,
   validateWorkspacePath,
@@ -725,11 +726,30 @@ async function runAgenticIteration(args: {
     maxFilesRead,
   } = args;
 
-  const response = await ctx.client.models.generateContent({
-    model: resolvedModel,
-    contents: conversation,
-    config: baseConfig,
-  });
+  // Each agentic iteration is its own `generateContent` call; a transient
+  // pre-response network failure in the middle of a long loop (default 20
+  // iterations) would otherwise discard partial progress. `withNetworkRetry`
+  // covers `TypeError: fetch failed` (see `src/gemini/retry.ts` for the
+  // rationale — SDK-side retry is intentionally disabled because enabling it
+  // strips Gemini's informative error bodies; 429 rate-limits continue to be
+  // handled at the tool layer via `isGemini429` + `parseRetryDelayMs`).
+  const response = await withNetworkRetry(
+    () =>
+      ctx.client.models.generateContent({
+        model: resolvedModel,
+        contents: conversation,
+        config: baseConfig,
+      }),
+    {
+      onRetry: (attempt, err) => {
+        logger.warn(
+          `ask_agentic: retrying generateContent after transient network failure (attempt ${attempt}): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      },
+    },
+  );
 
   const usage = response.usageMetadata;
   const usageOut = {
