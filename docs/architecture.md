@@ -34,6 +34,7 @@ Thin wrapper over the `@google/genai` SDK:
 - `client.ts` constructs `new GoogleGenAI(...)` from the resolved profile.
 - `model-registry.ts` enumerates models via `client.models.list()` with a 1-hour in-process cache.
 - `models.ts` resolves aliases (`latest-pro`, etc.) to the best available model or falls back with a logged warning.
+- `retry.ts` wraps `generateContent` calls in `withNetworkRetry` to ride out Node undici's `TypeError: fetch failed` — a pre-response failure shape the SDK's pinned `p-retry` 4.6.2 treats as non-retryable. Exponential backoff (1s → 3s → 9s, 3 attempts); non-transient errors (`.status`-bearing, `AbortError`, validation) propagate on the first failure. See [`./KNOWN-DEFICITS.md`](./KNOWN-DEFICITS.md) for the upstream-dependency rationale.
 
 ### `src/indexer/`
 
