@@ -42,7 +42,7 @@
 |---|---|---|
 | **Nazwa pakietu npm** | `@qmediat.io/gemini-code-context-mcp` | "bridge" = wyraźny produkt; Grok's framing; inne niż `gemini-cli-mcp` (commodity) |
 | **Repo** | `github.com/qmediat/gemini-code-context-mcp` | match |
-| **Folder lokalny** | `~/MCP-Servers/gemini-code-context-mcp/` | distinct od `gemini-cli/` (stary jamubc) |
+| **Folder lokalny** | `<local-dev-checkout>` | distinct od upstream `gemini-cli/` (jamubc) |
 | **Licencja** | MIT | qmediat standard |
 | **Node target** | `>=22.0.0` | qmediat standard |
 | **Język** | TypeScript strict mode | qmediat standard |
@@ -215,7 +215,7 @@ CREATE TABLE usage_metrics (
 ## Struktura folderu
 
 ```
-~/MCP-Servers/gemini-code-context-mcp/
+gemini-code-context-mcp/
 ├── PLAN.md                             # kopia tego planu
 ├── README.md                           # marketing (patrz niżej)
 ├── LICENSE                             # MIT, Quantum Media Technologies sp. z o.o.
@@ -353,7 +353,7 @@ Sekcje:
 ## Implementation phases (2 tygodnie ship)
 
 ### Phase 0 — Bootstrap (0.5 dnia)
-1. `mkdir ~/MCP-Servers/gemini-code-context-mcp/`, skopiuj PLAN.md.
+1. `mkdir <project-dir>/gemini-code-context-mcp/`, skopiuj PLAN.md.
 2. `gh repo create qmediat/gemini-code-context-mcp --public --license mit`.
 3. Setup: package.json (scope `@qmediat.io`), tsconfig strict, biome, vitest, struktura src.
 4. CI skeleton.
@@ -470,7 +470,7 @@ Sekcje:
 ## Critical files (reference)
 
 **Research source (jamubc, MIT license, inspection only):**
-- `/Users/mikeb/MCP-Servers/gemini-cli/node_modules/gemini-mcp-tool/dist/` — reference dla keepalive pattern, progress notification cycling, MCP schema patterns
+- `<ref-checkout>/gemini-mcp-tool/dist/` (from upstream jamubc `gemini-cli`) — reference dla keepalive pattern, progress notification cycling, MCP schema patterns
 
 **Google docs cited (all verified URLs):**
 - Context caching guide: https://ai.google.dev/gemini-api/docs/caching/
@@ -485,7 +485,7 @@ Sekcje:
 
 **Phase 3 (cache manager):**
 ```bash
-cd ~/MCP-Servers/gemini-code-context-mcp
+cd <repo-root>
 GEMINI_API_KEY=$GEMINI_API_KEY npm test -- test/integration/real-gemini.smoke.test.ts
 ```
 Oczekiwane: upload 5 testowych plików, build cache, follow-up query hits cache, `status` pokazuje `cache_hits > 0`.

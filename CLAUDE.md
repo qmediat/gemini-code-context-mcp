@@ -27,7 +27,17 @@ sh: gemini-code-context-mcp: command not found
 
 Reason: this repo's `package.json` declares the same name as the npm package. `npx` treats the source repo as the install target, finds no matching bin in local `node_modules/.bin/`, and bails. The package itself is fine — end users running from their own project dirs never see this.
 
-**Workaround for local MCP testing:** see `CONTRIBUTING.md` → *Local MCP setup*. Point your MCP host at the local build (`node ./dist/index.js`) instead of npx, OR set `cwd` outside the repo in your MCP config.
+**Recommended patterns for maintainers** (any of these avoids the conflict):
+
+1. **Global install** (simplest, decoupled from the repo entirely):
+   ```bash
+   npm install -g @qmediat.io/gemini-code-context-mcp
+   # MCP config: "command": "gemini-code-context-mcp"
+   ```
+2. **Point MCP host at the local build** — see `CONTRIBUTING.md` → *Local MCP setup*. Use `node ./dist/index.js` so no npx resolution happens.
+3. **Run `npx -y` from outside the repo** — set `cwd` in your MCP config to anywhere that isn't a sibling/parent of this repo.
+
+The gotcha is purely about cwd ≠ repo-root for `npx` resolution; nothing in the package itself is broken.
 
 ## Internal notes
 
