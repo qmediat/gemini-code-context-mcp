@@ -18,6 +18,7 @@ import type {
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
+import { withNetworkRetry } from '../gemini/retry.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -500,11 +501,27 @@ async function executeAskBody(
     let retriedOnStaleCache = false;
     let response: GenerateContentResponse;
     try {
-      response = await ctx.client.models.generateContent({
-        model: resolved.resolved,
-        contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
-        config: buildConfig(activePrep.cacheId),
-      });
+      // `withNetworkRetry` covers pre-response transient failures
+      // (`TypeError: fetch failed`). See `src/gemini/retry.ts` for the full
+      // rationale; 429 rate-limits continue to be handled at the tool layer
+      // via `isGemini429` + `parseRetryDelayMs`.
+      response = await withNetworkRetry(
+        () =>
+          ctx.client.models.generateContent({
+            model: resolved.resolved,
+            contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
+            config: buildConfig(activePrep.cacheId),
+          }),
+        {
+          onRetry: (attempt, retryErr) => {
+            logger.warn(
+              `ask: retrying generateContent after transient network failure (attempt ${attempt}): ${
+                retryErr instanceof Error ? retryErr.message : String(retryErr)
+              }`,
+            );
+          },
+        },
+      );
     } catch (err) {
       // Self-heal: if Gemini rejected our cached content (evicted, expired,
       // externally deleted), invalidate locally and retry ONCE with a fresh
@@ -545,11 +562,25 @@ async function executeAskBody(
             throttleReservationId = -1;
           }
           await reserveForDispatch();
-          response = await ctx.client.models.generateContent({
-            model: resolved.resolved,
-            contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-            config: buildConfig(rebuilt.cacheId),
-          });
+          // The stale-cache retry itself can hit a transient network failure;
+          // wrap it too so the rebuild isn't wasted on a one-off blip.
+          response = await withNetworkRetry(
+            () =>
+              ctx.client.models.generateContent({
+                model: resolved.resolved,
+                contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
+                config: buildConfig(rebuilt.cacheId),
+              }),
+            {
+              onRetry: (attempt, retryErr) => {
+                logger.warn(
+                  `ask (stale-cache retry): retrying generateContent after transient network failure (attempt ${attempt}): ${
+                    retryErr instanceof Error ? retryErr.message : String(retryErr)
+                  }`,
+                );
+              },
+            },
+          );
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {

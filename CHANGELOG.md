@@ -45,6 +45,23 @@ Four-way re-review of PR #24 (GPT + Gemini + Grok + Copilot) on the round-2 comm
 - Test suite: **393 tests** after round-4 regressions (8 new: eager case-insensitive × 4, agentic ext gate × 2, ENOTDIR × 2, durationMs × 1), all passing under lint + typecheck + build.
 - Round-4 also applied the `i` flag to `globToRegExp` so user-supplied patterns like `**/*.ts` match `App.TS` on case-insensitive FS — true parity with the lowercased include-ext gate.
 
+## [1.5.1] — 2026-04-22
+
+### Fixed
+
+- **`TypeError: fetch failed` no longer crashes long-running Gemini API calls.** Node 18+ undici emits `TypeError: fetch failed` for every pre-response network failure (TCP reset, DNS blip, TLS handshake timeout, connection abort mid-stream). The `@google/genai` SDK's built-in retry path cannot handle this: `p-retry` 4.6.2 (pinned by the SDK) only recognises browser-era network-error strings (`"Failed to fetch"`, `"Network request failed"`, …) and routes any other `TypeError` straight to `operation.stop()` — zero retries. For `ask_agentic` this was especially painful because each invocation runs up to 20 `generateContent` iterations; at an empirical ~1% per-call transient rate, roughly 1 in 5 big-repo runs would hit a dropout and discard all completed iterations. `ask` / `code` had the same gap on their single call.
+
+  New module `src/gemini/retry.ts` adds `withNetworkRetry(fn, opts)` wrapping every direct `generateContent` call in `ask`, `code`, and `ask_agentic` (including the `ask` / `code` stale-cache retry paths). Default policy: 3 attempts with exponential backoff (1s → 3s → 9s). `isTransientNetworkError` matches `TypeError: fetch failed` plus common errno codes surfaced via `err.cause.code` (`ECONNRESET`, `ECONNREFUSED`, `ETIMEDOUT`, `EAI_AGAIN`, `ENETUNREACH`, `ENETDOWN`, `EHOSTUNREACH`, `EPIPE`, `socket hang up`, `network socket disconnected`). Non-transient errors (auth failures, schema rejections, HTTP status errors — those carry a numeric `.status` and are handled upstream) propagate on the first failure so no retry budget is wasted on permanent problems.
+
+### Changed
+
+- **`createGeminiClient` intentionally does NOT enable `httpOptions.retryOptions`.** Briefly tried during v1.5.1 development; the SDK's retry path wraps responses via `p-retry`, replacing Gemini's informative error body (e.g. `ApiError: {"error":{"code":400,"status":"INVALID_ARGUMENT",…}}`) with a generic `"Non-retryable exception Bad Request sending request"` that strips the `INVALID_ARGUMENT` details callers and the integration smoke test rely on. Since `p-retry` 4.6.2 also cannot handle the actual pain point (`TypeError: fetch failed`), enabling SDK retry adds no benefit and costs error clarity. 429 rate-limit handling continues to live at the tool layer via `isGemini429` + `parseRetryDelayMs` in `src/tools/shared/throttle.ts`, which preserves the original error shape.
+
+### Developer notes
+
+- Test suite: **407 tests** (14 new covering `isTransientNetworkError` classification + `withNetworkRetry` behaviour incl. backoff timing, attempt clamping, and the `onRetry` hook). All passing under lint + typecheck + build.
+- Known limitation documented in [`docs/KNOWN-DEFICITS.md`](./docs/KNOWN-DEFICITS.md) — once `@google/genai` updates its pinned `p-retry` to 6.x (which uses `is-network-error` and recognises Node undici errors natively), application-level retry coverage can be scoped down to whatever the SDK still misses.
+
 ## [1.5.0] — 2026-04-21
 
 Three independent improvements shipping together. The common thread: oversized workspaces previously surfaced as opaque `400 INVALID_ARGUMENT` from Gemini, got misinterpreted as retryable by orchestrators, and drained tool-call budgets in a retry storm. This release attacks that failure class at three layers.

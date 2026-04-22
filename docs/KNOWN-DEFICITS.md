@@ -196,3 +196,30 @@ A related but distinct race lives in `prepareContext` itself: if both instances 
 **Workaround:** Operators can lower the floor via `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS=700` (or similar) to make the server attempt caching on workspaces our estimate says are borderline. The SDK try/catch still catches real rejections.
 
 **Revisit trigger:** First real-world benchmark showing the estimator systematically blocking caching for workspaces that would benefit.
+
+---
+
+## `@google/genai` SDK retry path cannot recognise Node undici `TypeError: fetch failed`
+
+**Source:** v1.5.1 root-cause investigation — transient `fetch failed` in `ask_agentic` surfaced twice in production on a real-world large-repo review, with no SDK-level retry kicking in despite the availability of `httpOptions.retryOptions`.
+
+**Status:** Mitigated at the application layer (`src/gemini/retry.ts` → `withNetworkRetry`), which wraps every `generateContent` call in `ask`, `code`, and `ask_agentic`. Upstream dependency limitation documented here so the application retry can be scoped down once the SDK fixes it.
+
+**What is the issue?** `@google/genai` 1.50.x delegates its optional retry wrapper to `p-retry` 4.6.2 (pinned via the SDK's own `package.json`). `p-retry` 4.6.2's `isNetworkError` whitelist is browser-era only:
+
+```js
+const networkErrorMsgs = [
+    'Failed to fetch',                                    // Chrome
+    'NetworkError when attempting to fetch resource.',    // Firefox
+    'The Internet connection appears to be offline.',     // Safari
+    'Network request failed',                             // cross-fetch
+];
+```
+
+Any `TypeError` whose message is outside this list is routed to `operation.stop()` → immediate reject, zero retries. Node 18+ undici (Node's built-in `fetch`) emits `TypeError: fetch failed` for EVERY pre-response failure — TCP reset, DNS hiccup, TLS handshake timeout, connection aborted mid-stream, upstream brief connection drop. That string is NOT in the whitelist, so the SDK cannot retry it even when the caller opts into `httpOptions.retryOptions`.
+
+**Why we do not enable `httpOptions.retryOptions` in `createGeminiClient`:** Briefly tried during v1.5.1 development. The SDK's retry path wraps responses through `p-retry`, and for non-retryable HTTP statuses (400 / 401 / 403 …) it replaces the informative Gemini error body (`ApiError: {"error":{"code":400,"status":"INVALID_ARGUMENT", …}}`) with `"Non-retryable exception Bad Request sending request"` — stripping the structured details our integration smoke test and user-visible error messages rely on. Since `p-retry` 4.6.2 also fails to address the actual transient case (`TypeError: fetch failed`), turning SDK retry on costs error clarity for zero benefit.
+
+**Impact today:** None for users running v1.5.1+ — `withNetworkRetry` covers the gap. Older releases would drop a long `ask_agentic` run on a single transient network blip (empirical ~18–26 % per invocation at 20–30 iterations with 1 % per-call transient rate).
+
+**Revisit trigger:** `@google/genai` bumps its `p-retry` dependency to 6.x (which uses the `is-network-error` package and recognises Node undici errors natively). At that point the app-layer retry can be narrowed — either to HTTP status codes the SDK still misses, or removed entirely. Track upstream via `@google/genai` release notes.
