@@ -278,14 +278,20 @@ describe('workspaceGuardRatio env clamping', () => {
     // loadConfig's clamp) and confirm the guard still fires when the
     // tool reads the value — i.e. the tool doesn't do its own clamp,
     // it trusts `config.workspaceGuardRatio` which must be pre-clamped
-    // by loadConfig. So this test really validates loadConfig.
+    // by loadConfig.
     //
-    // We exercise `loadConfig` to prove the clamp works.
-    process.env.GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO = '99';
+    // `vi.stubEnv` is used over raw `process.env` mutation so Vitest
+    // auto-restores on assertion failure + isolates parallel workers.
+    // The fake `GEMINI_API_KEY` is needed because `loadConfig` also
+    // invokes `resolveAuth` which throws on missing credentials — CI
+    // (no secret) hit that throw before ratio-clamp logic could run.
+    // PR #24 round-4 (external review confirmed by GPT-5.3-codex + Gemini 3-pro).
+    vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
+    vi.stubEnv('GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO', '99');
     const { loadConfig } = await import('../../src/config.js');
     const config = loadConfig();
     expect(config.workspaceGuardRatio).toBeLessThanOrEqual(0.98);
     expect(config.workspaceGuardRatio).toBeGreaterThanOrEqual(0.5);
-    Reflect.deleteProperty(process.env, 'GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO');
+    vi.unstubAllEnvs();
   });
 });
