@@ -512,3 +512,91 @@ describe('PR #24 review regressions — compat guards & final-text (F#6, F#9)', 
     expect(result.structuredContent?.overBudget).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// v1.5.1 — transient network retry at the loop layer
+// ---------------------------------------------------------------------------
+//
+// Belt-and-suspenders integration coverage to pair with the in-isolation unit
+// tests in `test/unit/gemini-retry.test.ts`. These exercise the full
+// `ask_agentic` loop under a mocked `generateContent` that rejects with the
+// exact Node undici `TypeError: fetch failed` shape. The loop controller itself
+// is unaware of retries — `withNetworkRetry` wraps `generateContent` inside
+// `runAgenticIteration`, so a successful recovery looks like a single iteration
+// from the loop's perspective, and an exhausted retry budget surfaces via the
+// top-level `errorResult({ errorCode: 'UNKNOWN' })` path.
+
+describe('ask_agentic loop — transient network retry (v1.5.1)', () => {
+  it('recovers from one transient `TypeError: fetch failed` and completes the answering iteration', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-retry-'));
+    writeFileSync(join(root, 'index.ts'), 'export const x = 1;');
+
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    // Fully control the mock queue so order is: reject → resolve.
+    generateContent.mockReset();
+    generateContent.mockRejectedValueOnce(new TypeError('fetch failed'));
+    generateContent.mockResolvedValueOnce(
+      buildResponse({ text: 'One file: index.ts defines `x`.' }),
+    );
+
+    // Real timers — single retry means one 1s backoff, acceptable for a test.
+    const result = await askAgenticTool.execute(
+      { prompt: 'what is in this repo?', workspace: root },
+      ctx,
+    );
+
+    // Loop sees exactly one completed iteration; the retry is internal to
+    // `runAgenticIteration` and opaque to the outer controller.
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.iterations).toBe(1);
+    expect(result.content[0]?.text).toContain('index.ts');
+    // SDK was hit twice — first rejected, second succeeded.
+    expect(generateContent).toHaveBeenCalledTimes(2);
+  }, 15_000);
+
+  it('surfaces a structured error when the retry budget exhausts on persistent failure', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-retry-'));
+    writeFileSync(join(root, 'index.ts'), 'export const x = 1;');
+
+    vi.useFakeTimers();
+    try {
+      const { ctx, generateContent } = buildCtx({ script: [] });
+      generateContent.mockReset();
+      // Every call rejects with the undici transient shape → withNetworkRetry
+      // exhausts its 3-attempt budget and re-throws.
+      generateContent.mockRejectedValue(new TypeError('fetch failed'));
+
+      const resultPromise = askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+      // Flush both backoff waits (1s then 3s) plus any pending microtasks.
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(3_000);
+      const result = await resultPromise;
+
+      expect(result.isError).toBe(true);
+      expect(String(result.content[0]?.text)).toMatch(/ask_agentic failed.*fetch failed/i);
+      expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+      // Three attempts: initial + 2 retries = 3 generateContent calls.
+      expect(generateContent).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does NOT retry permanent failures (no .status, no fetch-failed shape)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-retry-'));
+    writeFileSync(join(root, 'index.ts'), 'export const x = 1;');
+
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    // A plain validation-shaped error must propagate on the first failure so
+    // we do not spend retry budget on permanent problems.
+    generateContent.mockRejectedValue(new Error('INVALID_ARGUMENT: bad schema'));
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(String(result.content[0]?.text)).toContain('INVALID_ARGUMENT');
+    // Exactly one call — zero retries on non-transient errors.
+    expect(generateContent).toHaveBeenCalledTimes(1);
+  });
+});
