@@ -16,7 +16,7 @@ An MCP (Model Context Protocol) server that wraps Google's Gemini API with **per
 
 |  | [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool) | **`@qmediat.io/gemini-code-context-mcp`** |
 |---|---|---|
-| Maintenance | Abandoned (last release 2025-07) | Actively maintained |
+| Maintenance | Unmaintained on npm since 2025-07 (v1.1.4); last commit on `main` 2025-07-23; no maintainer reply on 2026 issues (#49/#62/#64 at time of writing) | Actively maintained |
 | Default model | Hardcoded `gemini-2.5-pro` (main) — no runtime override | Dynamic `latest-pro` alias — resolves against your API key tier at startup |
 | Backend | Shells out to `gemini` CLI (subprocess per call) | Direct `@google/genai` SDK |
 | Repeat queries | No caching layer — each call re-tokenises referenced files | **Files API + Context Cache** — repeat queries reuse the indexed codebase; cached input tokens billed at ~25 % of the uncached rate |
@@ -48,7 +48,7 @@ npx @qmediat.io/gemini-code-context-mcp init
 #    > Use gemini-code-context.ask to summarize this codebase
 ```
 
-First query: ~30–45 s (scan + upload + cache build). Every follow-up: ~2–3 s.
+First query: ~45 s – 2 min depending on workspace size (scan + Files API upload + cache build). Every follow-up (cache hit): ~13–16 s on `latest-pro-thinking` with `thinkingLevel: LOW`, faster on `latest-flash`. Measured on `vitejs/vite@main`'s `packages/vite/` (~670 k tokens, 451 files): cold 125 s, warm ~14 s, $0.60 cached vs $2.35 inline per query (~8× faster, ~4× cheaper on cache hit). Thinking budget dominates warm latency — `HIGH` thinking adds 15–45 s per call on top of the cache-hit floor. Raw ledger reproducible via the `status` tool.
 
 See [`docs/getting-started.md`](./docs/getting-started.md) for a 3-minute walkthrough.
 
@@ -70,8 +70,8 @@ All tools accept an optional `workspace` path (defaults to `cwd`), `model` alias
 | | `ask` (eager) | `ask_agentic` |
 |---|---|---|
 | Workspace size | ≤ ~900 k tokens | any — model reads what it needs |
-| First query | 30–45 s (upload + cache build) | 5–15 s (no upload) |
-| Repeat queries | ~2–3 s (cache hit) | 10–30 s (new tool-use iterations per question) |
+| First query | ~45 s – 2 min (upload + cache build; 125 s measured on 670 k-token workspace) | 5–15 s (no upload) |
+| Repeat queries | ~13–16 s on pro-thinking LOW, faster on flash-tier (cache hit) | 10–30 s (new tool-use iterations per question) |
 | Per-call tokens | Full repo in cached input | Only files the model opens |
 | Best for | Many questions on same repo | One-off questions on huge repos, or repos with large generated files |
 
@@ -176,7 +176,7 @@ Full threat model + incident response: [`docs/security.md`](./docs/security.md).
 
 ## Cost model
 
-Projected savings vs uncached usage on a 500 k-token repo with 20 queries/day: up to **~60 % lower spend** with cache enabled, with repeat-query latency typically an order of magnitude lower than the first (uncached) call. Actual numbers depend on repo size, TTL, and query volume — we'll publish measured benchmarks after the first real-world deployments.
+Measured 2026-04-22 on `vitejs/vite@main`'s `packages/vite/` (~670 k tokens, 451 files, Gemini 3.1 Pro, `thinkingLevel: LOW`): **$0.60 per cached query vs $2.35 per inline query — ~75 % cheaper on cache hit**, with cold-call latency ~125 s and warm-call latency ~14 s (~8× speedup). At 20 queries/day on this workspace that's **$35/day saved per developer** ($12 cached vs $47 inline). Actual numbers scale with workspace tokens × queries/day × thinking budget.
 
 Per-tool cost breakdown, free-tier guidance, and all the knobs: [`docs/cost-model.md`](./docs/cost-model.md).
 

@@ -5,6 +5,26 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-04-22
+
+### Added
+
+- **`mcpName` field in `package.json`** — set to `io.github.qmediat/gemini-code-context-mcp`. Required by the [Official MCP Registry](https://github.com/modelcontextprotocol/registry) for verified package publishing. The Registry's `mcp-publisher` tool reads this value to match the server's metadata against its npm package. GitHub-auth-scoped names must start with `io.github.<org>/`; this value locks the server to the `qmediat` GitHub org.
+
+### Changed
+
+- **README comparison table and cost-model section now cite measured benchmark data** (2026-04-22, `vitejs/vite@main`'s `packages/vite/`, ~670 k tokens across 451 files, `gemini-pro-latest` with `thinkingLevel: LOW`):
+  - First query (cold, cache build): **~125 s** at **$0.60**
+  - Repeat query (cache hit): **~14 s** (mean of 15.6 and 13.5) at **$0.60**
+  - Inline baseline (`noCache: true`, files embedded in prompt): **~20 s** at **$2.35**
+  - **Speedup cache-vs-cold: ~8×.** Cost cache-vs-inline: **~4× cheaper (~75 % reduction)**. Daily saving at 20 queries/day on this workspace: **~$35/day per developer**.
+  - Previous README claims of "~30–45 s first call" and "~2–3 s follow-up" were aspirational / scoped to `latest-flash`; the new copy scopes latency to the thinking level and workspace size and links to reproducible ledger output via the `status` tool.
+- **README wording on the `jamubc/gemini-mcp-tool` comparison row** softened from "Abandoned" to "Unmaintained on npm since 2025-07 (v1.1.4); last commit on `main` 2025-07-23; no maintainer reply on 2026 issues (#49/#62/#64)". Factual and specific rather than pejorative. Matches the project's "absorb orphan users, don't attack the original" positioning.
+
+### Rationale
+
+This is a **docs + registry-metadata patch**. No runtime behaviour, no API surface, no new env vars, no breaking changes. Safe for any consumer to pick up on next `npx -y` cache refresh or `npm update -g`. The `mcpName` field is read by the Registry publisher only; runtime ignores it.
+
 ## [Unreleased]
 
 ### Fixed (v1.5.0 PR #24 round-2 review — 11 findings, applied before release)
