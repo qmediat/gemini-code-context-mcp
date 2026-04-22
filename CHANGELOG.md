@@ -23,9 +23,27 @@ Three-way re-review of PR #24 (GPT + Gemini + Grok + self-review + Copilot) surf
 - **P3 Test hygiene — `process.env` cleanup.** `preflight-guard.test.ts` cleaned up with `process.env.X = undefined`, which in Node coerces to the string `"undefined"` rather than deleting. Switched to `Reflect.deleteProperty(process.env, 'X')` — semantically correct delete without triggering Biome's `noDelete` rewrite.
 - **P3 Module-header comment accuracy.** `workspace-tools.ts` header claimed all four executors enforce a `≤ 500 000 bytes` response cap. Only `grep` has a byte cap; `list_directory` and `find_files` cap by entry count (`MAX_LIST_ENTRIES`, `MAX_FIND_MATCHES`). Comment corrected.
 
+### Fixed (v1.5.0 PR #24 round-3 review — 10 findings, applied before release)
+
+Four-way re-review of PR #24 (GPT + Gemini + Grok + Copilot) on the round-2 commit surfaced 10 more findings. Round-2 case-insensitive fix was applied to the agentic sandbox but missed the eager-path mirror, plus a spread of doc-drift from the round-2 `.map` semantic flip that needed catching up.
+
+- **P1 Case-insensitive default-exclude — EAGER path.** Round-2 closed this in `sandbox.ts` + `workspace-tools.ts` (agentic) but left `src/indexer/globs.ts#isPathExcluded` + `isFileIncluded` strictly case-sensitive. On macOS (APFS) / Windows (NTFS) case-insensitive FS, `Node_Modules/` or `.NPMRC` slipped through and got uploaded to Gemini Context Cache in the eager `ask`/`code` flow — the same vulnerability we claimed to close in round-2, still wide open on the primary code path. Both functions now lowercase-on-both-sides for every comparison (dirs, filenames, exclude extensions, include extensions). Gemini P1.
+- **P2 `find_files` + `grep` include-extension gate case-sensitive.** `readFileExecutor` was already case-insensitive; the two walk-based executors used raw `entry.name`. Net effect: `App.TS` or `Page.JSX` is readable by the model via `read_file` but hidden from `find_files` / `grep` — inconsistent sandbox view. Both executors now lowercase `entry.name` before the extension check. Gemini P2.
+- **P1 `ask_agentic` `finalizeBudgetReservation` passed `durationMs: 0`.** `ask` / `code` pass real wall time; agentic copy-pasted a `0` literal, so every manifest row for agentic iterations showed zero latency — broke any analytics that AVG `duration_ms` or anomaly-detect slow iterations. Per-iteration timing wrapper (`Date.now()` before/after `runAgenticIteration`) now yields truthful manifest data. Copilot P1.
+- **P1 `listDirectoryExecutor` misclassified `ENOTDIR` as `NOT_FOUND`.** `readdir` on a regular file throws with `err.code === 'ENOTDIR'`; the blanket catch mapped everything to `NOT_FOUND`, so the model saw "path missing" and retried with different aliases instead of realising "use `read_file`, this is a file". Taxonomy now matches `grep`'s `pathPrefix` (already returns `NOT_A_DIRECTORY`). Copilot P1.
+- **P2 Doc / schema drift from round-2 `.map` semantic flip (5 places).** Round-2 flipped bare `.map` from extension-bucket → filename-bucket but the surrounding surface still advertised the old semantics in five locations:
+  - `src/tools/ask.tool.ts:86` — Zod `excludeGlobs` description (user-facing MCP tool doc)
+  - `src/tools/code.tool.ts:109` — same, mirrored
+  - `src/indexer/globs.ts` MatchConfig `excludeExtensions` field TSDoc
+  - `src/indexer/globs.ts` `normalizeExcludeGlob` function docstring "Supported shapes"
+  - `CHANGELOG.md` — v1.5.0 "Changed" bullet
+
+  All five updated to state: `*.ext` → extension (endsWith), bare `.ext` / `.env` → filename (exact-match). Copilot P2 (×5), GPT P1 (same root cause, observed at the contract layer).
+
 ### Developer notes
 
-- Test suite: **385 tests** (11 new regression tests for the round-2 findings above), all passing under lint + typecheck + build.
+- Test suite: **393 tests** after round-4 regressions (8 new: eager case-insensitive × 4, agentic ext gate × 2, ENOTDIR × 2, durationMs × 1), all passing under lint + typecheck + build.
+- Round-4 also applied the `i` flag to `globToRegExp` so user-supplied patterns like `**/*.ts` match `App.TS` on case-insensitive FS — true parity with the lowercased include-ext gate.
 
 ## [1.5.0] — 2026-04-21
 
@@ -48,8 +66,8 @@ Three independent improvements shipping together. The common thread: oversized w
 ### Changed
 
 - **`excludeGlobs` now interprets patterns as **glob shapes**, not literal directory names.** Before v1.5.0 every user pattern was force-pushed to `excludeDirs`, so `*.tsbuildinfo`, `*.patch`, `*-diff.txt` silently matched nothing. `normalizeExcludeGlob()` now classifies:
-  - `*.tsbuildinfo`, `.map` → extension bucket
-  - `pr27-diff.txt`, literal filenames → filename bucket
+  - `*.tsbuildinfo`, `*.map` → extension bucket (requires the explicit `*.` prefix)
+  - `.map`, `.env`, `.tsbuildinfo`, `pr27-diff.txt`, literal filenames → filename bucket (bare dot-prefixed names are exact-match, not extension globs; write `*.env` for endsWith semantics)
   - `node_modules`, `src/vendor` → directory bucket
   - `.vercel/`, `.next/`, `dist/` → directory bucket (trailing `/` forces dir intent even when the stripped form looks like an extension — **regression from review round 1**)
   - POSIX normalisation: backslashes → `/`, leading `./` and trailing `/` stripped before classification

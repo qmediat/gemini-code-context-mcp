@@ -528,6 +528,7 @@ async function executeAskAgenticBody(
       }
 
       let iterResult: Awaited<ReturnType<typeof runAgenticIteration>>;
+      const iterStarted = Date.now();
       try {
         iterResult = await runAgenticIteration({
           ctx,
@@ -552,8 +553,13 @@ async function executeAskAgenticBody(
         }
         throw iterErr;
       }
+      const iterDurationMs = Date.now() - iterStarted;
 
       // Finalise budget reservation with actual cost from usage metadata.
+      // `durationMs` is per-iteration wall time (matching `ask`/`code`), so
+      // the manifest row reflects real latency — agentic loops used to write
+      // `0` here, breaking usage-analytics queries (PR #24 round-4,
+      // Copilot P1).
       if (reservationId !== null) {
         const actualCost = estimateCostUsd({
           model: resolved.resolved,
@@ -567,7 +573,7 @@ async function executeAskAgenticBody(
             cachedTokens: 0,
             uncachedTokens: iterResult.usage.promptTokenCount,
             costUsdMicro: toMicrosUsd(actualCost),
-            durationMs: 0,
+            durationMs: iterDurationMs,
           });
         } catch (finalizeErr) {
           logger.error(

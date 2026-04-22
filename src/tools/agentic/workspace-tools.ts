@@ -105,7 +105,13 @@ function globToRegExp(glob: string): RegExp {
     .replace(/\*/g, '[^/]*') // single `*` → no-slash segment
     .replace(/\uE000/g, '(?:.*/)?') // dir-boundary expansion
     .replace(/\uE001/g, '.*'); // bare globstar
-  return new RegExp(`^${pattern}$`);
+  // `i` flag: macOS (APFS) and Windows (NTFS) default to case-insensitive
+  // filesystems — so `App.TS` and `app.ts` refer to the same inode. The
+  // extension-gate lowercasing (above) handles the include-ext check, but
+  // the user-supplied pattern still needs case-insensitive matching here,
+  // otherwise `**/*.ts` skips `App.TS` even though `read_file` would allow
+  // it (PR #24 round-4, Gemini P2 — true parity with readFileExecutor).
+  return new RegExp(`^${pattern}$`, 'i');
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +145,21 @@ export async function listDirectoryExecutor(
   try {
     rawEntries = await readdir(target.absolutePath, { withFileTypes: true, encoding: 'utf8' });
   } catch (err) {
+    // Distinguish "path exists but is a file" from "path missing" — same
+    // taxonomy grep's `pathPrefix` already uses. Blanket NOT_FOUND here
+    // misled the model into retrying a non-existent alias when the real
+    // fix was calling `read_file`. PR #24 round-4 review (Copilot P1).
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code?: unknown }).code)
+        : undefined;
+    if (code === 'ENOTDIR') {
+      throw new SandboxError(
+        'NOT_A_DIRECTORY',
+        `${target.relpath || '.'} is a file, not a directory — use read_file instead`,
+        relPath,
+      );
+    }
     throw new SandboxError('NOT_FOUND', `cannot list: ${String(err)}`, relPath);
   }
 
@@ -251,9 +272,15 @@ export async function findFilesExecutor(
       // Only surface paths with at least one include-ext match — otherwise
       // binary / generated files slip through find_files into the model's
       // conversation even though `read_file` would reject them.
+      //
+      // Case-insensitive to mirror `readFileExecutor` (PR #24 round-4
+      // review by Gemini P2): otherwise `App.TS` / `Page.JSX` are readable
+      // but hidden from find_files/grep, leaving the model with an
+      // inconsistent view of the workspace.
+      const lowerName = entry.name.toLowerCase();
       const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
-        if (ext.startsWith('.')) return entry.name.endsWith(ext);
-        return entry.name === ext;
+        if (ext.startsWith('.')) return lowerName.endsWith(ext);
+        return lowerName === ext;
       });
       if (!hasIncludeExt) continue;
 
@@ -537,9 +564,11 @@ export async function grepExecutor(
       if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
 
       const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+      // Case-insensitive ext gating — same rationale as findFilesExecutor.
+      const lowerName = entry.name.toLowerCase();
       const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
-        if (ext.startsWith('.')) return entry.name.endsWith(ext);
-        return entry.name === ext;
+        if (ext.startsWith('.')) return lowerName.endsWith(ext);
+        return lowerName === ext;
       });
       if (!hasIncludeExt) continue;
 

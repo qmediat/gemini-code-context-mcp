@@ -131,4 +131,57 @@ describe('workspace scanner', () => {
     const paths = result.files.map((f) => f.relpath).sort();
     expect(paths).toEqual(['src/lib/db/schema.ts']);
   });
+
+  // --- PR #24 round-4 regressions (eager-path case-insensitive closure) ---
+
+  it('R4#1: excludes `NODE_MODULES/` (mixed-case) on case-insensitive FS', async () => {
+    // Simulates macOS (APFS) / Windows (NTFS) where `Node_Modules/` and
+    // `node_modules/` resolve to the same inode. Before round-4 the eager
+    // scanner iterated in with strict `===`/`startsWith` and uploaded the
+    // entire dir to Gemini.
+    writeFileSync(join(root, 'index.ts'), 'export const a = 1;');
+    mkdirSync(join(root, 'Node_Modules', 'dep'), { recursive: true });
+    writeFileSync(join(root, 'Node_Modules', 'dep', 'pkg.ts'), 'export const bad = 1;');
+
+    const result = await scanWorkspace(root, { maxFiles: 1000, maxFileSizeBytes: 100_000 });
+    const paths = result.files.map((f) => f.relpath).sort();
+    expect(paths).toEqual(['index.ts']);
+  });
+
+  it('R4#1: excludes mixed-case lockfile basename (PACKAGE-LOCK.JSON)', async () => {
+    // Mirror-image test on the filename side.
+    writeFileSync(join(root, 'index.ts'), 'export const a = 1;');
+    writeFileSync(join(root, 'PACKAGE-LOCK.JSON'), '{}');
+
+    const result = await scanWorkspace(root, { maxFiles: 1000, maxFileSizeBytes: 100_000 });
+    const paths = result.files.map((f) => f.relpath).sort();
+    expect(paths).toEqual(['index.ts']);
+  });
+
+  it('R4#1: user-supplied excludeGlobs dir case-insensitive', async () => {
+    // User writes `excludeGlobs: ['Vendor']` on a repo that actually has
+    // `vendor/` on disk. Pre-round-4 the strict-equality path missed it.
+    mkdirSync(join(root, 'vendor', 'lib'), { recursive: true });
+    writeFileSync(join(root, 'vendor', 'lib', 'ext.ts'), 'export const v = 1;');
+    writeFileSync(join(root, 'keep.ts'), 'export const k = 1;');
+
+    const result = await scanWorkspace(root, {
+      maxFiles: 100,
+      maxFileSizeBytes: 100_000,
+      excludeGlobs: ['Vendor'],
+    });
+    const paths = result.files.map((f) => f.relpath).sort();
+    expect(paths).toEqual(['keep.ts']);
+  });
+
+  it('R4#1: uppercase source extension `.TS` is included via case-insensitive match', async () => {
+    // Case-insensitive include side: `App.TS` on macOS/Windows is still
+    // a TypeScript file. Pre-round-4 eager scanner dropped it.
+    writeFileSync(join(root, 'App.TS'), 'export const a = 1;');
+    writeFileSync(join(root, 'helper.ts'), 'export const b = 1;');
+
+    const result = await scanWorkspace(root, { maxFiles: 100, maxFileSizeBytes: 100_000 });
+    const paths = result.files.map((f) => f.relpath).sort();
+    expect(paths).toEqual(['App.TS', 'helper.ts']);
+  });
 });

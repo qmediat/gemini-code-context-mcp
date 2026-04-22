@@ -494,3 +494,56 @@ describe('round-3: readFileExecutor UTF-8 trailing strip for no-newline files', 
     expect(res.content.endsWith('\uFFFD')).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// PR #24 round-4 regressions
+// ---------------------------------------------------------------------------
+describe('round-4: find_files + grep case-insensitive include-ext gate', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-r4-ext-')));
+    writeFileSync(join(root, 'App.TS'), 'export const a = 1;');
+    writeFileSync(join(root, 'helper.ts'), 'export const b = 1;');
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'Page.JSX'), "import 'x'; export default null;");
+  });
+
+  it('R4#2: find_files surfaces `App.TS` (uppercase ext) — parity with readFileExecutor', async () => {
+    const res = await findFilesExecutor(root, '**/*.ts');
+    expect(res.matches.sort()).toEqual(['App.TS', 'helper.ts']);
+  });
+
+  it('R4#2: grep scans uppercase `App.TS` — parity with read/find', async () => {
+    const res = await grepExecutor(root, 'const a');
+    const files = res.matches.map((m) => m.relpath).sort();
+    expect(files).toContain('App.TS');
+  });
+});
+
+describe('round-4: listDirectoryExecutor ENOTDIR classification', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-r4-enotdir-')));
+    writeFileSync(join(root, 'app.ts'), 'export const a = 1;');
+  });
+
+  it('R4#5: list_directory on a file throws NOT_A_DIRECTORY (not NOT_FOUND)', async () => {
+    try {
+      await listDirectoryExecutor(root, 'app.ts');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('NOT_A_DIRECTORY');
+    }
+  });
+
+  it('R4#5: list_directory on a missing path still throws NOT_FOUND (via resolveInsideWorkspace)', async () => {
+    try {
+      await listDirectoryExecutor(root, 'does-not-exist');
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect((err as { code?: string }).code).toBe('NOT_FOUND');
+    }
+  });
+});

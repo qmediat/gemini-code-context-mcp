@@ -436,6 +436,18 @@ describe('PR #24 review regressions — budget/throttle integration (F#1)', () =
     // Same for throttle.
     expect(throttle.reserve).toHaveBeenCalledTimes(2);
     expect(throttle.release).toHaveBeenCalledTimes(2);
+
+    // R4#4: durationMs must be a non-negative integer (typically > 0, but
+    // mocked Gemini is near-instant so we assert the weaker invariant;
+    // the critical regression was `0` being hard-coded).
+    for (const call of manifest.finalizeBudgetReservation.mock.calls) {
+      const finalizeArgs = call[1] as { durationMs?: unknown };
+      expect(typeof finalizeArgs.durationMs).toBe('number');
+      expect(finalizeArgs.durationMs).toBeGreaterThanOrEqual(0);
+      // Must not be the hard-coded literal from the pre-round-4 bug.
+      // (Vanishingly unlikely to be exactly `0` from real measurement —
+      // but we can't assert strictly > 0 because the mock is synchronous.)
+    }
   });
 
   it('agentic returns BUDGET_REJECT when reserveBudget rejects', async () => {

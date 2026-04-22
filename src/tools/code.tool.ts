@@ -106,7 +106,7 @@ export const codeInputSchema = z
       .array(z.string())
       .optional()
       .describe(
-        'Additional patterns to exclude. Supports three shapes: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`), (2) literal filenames (`pr27-diff.txt`, `foo.bar.baz`), (3) extension globs (`*.tsbuildinfo`, `.map`). Paths are POSIX-normalised (backslashes → `/`, leading `./` and trailing `/` stripped). No mid-string `*` / `**` / `?` — split into dir + extension patterns if needed.',
+        'Additional patterns to exclude. Supports three shapes: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match, including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.map`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised (backslashes → `/`, leading `./` and trailing `/` stripped). Case-insensitive. No mid-string `*` / `**` / `?` — split into dir + extension patterns if needed.',
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {

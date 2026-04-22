@@ -264,11 +264,12 @@ export interface MatchConfig {
   includeExtensions: readonly string[];
   excludeDirs: readonly string[];
   /**
-   * File extension patterns to exclude, matched via `filename.endsWith(ext)`.
-   * Always stored with a leading dot (e.g. `.tsbuildinfo`). Populated from
-   * `DEFAULT_EXCLUDE_EXTENSIONS` plus any caller `excludeGlobs` pattern
-   * recognised as an extension by `normalizeExcludeGlob` (i.e. starts with
-   * `*.` or a leading dot).
+   * File extension patterns to exclude, matched via `filename.endsWith(ext)`
+   * (case-insensitive). Always stored with a leading dot (e.g. `.tsbuildinfo`).
+   * Populated from `DEFAULT_EXCLUDE_EXTENSIONS` plus any caller `excludeGlobs`
+   * pattern recognised as an extension by `normalizeExcludeGlob` — which is
+   * ONLY the explicit `*.ext` shape. Bare dot-prefixed inputs like `.map` or
+   * `.env` route to the `excludeFileNames` bucket (exact-match), not here.
    */
   excludeExtensions: readonly string[];
   excludeFileNames: readonly string[];
@@ -307,10 +308,18 @@ function normalizeIncludeGlob(pattern: string): string {
  * workspace (1.7M tokens) where 40 aggressive excludes reduced file count
  * by just one — see `docs/FOLLOW-UP-PRS.md` for the trace evidence.
  *
- * Supported shapes:
- *   - `*.tsbuildinfo`, `.map`         → extension (normalized to `.ext`)
- *   - `pr27-diff.txt`, `foo.bar.baz`  → literal filename (no separators, has dot)
+ * Supported shapes (post PR #24 round-3 semantics):
+ *   - `*.tsbuildinfo`                 → extension (normalized to `.ext`, matched via `endsWith`)
+ *   - `.map`, `.env`, `.tsbuildinfo`,
+ *     `pr27-diff.txt`, `foo.bar.baz`  → literal filename (bare dot-prefix or
+ *                                       name-with-dot, no separators, exact match)
  *   - `node_modules`, `src/vendor`    → directory name / path prefix
+ *   - `.vercel/`, `dist/`             → directory (trailing `/` forces dir intent
+ *                                       even if the body looks like an extension)
+ *
+ * Rationale for filename (not extension) on bare `.ext`: `endsWith('.env')`
+ * over-matches `staging.env`, `config.example.env`. If the caller wants
+ * extension semantics they write `*.env` — explicit and unambiguous.
  *
  * Pre-normalisation (codex PR #20 review): POSIX separator, strip leading
  * `./`, strip trailing `/`, trim whitespace. Without this, the bucketing
@@ -413,21 +422,39 @@ export function defaultMatchConfig(
   };
 }
 
+/**
+ * Case-insensitive path-exclude check. APFS (macOS) and NTFS (Windows) default
+ * to case-insensitive, so `Node_Modules/foo.ts` and `node_modules/foo.ts` refer
+ * to the same inode; the match must follow suit. PR #24 round-3 applied
+ * lowercasing to the agentic sandbox path but missed this eager-path mirror —
+ * PR #24 round-4 review (Gemini P1) closed that gap.
+ */
 export function isPathExcluded(relpath: string, config: MatchConfig): boolean {
+  const relLower = relpath.toLowerCase();
   for (const dir of config.excludeDirs) {
-    if (relpath === dir) return true;
-    if (relpath.startsWith(`${dir}/`)) return true;
-    if (relpath.includes(`/${dir}/`)) return true;
+    const dirLower = dir.toLowerCase();
+    if (relLower === dirLower) return true;
+    if (relLower.startsWith(`${dirLower}/`)) return true;
+    if (relLower.includes(`/${dirLower}/`)) return true;
   }
   return false;
 }
 
+/**
+ * Case-insensitive file-include check. Everything (filename vs each
+ * excludeFileName / excludeExtension / includeExtension) is compared
+ * lowercase-to-lowercase, same rationale as `isPathExcluded` above.
+ * Defaults already ship lowercase; user patterns may not, so we normalise
+ * on both sides on each call.
+ */
 export function isFileIncluded(relpath: string, config: MatchConfig): boolean {
   if (isPathExcluded(relpath, config)) return false;
 
   const filename = relpath.includes('/') ? relpath.slice(relpath.lastIndexOf('/') + 1) : relpath;
+  const filenameLower = filename.toLowerCase();
+
   for (const excluded of config.excludeFileNames) {
-    if (filename === excluded) return false;
+    if (filenameLower === excluded.toLowerCase()) return false;
   }
   // Extension-based excludes run AFTER filename excludes (which are more
   // specific) and BEFORE the include check. This ordering matters: an
@@ -437,13 +464,14 @@ export function isFileIncluded(relpath: string, config: MatchConfig): boolean {
   // still wins, matching the invariant already documented on
   // `DEFAULT_EXCLUDE_DIRS`).
   for (const ext of config.excludeExtensions) {
-    if (filename.endsWith(ext)) return false;
+    if (filenameLower.endsWith(ext.toLowerCase())) return false;
   }
 
   for (const ext of config.includeExtensions) {
+    const extLower = ext.toLowerCase();
     if (ext.startsWith('.')) {
-      if (filename.endsWith(ext)) return true;
-    } else if (filename === ext) {
+      if (filenameLower.endsWith(extLower)) return true;
+    } else if (filenameLower === extLower) {
       return true;
     }
   }
