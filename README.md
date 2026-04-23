@@ -25,7 +25,7 @@ An MCP (Model Context Protocol) server that wraps Google's Gemini API with **per
 | Cost control | — | Daily budget cap in USD (`GEMINI_DAILY_BUDGET_USD`) |
 | Dead deps | 5 unused packages (`ai`, `chalk`, `d3-shape`, `inquirer`, `prismjs`) | Zero dead deps |
 
-> *Comparison points reference `jamubc/gemini-mcp-tool` as seen on its GitHub `main` branch (most current snapshot, last commit 2025-07-23). The published npm v1.1.4 is ~9 months older and differs in a few specifics — default model is `gemini-3.1-pro-preview` there instead of `gemini-2.5-pro`, and only 3 of the 5 deps are dead in that tarball (`chalk` and `inquirer` still imported). The structural claims (hardcoded model, no caching, `gemini` CLI backend, unreleased improvements stuck behind an abandoned npm registry entry) hold for both.*
+> *Comparison points reference `jamubc/gemini-mcp-tool` as seen on its GitHub `main` branch (last commit `ef11fab`, 2025-07-23) and `gemini-mcp-tool@1.1.4` on npm (published 2025-07-22) — both ~9 months stale at time of writing (2026-04-23). The `main` branch and the npm tarball carry the same `gemini-2.5-pro` default (see `src/constants.ts`). One code-level difference: the npm tarball ships `dist/contribute.js` which still imports `chalk` and `inquirer` (so v1.1.4 has 3 genuinely dead deps — `ai`, `d3-shape`, `prismjs`), whereas `main` removed the `contribute` path and leaves `chalk` + `inquirer` declared-but-unimported — 5 dead deps. Structural claims (hardcoded model, no caching, `gemini` CLI subprocess backend, no npm publish since 2025-07) hold for both.*
 
 ## Quick start
 
