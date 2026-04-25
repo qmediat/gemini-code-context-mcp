@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Rationale
 
-This is a **test-coverage + docs hygiene patch**. Zero runtime change. Sole purpose: lock invariants in place before the v1.6.0 (`AbortController` timeout) and v1.7.0 (streaming refactor) PRs, so any regression in the cache-decision graph, files-API plumbing, TTL refresh, auth resolution, or response parsers breaks the build instead of silently shipping.
+This is a **test-coverage + docs hygiene patch**. **Zero runtime behaviour change** — the only diff to production code is the addition of an `export` keyword (and `/** @internal */` JSDoc marker) on two pure parser functions in `src/tools/code.tool.ts` (`parseEdits`, `parseCodeBlocks`). No execution path was modified, no module's runtime side effects changed. The `@internal` markers explicitly carve these exports out of the public API surface — they exist for unit testability only, not for downstream consumption. Sole purpose: lock invariants in place before the v1.6.0 (`AbortController` timeout) and v1.7.0 (streaming refactor) PRs, so any regression in the cache-decision graph, files-API plumbing, TTL refresh, auth resolution, or response parsers breaks the build instead of silently shipping.
 
 ## [1.5.2] - 2026-04-22
 

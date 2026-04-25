@@ -9,7 +9,7 @@
  *   - `concurrency` clamps `client.files.upload` parallelism (max-in-flight).
  */
 
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoogleGenAI } from '@google/genai';
@@ -56,6 +56,7 @@ describe('uploadWorkspaceFiles', () => {
 
   afterEach(() => {
     db.close();
+    rmSync(tmp, { recursive: true, force: true });
   });
 
   it('reuses an existing fresh upload by content hash (no client.files.upload call)', async () => {
@@ -181,42 +182,76 @@ describe('uploadWorkspaceFiles', () => {
     expect(result.files[0]?.relpath).toBe('good.ts');
   });
 
-  it('respects concurrency cap on parallel upload pool', async () => {
+  // Deterministic concurrency check: each upload registers on a barrier and
+  // waits to be released. We let the pool fully saturate (observe exactly
+  // `cap` concurrent in-flight), then drain via barrier release. No wall-clock.
+  // With cap=3 and 8 files the test sees observedMax === 3; with cap=1 the
+  // pool runs strictly sequentially → observedMax === 1. A broken impl that
+  // hardcoded `concurrency: 2` would fail BOTH assertions, not silently pass.
+  async function probeConcurrency(cap: number, fileCount: number): Promise<number> {
     let inFlight = 0;
     let observedMax = 0;
+    let completedCount = 0;
+    // Resolvers waiting to be released, in arrival order.
+    const heldResolvers: Array<() => void> = [];
+
     const uploadFn = vi.fn(async (params: { file: string }) => {
       inFlight += 1;
       observedMax = Math.max(observedMax, inFlight);
-      // Yield to the event loop so the pool can saturate.
-      await new Promise((r) => setTimeout(r, 5));
+      // Block until the test releases this worker.
+      await new Promise<void>((resolve) => heldResolvers.push(resolve));
       inFlight -= 1;
+      completedCount += 1;
       return { uri: `https://generativelanguage.googleapis.com/v1beta/files/${params.file}` };
     });
     const client = { files: { upload: uploadFn } } as unknown as GoogleGenAI;
 
-    const N = 8;
     const files: ScannedFile[] = [];
-    for (let i = 0; i < N; i += 1) {
-      const p = join(tmp, `f${i}.ts`);
+    for (let i = 0; i < fileCount; i += 1) {
+      const p = join(tmp, `cap${cap}-f${i}.ts`);
       writeFileSync(p, String(i));
-      files.push(mkScanned(`f${i}.ts`, `h${i}`, p));
+      files.push(mkScanned(`cap${cap}-f${i}.ts`, `cap${cap}-h${i}`, p));
     }
 
-    await uploadWorkspaceFiles({
+    const work = uploadWorkspaceFiles({
       client,
       manifest: db,
       workspaceRoot,
       files,
       emitter: mkEmitter(),
-      concurrency: 3,
+      concurrency: cap,
     });
 
-    expect(uploadFn).toHaveBeenCalledTimes(N);
-    expect(observedMax).toBeLessThanOrEqual(3);
-    expect(observedMax).toBeGreaterThan(1); // proves pool is actually parallel
+    // Pump-release cycle: every iteration waits for one or more workers to
+    // become held, releases ALL currently held, then yields. Repeats until
+    // every file's upload has completed. Since `runPool` only spawns `cap`
+    // workers (each loops), we'll hold AT MOST cap at a time → observedMax = cap.
+    while (completedCount < fileCount) {
+      // Let the pool reach steady state for this batch.
+      await new Promise((r) => setImmediate(r));
+      while (heldResolvers.length > 0) {
+        heldResolvers.shift()?.();
+      }
+    }
+    await work;
+
+    expect(uploadFn).toHaveBeenCalledTimes(fileCount);
+    return observedMax;
+  }
+
+  it('respects concurrency cap on parallel upload pool (concurrency=3)', async () => {
+    const max = await probeConcurrency(3, 8);
+    // Effective cap is the configured value, not just "bounded somewhere ≤ cap".
+    // Without exact equality here, a pool hardcoded to 2 would silently pass.
+    expect(max).toBe(3);
   });
 
-  it('throws if SDK returns neither uri nor name', async () => {
+  it('honours concurrency=1 (sequential, proves cap is effective not aspirational)', async () => {
+    const max = await probeConcurrency(1, 4);
+    expect(max).toBe(1);
+  });
+
+  it('captures "no identifier" SDK responses as failures (does not throw the batch)', async () => {
     const client = mkClient(async () => ({}));
     const file = join(tmp, 'orphan.ts');
     writeFileSync(file, 'z');

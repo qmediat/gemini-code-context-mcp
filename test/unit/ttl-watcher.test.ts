@@ -1,8 +1,16 @@
 /**
  * TtlWatcher background refresh behavior.
  *
- * Verifies (with vi.useFakeTimers + manual `tick()` calls — the watcher's
- * private tick is exercised via type-erased access for direct, race-free testing):
+ * Verifies the watcher's tick logic by passing it pre-seeded `Date.now()`
+ * timestamps and invoking `tick()` directly via a type-erased cast. The cast
+ * is intentional — the watcher's `tick()`, internal `hot` map, and `client`
+ * are private because they're implementation details, but pinning eviction
+ * and refresh decisions on actual map state is the most direct way to test
+ * the unit's contract. The alternative (driving via `setInterval` + observing
+ * `caches.update` calls only) would conflate the timer with the decision
+ * logic and require fake timers, hiding logic bugs behind scheduling races.
+ *
+ * Coverage:
  *   - Hot workspace whose cache nears expiry → caches.update fired + manifest writeback.
  *   - Hot workspace with plenty of TTL left → no caches.update.
  *   - Cold workspace (last used > HOT_WINDOW_MS ago) → evicted, no caches.update.
@@ -11,7 +19,7 @@
  *   - Concurrent ticks (re-entrancy guard): second firing skips while first runs.
  */
 
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoogleGenAI } from '@google/genai';
@@ -42,7 +50,7 @@ describe('TtlWatcher', () => {
 
   afterEach(() => {
     db.close();
-    vi.useRealTimers();
+    rmSync(tmp, { recursive: true, force: true });
   });
 
   function seedHot(args: { now: number; ttlMs: number; ttlSeconds: number }): TtlWatcher {

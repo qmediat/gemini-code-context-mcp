@@ -12,7 +12,7 @@
  * Also covers `isStaleCacheError` heuristic (regex coverage) and `markCacheStale`.
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoogleGenAI } from '@google/genai';
@@ -84,6 +84,7 @@ describe('prepareContext', () => {
 
   afterEach(() => {
     db.close();
+    rmSync(tmp, { recursive: true, force: true });
   });
 
   function mkScan(files: { relpath: string; size: number; content?: string }[]): ScanResult {
@@ -320,7 +321,13 @@ describe('prepareContext', () => {
 
     const p1 = prepareContext(args);
     const p2 = prepareContext(args);
-    // Wait for the (single) build to reach caches.create.
+    // The mutex registers via synchronous `inFlight.get → set` (no await
+    // between the two), so the second call resolves to the SAME inflight
+    // promise that the first call started — but identity (`p1 === p2`) does
+    // NOT hold because `async function` always wraps the return value in a
+    // fresh promise. Coalescing is observable instead via call count below
+    // (`caches.create` invoked exactly once + both promises resolve to the
+    // same cacheId).
     await pumpUntil(() => createCount === 1);
     expect(createCount).toBe(1);
     resolveCreate?.({ name: 'cachedContents/coalesced' });
@@ -353,7 +360,10 @@ describe('prepareContext', () => {
 
     const pAsk = prepareContext({ ...base, systemPromptHash: 'sph-ask' });
     const pCode = prepareContext({ ...base, systemPromptHash: 'sph-code' });
-    // Both must reach caches.create independently — different fingerprints.
+    // Different fingerprints → independent inflight entries → both reach
+    // caches.create. (Promise identity (`pAsk !== pCode`) is trivially true
+    // because async function always wraps — so it proves nothing here. The
+    // load-bearing observable is the create call count.)
     await pumpUntil(() => createCalls === 2);
     expect(createCalls).toBe(2);
     resolvers[0]?.({ name: 'cachedContents/ask' });

@@ -7,8 +7,10 @@
  * subtle drift in the assembled text breaks the build.
  *
  * Coverage: minimum-shape happy path, OLD-omitted (insertion), multi-file,
- * Unicode filenames, fenced code inside NEW (nested triple-backticks), windows
- * line endings, leading/trailing whitespace tolerance, malformed input.
+ * Unicode filenames, paths with spaces and dots, multi-line OLD/NEW
+ * preservation, language-tag variants, NEW-first regression-pin documenting
+ * the regex contract, malformed input. (CRLF coverage deferred — `code.tool.ts`
+ * is fed Gemini's UTF-8 LF responses; the regex is `\n`-anchored.)
  */
 
 import { describe, expect, it } from 'vitest';
