@@ -87,6 +87,16 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       },
     });
 
+  // T20 (v1.7.0) — production calls generateContentStream; wrap the
+  // generateContent mock as a single-chunk stream. See ask-throttle-integration.test.ts.
+  const generateContentStream = vi.fn(async (params: unknown) => {
+    const response = await generateContent(params);
+    async function* gen() {
+      yield response;
+    }
+    return gen();
+  });
+
   const ctx = {
     server: {} as ToolContext['server'],
     config: {
@@ -98,7 +108,9 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       tpmThrottleLimit: opts.tpmThrottleLimit ?? 80_000,
       forceMaxOutputTokens: opts.forceMaxOutputTokens ?? false,
     } as ToolContext['config'],
-    client: { models: { generateContent } } as unknown as ToolContext['client'],
+    client: {
+      models: { generateContent, generateContentStream },
+    } as unknown as ToolContext['client'],
     manifest: {
       reserveBudget: vi.fn().mockReturnValue({ id: 1 }),
       finalizeBudgetReservation: vi.fn(),

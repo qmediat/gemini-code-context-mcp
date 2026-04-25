@@ -106,6 +106,21 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       },
     });
 
+  // T20 (v1.7.0): production now calls `generateContentStream`, which returns
+  // `Promise<AsyncGenerator<GenerateContentResponse>>`. Wrap the
+  // `generateContent` mock as a single-chunk stream so existing test
+  // assertions (mock call args, return shape) continue to work without each
+  // suite needing a hand-rolled stream factory.
+  const generateContentStream = vi.fn(async (params: unknown) => {
+    // Forward args + resolved value to/from the underlying mock so spies and
+    // mockResolvedValue/mockRejectedValue chains keep their existing semantics.
+    const response = await generateContent(params);
+    async function* gen() {
+      yield response;
+    }
+    return gen();
+  });
+
   const ctx = {
     server: {} as ToolContext['server'],
     config: {
@@ -117,7 +132,9 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       tpmThrottleLimit: opts.tpmThrottleLimit ?? 80_000,
       forceMaxOutputTokens: opts.forceMaxOutputTokens ?? false,
     } as ToolContext['config'],
-    client: { models: { generateContent } } as unknown as ToolContext['client'],
+    client: {
+      models: { generateContent, generateContentStream },
+    } as unknown as ToolContext['client'],
     manifest: {
       reserveBudget: vi.fn().mockReturnValue({ id: 1 }),
       finalizeBudgetReservation: vi.fn(),

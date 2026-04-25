@@ -33,9 +33,18 @@ export const statusTool: ToolDefinition<StatusInput> = {
   async execute(input, ctx) {
     try {
       const workspaceRoot = resolve(input.workspace ?? process.cwd());
+      const now = Date.now();
       const ws = ctx.manifest.getWorkspace(workspaceRoot);
       const files = ctx.manifest.getFiles(workspaceRoot);
       const stats = ctx.manifest.workspaceStats(workspaceRoot);
+      const todayTotalMicros = ctx.manifest.todaysCostMicros(now);
+      const todayInFlightMicros = ctx.manifest.todaysInFlightReservedMicros(now);
+      // D#7 (v1.7.0): split settled vs in-flight so users running `status`
+      // mid-call see why total looks higher than completed work would
+      // suggest. Total still includes in-flight (so it's a true budget cap
+      // proxy), but the breakdown surfaces what's provisional.
+      const todaySettledMicros = Math.max(0, todayTotalMicros - todayInFlightMicros);
+      const wsSettledMicros = Math.max(0, stats.totalCostMicros - stats.inFlightReservedMicros);
       const models = await listAvailableModels(ctx.client).catch(() => []);
 
       const structured: Record<string, unknown> = {
@@ -48,7 +57,12 @@ export const statusTool: ToolDefinition<StatusInput> = {
         dailyBudgetUsd: Number.isFinite(ctx.config.dailyBudgetUsd)
           ? ctx.config.dailyBudgetUsd
           : null,
-        spentTodayUsd: microsToDollars(ctx.manifest.todaysCostMicros(Date.now())),
+        spentTodayUsd: microsToDollars(todayTotalMicros),
+        // D#7: backward-compatible split. `spentTodayUsd` stays as the
+        // conservative upper bound (settled + in-flight); new fields show
+        // the breakdown.
+        spentTodaySettledUsd: microsToDollars(todaySettledMicros),
+        inFlightReservedTodayUsd: microsToDollars(todayInFlightMicros),
         availableModels: models.map((m) => ({
           id: m.id,
           inputTokenLimit: m.inputTokenLimit,
@@ -71,15 +85,30 @@ export const statusTool: ToolDefinition<StatusInput> = {
           totalCachedTokens: stats.totalCachedTokens,
           totalUncachedTokens: stats.totalUncachedTokens,
           totalCostUsd: microsToDollars(stats.totalCostMicros),
+          // D#7: workspace-scoped split. Same semantics as the daily fields.
+          settledCostUsd: microsToDollars(wsSettledMicros),
+          inFlightReservedUsd: microsToDollars(stats.inFlightReservedMicros),
           last24hCostUsd: microsToDollars(stats.last24hCostMicros),
         },
       };
+
+      // Render the in-flight delta only when there IS one; mid-call status
+      // queries are the only situation where it's non-zero, and showing
+      // "$0.0000 in-flight" on every call would just be noise.
+      const todayInFlightSuffix =
+        todayInFlightMicros > 0
+          ? ` (settled $${microsToDollars(todaySettledMicros).toFixed(4)} + $${microsToDollars(todayInFlightMicros).toFixed(4)} in-flight reserved)`
+          : '';
+      const wsInFlightSuffix =
+        stats.inFlightReservedMicros > 0
+          ? ` (settled $${microsToDollars(wsSettledMicros).toFixed(4)} + $${microsToDollars(stats.inFlightReservedMicros).toFixed(4)} in-flight reserved)`
+          : '';
 
       const human = [
         `workspace:       ${workspaceRoot}`,
         `auth source:     ${ctx.config.auth.source} (${ctx.config.auth.keyFingerprint})`,
         `default model:   ${ctx.config.defaultModel}`,
-        `budget:          ${Number.isFinite(ctx.config.dailyBudgetUsd) ? `$${ctx.config.dailyBudgetUsd.toFixed(2)}/day` : 'unlimited'} (today: $${microsToDollars(ctx.manifest.todaysCostMicros(Date.now())).toFixed(4)})`,
+        `budget:          ${Number.isFinite(ctx.config.dailyBudgetUsd) ? `$${ctx.config.dailyBudgetUsd.toFixed(2)}/day` : 'unlimited'} (today: $${microsToDollars(todayTotalMicros).toFixed(4)}${todayInFlightSuffix})`,
         `available models (${models.length}):`,
         ...models
           .slice(0, 8)
@@ -103,7 +132,7 @@ export const statusTool: ToolDefinition<StatusInput> = {
         `  calls:         ${stats.callCount}`,
         `  cached tokens: ${stats.totalCachedTokens.toLocaleString()}`,
         `  input tokens:  ${stats.totalUncachedTokens.toLocaleString()}`,
-        `  total cost:    $${microsToDollars(stats.totalCostMicros).toFixed(4)}`,
+        `  total cost:    $${microsToDollars(stats.totalCostMicros).toFixed(4)}${wsInFlightSuffix}`,
         `  last 24h:      $${microsToDollars(stats.last24hCostMicros).toFixed(4)}`,
       ].join('\n');
 

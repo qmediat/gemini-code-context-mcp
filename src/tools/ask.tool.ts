@@ -8,13 +8,7 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type {
-  Content,
-  GenerateContentConfig,
-  GenerateContentResponse,
-  ThinkingConfig,
-  ThinkingLevel,
-} from '@google/genai';
+import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
@@ -29,6 +23,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
+import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
@@ -521,19 +516,33 @@ async function executeAskBody(
     // rebuilt PreparedContext so post-call markHot + metadata reflect reality.
     let activePrep = ctxPrep;
     let retriedOnStaleCache = false;
-    let response: GenerateContentResponse;
+    let response: CollectedResponse;
     try {
-      // `withNetworkRetry` covers pre-response transient failures
-      // (`TypeError: fetch failed`). See `src/gemini/retry.ts` for the full
-      // rationale; 429 rate-limits continue to be handled at the tool layer
-      // via `isGemini429` + `parseRetryDelayMs`.
+      // T20 (v1.7.0): generateContentStream + collectStream replaces the
+      // synchronous generateContent. Stream chunks accumulate into a
+      // CollectedResponse shaped like the old return — downstream parsing
+      // is unchanged. `withNetworkRetry` wraps the OPENING of the stream,
+      // not individual chunks: a pre-response failure → retry opens a
+      // fresh stream; a mid-stream failure cannot be retried (Gemini's
+      // generateContentStream doesn't support resume) → propagates as-is.
       response = await withNetworkRetry(
-        () =>
-          ctx.client.models.generateContent({
+        async () => {
+          const stream = await ctx.client.models.generateContentStream({
             model: resolved.resolved,
             contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
-          }),
+          });
+          return collectStream(stream, {
+            signal: abortSignal,
+            onThoughtChunk: (text) => {
+              // Surface the model's reasoning live as it arrives. Throttled
+              // to ~1.5s by collectStream so the MCP host's progress channel
+              // doesn't get flooded on long thinking bursts.
+              const trimmed = text.trim().slice(0, 80);
+              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+            },
+          });
+        },
         {
           signal: abortSignal,
           onRetry: (attempt, retryErr) => {
@@ -587,13 +596,24 @@ async function executeAskBody(
           await reserveForDispatch();
           // The stale-cache retry itself can hit a transient network failure;
           // wrap it too so the rebuild isn't wasted on a one-off blip.
+          // Stale-cache retry: discard partial response, open a brand-new
+          // stream with the rebuilt cache. Gemini's stream API doesn't
+          // support resume, so this is the only correct semantics.
           response = await withNetworkRetry(
-            () =>
-              ctx.client.models.generateContent({
+            async () => {
+              const stream = await ctx.client.models.generateContentStream({
                 model: resolved.resolved,
                 contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
-              }),
+              });
+              return collectStream(stream, {
+                signal: abortSignal,
+                onThoughtChunk: (text) => {
+                  const trimmed = text.trim().slice(0, 80);
+                  if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+                },
+              });
+            },
             {
               signal: abortSignal,
               onRetry: (attempt, retryErr) => {
@@ -633,22 +653,13 @@ async function executeAskBody(
       ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
     }
 
-    const text = response.text ?? '';
+    const text = response.text;
 
-    // Extract Gemini's thinking summary when `includeThoughts: true` is set.
-    // Parts flagged `thought: true` carry the model's internal reasoning
-    // digest — useful for the caller to see *why* an answer was given.
-    // We cap the joined summary at 1200 chars so it never dominates the
-    // MCP response payload (matches `code.tool.ts` behaviour).
-    const thoughtTexts: string[] = [];
-    for (const cand of response.candidates ?? []) {
-      for (const part of cand.content?.parts ?? []) {
-        if (part.thought === true && typeof part.text === 'string') {
-          thoughtTexts.push(part.text);
-        }
-      }
-    }
-    const thinkingSummary = thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
+    // `collectStream` already aggregated thought-flagged parts and capped
+    // the joined summary at 1200 chars (T20). Reuse directly — re-iterating
+    // `response.candidates` would risk drift between in-flight thought
+    // emit (live progress) and post-call summary.
+    const thinkingSummary = response.thoughtsSummary;
 
     const usage = response.usageMetadata;
     const cached =

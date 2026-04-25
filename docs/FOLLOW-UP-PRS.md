@@ -25,8 +25,8 @@ Each step must fully merge + publish before the next opens:
 | ~~D.1~~ | ~~**v1.5.1**~~ ✅ SHIPPED | ~~#25~~ | ~~App-layer `withNetworkRetry` (`src/gemini/retry.ts`) wrapping every direct `generateContent` call in `ask` / `code` / `ask_agentic` (including the stale-cache retry paths). Covers Node 18+ undici's `TypeError: fetch failed` — a pre-response failure shape the SDK's pinned `p-retry` 4.6.2 cannot recognise. 3 attempts with 1s → 3s → 9s exponential backoff; non-transient errors propagate on the first failure so retry budget is never spent on permanent problems.~~ | ~~~2 h~~ |
 | ~~D.2~~ | ~~**v1.5.2**~~ ✅ SHIPPED | ~~#26 + #27~~ | ~~Registry prep + docs accuracy. PR #26: `mcpName: "io.github.qmediat/gemini-code-context-mcp"` added to `package.json` (required by Official MCP Registry for verified publishing), README comparison table reworked with measured benchmarks (670k-token Vite workspace: cold 125 s / $0.60, warm ~14 s / $0.60, inline baseline ~20 s / $2.35 — ~8× faster, ~4× cheaper on cache hit), "Abandoned" softened to "Unmaintained on npm since 2025-07". PR #27: docs-only follow-up — corrected a false claim in the caveat paragraph below the table (previously said v1.1.4 defaulted to `gemini-3.1-pro-preview` while main defaulted to `gemini-2.5-pro`; both actually carry `gemini-2.5-pro`; verified empirically against the npm tarball and main branch).~~ | ~~~1 day~~ |
 | ~~D.3~~ | ~~**v1.5.3**~~ ✅ SHIPPED | ~~PR #29~~ | ~~Test-coverage prep patch for v1.6.0/v1.7.0 refactors. T1 unit tests for `cache-manager` (cache-decision branches + in-process mutex), `files-uploader` (hash dedup + safety-margin re-upload + concurrency cap + failure capture), `ttl-watcher` (refresh windows + 404 eviction + re-entrancy guard), `profile-loader` (3-tier resolution order + warn-on-env-key). T2 regression net for `code.tool.ts` parsers (`parseEdits` / `parseCodeBlocks`) — pin contract before T20's stream-collector refactor changes how the response string is assembled. Zero runtime change.~~ | ~~~3–4 h~~ |
-| ~~E~~ | ~~**v1.6.0**~~ ✅ SHIPPED | ~~PR #30~~ | ~~T19 — opt-in per-call `timeoutMs` parameter on `ask` / `code` (1s–30min) + `iterationTimeoutMs` on `ask_agentic`. Three new env vars: `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS`, `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`. New `TIMEOUT` errorCode. New module `src/tools/shared/abort-timeout.ts` with `createTimeoutController` / `isTimeoutAbort`. `withNetworkRetry` extended with `signal: AbortSignal` option (pre-flight check + abortable backoff sleep). 22 new test cases. Default disabled — zero behaviour change for existing users. Caveat: AbortSignal is client-only — Gemini bills for completed work even when client aborts.~~ | ~~~3–4 h~~ |
-| F | **v1.7.0** | T20 + T18 + D#7 | Migrate `ask` / `code` to `generateContentStream` for in-flight thinking heartbeat. Pairs with T19's `AbortController` for real stall detection — stream heartbeat + timeout abort + network retry = fully closed loop. Bundles T18 (precise budget accounting on stale-cache retry — release the failed first reservation before opening the second) and D#7 (status surface separates settled cost from in-flight reserved cost via new `inFlightReservedUsd` field) since both deficits become more visible under streaming and are cheap to address in the same hot-path pass. | ~1 day |
+| ~~E~~ | ~~**v1.6.0**~~ ✅ SHIPPED | ~~PR #30~~ | ~~T19 — opt-in per-call `timeoutMs` parameter on `ask` / `code` (1s–30min) + `iterationTimeoutMs` on `ask_agentic`. Three new env vars. New `TIMEOUT` errorCode. New module `src/tools/shared/abort-timeout.ts`. `withNetworkRetry` extended with `signal: AbortSignal`. Default disabled — zero behaviour change.~~ | ~~~3–4 h~~ |
+| ~~F~~ | ~~**v1.7.0**~~ ✅ SHIPPED | ~~PR #31~~ | ~~T20 — `ask` / `code` migrated to `generateContentStream`. New `src/tools/shared/stream-collector.ts` accumulates chunks into a `CollectedResponse`. Live thinking heartbeat via `onThoughtChunk` → emitter (throttled 1500ms). D#7 — `status` separates settled vs in-flight reserved cost via new `inFlightReservedUsd` / `settledCostUsd` fields (both daily and workspace-scoped). T18 deferred to v1.8+ — re-analysis showed cancel+re-reserve is a no-op for the stale-cache retry case (same estimate); D#7 closes the user-visible symptom. 32 new tests (524 → 556).~~ | ~~~1 day~~ |
 
 **Why T22+T23 bundled (not separate releases):** both fix a single concern ("reviewer workflows don't work today") and each PR alone doesn't deliver user-visible value — TPM throttle without wire-format fix still can't extract review text; wire-format fix without throttle still 429s on back-to-back calls. Bundling keeps the release-note story coherent for external users.
 
@@ -278,7 +278,13 @@ Each step must fully merge + publish before the next opens:
 
 ---
 
-## T18. Precise budget accounting during stale-cache retry
+## T18. Precise budget accounting during stale-cache retry — *deferred; symptom closed by D#7 in v1.7.0*
+
+**2026-04-25 update (v1.7.0):** Re-analysis during the v1.7.0 streaming refactor showed that the proposed cancel+re-reserve fix is a no-op from the budget-accounting perspective: in the stale-cache retry path, the new estimate is identical to the original (same prompt, same workspace, same expected output), so cancel+re-reserve would just rotate the row id without changing the reserved amount. The user-visible symptom this ticket was meant to address — "concurrent callers see inflated daily totals during the retry window" — is fully closed by D#7 in v1.7.0 (`status` now separates settled from in-flight reserved cost). The remaining T18 scope (a `downsizeBudgetReservation(id, newEstimate)` DB primitive that lets the system revise an in-flight reservation downward when the actual call would be cheaper than estimated) only matters for genuinely high-concurrency setups where multiple callers race the daily cap during a long in-flight window. Stays open for the day a user reports it; not on any near-term release.
+
+---
+
+## T18-orig. (Original scope — preserved for context)
 
 **Source:** 2026-04-19 code review (grok, 1/3 consensus).
 
@@ -318,7 +324,13 @@ Shipped 2026-04-25 (PR #30). New module `src/tools/shared/abort-timeout.ts`. Per
 
 ---
 
-## T20. Migrate `ask` / `code` to `generateContentStream` for in-flight thinking progress
+## ~~T20.~~ ✅ SHIPPED v1.7.0 — Migrate `ask` / `code` to `generateContentStream`
+
+Shipped 2026-04-25 (PR #31). New module `src/tools/shared/stream-collector.ts` (203 lines) accumulates chunks into a `CollectedResponse` with text concat, last-write-wins for usageMetadata + candidates, throttled `onThoughtChunk` emit (default 1500ms), full abort propagation, and mid-stream-error verbatim re-throw. `ask` and `code` migrated; `withNetworkRetry` wraps stream OPENING (chunk-level resume not supported by Gemini's API). Stale-cache mid-stream → discard partial, open fresh full stream. Live thinking heartbeat visible in Claude Code UI via `"thinking: …"` progress notifications. 20 new unit tests for stream-collector + 4 existing test files updated to mock `generateContentStream` (single-chunk wrapper preserves all existing assertions).
+
+---
+
+## T20-orig. (Original scope — preserved for context)
 
 **Source:** April 2026 user feedback — "check the documentation to see whether there is a way to ping whether thinking is active" (original Polish: "zbadaj w dokumentacji, czy istnieje możliwość pingowania, czy thinking jest aktywne").
 

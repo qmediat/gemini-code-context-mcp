@@ -261,4 +261,99 @@ describe('ManifestDb', () => {
     expect(db.getWorkspace('/tmp/wks')).toBeNull();
     expect(db.getFiles('/tmp/wks').length).toBe(0);
   });
+
+  describe('D#7 (v1.7.0) — in-flight reservation visibility', () => {
+    it('todaysInFlightReservedMicros returns sum of unfinalised rows only', () => {
+      const now = Date.now();
+      // Settled call (duration_ms > 0).
+      const settled = db.reserveBudget({
+        workspaceRoot: '/x',
+        toolName: 'ask',
+        model: 'gemini-x',
+        estimatedCostMicros: 1_000_000, // $1.00
+        dailyBudgetMicros: 100_000_000,
+        nowMs: now,
+      });
+      if (!('id' in settled)) throw new Error('reserve rejected unexpectedly');
+      db.finalizeBudgetReservation(settled.id, {
+        cachedTokens: 0,
+        uncachedTokens: 100,
+        costUsdMicro: 800_000, // $0.80 actual
+        durationMs: 1_500,
+      });
+
+      // In-flight (not finalised — still duration_ms = 0).
+      const inFlight = db.reserveBudget({
+        workspaceRoot: '/x',
+        toolName: 'ask',
+        model: 'gemini-x',
+        estimatedCostMicros: 2_000_000, // $2.00 estimate
+        dailyBudgetMicros: 100_000_000,
+        nowMs: now,
+      });
+      expect('id' in inFlight).toBe(true);
+
+      const todayTotal = db.todaysCostMicros(now);
+      const todayInFlight = db.todaysInFlightReservedMicros(now);
+      // Total includes both settled actual + in-flight estimate.
+      expect(todayTotal).toBe(800_000 + 2_000_000);
+      // In-flight is only the unfinalised slice.
+      expect(todayInFlight).toBe(2_000_000);
+    });
+
+    it('workspaceStats.inFlightReservedMicros isolates the unfinalised slice', () => {
+      const now = Date.now();
+      const r1 = db.reserveBudget({
+        workspaceRoot: '/wks',
+        toolName: 'code',
+        model: 'm',
+        estimatedCostMicros: 500_000,
+        dailyBudgetMicros: 100_000_000,
+        nowMs: now,
+      });
+      if (!('id' in r1)) throw new Error('reserve rejected');
+      db.finalizeBudgetReservation(r1.id, {
+        cachedTokens: 0,
+        uncachedTokens: 50,
+        costUsdMicro: 400_000,
+        durationMs: 800,
+      });
+      db.reserveBudget({
+        workspaceRoot: '/wks',
+        toolName: 'code',
+        model: 'm',
+        estimatedCostMicros: 1_500_000,
+        dailyBudgetMicros: 100_000_000,
+        nowMs: now,
+      });
+
+      const stats = db.workspaceStats('/wks');
+      expect(stats.totalCostMicros).toBe(400_000 + 1_500_000);
+      expect(stats.inFlightReservedMicros).toBe(1_500_000);
+      // callCount counts BOTH rows (in-flight is a real row, just not finalised).
+      expect(stats.callCount).toBe(2);
+    });
+
+    it('all-settled workspace reports inFlightReservedMicros = 0', () => {
+      const now = Date.now();
+      const r = db.reserveBudget({
+        workspaceRoot: '/clean',
+        toolName: 'ask',
+        model: 'm',
+        estimatedCostMicros: 100_000,
+        dailyBudgetMicros: 10_000_000,
+        nowMs: now,
+      });
+      if (!('id' in r)) throw new Error('reserve rejected');
+      db.finalizeBudgetReservation(r.id, {
+        cachedTokens: 0,
+        uncachedTokens: 10,
+        costUsdMicro: 80_000,
+        durationMs: 500,
+      });
+      const stats = db.workspaceStats('/clean');
+      expect(stats.inFlightReservedMicros).toBe(0);
+      expect(stats.totalCostMicros).toBe(80_000);
+    });
+  });
 });
