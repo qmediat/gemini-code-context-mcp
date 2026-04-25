@@ -238,6 +238,42 @@ describe('collectStream — mid-stream errors propagate', () => {
       /bang/,
     );
   });
+
+  it('does NOT swallow mid-stream errors as transient (caller chooses retry policy)', async () => {
+    // Regression-pin for v1.7.0 review CRITICAL #1: previously
+    // collectStream was inside withNetworkRetry which would have retried
+    // a `TypeError: fetch failed` mid-stream — duplicating model output
+    // and double-billing. collectStream itself MUST propagate verbatim.
+    await expect(
+      collectStream(genThatThrows([{ text: 'partial' }], new TypeError('fetch failed'))),
+    ).rejects.toThrow(/fetch failed/);
+  });
+
+  it('mid-stream onThoughtChunk emit is suppressed once signal aborts', async () => {
+    // Regression-pin for review MEDIUM #4: an abort that fires DURING the
+    // for-await iteration (between chunk receive and the inner thought-emit
+    // loop) must short-circuit before the stale `thinking: …` notification
+    // reaches the user.
+    const onThoughtChunk = vi.fn();
+    const controller = new AbortController();
+    async function* g(): AsyncGenerator<GenerateContentResponse> {
+      // First chunk yields a thought — no abort yet, so it emits.
+      yield {
+        candidates: [{ content: { parts: [{ text: 'first', thought: true }] } }],
+      } as GenerateContentResponse;
+      // Now abort — collectStream's loop-top check should fire BEFORE the
+      // second chunk's thought is processed.
+      controller.abort(new DOMException('mid-flight', 'TimeoutError'));
+      yield {
+        candidates: [{ content: { parts: [{ text: 'second', thought: true }] } }],
+      } as GenerateContentResponse;
+    }
+    await expect(
+      collectStream(g(), { signal: controller.signal, onThoughtChunk, thoughtEmitThrottleMs: 0 }),
+    ).rejects.toThrow(/mid-flight/);
+    expect(onThoughtChunk).toHaveBeenCalledTimes(1);
+    expect(onThoughtChunk).toHaveBeenCalledWith('first');
+  });
 });
 
 describe('collectStream — timing metadata', () => {

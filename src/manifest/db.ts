@@ -332,6 +332,16 @@ export class ManifestDb {
       durationMs: number;
     },
   ): void {
+    // D#7 (v1.7.0) belt-and-suspenders: D#7's settled-vs-in-flight split
+    // uses `WHERE duration_ms = 0` as the in-flight sentinel. A real
+    // network round-trip cannot complete in 0 ms (verified empirically
+    // and reasoned about — `Date.now()` resolution is 1 ms and the
+    // smallest realistic Gemini call takes 10+ ms wall-clock), but if a
+    // future code path ever managed to call `finalize` with `durationMs = 0`
+    // (clock skew, NTP backwards jump, instrumented mock test), that row
+    // would stay misclassified as in-flight forever. Floor to 1 ms to make
+    // the sentinel deterministic regardless of upstream weirdness.
+    const safeDurationMs = Math.max(1, data.durationMs);
     this.db
       .prepare(
         `UPDATE usage_metrics
@@ -342,7 +352,7 @@ export class ManifestDb {
         data.cachedTokens,
         data.uncachedTokens,
         data.costUsdMicro,
-        data.durationMs,
+        safeDurationMs,
         reservationId,
       );
   }

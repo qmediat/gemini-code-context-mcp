@@ -15,7 +15,10 @@
  *     telemetry). We always overwrite — last-write-wins is correct semantics
  *     even on the off-chance an early chunk includes a partial. If no chunk
  *     ever provided usageMetadata, the return is `undefined` and downstream
- *     cost accounting falls back to a 0-token estimate (logged as a warning).
+ *     cost accounting falls back to a 0-token estimate. (Callers may choose
+ *     to log this as a warning — neither this collector nor `ask`/`code`
+ *     currently does, since it would only fire if Google changed the stream
+ *     protocol.)
  *
  *   - **`candidates` last-write-wins**: finish reasons, safety ratings, and
  *     groundingMetadata only become authoritative on the final chunk —
@@ -114,6 +117,12 @@ export async function collectStream(
   let firstChunkAt: number | null = null;
   let lastChunkAt: number | null = null;
   let lastThoughtEmitAt = 0;
+  // Outer try/finally guarantees the underlying generator gets a `.return()`
+  // call on EVERY exit path — happy completion, mid-stream throw, abort
+  // propagation. Without this, the previous `void stream.return?.()` calls
+  // were "best effort" and could be skipped on uncommon error paths,
+  // leaking the underlying SSE connection until GC kicked in.
+  let needsCleanup = true;
 
   try {
     for await (const chunk of stream) {
@@ -124,7 +133,6 @@ export async function collectStream(
       // more chunk before the abort propagates from the SDK. Without the
       // explicit check, we'd accumulate that extra chunk.
       if (signal?.aborted) {
-        void stream.return?.(undefined);
         throw signal.reason instanceof Error
           ? signal.reason
           : new DOMException('Operation aborted', 'AbortError');
@@ -156,6 +164,17 @@ export async function collectStream(
           if (part.thought === true && typeof part.text === 'string' && part.text.length > 0) {
             thoughtChunks.push(part.text);
             if (onThoughtChunk && now - lastThoughtEmitAt >= throttleMs) {
+              // Re-check abort RIGHT BEFORE invoking the callback. If the
+              // signal flipped between the loop-top check and here (e.g.
+              // a long-running thought-extraction loop on a chunk with many
+              // parts), we don't want to surface a stale "thinking: …"
+              // notification AFTER the user has already seen the timeout
+              // error — that's confusing UX.
+              if (signal?.aborted) {
+                throw signal.reason instanceof Error
+                  ? signal.reason
+                  : new DOMException('Operation aborted', 'AbortError');
+              }
               lastThoughtEmitAt = now;
               try {
                 onThoughtChunk(part.text);
@@ -180,17 +199,28 @@ export async function collectStream(
         lastUsageMetadata = chunk.usageMetadata;
       }
     }
+    // for-await exited cleanly — generator is exhausted, no cleanup needed.
+    needsCleanup = false;
   } catch (err) {
     // If abort is the cause of the throw, prefer the signal's reason. SDK
     // sometimes throws a generic "fetch failed" because abort tore down
     // the socket — we want the timeout-driven error to surface.
     if (signal?.aborted) {
-      void stream.return?.(undefined);
       throw signal.reason instanceof Error
         ? signal.reason
         : new DOMException('Operation aborted', 'AbortError');
     }
     throw err;
+  } finally {
+    // Best-effort cleanup of the underlying generator + transport. Awaited
+    // detachment is fire-and-forget here — we're already on the way out
+    // of the function and any async cleanup error would mask the original
+    // throw (or just delay successful completion). The async generator's
+    // own try/finally inside the SDK is the actual guarantee; this is
+    // belt-and-suspenders.
+    if (needsCleanup) {
+      void stream.return?.(undefined);
+    }
   }
 
   const text = textChunks.join('');

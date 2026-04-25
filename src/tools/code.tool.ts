@@ -509,23 +509,18 @@ async function executeCodeBody(
     let retriedOnStaleCache = false;
     let response: CollectedResponse;
     try {
-      // T20 (v1.7.0): generateContentStream + collectStream — see
-      // ask.tool.ts for the full rationale (mirror semantics here).
-      response = await withNetworkRetry(
-        async () => {
-          const stream = await ctx.client.models.generateContentStream({
+      // T20 (v1.7.0) — withNetworkRetry wraps ONLY the stream opening.
+      // Mid-stream failures cannot be retried (Gemini's stream API has no
+      // resume) — wrapping collectStream too would discard the partial
+      // response and re-open a new stream → DOUBLE BILLING. See
+      // ask.tool.ts for the full rationale.
+      const stream = await withNetworkRetry(
+        () =>
+          ctx.client.models.generateContentStream({
             model: resolved.resolved,
             contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
-          });
-          return collectStream(stream, {
-            signal: abortSignal,
-            onThoughtChunk: (text) => {
-              const trimmed = text.trim().slice(0, 80);
-              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-            },
-          });
-        },
+          }),
         {
           signal: abortSignal,
           onRetry: (attempt, retryErr) => {
@@ -537,6 +532,13 @@ async function executeCodeBody(
           },
         },
       );
+      response = await collectStream(stream, {
+        signal: abortSignal,
+        onThoughtChunk: (text) => {
+          const trimmed = text.trim().slice(0, 80);
+          if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+        },
+      });
     } catch (err) {
       if (activePrep.cacheId && isStaleCacheError(err)) {
         logger.warn(
@@ -570,22 +572,15 @@ async function executeCodeBody(
           await reserveForDispatch();
           // The stale-cache retry itself can hit a transient network failure;
           // wrap it too so the rebuild isn't wasted on a one-off blip.
-          // Stale-cache retry — discard partial, open fresh stream.
-          response = await withNetworkRetry(
-            async () => {
-              const stream = await ctx.client.models.generateContentStream({
+          // Stale-cache retry — discard partial, open fresh stream. Same
+          // retry-OPENING-only contract as the happy path above.
+          const retryStream = await withNetworkRetry(
+            () =>
+              ctx.client.models.generateContentStream({
                 model: resolved.resolved,
                 contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
-              });
-              return collectStream(stream, {
-                signal: abortSignal,
-                onThoughtChunk: (text) => {
-                  const trimmed = text.trim().slice(0, 80);
-                  if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-                },
-              });
-            },
+              }),
             {
               signal: abortSignal,
               onRetry: (attempt, retryErr) => {
@@ -597,6 +592,13 @@ async function executeCodeBody(
               },
             },
           );
+          response = await collectStream(retryStream, {
+            signal: abortSignal,
+            onThoughtChunk: (text) => {
+              const trimmed = text.trim().slice(0, 80);
+              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+            },
+          });
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {

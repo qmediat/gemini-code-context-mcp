@@ -518,31 +518,21 @@ async function executeAskBody(
     let retriedOnStaleCache = false;
     let response: CollectedResponse;
     try {
-      // T20 (v1.7.0): generateContentStream + collectStream replaces the
-      // synchronous generateContent. Stream chunks accumulate into a
-      // CollectedResponse shaped like the old return — downstream parsing
-      // is unchanged. `withNetworkRetry` wraps the OPENING of the stream,
-      // not individual chunks: a pre-response failure → retry opens a
-      // fresh stream; a mid-stream failure cannot be retried (Gemini's
-      // generateContentStream doesn't support resume) → propagates as-is.
-      response = await withNetworkRetry(
-        async () => {
-          const stream = await ctx.client.models.generateContentStream({
+      // T20 (v1.7.0) — CRITICAL: withNetworkRetry wraps ONLY the stream
+      // opening, NOT collectStream itself. If collectStream were inside the
+      // retry closure, a mid-stream `TypeError: fetch failed` would discard
+      // the partial response and re-issue a brand-new generateContentStream
+      // — duplicating the model's billable work and emitting double
+      // "thinking: …" progress lines. Mid-stream failure CANNOT be retried
+      // (Gemini's generateContentStream doesn't support resume), so it must
+      // propagate verbatim to the caller.
+      const stream = await withNetworkRetry(
+        () =>
+          ctx.client.models.generateContentStream({
             model: resolved.resolved,
             contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
-          });
-          return collectStream(stream, {
-            signal: abortSignal,
-            onThoughtChunk: (text) => {
-              // Surface the model's reasoning live as it arrives. Throttled
-              // to ~1.5s by collectStream so the MCP host's progress channel
-              // doesn't get flooded on long thinking bursts.
-              const trimmed = text.trim().slice(0, 80);
-              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-            },
-          });
-        },
+          }),
         {
           signal: abortSignal,
           onRetry: (attempt, retryErr) => {
@@ -554,6 +544,16 @@ async function executeAskBody(
           },
         },
       );
+      response = await collectStream(stream, {
+        signal: abortSignal,
+        onThoughtChunk: (text) => {
+          // Surface the model's reasoning live as it arrives. Throttled
+          // to ~1.5s by collectStream so the MCP host's progress channel
+          // doesn't get flooded on long thinking bursts.
+          const trimmed = text.trim().slice(0, 80);
+          if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+        },
+      });
     } catch (err) {
       // Self-heal: if Gemini rejected our cached content (evicted, expired,
       // externally deleted), invalidate locally and retry ONCE with a fresh
@@ -599,21 +599,14 @@ async function executeAskBody(
           // Stale-cache retry: discard partial response, open a brand-new
           // stream with the rebuilt cache. Gemini's stream API doesn't
           // support resume, so this is the only correct semantics.
-          response = await withNetworkRetry(
-            async () => {
-              const stream = await ctx.client.models.generateContentStream({
+          // Same retry-OPENING-only contract as the happy path — see above.
+          const retryStream = await withNetworkRetry(
+            () =>
+              ctx.client.models.generateContentStream({
                 model: resolved.resolved,
                 contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
-              });
-              return collectStream(stream, {
-                signal: abortSignal,
-                onThoughtChunk: (text) => {
-                  const trimmed = text.trim().slice(0, 80);
-                  if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-                },
-              });
-            },
+              }),
             {
               signal: abortSignal,
               onRetry: (attempt, retryErr) => {
@@ -625,6 +618,13 @@ async function executeAskBody(
               },
             },
           );
+          response = await collectStream(retryStream, {
+            signal: abortSignal,
+            onThoughtChunk: (text) => {
+              const trimmed = text.trim().slice(0, 80);
+              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+            },
+          });
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {
