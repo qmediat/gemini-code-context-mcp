@@ -24,8 +24,9 @@ Each step must fully merge + publish before the next opens:
 | ~~D~~ | ~~**v1.5.0**~~ ✅ SHIPPED | ~~#24~~ | ~~New `ask_agentic` tool (agentic file access, no eager upload) + preflight workspace-size guard (`WORKSPACE_TOO_LARGE` on `ask`/`code`) + `excludeGlobs` glob-shape classification (extension / filename / dir buckets). Scope diverged from the original T19 plan — oversized-workspace failures were biting reviewer pipelines harder than per-call timeouts, so the agentic path + preflight was prioritised.~~ | ~~~2 days~~ |
 | ~~D.1~~ | ~~**v1.5.1**~~ ✅ SHIPPED | ~~#25~~ | ~~App-layer `withNetworkRetry` (`src/gemini/retry.ts`) wrapping every direct `generateContent` call in `ask` / `code` / `ask_agentic` (including the stale-cache retry paths). Covers Node 18+ undici's `TypeError: fetch failed` — a pre-response failure shape the SDK's pinned `p-retry` 4.6.2 cannot recognise. 3 attempts with 1s → 3s → 9s exponential backoff; non-transient errors propagate on the first failure so retry budget is never spent on permanent problems.~~ | ~~~2 h~~ |
 | ~~D.2~~ | ~~**v1.5.2**~~ ✅ SHIPPED | ~~#26 + #27~~ | ~~Registry prep + docs accuracy. PR #26: `mcpName: "io.github.qmediat/gemini-code-context-mcp"` added to `package.json` (required by Official MCP Registry for verified publishing), README comparison table reworked with measured benchmarks (670k-token Vite workspace: cold 125 s / $0.60, warm ~14 s / $0.60, inline baseline ~20 s / $2.35 — ~8× faster, ~4× cheaper on cache hit), "Abandoned" softened to "Unmaintained on npm since 2025-07". PR #27: docs-only follow-up — corrected a false claim in the caveat paragraph below the table (previously said v1.1.4 defaulted to `gemini-3.1-pro-preview` while main defaulted to `gemini-2.5-pro`; both actually carry `gemini-2.5-pro`; verified empirically against the npm tarball and main branch).~~ | ~~~1 day~~ |
-| E | **v1.6.0** | T19 | Opt-in `GEMINI_CODE_CONTEXT_*_TIMEOUT_MS` env var (default disabled). Complements T22's preflight with a post-call bounded-wait for stuck connections. With v1.5.1's `withNetworkRetry` already landed, T19's `AbortController` pairs naturally — timeout abort + transient-failure retry = a closed loop around `generateContent`. | ~2 h |
-| F | **v1.7.0** | T20 | Migrate `ask` / `code` to `generateContentStream` for in-flight thinking heartbeat. Pairs with T19's `AbortController` for real stall detection — stream heartbeat + timeout abort + network retry = fully closed loop. | ~1 day |
+| D.3 | **v1.5.3** | T1 + T2 | Test-coverage prep patch for v1.6.0/v1.7.0 refactors. T1 unit tests for `cache-manager` (cache-decision branches + in-process mutex), `files-uploader` (hash dedup + safety-margin re-upload + concurrency cap + failure capture), `ttl-watcher` (refresh windows + 404 eviction + re-entrancy guard), `profile-loader` (3-tier resolution order + warn-on-env-key). T2 regression net for `code.tool.ts` parsers (`parseEdits` / `parseCodeBlocks`) — pin contract before T20's stream-collector refactor changes how the response string is assembled. Zero runtime change. | ~3–4 h |
+| E | **v1.6.0** | T19 | Opt-in `GEMINI_CODE_CONTEXT_*_TIMEOUT_MS` env var (default disabled). Complements T22's preflight with a post-call bounded-wait for stuck connections. With v1.5.1's `withNetworkRetry` already landed, T19's `AbortController` pairs naturally — timeout abort + transient-failure retry = a closed loop around `generateContent`. | ~3–4 h |
+| F | **v1.7.0** | T20 + T18 + D#7 | Migrate `ask` / `code` to `generateContentStream` for in-flight thinking heartbeat. Pairs with T19's `AbortController` for real stall detection — stream heartbeat + timeout abort + network retry = fully closed loop. Bundles T18 (precise budget accounting on stale-cache retry — release the failed first reservation before opening the second) and D#7 (status surface separates settled cost from in-flight reserved cost via new `inFlightReservedUsd` field) since both deficits become more visible under streaming and are cheap to address in the same hot-path pass. | ~1 day |
 
 **Why T22+T23 bundled (not separate releases):** both fix a single concern ("reviewer workflows don't work today") and each PR alone doesn't deliver user-visible value — TPM throttle without wire-format fix still can't extract review text; wire-format fix without throttle still 429s on back-to-back calls. Bundling keeps the release-note story coherent for external users.
 
@@ -41,7 +42,13 @@ Each step must fully merge + publish before the next opens:
 
 ---
 
-## T1. Unit test coverage for `cache-manager`, `files-uploader`, `ttl-watcher`, `profile-loader`
+## ~~T1.~~ ✅ SHIPPED v1.5.3 — Unit test coverage for `cache-manager`, `files-uploader`, `ttl-watcher`, `profile-loader`
+
+48 new test cases landed in v1.5.3 (`test/unit/{cache-manager,files-uploader,ttl-watcher,profile-loader}.test.ts`). Mocked `@google/genai` client; covered cache-decision branches, in-process mutex coalescing (with proper microtask pump), hash-based dedup + safety-margin re-upload, parallel pool concurrency cap, refresh windows + 404 eviction + re-entrancy guard, 3-tier auth resolution. No runtime change.
+
+---
+
+## T1-orig. (Original scope — preserved for context)
 
 **Source:** GPT + Gemini + Grok reviews, April 2026.
 
@@ -58,7 +65,13 @@ Each step must fully merge + publish before the next opens:
 
 ---
 
-## T2. Unit tests for `parseEdits` / `parseCodeBlocks` regex in `code.tool.ts`
+## ~~T2.~~ ✅ SHIPPED v1.5.3 — Unit tests for `parseEdits` / `parseCodeBlocks` regex in `code.tool.ts`
+
+19 new test cases (`test/unit/code-parsers.test.ts`). Both parsers exported for testability (no behavior change). Coverage: minimal OLD/NEW, insertion (no OLD), multi-file, Unicode filenames, paths with spaces/dots, multi-line preservation, malformed input, language-tag variants, NEW-first regression-pin documenting the regex contract. Locks parser surface so the v1.7.0 streaming refactor can change response assembly without silent drift.
+
+---
+
+## T2-orig. (Original scope — preserved for context)
 
 **Source:** GPT code review.
 
@@ -323,7 +336,13 @@ Today we call `generateContent` (non-streaming) — single round-trip, no signal
 
 ---
 
-## T21. `thinkingLevel` parity on `code.tool.ts`
+## ~~T21.~~ ✅ SHIPPED v1.4.0 — `thinkingLevel` parity on `code.tool.ts`
+
+Empirically verified 2026-04-25: `code.tool.ts:78` exposes `thinkingLevel` with the Gemini-3 description; `code.tool.ts:113` enforces mutual exclusion with `thinkingBudget` via `.refine()`; `src/tools/shared/thinking.ts` exports `THINKING_LEVELS` + `THINKING_LEVEL_RESERVE` (open question from original scope answered — shared module won, freeing the location for T19/T20 helpers). Released as part of the model-taxonomy work.
+
+---
+
+## T21-orig. (Original scope — preserved for context)
 
 **Source:** April 2026 three-way code review on PR #16 (Gemini consensus) + self-review finding F5.
 

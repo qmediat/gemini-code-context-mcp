@@ -121,7 +121,7 @@ export const codeInputSchema = z
 
 export type CodeInput = z.infer<typeof codeInputSchema>;
 
-interface ParsedEdit {
+export interface ParsedEdit {
   file: string;
   old: string;
   new: string;
@@ -130,7 +130,7 @@ interface ParsedEdit {
 const EDIT_REGEX =
   /\*\*FILE: (.+?)\*\*\s*\n```[^\n]*\n(?:OLD:\s*\n([\s\S]*?)\n)?NEW:\s*\n([\s\S]*?)\n```/g;
 
-function parseEdits(text: string): ParsedEdit[] {
+export function parseEdits(text: string): ParsedEdit[] {
   const edits: ParsedEdit[] = [];
   for (const m of text.matchAll(EDIT_REGEX)) {
     const [, file, oldBlock, newBlock] = m;
@@ -146,7 +146,7 @@ function parseEdits(text: string): ParsedEdit[] {
 
 const CODE_BLOCK_REGEX = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
 
-function parseCodeBlocks(text: string): Array<{ lang: string; content: string }> {
+export function parseCodeBlocks(text: string): Array<{ lang: string; content: string }> {
   const blocks: Array<{ lang: string; content: string }> = [];
   for (const m of text.matchAll(CODE_BLOCK_REGEX)) {
     const [full, lang, content] = m;
