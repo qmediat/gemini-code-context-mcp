@@ -57,6 +57,7 @@ import {
   readFileExecutor,
 } from './agentic/workspace-tools.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { THINKING_LEVELS } from './shared/thinking.js';
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,15 @@ export const askAgenticInputSchema = z
       .optional()
       .describe(
         'Cap on distinct files opened via `read_file` during this agentic call. Default 40.',
+      ),
+    iterationTimeoutMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(1_800_000)
+      .optional()
+      .describe(
+        'Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls) is bounded by this; if Gemini hangs on a single iteration, that iteration aborts but the loop continues with whatever partial state was accumulated. Whole-loop budget is bounded separately by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled. Iteration that times out marks the agentic call as failed with `errorCode: "TIMEOUT"`.',
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -530,6 +540,12 @@ async function executeAskAgenticBody(
 
       let iterResult: Awaited<ReturnType<typeof runAgenticIteration>>;
       const iterStarted = Date.now();
+      // Per-iteration timeout — fresh controller every loop so a long iteration
+      // doesn't burn the budget for the next one. Disposed in the finally below.
+      const iterTimeout = createTimeoutController(
+        input.iterationTimeoutMs,
+        'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
+      );
       try {
         iterResult = await runAgenticIteration({
           ctx,
@@ -539,6 +555,7 @@ async function executeAskAgenticBody(
           workspaceRoot,
           filesReadSet,
           maxFilesRead,
+          abortSignal: iterTimeout.signal,
         });
       } catch (iterErr) {
         // Release both reservations on failure before re-throwing.
@@ -552,7 +569,29 @@ async function executeAskAgenticBody(
         if (throttleReservationId !== -1) {
           ctx.throttle.cancel(throttleReservationId);
         }
+        // If the iteration aborted on timeout, surface a structured TIMEOUT
+        // error so the caller can distinguish "this iteration was too slow"
+        // from "Gemini rejected the request". Annotate which iteration so
+        // ops can correlate with logs. The whole agentic call fails — we do
+        // NOT continue with partial state because the failed iteration's
+        // function-call results never came back, so the conversation is
+        // structurally incomplete.
+        if (isTimeoutAbort(iterErr)) {
+          const ms = iterTimeout.timeoutMs;
+          emitter.emit(`ask_agentic: iteration ${iterations + 1} aborted after ${ms ?? '?'}ms`);
+          return errorResult(
+            `ask_agentic: iteration ${iterations + 1} timed out after ${ms ?? '?'}ms. Increase \`iterationTimeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS\` higher; default disabled. Note: AbortSignal is client-only — Gemini may still finish server-side and bill tokens for completed work.`,
+            {
+              errorCode: 'TIMEOUT',
+              timeoutMs: ms,
+              iteration: iterations + 1,
+              retryable: true,
+            },
+          );
+        }
         throw iterErr;
+      } finally {
+        iterTimeout.dispose();
       }
       const iterDurationMs = Date.now() - iterStarted;
 
@@ -715,6 +754,8 @@ async function runAgenticIteration(args: {
   workspaceRoot: string;
   filesReadSet: Set<string>;
   maxFilesRead: number;
+  /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
+  abortSignal: AbortSignal;
 }): Promise<IterationResult> {
   const {
     ctx,
@@ -724,6 +765,7 @@ async function runAgenticIteration(args: {
     workspaceRoot,
     filesReadSet,
     maxFilesRead,
+    abortSignal,
   } = args;
 
   // Each agentic iteration is its own `generateContent` call; a transient
@@ -738,9 +780,10 @@ async function runAgenticIteration(args: {
       ctx.client.models.generateContent({
         model: resolvedModel,
         contents: conversation,
-        config: baseConfig,
+        config: { ...baseConfig, abortSignal },
       }),
     {
+      signal: abortSignal,
       onRetry: (attempt, err) => {
         logger.warn(
           `ask_agentic: retrying generateContent after transient network failure (attempt ${attempt}): ${

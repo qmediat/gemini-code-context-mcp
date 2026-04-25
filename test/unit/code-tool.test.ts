@@ -183,3 +183,27 @@ describe('code input schema — core fields unchanged', () => {
     expect(parsed.success).toBe(true);
   });
 });
+
+describe('code input schema — timeoutMs (T19, v1.6.0)', () => {
+  it('accepts omitted timeoutMs', () => {
+    const parsed = codeInputSchema.safeParse({ task: 'refactor x' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.timeoutMs).toBeUndefined();
+    }
+  });
+
+  it('accepts the documented bounds', () => {
+    expect(codeInputSchema.safeParse({ task: 't', timeoutMs: 1_000 }).success).toBe(true);
+    expect(codeInputSchema.safeParse({ task: 't', timeoutMs: 1_800_000 }).success).toBe(true);
+  });
+
+  it('rejects values below the 1s minimum', () => {
+    expect(codeInputSchema.safeParse({ task: 't', timeoutMs: 999 }).success).toBe(false);
+    expect(codeInputSchema.safeParse({ task: 't', timeoutMs: 0 }).success).toBe(false);
+  });
+
+  it('rejects values above the 30min maximum', () => {
+    expect(codeInputSchema.safeParse({ task: 't', timeoutMs: 1_800_001 }).success).toBe(false);
+  });
+});

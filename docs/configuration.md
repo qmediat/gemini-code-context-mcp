@@ -32,6 +32,9 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE` | `false` | Set `true` to bypass the `validateWorkspacePath` guard that rejects paths outside the MCP host's cwd unless they contain a recognised workspace marker. Only set this for genuinely unconventional roots (CI sandboxes, generated build dirs). Do NOT set it to work around a prompt-injection vector — the guard is the security control. |
 | `GEMINI_PRICING_OVERRIDES` | — | JSON map of `model → {inputPerMillion, outputPerMillion, cachedInputPerMillion?}`. See example below. |
 | `XDG_CONFIG_HOME` | — | Override the config directory (defaults to `~/.config`) |
+| `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` *(v1.6.0+)* | disabled | Wall-clock timeout in ms for `ask`. Bounded `[1000, 1_800_000]` (1 s to 30 min). Aborts the in-flight `generateContent` request via `AbortController` when exceeded. Empty / `0` / negative = disabled. Per-call `ask({ timeoutMs })` always wins. **Caveat:** `AbortSignal` is client-only — Gemini may still finish server-side and bill for completed work (per `@google/genai` SDK docs). |
+| `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS` *(v1.6.0+)* | disabled | Same shape as the `ask` variant, applied to the `code` tool. Per-call override: `code({ timeoutMs })`. |
+| `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` *(v1.6.0+)* | disabled | Per-iteration cap for `ask_agentic`. Bounds each loop iteration (one `generateContent` + possible tool calls) independently. A single hung iteration aborts the whole agentic call with `errorCode: "TIMEOUT"` — continuing with partial state would leave the conversation structurally incomplete (the failed iteration's function-call results never came back). Per-call override: `ask_agentic({ iterationTimeoutMs })`. |
 
 ## Per-call overrides
 
@@ -46,6 +49,9 @@ Every tool accepts runtime overrides that beat the defaults:
 - `code({ thinkingLevel: "HIGH" })` — discrete reasoning tier on Gemini 3 (Google's recommended knob there); mutually exclusive with `thinkingBudget`. `code` still defaults to `thinkingBudget: 16384` when neither is passed — a stronger default than `ask`'s "omit entirely" because coding genuinely benefits from reasoning
 - `code({ maxOutputTokens: 8192 })` — cap a specific call's response length (defaults to auto = model-full 65,536 per Google docs for Gemini 3.x / 2.5 Pro). Values above the resolved model's limit are clamped. Operators who want EVERY call at full capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level; this per-call field still beats the env override
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
+- `ask({ timeoutMs: 60_000 })` *(v1.6.0+)* — wall-clock cap for this call (1 s–30 min). Aborts via `AbortController` if Gemini takes longer; returns `errorCode: "TIMEOUT"`. Combine with `withNetworkRetry` (auto-on since v1.5.1) for a closed reliability loop: pre-response retry + bounded wall-clock.
+- `code({ timeoutMs: 120_000 })` *(v1.6.0+)* — same on `code`. Coding tasks tolerate longer timeouts because thinking budgets are higher; 2-min default is a reasonable starting point.
+- `ask_agentic({ iterationTimeoutMs: 90_000 })` *(v1.6.0+)* — bounds each loop iteration. Single-iteration hangs abort the whole agentic call (`maxIterations` × `maxTotalInputTokens` separately bound the whole loop)
 
 ## Model aliases
 

@@ -224,3 +224,38 @@ describe('ask input schema — core fields unchanged', () => {
     expect(parsed.success).toBe(true);
   });
 });
+
+describe('ask input schema — timeoutMs (T19, v1.6.0)', () => {
+  it('accepts omitted timeoutMs (runtime falls through to env / disabled)', () => {
+    const parsed = askInputSchema.safeParse({ prompt: 'hi' });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.timeoutMs).toBeUndefined();
+    }
+  });
+
+  it('accepts the documented bounds', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 1_000 }).success).toBe(true);
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 1_800_000 }).success).toBe(true);
+  });
+
+  it('rejects values below the 1s minimum', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 999 }).success).toBe(false);
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 0 }).success).toBe(false);
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: -1 }).success).toBe(false);
+  });
+
+  it('rejects values above the 30min maximum', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 1_800_001 }).success).toBe(false);
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 7_200_000 }).success).toBe(false);
+  });
+
+  it('rejects non-integer floats', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: 1500.5 }).success).toBe(false);
+  });
+
+  it('rejects non-numeric types', () => {
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: '5000' }).success).toBe(false);
+    expect(askInputSchema.safeParse({ prompt: 'hi', timeoutMs: null }).success).toBe(false);
+  });
+});

@@ -5,6 +5,30 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-04-25
+
+### Added — T19 wall-clock timeout for `ask` / `code` / `ask_agentic`
+
+- **New per-call schema parameter `timeoutMs`** on `ask`, `code` (1s–30min, integer). Aborts the in-flight `generateContent` request via `AbortController` if Gemini exceeds the deadline. Default disabled (zero behaviour change for existing users).
+- **New per-iteration parameter `iterationTimeoutMs`** on `ask_agentic`. Bounds each loop iteration; a single slow iteration aborts the whole agentic call with `errorCode: "TIMEOUT"` (continuing with partial state would leave the conversation structurally incomplete).
+- **Three new env vars** for default values: `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS`, `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`. Resolution: per-call > env var > disabled.
+- **New error code `TIMEOUT`** in `structuredContent.errorCode` with `timeoutMs` and `retryable: true` fields. Distinguishable from other failures (`UNKNOWN`, `BUDGET_REJECT`, `WORKSPACE_TOO_LARGE`, `BUDGET_EXCEEDED`).
+- **New module `src/tools/shared/abort-timeout.ts`** — `createTimeoutController(perCallMs, envVarName)` returns a controller with bounded clamping (1s minimum, 30min maximum) and an `unref()`'d timer that doesn't pin the event loop. `isTimeoutAbort(err)` distinguishes timeout-driven aborts (DOMException `TimeoutError`) from user/SDK aborts (`AbortError`).
+- **`withNetworkRetry` now accepts an optional `signal: AbortSignal`** in `NetworkRetryOptions`. Pre-flight check throws if pre-aborted; mid-loop check short-circuits before retry; backoff sleep is interruptible via `abortableSleep` so a 9s wait doesn't defeat a 5s timeout.
+- **22 new test cases** — `abort-timeout.test.ts` (17: env-var fallback, per-call override, clamping, abort semantics, dispose hygiene, never-firing disabled, `isTimeoutAbort` helper); `gemini-retry.test.ts` extended (5: pre-aborted signal, abort during backoff, abort after first attempt, signal-without-firing, signal-without-reason); `ask-timeout-integration.test.ts` (4: TIMEOUT errorCode mapping for `ask` and `code` including `error.cause` nesting); schema bound tests added to `ask-tool.test.ts` and `code-tool.test.ts` (10 cases). Total suite: 478 → 514.
+
+### Changed
+
+- **SDK `abortSignal` is now wired into `config.abortSignal`** (verified empirically against `node_modules/@google/genai/dist/genai.d.ts:1841`) on every `generateContent` call in `ask`, `code`, and `ask_agentic`. Threading is unconditional even when timeout is disabled — the no-op controller's signal never fires, so existing behaviour is preserved.
+
+### Caveat — server-side cancellation is impossible
+
+Per Google's SDK comment in `genai.d.ts:1837-1840`: *"AbortSignal is a client-only operation. Using it to cancel an operation will not cancel the request in the service. You will still be charged usage for any applicable operations."* — when timeout fires, our client drops the response stream, but Gemini may still finish generating server-side and bill for the completed work. The TIMEOUT error message and CHANGELOG both surface this fact so callers don't expect cost savings from aborting slow calls.
+
+### Rationale
+
+`withNetworkRetry` (v1.5.1) only catches PRE-response transient failures. Once Gemini accepts a response stream, a server that takes 10 minutes to think — or hangs on cached-content recall — is observable as a silent stall. The MCP host's progress notifications keep the connection alive, but there was no upper bound on total wall-clock time. T19 closes that gap. Combined with v1.5.1's transient-failure retry and v1.7.0's planned streaming heartbeat (T20), `ask` and `code` will have a fully closed reliability loop: pre-response retry, in-flight liveness signal, bounded wall-clock cap.
+
 ## [1.5.3] - 2026-04-25
 
 ### Added

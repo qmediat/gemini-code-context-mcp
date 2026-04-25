@@ -28,6 +28,7 @@ import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/c
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
@@ -113,6 +114,15 @@ export const askInputSchema = z
       .describe(
         "Per-call opt-in cap on response length (tokens). OMIT for the default 'auto' behaviour — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value when you want a bounded response (e.g. strict summary length, tighter budget per call). Values larger than the resolved model's limit are clamped down. Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` stays a true upper bound.",
       ),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(1_800_000)
+      .optional()
+      .describe(
+        'Per-call wall-clock timeout in ms (1s–30min). Aborts the in-flight `generateContent` request via `AbortController` if Gemini takes longer than this. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled (no timeout). Returns `errorCode: "TIMEOUT"` on abort. Note: `AbortSignal` is client-only — Gemini still finishes the request server-side and bills tokens for completed work.',
+      ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
     message:
@@ -158,6 +168,16 @@ async function executeAskBody(
   // ("latest-pro-thinking") — different key, different bucket.
   let resolvedModelKey: string | null = null;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
+  // Timeout controller is wall-clock-bound on the WHOLE dispatch (workspace
+  // scan + cache prep + generateContent + stale-cache retry). Set up before
+  // any await so a `timeoutMs: 1000` against a slow scan still fires. The
+  // signal threads into both `withNetworkRetry({signal})` and the SDK's
+  // `config.abortSignal` — abort propagates through both layers cleanly.
+  const timeoutController = createTimeoutController(
+    input.timeoutMs,
+    'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+  );
+  const abortSignal = timeoutController.signal;
   try {
     // Workspace path validation lives INSIDE the try so a
     // `WorkspaceValidationError` is reported as a regular tool error
@@ -510,9 +530,10 @@ async function executeAskBody(
           ctx.client.models.generateContent({
             model: resolved.resolved,
             contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
-            config: buildConfig(activePrep.cacheId),
+            config: { ...buildConfig(activePrep.cacheId), abortSignal },
           }),
         {
+          signal: abortSignal,
           onRetry: (attempt, retryErr) => {
             logger.warn(
               `ask: retrying generateContent after transient network failure (attempt ${attempt}): ${
@@ -569,9 +590,10 @@ async function executeAskBody(
               ctx.client.models.generateContent({
                 model: resolved.resolved,
                 contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-                config: buildConfig(rebuilt.cacheId),
+                config: { ...buildConfig(rebuilt.cacheId), abortSignal },
               }),
             {
+              signal: abortSignal,
               onRetry: (attempt, retryErr) => {
                 logger.warn(
                   `ask (stale-cache retry): retrying generateContent after transient network failure (attempt ${attempt}): ${
@@ -765,12 +787,23 @@ async function executeAskBody(
       ctx.throttle.cancel(throttleReservationId);
       throttleReservationId = -1;
     }
+    // Timeout-driven abort gets a dedicated errorCode so callers can
+    // distinguish "Gemini was slow" from "schema invalid" / "auth failed".
+    if (isTimeoutAbort(err)) {
+      const ms = timeoutController.timeoutMs;
+      emitter.emit(`ask: aborted after ${ms ?? '?'}ms timeout`);
+      return errorResult(
+        `ask timed out after ${ms ?? '?'}ms. Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS\` higher; default disabled. Note: Gemini may still finish server-side and bill tokens for completed work (AbortSignal is client-only).`,
+        { errorCode: 'TIMEOUT', timeoutMs: ms, retryable: true },
+      );
+    }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {
+    timeoutController.dispose();
     emitter.stop();
   }
 }
