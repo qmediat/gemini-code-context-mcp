@@ -123,6 +123,35 @@ describe('isTimeoutAbort', () => {
     expect(isTimeoutAbort(wrapped)).toBe(true);
   });
 
+  it('walks the full cause chain (depth ≥ 2) — SDK paths can wrap multiple times', () => {
+    const inner = new DOMException('timed out', 'TimeoutError');
+    const mid = new Error('fetch failed', { cause: inner });
+    const outer = new Error('SDK wrapped fetch', { cause: mid });
+    expect(isTimeoutAbort(outer)).toBe(true);
+  });
+
+  it('handles even deeper chains (3 levels)', () => {
+    const a = new DOMException('timed out', 'TimeoutError');
+    const b = new Error('layer 1', { cause: a });
+    const c = new Error('layer 2', { cause: b });
+    const d = new Error('layer 3', { cause: c });
+    expect(isTimeoutAbort(d)).toBe(true);
+  });
+
+  it('is cycle-safe: does not infinite-loop on a self-cyclic cause', () => {
+    const cyclic = new Error('cyclic') as Error & { cause?: unknown };
+    cyclic.cause = cyclic;
+    expect(isTimeoutAbort(cyclic)).toBe(false);
+  });
+
+  it('is cycle-safe: handles two-error cycle', () => {
+    const a = new Error('a') as Error & { cause?: unknown };
+    const b = new Error('b') as Error & { cause?: unknown };
+    a.cause = b;
+    b.cause = a;
+    expect(isTimeoutAbort(a)).toBe(false);
+  });
+
   it('returns false for a regular AbortError', () => {
     const err = new DOMException('aborted by user', 'AbortError');
     expect(isTimeoutAbort(err)).toBe(false);
@@ -137,5 +166,42 @@ describe('isTimeoutAbort', () => {
     expect(isTimeoutAbort(null)).toBe(false);
     expect(isTimeoutAbort(undefined)).toBe(false);
     expect(isTimeoutAbort({ name: 'TimeoutError' })).toBe(false);
+  });
+});
+
+describe('abortableSleep — exported for tool-side throttle waits (T19 H1 fix)', () => {
+  it('resolves normally after `ms` when signal never fires', async () => {
+    vi.useFakeTimers();
+    const { abortableSleep } = await import('../../src/gemini/retry.js');
+    const controller = new AbortController();
+    const promise = abortableSleep(50, controller.signal);
+    vi.advanceTimersByTime(60);
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it('rejects immediately when signal already aborted (pre-flight check)', async () => {
+    const { abortableSleep } = await import('../../src/gemini/retry.js');
+    const controller = new AbortController();
+    controller.abort(new DOMException('pre-aborted', 'TimeoutError'));
+    await expect(abortableSleep(60_000, controller.signal)).rejects.toThrow(/pre-aborted/);
+  });
+
+  it('rejects when signal fires DURING the sleep (interrupts long wait)', async () => {
+    vi.useFakeTimers();
+    const { abortableSleep } = await import('../../src/gemini/retry.js');
+    const controller = new AbortController();
+    const promise = abortableSleep(60_000, controller.signal);
+    // Fire abort while sleeping.
+    setTimeout(() => controller.abort(new DOMException('mid-sleep', 'TimeoutError')), 100);
+    vi.advanceTimersByTime(150);
+    await expect(promise).rejects.toThrow(/mid-sleep/);
+  });
+
+  it('handles undefined signal (treated as no abort capability)', async () => {
+    vi.useFakeTimers();
+    const { abortableSleep } = await import('../../src/gemini/retry.js');
+    const promise = abortableSleep(50, undefined);
+    vi.advanceTimersByTime(60);
+    await expect(promise).resolves.toBeUndefined();
   });
 });

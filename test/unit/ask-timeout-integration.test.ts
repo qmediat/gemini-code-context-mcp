@@ -178,3 +178,71 @@ describe('code — TIMEOUT errorCode mapping (T19)', () => {
     expect(cancelThrottle).toHaveBeenCalled();
   });
 });
+
+describe('Stale-cache retry + timeout — T19 H2 regression fix', () => {
+  it('ask: timeout DURING stale-cache retry maps to TIMEOUT (not UNKNOWN)', async () => {
+    const { ctx, generateContent } = buildCtx();
+    // First call: stale-cache error.
+    // Retry call: TimeoutError.
+    // Without the fix: outer catch wraps with `cause: <stale-cache-err>`,
+    // outer's `isTimeoutAbort(err)` walks the wrapped chain and sees the
+    // stale-cache error first → UNKNOWN. With the fix: timeout re-thrown
+    // directly so isTimeoutAbort returns true on the retry's TimeoutError.
+    mocks.prepareContext
+      .mockResolvedValueOnce({
+        cacheId: 'cachedContents/stale',
+        inlineContents: [],
+        reused: true,
+        rebuilt: false,
+        inlineOnly: false,
+        uploaded: { failedCount: 0, failures: [] },
+      })
+      .mockResolvedValueOnce({
+        cacheId: 'cachedContents/fresh',
+        inlineContents: [],
+        reused: false,
+        rebuilt: true,
+        inlineOnly: false,
+        uploaded: { failedCount: 0, failures: [] },
+      });
+    mocks.isStaleCacheError.mockReturnValue(true);
+    generateContent
+      .mockRejectedValueOnce(new Error('cachedContent NOT_FOUND'))
+      .mockRejectedValueOnce(new DOMException('retry timed out', 'TimeoutError'));
+
+    const result = await askTool.execute({ prompt: 'hi', timeoutMs: 5000 }, ctx);
+
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(5000);
+  });
+
+  it('code: timeout DURING stale-cache retry maps to TIMEOUT (not UNKNOWN)', async () => {
+    const { ctx, generateContent } = buildCtx();
+    mocks.prepareContext
+      .mockResolvedValueOnce({
+        cacheId: 'cachedContents/stale',
+        inlineContents: [],
+        reused: true,
+        rebuilt: false,
+        inlineOnly: false,
+        uploaded: { failedCount: 0, failures: [] },
+      })
+      .mockResolvedValueOnce({
+        cacheId: 'cachedContents/fresh',
+        inlineContents: [],
+        reused: false,
+        rebuilt: true,
+        inlineOnly: false,
+        uploaded: { failedCount: 0, failures: [] },
+      });
+    mocks.isStaleCacheError.mockReturnValue(true);
+    generateContent
+      .mockRejectedValueOnce(new Error('cachedContent NOT_FOUND'))
+      .mockRejectedValueOnce(new DOMException('retry timed out', 'TimeoutError'));
+
+    const result = await codeTool.execute({ task: 'refactor', timeoutMs: 7000 }, ctx);
+
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(7000);
+  });
+});

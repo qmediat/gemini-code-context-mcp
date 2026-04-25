@@ -18,7 +18,7 @@ import type {
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
-import { withNetworkRetry } from '../gemini/retry.js';
+import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -440,7 +440,9 @@ async function executeAskBody(
       throttleReservationId = reservation.releaseId;
       if (reservation.delayMs > 0) {
         emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
-        await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        // Abortable sleep — without this a 60s TPM throttle wait would block
+        // a 10s wall-clock timeout, defeating T19's whole-dispatch contract.
+        await abortableSleep(reservation.delayMs, abortSignal);
       }
     };
     await reserveForDispatch();
@@ -606,8 +608,14 @@ async function executeAskBody(
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {
-          // Preserve the ORIGINAL stale-cache error as `cause` so ops can
-          // root-cause diagnostics across both the first 404 and any
+          // Re-throw the retry's TimeoutError directly so the outer catch's
+          // `isTimeoutAbort` check sees it on the cause chain. Without this,
+          // wrapping with `cause: err` (the original stale-cache error)
+          // would mask the timeout — outer catch maps to UNKNOWN instead of
+          // TIMEOUT, breaking the contract on stale-cache+timeout paths.
+          if (isTimeoutAbort(retryErr)) throw retryErr;
+          // Otherwise preserve the ORIGINAL stale-cache error as `cause` so
+          // ops can root-cause diagnostics across both the first 404 and any
           // rebuild-time failure.
           throw new Error(
             `ask retry after stale cache failed: ${

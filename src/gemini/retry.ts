@@ -127,10 +127,14 @@ export async function withNetworkRetry<T>(
       // SDK error that happened to surface concurrently. (E.g. SDK throws
       // generic "fetch failed" because abort tore down the socket; we want
       // the timeout-driven AbortError, not the generic transient error.)
+      // Checked TWICE: once before classifying the error (catches the common
+      // case), once on the final-attempt throw (closes the narrow window
+      // where abort flips between the first check and the terminal throw).
       if (signal?.aborted) {
         throwAbortReason(signal);
       }
       if (!isTransientNetworkError(err) || attempt === attempts) {
+        if (signal?.aborted) throwAbortReason(signal);
         throw err;
       }
       options.onRetry?.(attempt, err);
@@ -156,11 +160,21 @@ function throwAbortReason(signal: AbortSignal): never {
 }
 
 /**
- * `setTimeout(resolve, ms)` that also resolves immediately when `signal`
- * fires. Without abort awareness, a 9s backoff sleep would block timeout
- * abort — defeating the purpose of T19's wall-clock cap.
+ * `setTimeout(resolve, ms)` that also rejects with the abort reason when
+ * `signal` fires. Without abort awareness, a 9s backoff sleep — or worse, a
+ * 60s TPM-throttle wait — would block T19's wall-clock cap. Exported so tool
+ * call sites can reuse it for the throttle/reservation sleep without
+ * duplicating the listener+timer dance.
+ *
+ * Race-safety:
+ *   - Pre-flight check throws synchronously when signal is already aborted.
+ *   - Listener uses `{ once: true }` → auto-removes on fire (no leak).
+ *   - Timer-first path explicitly removes the listener before `resolve()` so
+ *     a same-tick abort that would re-fire is impossible.
+ *   - Abort-first path clears the timer before `reject()`.
+ *   - Single-threaded JS means no read-resolve-then-write-reject window.
  */
-function abortableSleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+export function abortableSleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       try {

@@ -20,7 +20,7 @@ import type {
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
-import { withNetworkRetry } from '../gemini/retry.js';
+import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -433,7 +433,8 @@ async function executeCodeBody(
       throttleReservationId = reservation.releaseId;
       if (reservation.delayMs > 0) {
         emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
-        await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        // Abortable — wall-clock timeout (T19) must beat throttle delay.
+        await abortableSleep(reservation.delayMs, abortSignal);
       }
     };
     await reserveForDispatch();
@@ -589,6 +590,11 @@ async function executeCodeBody(
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {
+          // Re-throw timeout directly so the outer catch's `isTimeoutAbort`
+          // sees it. Wrapping with `cause: err` (the original stale-cache
+          // error) would mask the timeout; outer catch would map to UNKNOWN
+          // instead of TIMEOUT.
+          if (isTimeoutAbort(retryErr)) throw retryErr;
           throw new Error(
             `code retry after stale cache failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)

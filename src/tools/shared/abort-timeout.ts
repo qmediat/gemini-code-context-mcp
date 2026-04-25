@@ -115,14 +115,27 @@ function disabledController(): TimeoutController {
  * Identify a timeout-driven abort vs a user-driven abort.
  *
  * `createTimeoutController` aborts with a `DOMException` whose `name` is
- * `'TimeoutError'`. Callers can use this to map the error to a user-facing
+ * `'TimeoutError'`. Callers use this to map the error to a user-facing
  * `errorCode: 'TIMEOUT'` rather than the generic `'ABORTED'`.
+ *
+ * Walks the full `error.cause` chain rather than just one level — the
+ * `@google/genai` SDK paths through Node `undici` can wrap errors more than
+ * once (e.g. `Error('SDK error') → Error('fetch failed') → DOMException
+ * TimeoutError`), and a single-level check would miss those. Cycle-safe via
+ * `Set<Error>` tracker (real production traces have produced cyclical
+ * `cause` chains via re-thrown wrappers).
  */
+const MAX_CAUSE_DEPTH = 8;
+
 export function isTimeoutAbort(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  if (err.name === 'TimeoutError') return true;
-  // Some SDK paths re-throw with `cause` set to the abort reason.
-  const cause = (err as { cause?: unknown }).cause;
-  if (cause instanceof Error && cause.name === 'TimeoutError') return true;
+  let current: unknown = err;
+  const seen = new Set<unknown>();
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth += 1) {
+    if (!(current instanceof Error)) return false;
+    if (seen.has(current)) return false;
+    seen.add(current);
+    if (current.name === 'TimeoutError') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
   return false;
 }
