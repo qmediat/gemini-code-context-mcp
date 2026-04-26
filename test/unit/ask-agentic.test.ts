@@ -17,7 +17,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { askAgenticTool } from '../../src/tools/ask-agentic.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 
@@ -158,6 +158,19 @@ function buildCtx(args: {
   };
   return { ctx, generateContent, manifest, throttle };
 }
+
+// Defense-in-depth: any test that calls `vi.useFakeTimers()` and fails to
+// restore real timers (e.g. an `await` inside a `try { … } finally { … }`
+// block never settles, so the `finally` arm never runs) leaves the worker's
+// global `setTimeout` hijacked. Subsequent real-timer tests in the same file
+// (vitest runs all tests of one file in the same worker) then deadlock —
+// their `setTimeout(…, 1000)` is intercepted by the fake-timer queue and
+// never fires. This `afterEach` is a hard floor: every test starts with
+// real timers regardless of the previous test's exit path. The leak that
+// motivated this guard is documented in CHANGELOG.md `[1.7.2]`.
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -590,31 +603,33 @@ describe('ask_agentic loop — transient network retry (v1.5.1)', () => {
   }, 15_000);
 
   it('surfaces a structured error when the retry budget exhausts on persistent failure', async () => {
+    // REAL timers — see the v1.7.2 root-cause note. The earlier fake-timer
+    // implementation raced `vi.advanceTimersByTimeAsync` (only drains the
+    // microtask queue) against `await resolveWorkspaceRoot(...)` which calls
+    // `fs.promises.realpath` (libuv thread-pool I/O — NOT touched by fake
+    // timers). On hot CI disks the realpath could resolve AFTER the advance
+    // calls, so the `withNetworkRetry` `setTimeout(1000)` was registered
+    // post-advance and the fake-timer queue never fired it again — the test
+    // hung to the 30s ceiling, abandoned its `finally { useRealTimers() }`,
+    // and poisoned every subsequent real-timer test in this file. Real
+    // timers run in ~4s wall-clock (1s + 3s exponential backoff) — well
+    // under the 30s budget — and have no race with realpath.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-retry-'));
     writeFileSync(join(root, 'index.ts'), 'export const x = 1;');
 
-    vi.useFakeTimers();
-    try {
-      const { ctx, generateContent } = buildCtx({ script: [] });
-      generateContent.mockReset();
-      // Every call rejects with the undici transient shape → withNetworkRetry
-      // exhausts its 3-attempt budget and re-throws.
-      generateContent.mockRejectedValue(new TypeError('fetch failed'));
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    // Every call rejects with the undici transient shape → withNetworkRetry
+    // exhausts its 3-attempt budget and re-throws.
+    generateContent.mockRejectedValue(new TypeError('fetch failed'));
 
-      const resultPromise = askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
-      // Flush both backoff waits (1s then 3s) plus any pending microtasks.
-      await vi.advanceTimersByTimeAsync(1_000);
-      await vi.advanceTimersByTimeAsync(3_000);
-      const result = await resultPromise;
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
 
-      expect(result.isError).toBe(true);
-      expect(String(result.content[0]?.text)).toMatch(/ask_agentic failed.*fetch failed/i);
-      expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
-      // Three attempts: initial + 2 retries = 3 generateContent calls.
-      expect(generateContent).toHaveBeenCalledTimes(3);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(result.isError).toBe(true);
+    expect(String(result.content[0]?.text)).toMatch(/ask_agentic failed.*fetch failed/i);
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    // Three attempts: initial + 2 retries = 3 generateContent calls.
+    expect(generateContent).toHaveBeenCalledTimes(3);
   });
 
   it('does NOT retry permanent failures (no .status, no fetch-failed shape)', async () => {

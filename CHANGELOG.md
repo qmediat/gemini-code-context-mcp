@@ -5,17 +5,34 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.1] - 2026-04-26
+## [1.7.2] - 2026-04-26
 
-### Fixed — release pipeline reliability
+### Fixed — release pipeline reliability (true root cause)
 
-- **`vitest.config.ts` `testTimeout` raised from 10 s to 30 s.** Four real-timer based tests in `test/unit/ask-agentic.test.ts` (the F2/F3 iteration-timeout cases plus the end-to-end real-timer assertion and the retry-budget exhaustion test) sat just under the 10 s ceiling locally (~1.5–3 s each operation), but slower GitHub Actions runners crossed it intermittently. The v1.7.0 `release.yml` run failed at the test step and never reached the npm publish — meaning **the npm tarball for v1.7.0 shipped without the `--provenance` supply-chain attestation** that the workflow normally adds. v1.7.1 onwards lands on npm with provenance again.
-- **Removed three redundant per-test `}, 10_000)` overrides** in `ask-agentic.test.ts` so the affected tests inherit the new 30 s global instead of pinning themselves to the pre-fix ceiling.
+- **`test/unit/ask-agentic.test.ts:592` rewritten to use real timers.** The pre-existing fake-timer implementation (added in v1.5.1, `bdd2b3f`) had a latent race condition that finally triggered intermittent CI deadlocks on second-run-in-same-job invocations:
+  - The test called `vi.useFakeTimers()` then `await askAgenticTool.execute(…)`. Inside `execute`, `await resolveWorkspaceRoot(…)` calls `fs.promises.realpath` (`src/tools/agentic/sandbox.ts:155`) — libuv thread-pool I/O that is **not** observable by `vi.advanceTimersByTimeAsync` (which only drains the microtask queue).
+  - Sequence on a slow disk: `advanceTimersByTimeAsync(1_000)` and `(3_000)` returned BEFORE realpath resolved. When realpath finally resolved, `withNetworkRetry` (`src/gemini/retry.ts:141`) registered `setTimeout(1000)` for backoff — but this timer was queued AFTER the fake clock already advanced past it. With fake timers active, that setTimeout never fired again. The test hung to the 30 s ceiling. Its `finally { vi.useRealTimers() }` block never ran (because the awaited promise never settled), so **fake timers stayed active globally for the worker**.
+  - Cascade: vitest runs all tests of one file in the same worker. The next three tests in this file (`:748`, `:794`, `:853` — the F2 / F3 / end-to-end real-timer assertions added in v1.6.0 + v1.7.0) all rely on a real `setTimeout` firing inside `createTimeoutController` (`src/tools/shared/abort-timeout.ts:82`). With the global hijacked, their timers never fired either. Each ate the full 30 s timeout — observed total in CI: 121.65 s, exactly `4 × 30 s + ~1.65 s overhead`.
+  - Trigger of the race in CI run #2 specifically: the explicit `Unit tests` step ran first cleanly. Then `npm run build` wrote ~160 files to `dist/`. Then `npm publish` triggered `prepublishOnly` which re-ran the full test suite. The post-build hot disk-write queue slowed `realpath` on the test's `tmpdir`-fresh directory, widening the race window enough to lose. Run #1 had a cold queue and won the race. Local macOS APFS is fast enough to win every time. `ci.yml` runs the suite once so never sees the second-run path.
+  - **Why v1.5.x didn't surface this:** the v1.6.0 + v1.7.0 fixes did not introduce the race — they introduced the *witnesses* (real-timer tests that get cascade-killed once the fake-timer global leaks). Before those, fake-timer leakage from `:592` was invisible because no later test in the same file depended on a real `setTimeout` firing.
+- **Defense-in-depth: file-level `afterEach(() => vi.useRealTimers())` added** to `ask-agentic.test.ts`. Future tests that call `vi.useFakeTimers()` and fail to clean up cannot poison subsequent tests in the file. The cascade pattern (one failing fake-timer test deadlocks the next N real-timer tests) is now structurally impossible.
+
+### Why this is the root cause, not a band-aid
+
+- An earlier alternative considered passing `--ignore-scripts` to `npm publish` in `release.yml` to skip the `prepublishOnly` re-run. That would have masked the test bug while leaving local `npm publish` invocations exposed to the same deadlock. The current fix removes the underlying race; `release.yml` runs the test suite twice cleanly without any flag changes.
+- v1.7.1 (`testTimeout` 10 s → 30 s) was a partial fix that addressed run #1 only — the timeout was correctly raised so the first invocation no longer flaked, but the second-run race was unaffected. v1.7.2 closes the remaining gap.
 
 ### Notes
 
-- Zero runtime change. Production code (`src/`), `server.json` schema, and the MCP wire format are byte-identical to v1.7.0 except for the version-string bump in `package.json` / `server.json`.
-- v1.7.0 remains usable on npm — the missing-provenance is a supply-chain-audit concern, not a runtime bug. Users can stay on 1.7.0 if they don't gate on attestations; otherwise upgrade to 1.7.1 for the provenance-signed tarball.
+- Zero runtime change vs v1.7.1 / v1.7.0. Production code (`src/`) is byte-identical except for the version-string bumps in `package.json` + `server.json`.
+- v1.7.1 was never published to npm — its `release.yml` run failed at `Publish to npm` because of the cascade described above. Users see latest = 1.7.0 (no provenance) before this release; latest = 1.7.2 (provenance-signed) after.
+
+## [1.7.1] - 2026-04-26 (NEVER PUBLISHED — same root cause it was meant to address; superseded by v1.7.2)
+
+### Fixed — release pipeline reliability (partial — completed in v1.7.2)
+
+- **`vitest.config.ts` `testTimeout` raised from 10 s to 30 s.** Fixed run #1 of the test suite in `release.yml` (the explicit `Unit tests` step). Did not address the run #2 (`prepublishOnly`) deadlock — which v1.7.2 traced to a fake-timer race in `ask-agentic.test.ts:592` rather than an undersized timeout. Kept in 1.7.2 for headroom on slower runners.
+- **Removed three redundant per-test `}, 10_000)` overrides** in `ask-agentic.test.ts` so the affected tests inherit the new 30 s global.
 
 ## [1.7.0] - 2026-04-25
 
