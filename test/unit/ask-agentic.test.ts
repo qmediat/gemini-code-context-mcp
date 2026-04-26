@@ -12,9 +12,46 @@
  *
  * `generateContent` is mocked; the executors (list_directory / read_file
  * / find_files / grep) run for real against a tmpdir workspace.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ *   FAKE-TIMER HAZARD — READ BEFORE ADDING TESTS HERE
+ * ─────────────────────────────────────────────────────────────────────────
+ * Tests in this file MUST NOT call `vi.useFakeTimers()` before
+ * `await askAgenticTool.execute(...)`. The production code path (line ~409
+ * in `src/tools/ask-agentic.tool.ts`) calls `await resolveWorkspaceRoot(...)`
+ * → `await fs.promises.realpath(...)` (sandbox.ts:155) — libuv thread-pool
+ * I/O that fake timers CANNOT intercept. Sequence:
+ *
+ *   1. Test calls `vi.useFakeTimers()`
+ *   2. Test calls `await askAgenticTool.execute(...)` → starts realpath
+ *   3. Test calls `await vi.advanceTimersByTimeAsync(N)` — drains the
+ *      microtask queue and returns BEFORE realpath resolves on a slow disk
+ *   4. realpath finally resolves; `withNetworkRetry` registers
+ *      `setTimeout(1000)` for backoff — but this timer is queued AFTER the
+ *      fake clock already advanced past it. The timer never fires.
+ *   5. Test hangs to the 30 s `testTimeout`. Its `try { … } finally
+ *      { useRealTimers() }` block never runs. Fake timers stay hijacked
+ *      globally for the worker (vitest runs all tests of one file in the
+ *      same worker), and every subsequent real-timer test in this file
+ *      (e.g. the F2 / F3 / end-to-end iteration-timeout tests) deadlocks
+ *      its own `setTimeout` against the leaked fake-timer queue.
+ *
+ * v1.7.2 traced this race (CHANGELOG `[1.7.2]`) and rewrote `:592` (the
+ * one offender at the time) to use real timers. The file-level `afterEach`
+ * below is defense-in-depth so a future regression of the same pattern is
+ * contained to one test instead of cascading.
+ *
+ * If you NEED to drive a timer-based assertion through `askAgenticTool.execute`,
+ * use REAL timers — the production backoff is bounded (1s + 3s = ~4s for the
+ * full retry-budget exhaust path) and the suite's 30s `testTimeout` has
+ * plenty of headroom. Fake timers are appropriate for unit tests of
+ * `withNetworkRetry` / `abortableSleep` / `createTimeoutController` in
+ * isolation (see `gemini-retry.test.ts` and `abort-timeout.test.ts`), where
+ * no realpath I/O sits between the timer and the test boundary.
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -167,10 +204,44 @@ function buildCtx(args: {
 // their `setTimeout(…, 1000)` is intercepted by the fake-timer queue and
 // never fires. This `afterEach` is a hard floor: every test starts with
 // real timers regardless of the previous test's exit path. The leak that
-// motivated this guard is documented in CHANGELOG.md `[1.7.2]`.
+// motivated this guard is documented in CHANGELOG.md `[1.7.2]`. **DO NOT
+// REMOVE THIS HOOK** without re-introducing the cascade described in that
+// entry — see also the top-of-file comment block on the fake-timer hazard.
+//
+// `clearAllTimers` (v1.7.3, /6step Finding #2) drops any pending fake-timer
+// entries before swapping back to real, so a future test that calls
+// `vi.useFakeTimers()` does not inherit stale queue state from a prior test.
+//
+// `cleanupTmpDirs` (v1.7.3, /6step Finding #7) sweeps `gcctx-askagent-*`
+// dirs created by `mkdtempSync` in the previous test. Tests in this file
+// run sequentially in one worker, so by the time `afterEach` fires the
+// previous test's `it()` body has resolved and no longer holds open file
+// handles to the dir. Best-effort: rmSync errors are swallowed so a single
+// flake in cleanup does not mask a real test failure in the next case.
 afterEach(() => {
+  vi.clearAllTimers();
   vi.useRealTimers();
+  cleanupTmpDirs();
 });
+
+function cleanupTmpDirs(): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(tmpdir());
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!entry.startsWith('gcctx-askagent-')) continue;
+    try {
+      rmSync(join(tmpdir(), entry), { recursive: true, force: true });
+    } catch {
+      // Best-effort. The next CI run on a fresh GH Actions runner starts
+      // with an empty /tmp anyway; the only cost of a failed sweep here
+      // is dev-machine /tmp accumulation, which is bounded and harmless.
+    }
+  }
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -629,6 +700,10 @@ describe('ask_agentic loop — transient network retry (v1.5.1)', () => {
     expect(String(result.content[0]?.text)).toMatch(/ask_agentic failed.*fetch failed/i);
     expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
     // Three attempts: initial + 2 retries = 3 generateContent calls.
+    // Coupled to `withNetworkRetry`'s default `attempts: 3` in
+    // `src/gemini/retry.ts:112`. If that default ever changes, update both
+    // the assertion AND the ~4 s wall-clock comment in the test docstring
+    // (1 s + 3 s exponential backoff = 4 s for default attempts=3 + base=1s).
     expect(generateContent).toHaveBeenCalledTimes(3);
   });
 
