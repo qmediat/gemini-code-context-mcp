@@ -800,9 +800,14 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
     expect(manifest.cancelBudgetReservation).toHaveBeenCalledWith(1);
     expect(throttle.cancel).toHaveBeenCalledWith(42);
-    // Sanity: actually waited for the timer (≥ 1 s) — not an instant
-    // resolve from a misfired guard.
-    expect(elapsedMs).toBeGreaterThanOrEqual(1_000);
+    // Sanity: actually waited for the timer (≥ ~1 s) — not an instant
+    // resolve from a misfired guard. Lower bound is 950ms (5 % slack)
+    // because Node's `setTimeout(fn, 1_000)` is documented as "approximately
+    // 1000ms" and can fire 1-2 ms early due to clock-source quantisation
+    // between `Date.now()` and the timer's internal monotonic clock —
+    // observed in CI on Node 22 / Linux runner: 999ms elapsed for a 1000ms
+    // timer (PR #35 round 1).
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(elapsedMs).toBeLessThan(5_000);
   });
 
@@ -859,9 +864,11 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(throttle.cancel).not.toHaveBeenCalled();
     expect(manifest.finalizeBudgetReservation).not.toHaveBeenCalled();
     // Timing sanity: must have actually waited for the slow executor
-    // (≥ 1.5 s). If this falls below 1.5 s the wrapper isn't being
-    // invoked and the test is silently a no-op.
-    expect(elapsedMs).toBeGreaterThanOrEqual(1_500);
+    // (≥ ~1.5 s). If this falls below 1.5 s the wrapper isn't being
+    // invoked and the test is silently a no-op. Lower bound is 1450ms
+    // (~3 % slack) for the same `setTimeout` precision reason documented
+    // in the F3 / end-to-end tests above.
+    expect(elapsedMs).toBeGreaterThanOrEqual(1_450);
     expect(elapsedMs).toBeLessThan(5_000);
   });
 
@@ -919,10 +926,13 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(result.structuredContent?.timeoutMs).toBe(1_000);
     expect(result.structuredContent?.iteration).toBe(1);
 
-    // Sanity: actually waited for the timer to fire (≥ 1s) and didn't run
-    // into pathological stall (< 5s gives generous CI headroom). Tightening
-    // the upper bound risks flakes on slow shared runners.
-    expect(elapsedMs).toBeGreaterThanOrEqual(1_000);
+    // Sanity: actually waited for the timer to fire (≥ ~1 s) and didn't
+    // run into pathological stall (< 5s gives generous CI headroom).
+    // Tightening the upper bound risks flakes on slow shared runners.
+    // Lower bound is 950ms (5 % slack) because Node's `setTimeout(fn, 1_000)`
+    // is documented as "approximately 1000ms" and can fire 1-2 ms early —
+    // observed in CI on Node 22 / Linux: 999ms elapsed (PR #35 round 1).
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(elapsedMs).toBeLessThan(5_000);
   });
 });
