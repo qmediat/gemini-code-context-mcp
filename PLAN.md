@@ -103,13 +103,15 @@ async function resolveModel(alias: string): Promise<string> {
 
 **Wyexpozowane w `status` tool:**
 ```
-workspace:       /Users/mikeb/Projects/ConsistencyForge
-current_model:   gemini-3-pro-preview (resolved from 'latest-pro')
-available_models: [gemini-3-pro-preview, gemini-3-flash, gemini-2.5-pro, gemini-2.5-flash]
-context_window:  2,000,000 tokens
-cache_tokens:    847,512 cached (12h TTL, pinned)
+workspace:       /path/to/your-workspace
+current_model:   gemini-3.1-pro-preview (resolved from 'latest-pro')
+available_models: [gemini-3.1-pro-preview, gemini-3-pro-preview, gemini-3.1-flash-preview, gemini-2.5-pro, gemini-2.5-flash]
+context_window:  1,048,576 tokens
+cache_tokens:    847,512 cached (1h TTL, pinned)
 ...
 ```
+
+> *Example values for illustration only. Actual model lineup is whatever your API key sees at startup (`latest-pro` / `latest-pro-thinking` / `latest-flash` resolve to the newest matching category) and the live `status` tool returns the real numbers.*
 
 ### Tool surface (v1.0) — 5 tooli
 
