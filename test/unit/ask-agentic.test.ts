@@ -789,7 +789,7 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // resolve from a misfired guard.
     expect(elapsedMs).toBeGreaterThanOrEqual(1_000);
     expect(elapsedMs).toBeLessThan(5_000);
-  }, 10_000);
+  });
 
   it('surfaces TIMEOUT when the iteration timer fires DURING tool execution (F2 — post-dispatch abort check)', async () => {
     // Production guards against a slow tool overrunning the deadline at
@@ -848,7 +848,7 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // invoked and the test is silently a no-op.
     expect(elapsedMs).toBeGreaterThanOrEqual(1_500);
     expect(elapsedMs).toBeLessThan(5_000);
-  }, 10_000);
+  });
 
   it('end-to-end: real timer fires on a hung generateContent and surfaces TIMEOUT', async () => {
     // No fake timers — we want the controller's actual setTimeout to fire so
@@ -909,5 +909,5 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // the upper bound risks flakes on slow shared runners.
     expect(elapsedMs).toBeGreaterThanOrEqual(1_000);
     expect(elapsedMs).toBeLessThan(5_000);
-  }, 10_000);
+  });
 });
