@@ -5,6 +5,18 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-04-26
+
+### Fixed — release pipeline reliability
+
+- **`vitest.config.ts` `testTimeout` raised from 10 s to 30 s.** Four real-timer based tests in `test/unit/ask-agentic.test.ts` (the F2/F3 iteration-timeout cases plus the end-to-end real-timer assertion and the retry-budget exhaustion test) sat just under the 10 s ceiling locally (~1.5–3 s each operation), but slower GitHub Actions runners crossed it intermittently. The v1.7.0 `release.yml` run failed at the test step and never reached the npm publish — meaning **the npm tarball for v1.7.0 shipped without the `--provenance` supply-chain attestation** that the workflow normally adds. v1.7.1 onwards lands on npm with provenance again.
+- **Removed three redundant per-test `}, 10_000)` overrides** in `ask-agentic.test.ts` so the affected tests inherit the new 30 s global instead of pinning themselves to the pre-fix ceiling.
+
+### Notes
+
+- Zero runtime change. Production code (`src/`), `server.json` schema, and the MCP wire format are byte-identical to v1.7.0 except for the version-string bump in `package.json` / `server.json`.
+- v1.7.0 remains usable on npm — the missing-provenance is a supply-chain-audit concern, not a runtime bug. Users can stay on 1.7.0 if they don't gate on attestations; otherwise upgrade to 1.7.1 for the provenance-signed tarball.
+
 ## [1.7.0] - 2026-04-25
 
 ### Added — T20 streaming heartbeat for `ask` / `code`
