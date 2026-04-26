@@ -123,3 +123,72 @@ describe('withNetworkRetry', () => {
     setTimeoutSpy.mockRestore();
   });
 });
+
+describe('withNetworkRetry — AbortSignal integration (T19, v1.6.0)', () => {
+  it('throws immediately if signal is already aborted before first attempt', async () => {
+    const controller = new AbortController();
+    controller.abort(new DOMException('pre-aborted', 'TimeoutError'));
+    const fn = vi.fn(async () => 'should not run');
+    await expect(withNetworkRetry(fn, { signal: controller.signal })).rejects.toThrow(
+      /pre-aborted/,
+    );
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('short-circuits the backoff sleep when signal fires during retry wait', async () => {
+    let calls = 0;
+    const fn = vi.fn(async () => {
+      calls += 1;
+      throw new TypeError('fetch failed');
+    });
+    const controller = new AbortController();
+    const promise = withNetworkRetry(fn, {
+      signal: controller.signal,
+      attempts: 5,
+      baseMs: 5_000,
+    });
+    // Wait for first attempt to land + start sleeping.
+    await new Promise((r) => setImmediate(r));
+    controller.abort(new DOMException('cancel', 'TimeoutError'));
+    await expect(promise).rejects.toThrow(/cancel/);
+    // Only the first attempt ran; the abort interrupted the backoff before
+    // the retry even dispatched.
+    expect(calls).toBe(1);
+  });
+
+  it('after a transient failure, an aborted signal short-circuits the loop', async () => {
+    const controller = new AbortController();
+    let calls = 0;
+    const fn = vi.fn(async () => {
+      calls += 1;
+      // Fire abort after the first failure has been thrown.
+      if (calls === 1) {
+        controller.abort(new DOMException('mid-loop abort', 'TimeoutError'));
+      }
+      throw new TypeError('fetch failed');
+    });
+    await expect(
+      withNetworkRetry(fn, { signal: controller.signal, attempts: 5, baseMs: 0 }),
+    ).rejects.toThrow(/mid-loop abort/);
+    // Should NOT proceed to attempt 2 — abort wins over transient retry.
+    expect(calls).toBe(1);
+  });
+
+  it('completes normally when signal is provided but never fires', async () => {
+    const controller = new AbortController();
+    const fn = vi.fn(async () => 'ok');
+    const result = await withNetworkRetry(fn, { signal: controller.signal });
+    expect(result).toBe('ok');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it('synthesises an AbortError when signal aborts without a reason', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const fn = vi.fn(async () => 'unused');
+    // Without a reason, the controller's `abort()` sets `signal.reason` to a
+    // synthesised DOMException(AbortError) per spec — verify that propagates.
+    await expect(withNetworkRetry(fn, { signal: controller.signal })).rejects.toThrow();
+    expect(fn).not.toHaveBeenCalled();
+  });
+});

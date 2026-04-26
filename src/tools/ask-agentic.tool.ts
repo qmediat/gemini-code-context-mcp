@@ -41,7 +41,7 @@ import type {
 import { Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
-import { withNetworkRetry } from '../gemini/retry.js';
+import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import {
   WorkspaceValidationError,
   validateWorkspacePath,
@@ -57,6 +57,7 @@ import {
   readFileExecutor,
 } from './agentic/workspace-tools.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { THINKING_LEVELS } from './shared/thinking.js';
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,15 @@ export const askAgenticInputSchema = z
       .optional()
       .describe(
         'Cap on distinct files opened via `read_file` during this agentic call. Default 40.',
+      ),
+    iterationTimeoutMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(1_800_000)
+      .optional()
+      .describe(
+        'Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls + per-iteration TPM throttle wait) is bounded by this. **A single iteration that times out FAILS THE WHOLE agentic call** with `errorCode: "TIMEOUT"` (the failed iteration\'s function-call results never came back, leaving the conversation structurally incomplete — continuing with partial state would 400 on the next turn). Whole-loop budget is also bounded by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled.',
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -515,6 +525,15 @@ async function executeAskAgenticBody(
         reservationId = reserve.id;
       }
 
+      // Per-iteration timeout — created BEFORE the throttle wait so the
+      // wait itself is bounded by the iteration timeout. (If iterTimeout
+      // is created after the wait, a 60s throttle delay can blow past a
+      // 10s iterationTimeoutMs without ever firing.) Disposed in finally.
+      const iterTimeout = createTimeoutController(
+        input.iterationTimeoutMs,
+        'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
+      );
+
       // Per-iteration TPM throttle reservation.
       let throttleReservationId = -1;
       if (tpmEnforced) {
@@ -524,7 +543,8 @@ async function executeAskAgenticBody(
           emitter.emit(
             `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
           );
-          await new Promise<void>((r) => setTimeout(r, reservation.delayMs));
+          // Abortable so iteration timeout interrupts the wait.
+          await abortableSleep(reservation.delayMs, iterTimeout.signal);
         }
       }
 
@@ -539,6 +559,7 @@ async function executeAskAgenticBody(
           workspaceRoot,
           filesReadSet,
           maxFilesRead,
+          abortSignal: iterTimeout.signal,
         });
       } catch (iterErr) {
         // Release both reservations on failure before re-throwing.
@@ -552,7 +573,29 @@ async function executeAskAgenticBody(
         if (throttleReservationId !== -1) {
           ctx.throttle.cancel(throttleReservationId);
         }
+        // If the iteration aborted on timeout, surface a structured TIMEOUT
+        // error so the caller can distinguish "this iteration was too slow"
+        // from "Gemini rejected the request". Annotate which iteration so
+        // ops can correlate with logs. The whole agentic call fails — we do
+        // NOT continue with partial state because the failed iteration's
+        // function-call results never came back, so the conversation is
+        // structurally incomplete.
+        if (isTimeoutAbort(iterErr)) {
+          const ms = iterTimeout.timeoutMs;
+          emitter.emit(`ask_agentic: iteration ${iterations} aborted after ${ms ?? '?'}ms`);
+          return errorResult(
+            `ask_agentic: iteration ${iterations} timed out after ${ms ?? '?'}ms. Increase \`iterationTimeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS\` higher; default disabled. Note: AbortSignal is client-only — Gemini may still finish server-side and bill tokens for completed work.`,
+            {
+              errorCode: 'TIMEOUT',
+              timeoutMs: ms,
+              iteration: iterations,
+              retryable: true,
+            },
+          );
+        }
         throw iterErr;
+      } finally {
+        iterTimeout.dispose();
       }
       const iterDurationMs = Date.now() - iterStarted;
 
@@ -715,6 +758,8 @@ async function runAgenticIteration(args: {
   workspaceRoot: string;
   filesReadSet: Set<string>;
   maxFilesRead: number;
+  /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
+  abortSignal: AbortSignal;
 }): Promise<IterationResult> {
   const {
     ctx,
@@ -724,6 +769,7 @@ async function runAgenticIteration(args: {
     workspaceRoot,
     filesReadSet,
     maxFilesRead,
+    abortSignal,
   } = args;
 
   // Each agentic iteration is its own `generateContent` call; a transient
@@ -738,9 +784,10 @@ async function runAgenticIteration(args: {
       ctx.client.models.generateContent({
         model: resolvedModel,
         contents: conversation,
-        config: baseConfig,
+        config: { ...baseConfig, abortSignal },
       }),
     {
+      signal: abortSignal,
       onRetry: (attempt, err) => {
         logger.warn(
           `ask_agentic: retrying generateContent after transient network failure (attempt ${attempt}): ${
@@ -862,6 +909,17 @@ async function runAgenticIteration(args: {
     toDispatch,
     TOOL_EXECUTION_CONCURRENCY,
   );
+  // Check abort AFTER tool execution — local file I/O / large grep regex /
+  // huge directory walk can take real wall-clock time, and without this
+  // check a 5s iterationTimeoutMs could be ignored for the duration of a
+  // multi-second tool call. The next iteration would then start with the
+  // signal already aborted, but the user's expectation is that the timeout
+  // fires AS SOON AS the deadline passes.
+  if (abortSignal.aborted) {
+    throw abortSignal.reason instanceof Error
+      ? abortSignal.reason
+      : new DOMException('Operation aborted', 'AbortError');
+  }
 
   // Merge dispatched results back into responseParts at their original
   // positions. Canonicalise filesReadSet using the sandbox-resolved

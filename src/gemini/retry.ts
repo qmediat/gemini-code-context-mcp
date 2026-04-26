@@ -40,6 +40,18 @@ export interface NetworkRetryOptions {
   readonly baseMs?: number;
   /** Called before each retry with the 1-indexed attempt number that just failed. */
   readonly onRetry?: (attempt: number, err: unknown) => void;
+  /**
+   * Optional abort signal (T19, v1.6.0). When the signal fires:
+   *   1. The currently-pending `fn()` is left to throw `AbortError` on its own
+   *      (the SDK propagates `signal.aborted` through `config.abortSignal`).
+   *   2. The retry loop short-circuits — no further attempts, no backoff sleep.
+   *   3. The signal's reason (or a synthesised AbortError) is thrown.
+   *
+   * Pre-attempt check: if `signal.aborted` is set BEFORE the first try, we
+   * throw immediately rather than dispatching a doomed call. Saves the cost
+   * of the first abortive request.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -99,6 +111,11 @@ export async function withNetworkRetry<T>(
 ): Promise<T> {
   const attempts = Math.max(1, Math.min(10, options.attempts ?? 3));
   const baseMs = Math.max(0, options.baseMs ?? 1000);
+  const signal = options.signal;
+
+  // Pre-flight abort check — never dispatch when the caller has already
+  // signalled they don't want the work done.
+  throwIfAborted(signal);
 
   let lastErr: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -106,16 +123,79 @@ export async function withNetworkRetry<T>(
       return await fn();
     } catch (err) {
       lastErr = err;
+      // Abort short-circuits everything — the signal's reason wins over any
+      // SDK error that happened to surface concurrently. (E.g. SDK throws
+      // generic "fetch failed" because abort tore down the socket; we want
+      // the timeout-driven AbortError, not the generic transient error.)
+      // Checked TWICE: once before classifying the error (catches the common
+      // case), once on the final-attempt throw (closes the narrow window
+      // where abort flips between the first check and the terminal throw).
+      if (signal?.aborted) {
+        throwAbortReason(signal);
+      }
       if (!isTransientNetworkError(err) || attempt === attempts) {
+        if (signal?.aborted) throwAbortReason(signal);
         throw err;
       }
       options.onRetry?.(attempt, err);
       const delayMs = baseMs * 3 ** (attempt - 1);
       if (delayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await abortableSleep(delayMs, signal);
       }
     }
   }
   // Unreachable: the loop either returns or throws on the final attempt.
   throw lastErr;
+}
+
+/** Throws the signal's reason (or synthesised AbortError) if aborted. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throwAbortReason(signal);
+}
+
+function throwAbortReason(signal: AbortSignal): never {
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  throw new DOMException('Operation aborted', 'AbortError');
+}
+
+/**
+ * `setTimeout(resolve, ms)` that also rejects with the abort reason when
+ * `signal` fires. Without abort awareness, a 9s backoff sleep — or worse, a
+ * 60s TPM-throttle wait — would block T19's wall-clock cap. Exported so tool
+ * call sites can reuse it for the throttle/reservation sleep without
+ * duplicating the listener+timer dance.
+ *
+ * Race-safety:
+ *   - Pre-flight check throws synchronously when signal is already aborted.
+ *   - Listener uses `{ once: true }` → auto-removes on fire (no leak).
+ *   - Timer-first path explicitly removes the listener before `resolve()` so
+ *     a same-tick abort that would re-fire is impossible.
+ *   - Abort-first path clears the timer before `reject()`.
+ *   - Single-threaded JS means no read-resolve-then-write-reject window.
+ */
+export function abortableSleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      try {
+        throwAbortReason(signal);
+      } catch (err) {
+        reject(err);
+      }
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      try {
+        if (signal) throwAbortReason(signal);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }

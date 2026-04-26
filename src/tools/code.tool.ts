@@ -20,7 +20,7 @@ import type {
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
-import { withNetworkRetry } from '../gemini/retry.js';
+import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -30,6 +30,7 @@ import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/c
 import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
@@ -108,6 +109,15 @@ export const codeInputSchema = z
       .optional()
       .describe(
         'Additional patterns to exclude. Supports three shapes: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match, including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.map`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised (backslashes → `/`, leading `./` and trailing `/` stripped). Case-insensitive. No mid-string `*` / `**` / `?` — split into dir + extension patterns if needed.',
+      ),
+    timeoutMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(1_800_000)
+      .optional()
+      .describe(
+        'Per-call wall-clock timeout in ms (1s–30min). Aborts the in-flight `generateContent` request via `AbortController` if Gemini takes longer than this. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS`, then to disabled (no timeout). Returns `errorCode: "TIMEOUT"` on abort. Note: `AbortSignal` is client-only — Gemini still finishes the request server-side and bills tokens for completed work.',
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -208,6 +218,12 @@ async function executeCodeBody(
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
+  // T19 — wall-clock timeout. See ask.tool.ts for rationale; same shape here.
+  const timeoutController = createTimeoutController(
+    input.timeoutMs,
+    'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
+  );
+  const abortSignal = timeoutController.signal;
   try {
     // Workspace validation inside try → reported as a regular tool error
     // (errorResult, "code failed: …") rather than an unhandled exception
@@ -417,7 +433,8 @@ async function executeCodeBody(
       throttleReservationId = reservation.releaseId;
       if (reservation.delayMs > 0) {
         emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
-        await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, reservation.delayMs));
+        // Abortable — wall-clock timeout (T19) must beat throttle delay.
+        await abortableSleep(reservation.delayMs, abortSignal);
       }
     };
     await reserveForDispatch();
@@ -506,9 +523,10 @@ async function executeCodeBody(
           ctx.client.models.generateContent({
             model: resolved.resolved,
             contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
-            config: buildConfig(activePrep.cacheId),
+            config: { ...buildConfig(activePrep.cacheId), abortSignal },
           }),
         {
+          signal: abortSignal,
           onRetry: (attempt, retryErr) => {
             logger.warn(
               `code: retrying generateContent after transient network failure (attempt ${attempt}): ${
@@ -556,9 +574,10 @@ async function executeCodeBody(
               ctx.client.models.generateContent({
                 model: resolved.resolved,
                 contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-                config: buildConfig(rebuilt.cacheId),
+                config: { ...buildConfig(rebuilt.cacheId), abortSignal },
               }),
             {
+              signal: abortSignal,
               onRetry: (attempt, retryErr) => {
                 logger.warn(
                   `code (stale-cache retry): retrying generateContent after transient network failure (attempt ${attempt}): ${
@@ -571,6 +590,11 @@ async function executeCodeBody(
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {
+          // Re-throw timeout directly so the outer catch's `isTimeoutAbort`
+          // sees it. Wrapping with `cause: err` (the original stale-cache
+          // error) would mask the timeout; outer catch would map to UNKNOWN
+          // instead of TIMEOUT.
+          if (isTimeoutAbort(retryErr)) throw retryErr;
           throw new Error(
             `code retry after stale cache failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
@@ -743,12 +767,21 @@ async function executeCodeBody(
       ctx.throttle.cancel(throttleReservationId);
       throttleReservationId = -1;
     }
+    if (isTimeoutAbort(err)) {
+      const ms = timeoutController.timeoutMs;
+      emitter.emit(`code: aborted after ${ms ?? '?'}ms timeout`);
+      return errorResult(
+        `code timed out after ${ms ?? '?'}ms. Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS\` higher; default disabled. Note: Gemini may still finish server-side and bill tokens for completed work (AbortSignal is client-only).`,
+        { errorCode: 'TIMEOUT', timeoutMs: ms, retryable: true },
+      );
+    }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {
+    timeoutController.dispose();
     emitter.stop();
   }
 }

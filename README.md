@@ -159,6 +159,9 @@ Every env var, auth tier, and per-call override lives in [`docs/configuration.md
 | `GEMINI_CODE_CONTEXT_WORKSPACE_GUARD_RATIO` *(v1.5.0+)* | `0.9` | Fraction of `model.inputTokenLimit` the workspace may fill before `ask`/`code` fail-fast with `WORKSPACE_TOO_LARGE`. Clamped to `[0.5, 0.98]`. Raise toward `0.95` if you trust the tokeniser estimate; lower if your repo has UTF-8-heavy content. |
 | `GEMINI_CODE_CONTEXT_TPM_THROTTLE_LIMIT` | `80_000` | Client-side tokens-per-minute ceiling per resolved model. `0` disables the throttle. |
 | `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT` | `false` | Force every call to send `maxOutputTokens = model.outputTokenLimit` (auto otherwise). |
+| `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` *(v1.6.0+)* | disabled | Wall-clock timeout in ms for `ask` (1s–30min). Aborts via `AbortController` when Gemini exceeds the deadline. Returns `errorCode: "TIMEOUT"`. Per-call `ask({ timeoutMs })` overrides. **Note:** `AbortSignal` is client-only — Gemini may still finish server-side and bill for completed work. |
+| `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS` *(v1.6.0+)* | disabled | Same as above, applied to the `code` tool. Per-call override: `code({ timeoutMs })`. |
+| `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` *(v1.6.0+)* | disabled | Per-iteration wall-clock cap for `ask_agentic`. A single hung iteration aborts the whole agentic call (continuing with partial state would leave the conversation structurally incomplete). Per-call override: `ask_agentic({ iterationTimeoutMs })`. |
 
 ## Migrating from `gemini-mcp-tool`
 
