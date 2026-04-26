@@ -24,6 +24,12 @@ import type { ToolContext } from '../../src/tools/registry.js';
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
   resolveModel: vi.fn(),
+  // F2: opt-in latency injection for `grepExecutor`. Default 0 = pass-through
+  // for all existing tests. Per-test override (set in the test body, reset
+  // in `beforeEach`) wraps the real executor with `setTimeout`-based delay
+  // so we can drive the post-dispatch abort check at
+  // `src/tools/ask-agentic.tool.ts:918-922` without faking timers.
+  grepExecutorDelayMs: 0,
 }));
 
 vi.mock('../../src/indexer/workspace-validation.js', () => ({
@@ -33,6 +39,28 @@ vi.mock('../../src/indexer/workspace-validation.js', () => ({
 vi.mock('../../src/gemini/models.js', () => ({
   resolveModel: mocks.resolveModel,
 }));
+// Partial mock — leave list_directory / find_files / read_file untouched
+// (other tests in this file depend on them running for real against tmpdir
+// fixtures). Only `grepExecutor` is wrapped, and only adds latency when a
+// test explicitly sets `mocks.grepExecutorDelayMs` > 0.
+vi.mock('../../src/tools/agentic/workspace-tools.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/tools/agentic/workspace-tools.js')>(
+    '../../src/tools/agentic/workspace-tools.js',
+  );
+  const slowGrepExecutor: typeof actual.grepExecutor = async (...args) => {
+    const delay = mocks.grepExecutorDelayMs;
+    if (delay > 0) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, delay);
+      });
+    }
+    return actual.grepExecutor(...args);
+  };
+  return {
+    ...actual,
+    grepExecutor: slowGrepExecutor,
+  };
+});
 
 interface ScriptedResponse {
   functionCalls?: Array<{ id?: string; name: string; args: Record<string, unknown> }>;
@@ -90,9 +118,13 @@ function buildCtx(args: {
 
   // Budget-enforced scenarios get a real-ish reserveBudget that accepts by
   // default; tests override via `.mockReturnValueOnce({rejected:true,...})`
-  // to exercise rejection. Returning `{ id: N }` is the success shape.
+  // to exercise rejection. Returning `{ id: N }` is the success shape — IDs
+  // increment per call so cancel/finalize assertions can structurally pin
+  // WHICH iteration's reservation was affected (a hardcoded `id: 1` would
+  // mask an ordering bug where iter-N cancels iter-1's reservation).
+  let nextReserveId = 1;
   const manifest = {
-    reserveBudget: vi.fn().mockReturnValue({ id: 1 }),
+    reserveBudget: vi.fn().mockImplementation(() => ({ id: nextReserveId++ })),
     finalizeBudgetReservation: vi.fn(),
     cancelBudgetReservation: vi.fn(),
     insertUsageMetric: vi.fn(),
@@ -129,6 +161,9 @@ function buildCtx(args: {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Reset the F2 grep-latency override so a test that opted-in does not
+  // bleed into the next case (`vi.hoisted` state survives between tests).
+  mocks.grepExecutorDelayMs = 0;
   mocks.validateWorkspacePath.mockReturnValue(undefined);
   mocks.resolveModel.mockResolvedValue({
     requested: 'latest-pro-thinking',
@@ -599,4 +634,280 @@ describe('ask_agentic loop — transient network retry (v1.5.1)', () => {
     // Exactly one call — zero retries on non-transient errors.
     expect(generateContent).toHaveBeenCalledTimes(1);
   });
+});
+
+// ---------------------------------------------------------------------------
+// v1.6.0 — iterationTimeoutMs (T19) — TIMEOUT errorCode mapping + real abort
+// ---------------------------------------------------------------------------
+//
+// Two layers of coverage, both missing prior to this block:
+//
+// 1. Error mapping — `runAgenticIteration` rejecting with a TimeoutError
+//    surfaces as `errorCode: 'TIMEOUT'` with the configured `timeoutMs` and
+//    iteration number, AND the loop releases its budget + throttle
+//    reservations so the failed iteration does not leak quota.
+//
+// 2. Real abort end-to-end — with a 1000ms `iterationTimeoutMs` (the schema
+//    minimum) and a `generateContent` mock that hangs until the signal
+//    aborts, the controller's actual `setTimeout` fires, the abort
+//    propagates via `config.abortSignal`, and the loop catches the
+//    resulting TimeoutError. The integration test G uses a generous 60s
+//    timeout that never fires; this is the missing FIRING path.
+//
+// Pairs with `abort-timeout.test.ts` (controller in isolation) and
+// `ask-timeout-integration.test.ts` (ask + code mapping). Brings ask_agentic
+// to the same coverage bar.
+
+describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => {
+  it('maps a TimeoutError from generateContent to errorCode TIMEOUT with iteration metadata', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-'));
+    writeFileSync(join(root, 'a.ts'), 'export const x = 1;');
+
+    const { ctx, generateContent, manifest, throttle } = buildCtx({
+      script: [],
+      // Finite budget so reservation runs (gated on Number.isFinite) — needed
+      // to verify the cancel path.
+      dailyBudgetUsd: 100,
+      tpmThrottleLimit: 80_000,
+    });
+    generateContent.mockReset();
+    // First iteration: a real function call so the loop reaches iteration 2.
+    generateContent.mockResolvedValueOnce(
+      buildResponse({ functionCalls: [{ id: 'c1', name: 'read_file', args: { path: 'a.ts' } }] }),
+    );
+    // Second iteration: TimeoutError — what the SDK throws when our
+    // `config.abortSignal` fires from the iteration timer.
+    generateContent.mockRejectedValueOnce(
+      new DOMException('Timed out after 5000 ms', 'TimeoutError'),
+    );
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 5_000 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(5_000);
+    expect(result.structuredContent?.iteration).toBe(2);
+    expect(result.structuredContent?.retryable).toBe(true);
+    // Both reservations on the failing iteration must be released so a
+    // timed-out call does not consume quota / budget for work that produced
+    // no usable response. Iteration 1 succeeded (1 reserve + 1 finalise),
+    // iteration 2 failed (1 reserve + 1 cancel — finalise only fires on
+    // success). Same shape applies to throttle.
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(throttle.cancel).toHaveBeenCalledTimes(1);
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(1);
+    // Structural pin (F1): incrementing reservation IDs let us assert WHICH
+    // iteration was cancelled vs finalised — iter-1 reserves id=1 and is
+    // finalised, iter-2 reserves id=2 and is cancelled. With a hardcoded
+    // mock id this would silently pass even if the loop cancelled the
+    // wrong reservation.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledWith(1, expect.anything());
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledWith(2);
+  });
+
+  it('detects TimeoutError nested under error.cause (SDK wrap)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    const inner = new DOMException('inner timeout', 'TimeoutError');
+    const wrapped = new Error('SDK wrapped the abort', { cause: inner });
+    generateContent.mockRejectedValueOnce(wrapped);
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 3_000 },
+      ctx,
+    );
+
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(3_000);
+    expect(result.structuredContent?.iteration).toBe(1);
+  });
+
+  it('does NOT surface TIMEOUT for plain AbortError (user-cancelled, not timed out)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    generateContent.mockRejectedValueOnce(new DOMException('aborted', 'AbortError'));
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 5_000 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+  });
+
+  it('surfaces TIMEOUT when the iteration timer fires DURING the TPM throttle wait (F3)', async () => {
+    // Production guarantees (`src/tools/ask-agentic.tool.ts:528-531`) that
+    // the iteration timer is created BEFORE `abortableSleep` so the throttle
+    // wait itself is bounded by `iterationTimeoutMs`. The other tests in
+    // this suite either disable the throttle (`tpmThrottleLimit: 0`) or
+    // mock `throttle.reserve` with the default `delayMs: 0`, so the
+    // abortable-sleep branch at `:547` is never exercised. Without this
+    // test, swapping the timer/throttle order back to the original buggy
+    // form (timer AFTER wait) would not fail any test.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-throttle-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent, throttle, manifest } = buildCtx({
+      script: [],
+      dailyBudgetUsd: 100,
+      tpmThrottleLimit: 80_000, // tpmEnforced gate flips on
+    });
+    generateContent.mockReset();
+    // Force the throttle to ask for a 5 s wait — the 1 s iter timeout
+    // must abort `abortableSleep` before the SDK is ever called.
+    throttle.reserve.mockReturnValueOnce({ delayMs: 5_000, releaseId: 42 });
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 1_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(1_000);
+    expect(result.structuredContent?.iteration).toBe(1);
+    // Critical: SDK was NEVER called — the timeout fired during the
+    // pre-flight throttle wait, not after generateContent began.
+    expect(generateContent).not.toHaveBeenCalled();
+    // Reservation cleanup still fires for the iteration that timed out.
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledWith(1);
+    expect(throttle.cancel).toHaveBeenCalledWith(42);
+    // Sanity: actually waited for the timer (≥ 1 s) — not an instant
+    // resolve from a misfired guard.
+    expect(elapsedMs).toBeGreaterThanOrEqual(1_000);
+    expect(elapsedMs).toBeLessThan(5_000);
+  }, 10_000);
+
+  it('surfaces TIMEOUT when the iteration timer fires DURING tool execution (F2 — post-dispatch abort check)', async () => {
+    // Production guards against a slow tool overrunning the deadline at
+    // `src/tools/ask-agentic.tool.ts:918-922`: after `dispatchToolCallsParallel`
+    // returns, if the signal aborted during dispatch we re-throw
+    // `signal.reason` so the catch path maps it to TIMEOUT. None of the
+    // other tests reach the THROW arm of that branch — test 1 dispatches
+    // a fast `read_file`, test 4 hangs on the SDK call before dispatch
+    // ever happens. Without this case, deleting lines 919-921 would not
+    // fail any test, silently uncapping per-iteration deadlines.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-tool-'));
+    writeFileSync(join(root, 'a.ts'), 'export const x = 1;');
+
+    const { ctx, generateContent, manifest, throttle } = buildCtx({
+      script: [],
+      dailyBudgetUsd: 100,
+    });
+    generateContent.mockReset();
+    // Iteration 1: model issues a single grep call. Our `vi.mock` wrapper
+    // for `grepExecutor` (top of file) sleeps `mocks.grepExecutorDelayMs`
+    // before delegating to the real executor — long enough that the
+    // 1 s iter timeout fires mid-dispatch. `setTimeout` here is NOT
+    // wired to `abortSignal`, so the dispatch completes naturally; the
+    // post-dispatch `abortSignal.aborted` check (`:918`) is what triggers
+    // the throw.
+    generateContent.mockResolvedValueOnce(
+      buildResponse({ functionCalls: [{ id: 'g1', name: 'grep', args: { pattern: 'x' } }] }),
+    );
+    mocks.grepExecutorDelayMs = 1_500; // > iterationTimeoutMs
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 1_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(1_000);
+    expect(result.structuredContent?.iteration).toBe(1);
+    // The SDK was called once (model issued the grep call); the slow
+    // executor ran (~1.5 s); the abort fired during dispatch.
+    expect(generateContent).toHaveBeenCalledTimes(1);
+    // Single iteration → single reservation → cancelled (not finalised)
+    // because the iteration threw on the post-dispatch abort check.
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledWith(1);
+    // tpmEnforced=false here (no `tpmThrottleLimit` override → defaults to 0
+    // in `buildCtx`), so `throttle.reserve` never ran and `throttle.cancel`
+    // has nothing to release. F3 covers the throttle-cancel path.
+    expect(throttle.cancel).not.toHaveBeenCalled();
+    expect(manifest.finalizeBudgetReservation).not.toHaveBeenCalled();
+    // Timing sanity: must have actually waited for the slow executor
+    // (≥ 1.5 s). If this falls below 1.5 s the wrapper isn't being
+    // invoked and the test is silently a no-op.
+    expect(elapsedMs).toBeGreaterThanOrEqual(1_500);
+    expect(elapsedMs).toBeLessThan(5_000);
+  }, 10_000);
+
+  it('end-to-end: real timer fires on a hung generateContent and surfaces TIMEOUT', async () => {
+    // No fake timers — we want the controller's actual setTimeout to fire so
+    // this test exercises the full chain: createTimeoutController → setTimeout
+    // → AbortController.abort(reason) → SDK rejects → isTimeoutAbort(err) →
+    // errorCode TIMEOUT. The generous-timeout integration test G never trips
+    // this path; without this assertion we have no proof the wiring works
+    // end-to-end with a real timer.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-real-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    let observedSignal: AbortSignal | undefined;
+    generateContent.mockImplementationOnce(
+      (req: { config?: { abortSignal?: AbortSignal } }) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = req.config?.abortSignal;
+          if (!observedSignal) {
+            reject(new Error('test invariant: config.abortSignal not plumbed to generateContent'));
+            return;
+          }
+          if (observedSignal.aborted) {
+            reject(observedSignal.reason);
+            return;
+          }
+          observedSignal.addEventListener('abort', () => {
+            reject(observedSignal?.reason);
+          });
+          // Otherwise hang forever — the timer must fire and abort the signal.
+        }),
+    );
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      // 1000ms is the schema minimum; anything smaller is rejected by Zod and
+      // anything smaller than ABSOLUTE_MIN_MS (1000) is clamped by
+      // createTimeoutController. 1s is the smallest deadline we can verify.
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 1_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    // Wiring contract: SDK saw OUR signal — same controller as the loop's
+    // iterTimeout (proves config.abortSignal threading is real).
+    expect(observedSignal).toBeDefined();
+    expect(observedSignal?.aborted).toBe(true);
+    expect((observedSignal?.reason as { name?: string })?.name).toBe('TimeoutError');
+
+    // Outcome contract: structured TIMEOUT surfaces to the caller.
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutMs).toBe(1_000);
+    expect(result.structuredContent?.iteration).toBe(1);
+
+    // Sanity: actually waited for the timer to fire (≥ 1s) and didn't run
+    // into pathological stall (< 5s gives generous CI headroom). Tightening
+    // the upper bound risks flakes on slow shared runners.
+    expect(elapsedMs).toBeGreaterThanOrEqual(1_000);
+    expect(elapsedMs).toBeLessThan(5_000);
+  }, 10_000);
 });

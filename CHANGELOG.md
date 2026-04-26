@@ -40,16 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **T18 ("precise budget accounting on stale-cache retry") cancel+re-reserve fix is NOT shipped.** Re-analysis showed the proposed fix is a no-op from the budget-accounting perspective: in the stale-cache retry path, the new estimate is identical to the original (same prompt, same workspace, same expected output), so cancel+re-reserve would just rotate the row id without changing the reserved amount. The user-visible symptom T18 was meant to address — concurrent callers seeing inflated daily totals during the retry window — is fully closed by D#7 above. T18 stays open in `docs/FOLLOW-UP-PRS.md` for the day a high-concurrency user genuinely needs a "downsize reservation" DB primitive (would be a separate ticket; v1.8+ if triggered).
 
+### Fixed — `ask_agentic` iteration-timeout during throttle wait (v1.6.0 regression)
+
+- **`ask_agentic`: a TPM-throttle wait that aborts on the per-iteration timeout now correctly maps to `errorCode: 'TIMEOUT'` AND releases both the budget and throttle reservations.** The v1.6.0 implementation wrapped only the `runAgenticIteration` call in the per-iteration try/catch; an abort firing inside `abortableSleep` during the pre-call throttle wait escaped to the outer catch with `errorCode: 'UNKNOWN'`, and both the in-flight budget reservation (over-counts daily spend) and TPM bucket entry (`releaseId`) leaked. Throttle wait moved INSIDE the per-iteration try (`src/tools/ask-agentic.tool.ts:537-560`); existing cancel/finalise/`isTimeoutAbort` mapping path now covers this branch. Surfaced by the new F3 unit test (`test/unit/ask-agentic.test.ts`). Pre-release fix — affects only users running the v1.6.0 branch under a tight `iterationTimeoutMs` AND a non-zero `tpmThrottleLimit` AND a throttle wait long enough to overrun the deadline.
+
 ### Caveat carry-over from v1.6.0
 
 The streaming refactor preserves v1.6.0's T19 timeout caveat: `AbortSignal` is client-only — Gemini may still finish server-side and bill for completed work. When timeout aborts mid-stream, our client drops the response stream; the request server-side finishes normally.
 
-### Tests — 32 new cases (524 → 556)
+### Tests — 38 new cases (524 → 562)
 
 - `stream-collector.test.ts` (20): text concat, usageMetadata last-write-wins, candidates last-non-empty-wins, thoughtsSummary aggregation + 1200-char cap, throttled `onThoughtChunk` (default 1500 ms + custom 0 ms), callback error swallowing, abort propagation (pre-flight, mid-stream, abort-wins-over-generic), mid-stream error verbatim, timing metadata
 - `manifest-db.test.ts` extended (3): `todaysInFlightReservedMicros` isolation, `workspaceStats.inFlightReservedMicros` slice, all-settled = 0 case
 - `ask-throttle-integration.test.ts`, `code-throttle-integration.test.ts`, `preflight-guard.test.ts`, `ask-timeout-integration.test.ts` updated to mock `generateContentStream` (wraps existing `generateContent` mock as a single-chunk stream — preserves all assertions)
 - `test/helpers/stream-mock.ts` (new): `singleChunkStream`, `chunkedStream`, `rejectingStream`, `midStreamFailure` helpers for future stream-shape tests
+- `ask-agentic.test.ts` extended (6): T19 `iterationTimeoutMs` coverage — error-mapping with iteration metadata + reservation cancel/finalise pinning (incrementing reservation IDs), wrapped `error.cause` `TimeoutError` detection, `AbortError` ≠ `TIMEOUT` distinction, F2 abort-during-tool-execution (`vi.mock` partial replacement of `grepExecutor` with opt-in latency), F3 abort-during-throttle-wait (drove discovery of the v1.6.0 regression fixed above), end-to-end real-timer-fire on a hung `generateContent`
 
 ## [1.6.0] - 2026-04-25
 
