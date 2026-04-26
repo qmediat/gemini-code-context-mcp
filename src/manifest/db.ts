@@ -332,6 +332,16 @@ export class ManifestDb {
       durationMs: number;
     },
   ): void {
+    // D#7 (v1.7.0) belt-and-suspenders: D#7's settled-vs-in-flight split
+    // uses `WHERE duration_ms = 0` as the in-flight sentinel. A real
+    // network round-trip cannot complete in 0 ms (verified empirically
+    // and reasoned about — `Date.now()` resolution is 1 ms and the
+    // smallest realistic Gemini call takes 10+ ms wall-clock), but if a
+    // future code path ever managed to call `finalize` with `durationMs = 0`
+    // (clock skew, NTP backwards jump, instrumented mock test), that row
+    // would stay misclassified as in-flight forever. Floor to 1 ms to make
+    // the sentinel deterministic regardless of upstream weirdness.
+    const safeDurationMs = Math.max(1, data.durationMs);
     this.db
       .prepare(
         `UPDATE usage_metrics
@@ -342,7 +352,7 @@ export class ManifestDb {
         data.cachedTokens,
         data.uncachedTokens,
         data.costUsdMicro,
-        data.durationMs,
+        safeDurationMs,
         reservationId,
       );
   }
@@ -355,7 +365,10 @@ export class ManifestDb {
     this.db.prepare('DELETE FROM usage_metrics WHERE id = ?').run(reservationId);
   }
 
-  /** Sum costs spent today (UTC) in USD micros. */
+  /** Sum costs spent today (UTC) in USD micros. Includes both settled
+   * (`duration_ms > 0`) and in-flight reserved (`duration_ms = 0`) rows —
+   * conservative for the purpose of budget-cap enforcement, where the
+   * reservation MUST count against headroom until the call finalises. */
   todaysCostMicros(nowMs: number): number {
     const startOfUtcDay = new Date(nowMs);
     startOfUtcDay.setUTCHours(0, 0, 0, 0);
@@ -367,12 +380,43 @@ export class ManifestDb {
     return row.total ?? 0;
   }
 
+  /**
+   * Sum of TODAY's in-flight reservations (rows where `duration_ms = 0` —
+   * reserved but not yet finalised). Subset of `todaysCostMicros`. Used by
+   * `status` (D#7, v1.7.0) to show users the breakdown of "this is what
+   * has actually settled" vs "this is provisional and may shrink when the
+   * call completes". The reservation IS counted against the daily cap (so
+   * cap enforcement stays safe), but surfacing the split lets users
+   * understand why `status` looks higher than expected during a long
+   * in-flight call (especially under streaming, where calls can be in
+   * flight for 60-180s on HIGH thinking levels).
+   */
+  todaysInFlightReservedMicros(nowMs: number): number {
+    const startOfUtcDay = new Date(nowMs);
+    startOfUtcDay.setUTCHours(0, 0, 0, 0);
+    const row = this.db
+      .prepare(
+        'SELECT COALESCE(SUM(cost_usd_micro), 0) AS total FROM usage_metrics WHERE occurred_at >= ? AND duration_ms = 0',
+      )
+      .get(startOfUtcDay.getTime()) as { total: number };
+    return row.total ?? 0;
+  }
+
   /** Aggregate stats for a workspace — powers the `status` tool. */
   workspaceStats(workspaceRoot: string): {
     callCount: number;
     totalCachedTokens: number;
     totalUncachedTokens: number;
     totalCostMicros: number;
+    /**
+     * Subset of `totalCostMicros` representing in-flight reservations
+     * (D#7, v1.7.0). Settled cost = `totalCostMicros - inFlightReservedMicros`.
+     * Reservation rows are written with `duration_ms = 0` and updated to
+     * the real duration when the call finalises; this slice surfaces the
+     * provisional portion so users running `status` mid-call understand
+     * why the cost looks higher than the calls that have actually completed.
+     */
+    inFlightReservedMicros: number;
     last24hCostMicros: number;
   } {
     const row = this.db
@@ -381,7 +425,8 @@ export class ManifestDb {
            COUNT(*) AS call_count,
            COALESCE(SUM(cached_tokens), 0) AS total_cached,
            COALESCE(SUM(uncached_tokens), 0) AS total_uncached,
-           COALESCE(SUM(cost_usd_micro), 0) AS total_cost
+           COALESCE(SUM(cost_usd_micro), 0) AS total_cost,
+           COALESCE(SUM(CASE WHEN duration_ms = 0 THEN cost_usd_micro ELSE 0 END), 0) AS in_flight
          FROM usage_metrics WHERE workspace_root = ?`,
       )
       .get(workspaceRoot) as {
@@ -389,6 +434,7 @@ export class ManifestDb {
       total_cached: number;
       total_uncached: number;
       total_cost: number;
+      in_flight: number;
     };
 
     const last24h = this.db
@@ -403,6 +449,7 @@ export class ManifestDb {
       totalCachedTokens: row.total_cached,
       totalUncachedTokens: row.total_uncached,
       totalCostMicros: row.total_cost,
+      inFlightReservedMicros: row.in_flight,
       last24hCostMicros: last24h.total,
     };
   }

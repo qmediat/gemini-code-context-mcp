@@ -56,10 +56,10 @@ See [`docs/getting-started.md`](./docs/getting-started.md) for a 3-minute walkth
 
 | Tool | What it does |
 |---|---|
-| **`ask`** | Q&A and long-context analysis against your workspace. **Eager** — uploads the whole repo to Gemini Context Cache. Best for repeat queries on a repo ≤ ~900 k tokens. |
+| **`ask`** | Q&A and long-context analysis against your workspace. **Eager** — uploads the whole repo to Gemini Context Cache. Best for repeat queries on a repo ≤ ~900 k tokens. *(v1.7.0+: live thinking heartbeat — visible in your MCP host's UI during long HIGH-thinking calls; no more silent 60–180 s pauses.)* |
 | **`ask_agentic`** *(v1.5.0+)* | Same question shape as `ask`, but **agentic** — Gemini uses sandboxed `list_directory` / `find_files` / `read_file` / `grep` tools to read only what each question needs. Scales to arbitrarily large repos; no eager upload. Use when your workspace would exceed the model's input-token limit. |
-| **`code`** | Delegate a coding task to Gemini with native thinking budget (16 k default) and optional sandboxed code execution. Returns structured OLD/NEW diffs Claude Code can apply directly. (Eager — same scale constraint as `ask`.) |
-| **`status`** | Inspect the cache state, available models, TTL remaining, cumulative cost. |
+| **`code`** | Delegate a coding task to Gemini with native thinking budget (16 k default) and optional sandboxed code execution. Returns structured OLD/NEW diffs Claude Code can apply directly. (Eager — same scale constraint as `ask`.) *(v1.7.0+: same live thinking heartbeat as `ask`.)* |
+| **`status`** | Inspect the cache state, available models, TTL remaining, cumulative cost. *(v1.7.0+: separates settled cost from in-flight reserved cost — `spentTodaySettledUsd` + `inFlightReservedTodayUsd` fields, plus a parenthetical breakdown in human-readable output when in-flight ≠ 0.)* |
 | **`reindex`** | Force a fresh cache rebuild for this workspace. |
 | **`clear`** | Delete the cache and manifest for this workspace. |
 

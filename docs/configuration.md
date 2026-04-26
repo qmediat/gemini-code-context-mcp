@@ -51,7 +51,22 @@ Every tool accepts runtime overrides that beat the defaults:
 - `ask({ includeGlobs: [".proto"], excludeGlobs: ["legacy"] })` — extend the indexer
 - `ask({ timeoutMs: 60_000 })` *(v1.6.0+)* — wall-clock cap for this call (1 s–30 min). Aborts via `AbortController` if Gemini takes longer; returns `errorCode: "TIMEOUT"`. Combine with `withNetworkRetry` (auto-on since v1.5.1) for a closed reliability loop: pre-response retry + bounded wall-clock.
 - `code({ timeoutMs: 120_000 })` *(v1.6.0+)* — same on `code`. Coding tasks tolerate longer timeouts because thinking budgets are higher; 2-min default is a reasonable starting point.
-- `ask_agentic({ iterationTimeoutMs: 90_000 })` *(v1.6.0+)* — bounds each loop iteration. Single-iteration hangs abort the whole agentic call (`maxIterations` × `maxTotalInputTokens` separately bound the whole loop)
+- `ask_agentic({ iterationTimeoutMs: 90_000 })` *(v1.6.0+)* — bounds each loop iteration. Single-iteration hangs abort the whole agentic call (`maxIterations` × `maxTotalInputTokens` separately bound the whole loop). Bound covers BOTH the per-iteration TPM throttle wait AND the SDK call — a wait that exceeds the deadline aborts cleanly, releases its budget + throttle reservations, and surfaces as `errorCode: 'TIMEOUT'`.
+
+## Live thinking heartbeat *(v1.7.0+)*
+
+`ask` and `code` use Gemini's `generateContentStream` under the hood. Whenever the model emits a thought-flagged chunk (Gemini's reasoning trace, enabled by `includeThoughts: true`), the server forwards a truncated preview to the MCP host as a progress notification — `"thinking: <first ~120 chars>…"`. Throttled at ~1500 ms by default to avoid flooding the host. Visible in Claude Code's UI during long HIGH-thinking calls; replaces what used to be silent 60–180 s pauses with continuous evidence the call is alive.
+
+The stream collector preserves all existing behaviour — `text`, `usageMetadata`, `candidates`, `thoughtsSummary`, `withNetworkRetry`, stale-cache retry, `timeoutMs` — only the response-assembly path changes. A mid-stream failure cannot be retried (Gemini's stream API has no resume); pre-response failures still get the full 3-attempt retry budget.
+
+## Status output *(v1.7.0+ adds settled vs in-flight breakdown)*
+
+`status` returns workspace cache state, available models, daily/lifetime usage, and the active model registry. v1.7.0 added two new field pairs that separate finalised cost from in-flight reservations:
+
+- `spentTodaySettledUsd` / `usage.settledCostUsd` — cost from completed calls only
+- `inFlightReservedTodayUsd` / `usage.inFlightReservedUsd` — sum of reservations whose `generateContent` is still running
+
+`spentTodayUsd` and `usage.totalCostUsd` keep their existing semantics (settled + in-flight) so daily-budget enforcement remains a true upper bound. The human-readable line appends `"(settled $X + $Y in-flight reserved)"` only when in-flight ≠ 0 — no noise on the common path. Streaming made the in-flight window much more observable on long HIGH-thinking calls; the breakdown closes that perception gap.
 
 ## Model aliases
 

@@ -10,13 +10,7 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type {
-  Content,
-  GenerateContentConfig,
-  GenerateContentResponse,
-  ThinkingConfig,
-  ThinkingLevel,
-} from '@google/genai';
+import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
@@ -31,6 +25,7 @@ import { logger } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
+import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
@@ -512,15 +507,16 @@ async function executeCodeBody(
 
     let activePrep = ctxPrep;
     let retriedOnStaleCache = false;
-    let response: GenerateContentResponse;
+    let response: CollectedResponse;
     try {
-      // `withNetworkRetry` covers pre-response transient failures
-      // (`TypeError: fetch failed`). See `src/gemini/retry.ts` for the full
-      // rationale; 429 rate-limits continue to be handled at the tool layer
-      // via `isGemini429` + `parseRetryDelayMs`.
-      response = await withNetworkRetry(
+      // T20 (v1.7.0) — withNetworkRetry wraps ONLY the stream opening.
+      // Mid-stream failures cannot be retried (Gemini's stream API has no
+      // resume) — wrapping collectStream too would discard the partial
+      // response and re-open a new stream → DOUBLE BILLING. See
+      // ask.tool.ts for the full rationale.
+      const stream = await withNetworkRetry(
         () =>
-          ctx.client.models.generateContent({
+          ctx.client.models.generateContentStream({
             model: resolved.resolved,
             contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
@@ -536,6 +532,13 @@ async function executeCodeBody(
           },
         },
       );
+      response = await collectStream(stream, {
+        signal: abortSignal,
+        onThoughtChunk: (text) => {
+          const trimmed = text.trim().slice(0, 80);
+          if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+        },
+      });
     } catch (err) {
       if (activePrep.cacheId && isStaleCacheError(err)) {
         logger.warn(
@@ -569,9 +572,11 @@ async function executeCodeBody(
           await reserveForDispatch();
           // The stale-cache retry itself can hit a transient network failure;
           // wrap it too so the rebuild isn't wasted on a one-off blip.
-          response = await withNetworkRetry(
+          // Stale-cache retry — discard partial, open fresh stream. Same
+          // retry-OPENING-only contract as the happy path above.
+          const retryStream = await withNetworkRetry(
             () =>
-              ctx.client.models.generateContent({
+              ctx.client.models.generateContentStream({
                 model: resolved.resolved,
                 contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
@@ -587,6 +592,13 @@ async function executeCodeBody(
               },
             },
           );
+          response = await collectStream(retryStream, {
+            signal: abortSignal,
+            onThoughtChunk: (text) => {
+              const trimmed = text.trim().slice(0, 80);
+              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+            },
+          });
           activePrep = rebuilt;
           retriedOnStaleCache = true;
         } catch (retryErr) {
@@ -611,28 +623,26 @@ async function executeCodeBody(
       ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
     }
 
-    const text = response.text ?? '';
+    const text = response.text;
     const edits = expectEdits ? parseEdits(text) : [];
     const codeBlocks = parseCodeBlocks(text);
 
-    // Extract code_execution tool artifacts + Gemini's thinking summary if present.
+    // Extract code_execution tool artifacts. Thought summary now comes from
+    // `collectStream` (T20) — `response.thoughtsSummary` is already capped
+    // and matches the live progress emit. We still iterate candidates here
+    // for executableCode / codeExecutionResult parts (those aren't
+    // accumulated by collectStream — they're full per-chunk artefacts).
     const executedCode: string[] = [];
     const executionOutput: string[] = [];
-    const thoughtTexts: string[] = [];
     const candidates = response.candidates ?? [];
     for (const cand of candidates) {
       const parts = cand.content?.parts ?? [];
       for (const part of parts) {
         if (part.executableCode?.code) executedCode.push(part.executableCode.code);
         if (part.codeExecutionResult?.output) executionOutput.push(part.codeExecutionResult.output);
-        // `thinkingConfig: { includeThoughts: true }` returns thinking as parts
-        // flagged with `thought: true`. Cap the summary to avoid overwhelming the MCP response.
-        if (part.thought === true && typeof part.text === 'string') {
-          thoughtTexts.push(part.text);
-        }
       }
     }
-    const thinkingSummary = thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
+    const thinkingSummary = response.thoughtsSummary;
 
     const usage = response.usageMetadata;
     const cached =

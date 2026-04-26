@@ -5,6 +5,57 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-04-25
+
+### Added — T20 streaming heartbeat for `ask` / `code`
+
+- **`ask` and `code` now use `generateContentStream` instead of `generateContent`**. Stream chunks accumulate into a `CollectedResponse` (same shape as the old return) via the new `src/tools/shared/stream-collector.ts` helper. Downstream parsing (`parseEdits`, `parseCodeBlocks`, etc.) is unchanged.
+- **Live thinking heartbeat.** When the model emits thought-flagged parts (`includeThoughts: true`), `collectStream` extracts them and forwards via `onThoughtChunk` to the MCP progress emitter as `"thinking: <truncated>…"` notifications. Throttled at ~1500 ms by default to avoid flooding the MCP host. Visible in Claude Code's UI during long HIGH-thinking calls — no more silent 60-180 s pauses.
+- **`stream-collector.ts` semantics** (verified by 20 unit tests):
+  - Text concat across all chunks
+  - `usageMetadata` last-write-wins (Gemini sends only on the final chunk)
+  - `candidates` last-non-empty-wins (finish reasons + safety ratings authoritative on final chunk only)
+  - `thoughtsSummary` joined and capped at 1200 chars (matches existing post-call extraction)
+  - Abort propagation: pre-flight check + mid-stream check; closes the generator and rethrows the signal's reason
+  - Mid-stream errors propagate verbatim; abort wins over generic SDK errors
+  - `onThoughtChunk` callback errors are swallowed (logged) so emitter bugs don't kill the stream
+
+### Added — D#7 (closes the visibility symptom of T18)
+
+- **`status` now separates settled cost from in-flight reserved cost.** New fields on the structured response:
+  - `spentTodaySettledUsd` — cost from finalised calls only (today, UTC)
+  - `inFlightReservedTodayUsd` — sum of in-flight reservation rows (today, UTC)
+  - `usage.settledCostUsd` — workspace-scoped equivalent
+  - `usage.inFlightReservedUsd` — workspace-scoped in-flight slice
+- **Human-readable output adds parenthetical breakdown** when in-flight is non-zero: `"(today: $4.1360 (settled $3.5360 + $0.6000 in-flight reserved))"`. Hidden when no calls are in flight to avoid noise on the common path.
+- **Backward-compatible.** `spentTodayUsd` and `usage.totalCostUsd` keep their existing semantics (settled + in-flight) so daily-budget enforcement stays a true upper bound; the new fields are pure additions for visibility. Streaming made the in-flight window much more observable (60-180 s on HIGH thinking) — D#7 closes that perception gap.
+- **New `ManifestDb` methods**: `todaysInFlightReservedMicros(nowMs)` and `inFlightReservedMicros` field on `workspaceStats()` return.
+
+### Changed
+
+- **`ask.tool.ts` and `code.tool.ts` post-call thought extraction now reuses `response.thoughtsSummary`** from the collector instead of re-iterating `response.candidates` for thought parts. Eliminates the risk of drift between live thought-emit and post-call summary.
+- **`withNetworkRetry` wraps the OPENING of the stream**, not individual chunks. A pre-response failure → retry opens a fresh full stream. A mid-stream failure cannot be retried (Gemini's `generateContentStream` doesn't support resume) → propagates verbatim. The same applies to stale-cache retry: a stale-cache error mid-stream invalidates the cache and opens a brand-new full stream (discards partial response).
+
+### Deferred
+
+- **T18 ("precise budget accounting on stale-cache retry") cancel+re-reserve fix is NOT shipped.** Re-analysis showed the proposed fix is a no-op from the budget-accounting perspective: in the stale-cache retry path, the new estimate is identical to the original (same prompt, same workspace, same expected output), so cancel+re-reserve would just rotate the row id without changing the reserved amount. The user-visible symptom T18 was meant to address — concurrent callers seeing inflated daily totals during the retry window — is fully closed by D#7 above. T18 stays open in `docs/FOLLOW-UP-PRS.md` for the day a high-concurrency user genuinely needs a "downsize reservation" DB primitive (would be a separate ticket; v1.8+ if triggered).
+
+### Fixed — `ask_agentic` iteration-timeout during throttle wait (v1.6.0 regression)
+
+- **`ask_agentic`: a TPM-throttle wait that aborts on the per-iteration timeout now correctly maps to `errorCode: 'TIMEOUT'` AND releases both the budget and throttle reservations.** The v1.6.0 implementation wrapped only the `runAgenticIteration` call in the per-iteration try/catch; an abort firing inside `abortableSleep` during the pre-call throttle wait escaped to the outer catch with `errorCode: 'UNKNOWN'`, and both the in-flight budget reservation (over-counts daily spend) and TPM bucket entry (`releaseId`) leaked. Throttle wait moved INSIDE the per-iteration try (`src/tools/ask-agentic.tool.ts:537-560`); existing cancel/finalise/`isTimeoutAbort` mapping path now covers this branch. Surfaced by the new F3 unit test (`test/unit/ask-agentic.test.ts`). Pre-release fix — affects only users running the v1.6.0 branch under a tight `iterationTimeoutMs` AND a non-zero `tpmThrottleLimit` AND a throttle wait long enough to overrun the deadline.
+
+### Caveat carry-over from v1.6.0
+
+The streaming refactor preserves v1.6.0's T19 timeout caveat: `AbortSignal` is client-only — Gemini may still finish server-side and bill for completed work. When timeout aborts mid-stream, our client drops the response stream; the request server-side finishes normally.
+
+### Tests — 38 new cases (524 → 562)
+
+- `stream-collector.test.ts` (20): text concat, usageMetadata last-write-wins, candidates last-non-empty-wins, thoughtsSummary aggregation + 1200-char cap, throttled `onThoughtChunk` (default 1500 ms + custom 0 ms), callback error swallowing, abort propagation (pre-flight, mid-stream, abort-wins-over-generic), mid-stream error verbatim, timing metadata
+- `manifest-db.test.ts` extended (3): `todaysInFlightReservedMicros` isolation, `workspaceStats.inFlightReservedMicros` slice, all-settled = 0 case
+- `ask-throttle-integration.test.ts`, `code-throttle-integration.test.ts`, `preflight-guard.test.ts`, `ask-timeout-integration.test.ts` updated to mock `generateContentStream` (wraps existing `generateContent` mock as a single-chunk stream — preserves all assertions)
+- `test/helpers/stream-mock.ts` (new): `singleChunkStream`, `chunkedStream`, `rejectingStream`, `midStreamFailure` helpers for future stream-shape tests
+- `ask-agentic.test.ts` extended (6): T19 `iterationTimeoutMs` coverage — error-mapping with iteration metadata + reservation cancel/finalise pinning (incrementing reservation IDs), wrapped `error.cause` `TimeoutError` detection, `AbortError` ≠ `TIMEOUT` distinction, F2 abort-during-tool-execution (`vi.mock` partial replacement of `grepExecutor` with opt-in latency), F3 abort-during-throttle-wait (drove discovery of the v1.6.0 regression fixed above), end-to-end real-timer-fire on a hung `generateContent`
+
 ## [1.6.0] - 2026-04-25
 
 ### Added — T19 wall-clock timeout for `ask` / `code` / `ask_agentic`

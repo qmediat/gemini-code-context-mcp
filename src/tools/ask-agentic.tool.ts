@@ -534,23 +534,30 @@ async function executeAskAgenticBody(
         'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
       );
 
-      // Per-iteration TPM throttle reservation.
+      // Per-iteration TPM throttle reservation + iteration call. Both must
+      // run INSIDE the same try/catch so that a timeout firing during the
+      // throttle wait — `abortableSleep` rejects with the iter timeout's
+      // TimeoutError — flows through the same cancel/finalise/TIMEOUT-map
+      // path as a timeout firing during the SDK call. Earlier shape
+      // wrapped only `runAgenticIteration`, leaving an aborted throttle
+      // wait to escape to the outer catch with `errorCode: 'UNKNOWN'` AND
+      // both reservations leaked (budget over-counts, TPM bucket holds
+      // `releaseId` forever). Surfaced by the F3 unit test below.
       let throttleReservationId = -1;
-      if (tpmEnforced) {
-        const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
-        throttleReservationId = reservation.releaseId;
-        if (reservation.delayMs > 0) {
-          emitter.emit(
-            `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
-          );
-          // Abortable so iteration timeout interrupts the wait.
-          await abortableSleep(reservation.delayMs, iterTimeout.signal);
-        }
-      }
-
       let iterResult: Awaited<ReturnType<typeof runAgenticIteration>>;
       const iterStarted = Date.now();
       try {
+        if (tpmEnforced) {
+          const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
+          throttleReservationId = reservation.releaseId;
+          if (reservation.delayMs > 0) {
+            emitter.emit(
+              `throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`,
+            );
+            // Abortable so iteration timeout interrupts the wait.
+            await abortableSleep(reservation.delayMs, iterTimeout.signal);
+          }
+        }
         iterResult = await runAgenticIteration({
           ctx,
           resolvedModel: resolved.resolved,

@@ -74,7 +74,21 @@ function buildCtx(opts: {
       forceMaxOutputTokens: false,
       workspaceGuardRatio: opts.workspaceGuardRatio ?? 0.9,
     } as ToolContext['config'],
-    client: { models: { generateContent } } as unknown as ToolContext['client'],
+    client: {
+      models: {
+        generateContent,
+        // T20 (v1.7.0): production now calls `generateContentStream`; wrap
+        // the existing `generateContent` mock as a single-chunk stream so
+        // call-args / mockRejectedValue / mockResolvedValue all keep working.
+        generateContentStream: vi.fn(async (params: unknown) => {
+          const response = await generateContent(params);
+          async function* gen() {
+            yield response;
+          }
+          return gen();
+        }),
+      },
+    } as unknown as ToolContext['client'],
     manifest: {
       reserveBudget: vi.fn().mockReturnValue({ id: 1 }),
       finalizeBudgetReservation: vi.fn(),

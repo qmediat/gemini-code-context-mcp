@@ -92,7 +92,7 @@ Result: N concurrent tool calls cannot collectively overshoot the cap. A single 
 
 **Caveat:** the `bytes ÷ 4` token heuristic undercounts multibyte / CJK / emoji-dense content by ~1.3×–2×. For accurate caps on those workloads, set `GEMINI_DAILY_BUDGET_USD` ~2× lower than your true limit until the heuristic is upgraded (see [FOLLOW-UP-PRS.md T17](./FOLLOW-UP-PRS.md)).
 
-**Transient visibility quirk:** `status` sums `usage_metrics.cost_usd_micro` including in-flight reservations. During the seconds between reserve-and-finalize, reported daily spend reads slightly higher than the real amount. It reconciles the moment the call completes. See [KNOWN-DEFICITS.md](./KNOWN-DEFICITS.md) for the schema-migration fix roadmap.
+**`status` cost breakdown:** `spentTodayUsd` keeps its conservative-upper-bound semantics (settled + in-flight reservations) so daily-budget enforcement stays a true cap. *(v1.7.0+)* `status` additionally exposes `spentTodaySettledUsd` and `inFlightReservedTodayUsd` (plus workspace-scoped equivalents `usage.settledCostUsd` / `usage.inFlightReservedUsd`), and the human-readable line shows `"(settled $X + $Y in-flight reserved)"` whenever in-flight ≠ 0. Streaming made the in-flight window much more observable on long HIGH-thinking calls (60–180 s) — the breakdown closes that perception gap.
 
 ## Free tier
 

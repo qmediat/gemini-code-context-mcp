@@ -40,9 +40,9 @@ caller takes responsibility).
 
 | Category | What it's for | Example IDs | Accepted by tools |
 |---|---|---|---|
-| `text-reasoning` | Deep thinking, code review, long analysis | `gemini-3-pro-preview`, `gemini-2.5-pro`, `gemini-pro-latest` | `ask`, `code` |
-| `text-fast` | Quick Q&A, shallow reasoning | `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
-| `text-lite` | Cheapest text gen, simple classification | `gemini-3-flash-lite`, `gemini-2.5-flash-lite` | `ask` |
+| `text-reasoning` | Deep thinking, code review, long analysis | `gemini-pro-latest`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro` | `ask`, `code` |
+| `text-fast` | Quick Q&A, shallow reasoning | `gemini-flash-latest`, `gemini-3.1-flash-preview`, `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
+| `text-lite` | Cheapest text gen, simple classification | `gemini-flash-lite-latest`, `gemini-3.1-flash-lite-preview`, `gemini-2.5-flash-lite` | `ask` |
 | `image-generation` | Text → image (different pricing tier!) | `nano-banana-pro-preview`, `gemini-3-pro-image`, `imagen-4-ultra` | — (not supported by ask/code) |
 | `audio-generation` | TTS, music generation, dialog-native audio | `lyria-3-pro-preview`, `*-tts`, `*-native-audio-*` | — |
 | `video-generation` | Video synthesis | `veo-3`, `veo-3.1-preview` | — |
