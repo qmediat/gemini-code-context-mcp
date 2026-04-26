@@ -5,6 +5,29 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] - 2026-04-26
+
+### Fixed — /6step adversarial follow-ups on the v1.7.2 fakes-timer cascade fix
+
+A post-merge `/6step` audit on the v1.7.2 changes surfaced two MEDIUM and four LOW residual issues. None gated v1.7.2's empirical validation (release.yml ran end-to-end in 49 s on the post-fix tag), but each represented a latent regression risk. v1.7.3 closes them as a single hardening patch.
+
+- **`test/unit/abort-timeout.test.ts` — file-level `afterEach` hoisted (Finding #1, MEDIUM).** The first describe (`createTimeoutController`) had `afterEach(() => { vi.unstubAllEnvs(); vi.useRealTimers(); })` scoped inside it; the third describe (`abortableSleep`) called `vi.useFakeTimers()` in three tests with NO matching cleanup hook. Today this was masked because `abortableSleep` is the last describe in the file (no downstream tests to cascade into), but a future contributor appending a real-timer describe BELOW it would have re-introduced the same v1.7.2 deadlock pattern in a different file. The hook is now at file top level, applies to every test in the file, and includes `vi.clearAllTimers()` for queue hygiene.
+- **`test/unit/ask-agentic.test.ts` — `vi.clearAllTimers()` added to the file-level `afterEach` (Finding #2, LOW defense-in-depth).** v1.7.2's hook called only `vi.useRealTimers()`, which reverts the global swap but does not drop pending fake-timer queue entries. A future test calling `vi.useFakeTimers()` after a leaky earlier test could have inherited stale entries (vitest's behaviour around lingering fake-timer state is implementation-defined). Order matters: `clearAllTimers` first (against the still-fake global), then `useRealTimers` swap.
+- **`test/unit/ask-agentic.test.ts` — top-of-file fake-timer hazard comment block (Finding #6, MEDIUM).** The v1.7.2 root-cause documentation lived inline in `:592`'s body, easy to miss. New contributors adding tests have no obvious signal that mixing `vi.useFakeTimers()` with `await askAgenticTool.execute(...)` is structurally broken. v1.7.3 hoists the warning to the file's module docstring with the full race timeline (1-5) and a positive guidance section (where fake timers ARE appropriate: `gemini-retry.test.ts`, `abort-timeout.test.ts` — i.e. tests that don't sit downstream of the `realpath` I/O).
+- **`test/unit/ask-agentic.test.ts` — `mkdtempSync` cleanup added to `afterEach` (Finding #7, LOW housekeeping).** 23 tests in this file create `gcctx-askagent-*` directories under `tmpdir()` and never clean them. CI runners are ephemeral so production impact is zero, but developer machines accumulate the dirs forever. v1.7.3 adds a scan-and-cleanup pass in `afterEach` that sweeps the prefix. The pattern is single-file scope: the other 14 test files using `mkdtempSync` (74 call sites total across the repo) retain the existing behaviour — same justification (ephemeral runners), but lower-priority for now.
+- **Inline coupling note next to `expect(generateContent).toHaveBeenCalledTimes(3)` (Finding #8, LOW).** The assertion is implicitly tied to `withNetworkRetry`'s default `attempts: 3` in `src/gemini/retry.ts:112`. v1.7.3 adds a one-line comment near the assertion citing the source file:line so a future change to the retry default surfaces a clear test-update path instead of a confusing failure.
+- **CHANGELOG `[1.7.2]` disk-queue hypothesis flagged as inferential (Finding #9, LOW).** The v1.7.2 narrative attributed the run #2 failure to "the post-build hot disk-write queue slowed `realpath`" — a plausible model consistent with all observations (3-tool consult convergence + 121.65 s ≈ 4 × 30 s + post-fix 49 s success), but never directly measured. v1.7.3 adds a one-line caveat in `[1.7.2]` Notes acknowledging the hypothesis was inferential, not benchmarked. The fix itself stands; only the explanatory model is hedged.
+
+### Defense-in-depth NOT taken (deliberate)
+
+- **No regression test that fails if the `afterEach` hook is removed.** Such a test would amount to "test that vitest's afterEach hooks fire" — borderline tautological, and vitest itself tests its own lifecycle. The strengthened comment block above (citing this CHANGELOG entry directly) is the chosen guard. (/6step Finding #4)
+- **`>= 950 ms` lower bound retained.** 5 % slack is empirically sufficient (50 ms > Windows's 15.6 ms timer precision worst case) and semantically meaningful (rejects "instant resolve from misfired guard" while tolerating real timer noise). Dropping to `>= 900` for additional headroom has marginal value. (/6step Finding #3)
+
+### Notes
+
+- Zero production-code change. `src/` is byte-identical to v1.7.2 modulo the version bump in `package.json` + `server.json`.
+- Empirical validation on the same path that v1.7.2's release.yml exercised: local double-`npm test` clean, lint clean, typecheck clean, build clean, `release.yml` will fire on the v1.7.3 tag and exercise the prior-deadlock-prone double-test scenario again.
+
 ## [1.7.2] - 2026-04-26
 
 ### Fixed — release pipeline reliability (true root cause)
@@ -27,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Zero runtime change vs v1.7.1 / v1.7.0. Production code (`src/`) is byte-identical except for the version-string bumps in `package.json` + `server.json`.
 - v1.7.1 was never published to npm — its `release.yml` run failed at `Publish to npm` because of the cascade described above. Users see latest = 1.7.0 (no provenance) before this release; latest = 1.7.2 (provenance-signed) after.
+- The "post-build hot disk-write queue slows `realpath`" model in the trigger paragraph above is the best explanation consistent with all available evidence (3-way consult convergence, 121.65 s ≈ 4 × 30 s timing signature, post-fix 49 s release.yml success), but it was NOT directly benchmarked. If a future incident challenges the model, the FIX still holds (race removed, defense-in-depth in place); only the explanatory narrative would need revising. Flagged in v1.7.3 `/6step` Finding #9.
 
 ## [1.7.1] - 2026-04-26 (NEVER PUBLISHED — same root cause it was meant to address; superseded by v1.7.2)
 

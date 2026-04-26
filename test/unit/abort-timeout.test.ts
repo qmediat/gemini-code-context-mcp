@@ -6,15 +6,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createTimeoutController, isTimeoutAbort } from '../../src/tools/shared/abort-timeout.js';
 
+// File-level hard floor: every test in this file starts with real timers and a
+// clean env-stub state regardless of the previous test's exit path. The first
+// describe (`createTimeoutController`) and the third (`abortableSleep`) both
+// call `vi.useFakeTimers()`; without a file-level afterEach, the third
+// describe was unprotected — a future contributor appending a real-timer
+// test below it would have hit the same fake-timer leak cascade documented in
+// `ask-agentic.test.ts` for v1.7.2. Hoisting the cleanup here closes that gap
+// (CHANGELOG `[1.7.3]`, /6step Finding #1).
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.clearAllTimers();
+  vi.useRealTimers();
+});
+
 describe('createTimeoutController', () => {
   beforeEach(() => {
     // Hermetic env — no real GEMINI_CODE_CONTEXT_*_TIMEOUT_MS bleeds through.
     vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', undefined);
-  });
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.useRealTimers();
   });
 
   describe('disabled (no env, no per-call)', () => {
