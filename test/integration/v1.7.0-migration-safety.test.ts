@@ -1,12 +1,3 @@
-/**
- * Backward-compat verification: v1.5.2 manifest.db opened by v1.7.0 ManifestDb
- * must read existing rows correctly + accept new writes + populate D#7 fields.
- *
- * D#7 added NO new columns — it queries existing `duration_ms = 0` differently.
- * SCHEMA_VERSION stayed at '1'. This test pins the no-migration-needed claim.
- */
-
-import { execSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -76,24 +67,37 @@ describe('v1.5.2 → v1.7.0 manifest.db forward-compatibility', () => {
     // Seed with realistic v1.5.2-era data.
     const now = Date.now();
     raw
-      .prepare(
-        `INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run('/legacy/wks', 'h-old', 'gemini-2.5-pro', '', 'cachedContents/legacy', now + 3_600_000, '[]', now - 60_000, now - 1_000);
+      .prepare('INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        '/legacy/wks',
+        'h-old',
+        'gemini-2.5-pro',
+        '',
+        'cachedContents/legacy',
+        now + 3_600_000,
+        '[]',
+        now - 60_000,
+        now - 1_000,
+      );
     raw
-      .prepare(
-        `INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run('/legacy/wks', 'src/old.ts', 'h1', 'files/legacy-1', now - 60_000, now + 47 * 3600 * 1000);
+      .prepare('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)')
+      .run(
+        '/legacy/wks',
+        'src/old.ts',
+        'h1',
+        'files/legacy-1',
+        now - 60_000,
+        now + 47 * 3600 * 1000,
+      );
     // Settled call (duration_ms > 0) + an in-flight reservation (duration_ms = 0)
     raw
       .prepare(
-        `INSERT INTO usage_metrics(workspace_root, tool_name, model, cached_tokens, uncached_tokens, cost_usd_micro, duration_ms, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        'INSERT INTO usage_metrics(workspace_root, tool_name, model, cached_tokens, uncached_tokens, cost_usd_micro, duration_ms, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run('/legacy/wks', 'ask', 'gemini-2.5-pro', 1000, 500, 800_000, 1500, now - 30_000); // settled $0.80
     raw
       .prepare(
-        `INSERT INTO usage_metrics(workspace_root, tool_name, model, cached_tokens, uncached_tokens, cost_usd_micro, duration_ms, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        'INSERT INTO usage_metrics(workspace_root, tool_name, model, cached_tokens, uncached_tokens, cost_usd_micro, duration_ms, occurred_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run('/legacy/wks', 'ask', 'gemini-2.5-pro', 0, 0, 2_500_000, 0, now - 5_000); // in-flight $2.50
     raw.close();
@@ -142,12 +146,9 @@ describe('v1.5.2 → v1.7.0 manifest.db forward-compatibility', () => {
     // 5. v1.5.2-era stuck reservation (the duration_ms=0 row) is still
     //    discoverable. Operators can clean it up via cancelBudgetReservation
     //    if they detect a dead reservation from a crashed process.
-    const stuckId = (raw as unknown as { exec: (sql: string) => unknown }) === undefined
-      ? null
-      : null; // (raw is closed; we look up by query)
     const reopened = new Database(dbPath, { readonly: true });
     const stuck = reopened
-      .prepare(`SELECT id FROM usage_metrics WHERE duration_ms = 0 AND cost_usd_micro = 2500000`)
+      .prepare('SELECT id FROM usage_metrics WHERE duration_ms = 0 AND cost_usd_micro = 2500000')
       .get() as { id: number } | undefined;
     reopened.close();
     expect(stuck?.id).toBeGreaterThan(0);
@@ -182,13 +183,17 @@ describe('v1.5.2 → v1.7.0 manifest.db forward-compatibility', () => {
       }>;
 
     // workspaces — same shape as v1.5.2 (and earlier)
-    const wsCols = colsFor('workspaces').map((c) => `${c.name}:${c.type}`).join(',');
+    const wsCols = colsFor('workspaces')
+      .map((c) => `${c.name}:${c.type}`)
+      .join(',');
     expect(wsCols).toBe(
       'workspace_root:TEXT,files_hash:TEXT,model:TEXT,system_prompt_hash:TEXT,cache_id:TEXT,cache_expires_at:INTEGER,file_ids:TEXT,created_at:INTEGER,updated_at:INTEGER',
     );
 
     // usage_metrics — D#7's new field is NOT a column; it's derived from duration_ms.
-    const umCols = colsFor('usage_metrics').map((c) => c.name).join(',');
+    const umCols = colsFor('usage_metrics')
+      .map((c) => c.name)
+      .join(',');
     expect(umCols).toBe(
       'id,workspace_root,tool_name,model,cached_tokens,uncached_tokens,cost_usd_micro,duration_ms,occurred_at',
     );

@@ -8,19 +8,19 @@
  *   GEMINI_CREDENTIALS_PROFILE=default npx vitest run test/integration/v1.7.0-streaming-srogi.test.ts --reporter=verbose
  */
 
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createGeminiClient } from '../../src/gemini/client.js';
 import { resolveAuth } from '../../src/auth/profile-loader.js';
-import { ManifestDb } from '../../src/manifest/db.js';
 import { TtlWatcher } from '../../src/cache/ttl-watcher.js';
-import { createTpmThrottle } from '../../src/tools/shared/throttle.js';
+import { createGeminiClient } from '../../src/gemini/client.js';
+import { ManifestDb } from '../../src/manifest/db.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
-import { statusTool } from '../../src/tools/status.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { createTpmThrottle } from '../../src/tools/shared/throttle.js';
+import { statusTool } from '../../src/tools/status.tool.js';
 
 // --- Cost cap enforcement -----------------------------------------------------
 
@@ -393,7 +393,10 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
       // eslint-disable-next-line no-console
       console.error('[T20 cold] FAILED. content:', JSON.stringify(result.content, null, 2));
       // eslint-disable-next-line no-console
-      console.error('[T20 cold] structuredContent:', JSON.stringify(result.structuredContent, null, 2));
+      console.error(
+        '[T20 cold] structuredContent:',
+        JSON.stringify(result.structuredContent, null, 2),
+      );
     }
     expect(result.isError).toBeFalsy();
     const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
@@ -410,7 +413,10 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     expect(sc?.cacheHit).toBe(false);
     // HIGH thinking → thinking tokens > 0.
     expect(sc?.thinkingTokens).toBeGreaterThan(0);
-    recordCost(`T20 cold + HIGH thinking [model=${sc?.resolvedModel}]`, sc?.costEstimateUsd as number);
+    recordCost(
+      `T20 cold + HIGH thinking [model=${sc?.resolvedModel}]`,
+      sc?.costEstimateUsd as number,
+    );
   }, 300_000);
 
   it('T20 warm streaming — same workspace, second call hits cache', async () => {
@@ -436,7 +442,10 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     const cached = sc?.cachedTokens as number;
     const uncached = sc?.uncachedTokens as number;
     expect(cached).toBeGreaterThan(uncached);
-    recordCost(`T20 warm cache hit [cached=${cached} uncached=${uncached}]`, sc?.costEstimateUsd as number);
+    recordCost(
+      `T20 warm cache hit [cached=${cached} uncached=${uncached}]`,
+      sc?.costEstimateUsd as number,
+    );
   }, 120_000);
 
   it('T19 timeout interrupts a streaming call mid-flight (returns TIMEOUT errorCode)', async () => {
@@ -461,7 +470,7 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     // No real cost recorded by us — but Gemini may still bill server-side
     // for completed work (per the AbortSignal client-only caveat). Record
     // estimated worst-case so the budget cap honours it.
-    recordCost('T19 timeout abort (Gemini may still bill — recorded as $0.10 estimate)', 0.10);
+    recordCost('T19 timeout abort (Gemini may still bill — recorded as $0.10 estimate)', 0.1);
   }, 30_000);
 
   it('D#7 status separates settled from in-flight reserved cost', async () => {
@@ -525,8 +534,7 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     expect(scAfter?.spentTodaySettledUsd).toBeCloseTo(settledBefore + actualCost, 3);
 
     // Human output should NOT include in-flight section once cleared.
-    const humanAfter =
-      statusAfter.content?.[0]?.type === 'text' ? statusAfter.content[0].text : '';
+    const humanAfter = statusAfter.content?.[0]?.type === 'text' ? statusAfter.content[0].text : '';
     expect(humanAfter).not.toMatch(/in-flight reserved/);
   }, 240_000);
 
@@ -535,8 +543,7 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     const result = await codeTool.execute(
       {
         workspace: workspaceRoot,
-        task:
-          'Refactor `withRetry` in src/retry.ts to add a `onAttemptFailure?: (attempt: number, err: unknown) => void` callback that is invoked before each backoff sleep. Provide an OLD/NEW diff edit.',
+        task: 'Refactor `withRetry` in src/retry.ts to add a `onAttemptFailure?: (attempt: number, err: unknown) => void` callback that is invoked before each backoff sleep. Provide an OLD/NEW diff edit.',
         thinkingLevel: 'MEDIUM',
         expectEdits: true,
       },
@@ -548,13 +555,18 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     const edits = sc?.edits as Array<unknown> | undefined;
     expect(edits).toBeDefined();
     expect((edits ?? []).length).toBeGreaterThan(0);
-    recordCost(`code tool with OLD/NEW edits [edits=${edits?.length ?? 0}]`, sc?.costEstimateUsd as number);
+    recordCost(
+      `code tool with OLD/NEW edits [edits=${edits?.length ?? 0}]`,
+      sc?.costEstimateUsd as number,
+    );
   }, 240_000);
 
   it('FINAL: cost summary', () => {
     // eslint-disable-next-line no-console
-    console.log(`\n=== SROGI TEST SUITE COST SUMMARY ===`);
+    console.log('\n=== SROGI TEST SUITE COST SUMMARY ===');
     // eslint-disable-next-line no-console
-    console.log(`Total cumulative cost: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)} cap`);
+    console.log(
+      `Total cumulative cost: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)} cap`,
+    );
   });
 });

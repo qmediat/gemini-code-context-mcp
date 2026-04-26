@@ -19,14 +19,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { resolveAuth } from '../../src/auth/profile-loader.js';
-import { estimateCostUsd } from '../../src/utils/cost-estimator.js';
 import { TtlWatcher } from '../../src/cache/ttl-watcher.js';
 import { createGeminiClient } from '../../src/gemini/client.js';
 import { ManifestDb } from '../../src/manifest/db.js';
-import { askTool } from '../../src/tools/ask.tool.js';
 import { askAgenticTool } from '../../src/tools/ask-agentic.tool.js';
-import { createTpmThrottle } from '../../src/tools/shared/throttle.js';
+import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { createTpmThrottle } from '../../src/tools/shared/throttle.js';
+import { estimateCostUsd } from '../../src/utils/cost-estimator.js';
 
 const HARD_BUDGET_USD = 5.0;
 let cumulativeCost = 0;
@@ -94,7 +94,8 @@ beforeAll(() => {
     JSON.stringify({ name: 'extras-fixture', version: '0.0.0', type: 'module' }, null, 2),
   );
   // Same calibrated bulk pattern as the main srogi suite — clears the 1024-token cache floor.
-  const bulk = (name: string, content: string) => writeFileSync(join(workspaceRoot, 'src', name), content);
+  const bulk = (name: string, content: string) =>
+    writeFileSync(join(workspaceRoot, 'src', name), content);
   bulk(
     'auth.ts',
     `export interface AuthProfile { kind: 'api-key' | 'vertex'; apiKey?: string; project?: string; }
@@ -298,7 +299,9 @@ afterAll(() => {
   rmSync(tmpStateDir, { recursive: true, force: true });
   rmSync(workspaceRoot, { recursive: true, force: true });
   // eslint-disable-next-line no-console
-  console.log(`\n=== EXTRAS SUITE COST: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)} ===`);
+  console.log(
+    `\n=== EXTRAS SUITE COST: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)} ===`,
+  );
 });
 
 suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', () => {
@@ -390,18 +393,23 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
       return;
     }
     // eslint-disable-next-line no-console
-    console.log(`[F] Built cache: ${cacheId} — externally deleting now to simulate stale-cache event…`);
+    console.log(
+      `[F] Built cache: ${cacheId} — externally deleting now to simulate stale-cache event…`,
+    );
 
     // Step 2: externally delete the cache via raw client (same call our
     // invalidateWorkspaceCache uses internally).
-    const client = createGeminiClient(auth!.profile);
+    if (!auth) throw new Error('auth missing');
+    const client = createGeminiClient(auth.profile);
     try {
       await client.caches.delete({ name: cacheId });
       // eslint-disable-next-line no-console
-      console.log(`[F] External delete succeeded`);
+      console.log('[F] External delete succeeded');
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.log(`[F] External delete failed (may already be gone): ${err instanceof Error ? err.message : String(err)}`);
+      console.log(
+        `[F] External delete failed (may already be gone): ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
 
     // Step 3: ask again — the cached pointer in our manifest is now stale.
