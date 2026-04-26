@@ -5,6 +5,23 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] - 2026-04-25
+
+### Added
+
+- **48 unit test cases for previously integration-only modules** — `cache-manager` (cache HIT/MISS/REBUILD branches, in-process mutex coalescing under microtask pump, mismatch-triggered rebuild for filesHash/model/systemPromptHash, cache-build failure → inline fallback), `files-uploader` (hash-based dedup with reuse-path identity preservation, safety-margin re-upload when expiry < 2 h, in-batch dedup for same-content files, per-upload failure capture in `failures[]`, parallel-pool concurrency cap), `ttl-watcher` (refresh inside `REFRESH_IF_EXPIRES_WITHIN_MS`, skip when plenty of TTL left, cold-workspace eviction, manifest-mismatch eviction, 404/NOT_FOUND eviction with manifest cacheId null-out, transient-error retain-and-retry, re-entrancy guard for overlapping ticks, lifecycle idempotence), `profile-loader` (Tier-1/2/3 resolution order, GOOGLE_CLOUD_LOCATION override, vertex-from-file profile shape, all-missing actionable error). Total suite: 410 → 477.
+- **19 unit test cases for `code.tool.ts` parsers** (`parseEdits` + `parseCodeBlocks`) — minimal OLD/NEW edits, insertion path (NEW-only), multi-file edits, Unicode filenames, paths with spaces and dots, multi-line OLD/NEW preservation, language-tag variants (`c++`, `x86_64`, `foo-bar`, `foo_bar`), NEW-first regression-pin documenting the regex contract for arbitrary text following `NEW:`, malformed inputs (no fence, no marker, incomplete fences). Locks parser surface in advance of v1.7.0's stream-collector refactor (T20).
+
+### Changed
+
+- **`parseEdits` and `parseCodeBlocks` are now exported** from `src/tools/code.tool.ts`. Pure functions with no side effects; promotion is purely for testability — runtime behaviour unchanged.
+- **`docs/FOLLOW-UP-PRS.md`** — T1, T2, T21 marked SHIPPED with empirical evidence pointers; T21's "open question" (where `THINKING_LEVEL_RESERVE` lives) resolved in favour of the shared module path. Added v1.5.3 row to the release-sequencing table; v1.7.0 row updated to reflect bundling of T18 + D#7 with T20.
+- **`CONTRIBUTING.md`** — clarified that `gemini-code-context-dev` and `gemini-code-context` can coexist as separate MCP entries; documented the `XDG_STATE_HOME` isolation pattern so dev branches don't share prod's manifest DB at `~/.qmediat/gemini-code-context-mcp/manifest.db`.
+
+### Rationale
+
+This is a **test-coverage + docs hygiene patch**. **Zero runtime behaviour change** — the only diff to production code is the addition of an `export` keyword (and `/** @internal */` JSDoc marker) on two pure parser functions in `src/tools/code.tool.ts` (`parseEdits`, `parseCodeBlocks`). No execution path was modified, no module's runtime side effects changed. The `@internal` markers explicitly carve these exports out of the public API surface — they exist for unit testability only, not for downstream consumption. Sole purpose: lock invariants in place before the v1.6.0 (`AbortController` timeout) and v1.7.0 (streaming refactor) PRs, so any regression in the cache-decision graph, files-API plumbing, TTL refresh, auth resolution, or response parsers breaks the build instead of silently shipping.
+
 ## [1.5.2] - 2026-04-22
 
 ### Added

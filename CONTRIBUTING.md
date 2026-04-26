@@ -53,6 +53,27 @@ Workflow: edit code → `npm run build` → restart your MCP host → test.
 
 The `cwd` field tells the MCP host to spawn `npx` from a directory that doesn't contain a same-named `package.json`, sidestepping the resolution conflict. End users never need this — only contributors who keep their MCP host's `cwd` set to the repo do.
 
+**Coexisting prod + dev side-by-side.** Option A's `gemini-code-context-dev` is a different MCP server name from the published `gemini-code-context`, so you can keep BOTH entries in your config simultaneously. Daily usage stays on the stable runtime install (`npm install -g @qmediat.io/gemini-code-context-mcp` → `command: "gemini-code-context-mcp"`); dogfood happens via `gemini-code-context-dev` against the dev tree.
+
+**Isolate the dev manifest DB from prod.** Both processes default to `~/.qmediat/gemini-code-context-mcp/manifest.db` — the SAME SQLite file. Running an experimental branch against prod's manifest can corrupt cache-id pointers, leak Files API uploads, or double-count budget reservations. Set `XDG_STATE_HOME` on the dev entry to a separate directory:
+
+```jsonc
+{
+  "mcpServers": {
+    "gemini-code-context-dev": {
+      "command": "node",
+      "args": ["/absolute/path/to/gemini-code-context-mcp/dist/index.js"],
+      "env": {
+        "GEMINI_CREDENTIALS_PROFILE": "default",
+        "XDG_STATE_HOME": "/Users/<you>/.qmediat-dev"
+      }
+    }
+  }
+}
+```
+
+The dev server resolves its state to `<XDG_STATE_HOME>/qmediat/gemini-code-context-mcp/manifest.db` — fully isolated from prod. Credentials profiles are read-only and shared (no need for a separate `XDG_CONFIG_HOME` unless you want a separate API key bucket too).
+
 ## Workflow
 
 1. **Fork + branch** — create a feature branch from `main`.
