@@ -123,7 +123,13 @@ Each step must fully merge + publish before the next opens:
 
 ---
 
-## T6. SIGTERM graceful-drain for in-flight tool calls
+## ~~T6.~~ ✅ SHIPPED v1.8.0 — SIGTERM graceful-drain for in-flight tool calls
+
+Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler's `tool.execute(...)` promise in `inFlightCalls: Set<Promise<CallToolResult>>`. On `SIGINT`/`SIGTERM`, `drainInFlight(inFlightCalls, drainBudgetMs)` races `Promise.allSettled` against `setTimeout(drainBudgetMs)` — settled calls return their response cleanly; abandoned calls are logged at WARN. Configurable via `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS` (default 5000, range `[0, 60000]`). 6 new test cases in `test/unit/server-drain.test.ts` (562 → 568). Closes the reliability triangle started in v1.5.1 → v1.6.0 → v1.7.0 with clean shutdown UX.
+
+---
+
+## T6-orig. (Original scope — preserved for context)
 
 **Source:** Prior `/6step` self-review.
 

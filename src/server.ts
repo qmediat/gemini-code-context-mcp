@@ -1,5 +1,15 @@
 /**
  * MCP server bootstrap — stdio transport, tool dispatch, graceful lifecycle.
+ *
+ * **Shutdown drain (T6, v1.8.0):** SIGINT/SIGTERM does not immediately tear
+ * down the transport. Each `CallToolRequestSchema` handler invocation is
+ * tracked in `inFlightCalls` for the duration of `tool.execute(...)`. On
+ * shutdown we `Promise.race` the set against `SHUTDOWN_DRAIN_MS` (default
+ * 5000 ms) so a long `ask`/`code`/`ask_agentic` already in flight when
+ * Claude Code restarts the server can return its response before the
+ * process exits. Hard timeout: a hung call cannot block shutdown — abandoned
+ * calls are logged at WARN, not silently dropped. Override the drain budget
+ * with `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS=<ms>` (clamped to [0, 60000]).
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -28,6 +38,67 @@ import { dirname as pathDirname, join as pathJoin } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SERVER_NAME = '@qmediat.io/gemini-code-context-mcp';
+const DEFAULT_SHUTDOWN_DRAIN_MS = 5_000;
+const MAX_SHUTDOWN_DRAIN_MS = 60_000;
+
+/**
+ * Resolve the drain budget from `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS`.
+ * Non-finite, negative, or out-of-range values fall back to the default —
+ * an operator typo (`abc`, `-1`, `999999`) must NOT silently disable the
+ * timeout (would block forever) or set it to a pathological value.
+ */
+function resolveDrainBudgetMs(): number {
+  const raw = process.env.GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS;
+  if (raw === undefined || raw === '') return DEFAULT_SHUTDOWN_DRAIN_MS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_SHUTDOWN_DRAIN_MS) {
+    logger.warn(
+      `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS='${raw}' is invalid (must be 0–${MAX_SHUTDOWN_DRAIN_MS}); using default ${DEFAULT_SHUTDOWN_DRAIN_MS}ms`,
+    );
+    return DEFAULT_SHUTDOWN_DRAIN_MS;
+  }
+  return parsed;
+}
+
+/**
+ * Wait for every promise in `inFlight` to settle, but no longer than
+ * `timeoutMs`. Returns the count of promises that settled in time.
+ *
+ * Exported for unit testing without booting a real server.
+ */
+export async function drainInFlight(
+  inFlight: ReadonlySet<Promise<unknown>>,
+  timeoutMs: number,
+): Promise<{ settled: number; abandoned: number }> {
+  const total = inFlight.size;
+  if (total === 0) return { settled: 0, abandoned: 0 };
+  if (timeoutMs <= 0) return { settled: 0, abandoned: total };
+
+  let settled = 0;
+  // Wrap each promise to count completions as they settle. We don't care
+  // about resolve vs reject — both mean "the handler returned, no longer
+  // in-flight". The `settled` counter is read by the caller AFTER the race
+  // resolves, so it reflects the count at the moment the timeout (or
+  // allSettled) fired.
+  const tracked = [...inFlight].map((p) =>
+    p.then(
+      () => {
+        settled++;
+      },
+      () => {
+        settled++;
+      },
+    ),
+  );
+
+  await Promise.race([
+    Promise.allSettled(tracked),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs).unref?.()),
+  ]);
+
+  return { settled, abandoned: total - settled };
+}
+
 /**
  * Read version from package.json at runtime. `server.js` lives in `dist/` after
  * compilation (or `src/` under `tsx`) so package.json is the parent directory.
@@ -86,6 +157,14 @@ export async function runServer(): Promise<void> {
     })),
   }));
 
+  // Tracks `tool.execute(...)` calls that are still mid-flight. Used by
+  // `shutdown()` to drain gracefully on SIGINT/SIGTERM (T6). Set semantics:
+  // each handler invocation `add`s its own promise on entry and `delete`s
+  // it in a `finally` block, regardless of resolve/reject path. A hung call
+  // remains in the set until shutdown's `drainInFlight` either races it to
+  // completion or times out and abandons it.
+  const inFlightCalls = new Set<Promise<CallToolResult>>();
+
   server.setRequestHandler(CallToolRequestSchema, async (request): Promise<CallToolResult> => {
     const { name, arguments: rawArgs } = request.params;
     const progressToken = request.params._meta?.progressToken;
@@ -114,13 +193,21 @@ export async function runServer(): Promise<void> {
       throttle,
     };
 
+    const callPromise = (async (): Promise<CallToolResult> => {
+      try {
+        const result: ToolResult = await tool.execute(parse.data, ctx);
+        return result as CallToolResult;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(`tool '${name}' threw: ${message}`);
+        return errorResult(`${name} threw: ${message}`) as CallToolResult;
+      }
+    })();
+    inFlightCalls.add(callPromise);
     try {
-      const result: ToolResult = await tool.execute(parse.data, ctx);
-      return result as CallToolResult;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      logger.error(`tool '${name}' threw: ${message}`);
-      return errorResult(`${name} threw: ${message}`) as CallToolResult;
+      return await callPromise;
+    } finally {
+      inFlightCalls.delete(callPromise);
     }
   });
 
@@ -128,6 +215,26 @@ export async function runServer(): Promise<void> {
 
   const shutdown = async (signal: string): Promise<void> => {
     logger.info(`received ${signal}, shutting down…`);
+
+    // Drain in-flight tool calls BEFORE closing the transport / DB. Otherwise
+    // an in-progress `await tool.execute(...)` in the request handler would
+    // race against `server.close()` / `manifest.close()` and either lose its
+    // response (transport torn down) or hit "manifest closed" mid-write.
+    if (inFlightCalls.size > 0) {
+      const drainBudgetMs = resolveDrainBudgetMs();
+      logger.info(
+        `waiting up to ${drainBudgetMs}ms for ${inFlightCalls.size} in-flight tool call(s) to drain`,
+      );
+      const { settled, abandoned } = await drainInFlight(inFlightCalls, drainBudgetMs);
+      if (abandoned > 0) {
+        logger.warn(
+          `${abandoned}/${settled + abandoned} in-flight call(s) did not drain in ${drainBudgetMs}ms — abandoning`,
+        );
+      } else if (settled > 0) {
+        logger.info(`drained ${settled} in-flight call(s) cleanly`);
+      }
+    }
+
     ttlWatcher.stop();
     try {
       manifest.close();
