@@ -76,10 +76,36 @@ const AGENTIC_SECRET_EXTENSIONS: readonly string[] = [
   '.ovpn',
 ];
 
+/**
+ * Where each code fires (v1.9.0 — keep this map current as new throw sites
+ * are added):
+ *
+ *   PATH_TRAVERSAL     — sandbox.ts (jail violation: symlink escape, abs path outside)
+ *   SECRET_DENYLIST    — sandbox.ts (basename / extension / dir on hardcoded secret list)
+ *   EXCLUDED_DIR       — sandbox.ts (DEFAULT_EXCLUDE_DIRS hit, line ~302)
+ *                        AND workspace-tools.ts top-level gates (v1.9.0+):
+ *                        listDirectoryExecutor + grepExecutor's pathPrefix,
+ *                        when the requested dir matches user-supplied excludeGlobs
+ *   EXCLUDED_FILE      — workspace-tools.ts (v1.9.0+): readFileExecutor when
+ *                        the file is excluded by user globs (filename / extension
+ *                        / dir-prefix). Generic message — no path leak.
+ *   EXCLUDED_FILENAME  — sandbox.ts (DEFAULT_EXCLUDE_FILE_NAMES hit, line ~321)
+ *   NON_SOURCE_FILE    — workspace-tools.ts: readFileExecutor when no
+ *                        include-extension matches (path retained — different
+ *                        threat model from EXCLUDED_FILE)
+ *   NOT_A_DIRECTORY    — workspace-tools.ts (listDir / grep when target is a file)
+ *   NOT_FOUND          — sandbox.ts (resolveInsideWorkspace, missing path)
+ *                        AND workspace-tools.ts (executor-side fs errors)
+ *   NOT_INSIDE_ROOT    — sandbox.ts (jail violation, in-workspace check)
+ *   INVALID_INPUT      — workspace-tools.ts (empty pattern, malformed regex)
+ *
+ * If you add a new throw site for an existing code, update this map.
+ */
 export type SandboxErrorCode =
   | 'PATH_TRAVERSAL'
   | 'SECRET_DENYLIST'
   | 'EXCLUDED_DIR'
+  | 'EXCLUDED_FILE'
   | 'EXCLUDED_FILENAME'
   | 'NON_SOURCE_FILE'
   | 'NOT_A_DIRECTORY'

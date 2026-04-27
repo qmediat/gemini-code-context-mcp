@@ -5,6 +5,46 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-04-27
+
+### Added — `ask_agentic` glob parity with `ask`/`code` (Phase 1 of the v1.9.0 plan)
+
+`ask_agentic`'s input schema now accepts the same `includeGlobs` / `excludeGlobs` shape as `ask` / `code`. Every executor (`list_directory`, `find_files`, `read_file`, `grep`) honours the user's filters: refused paths surface as `SandboxError` with codes `EXCLUDED_DIR` / `EXCLUDED_FILE` (new) and the four executors share one filtering predicate (`isFileIncluded` / `isPathExcluded` from `src/indexer/globs.ts`) with the eager scanner — agentic / eager divergence closed.
+
+This is the prerequisite for the v1.x roadmap's `ask` → `ask_agentic` auto-fallback on `WORKSPACE_TOO_LARGE` (separate release, separate plan): without consistent glob honouring, a fallback would silently drop user-supplied excludes — a privacy regression. Phase 1 closes that.
+
+- **Schema**: `includeGlobs?: string[]` and `excludeGlobs?: string[]` on `ask_agentic` (mirrors of `ask`/`code` shape and docstring).
+- **Executors**: `listDirectoryExecutor`, `findFilesExecutor`, `readFileExecutor`, `grepExecutor` accept an optional `matchConfig?: MatchConfig` parameter. When omitted, `defaultMatchConfig({})` is used — backwards compatible with pre-v1.9.0 test call-sites and direct callers.
+- **Top-level dir gate** (Phase 1.1 hardening, /6step finding): `list_directory` and `grep` (when `pathPrefix` given) now check `isPathExcluded(target.relpath, config)` BEFORE `readdir` / walk fires, throwing `SandboxError('EXCLUDED_DIR')` on hit. Without this gate the model could probe path existence by comparing success vs `NOT_FOUND` from `resolveInsideWorkspace` (the sandbox layer only checks `DEFAULT_EXCLUDE_DIRS`, not user globs).
+- **Privacy-aware error messages** (Phase 1.1 hardening): `EXCLUDED_FILE` and `EXCLUDED_DIR` use a generic `.message` that does NOT echo the excluded path — closes the existence-probe oracle via error-string differential. The path is preserved on `SandboxError.requestedPath` for ops logging only. `NON_SOURCE_FILE` retains the path in its message (different threat model — that's a "wrong tool" signal, not privacy-bearing).
+- **Single source of truth for include-extension matching** (Phase 1.1 hardening): new `matchesAnyIncludeExtension(relpath, config)` exported from `src/indexer/globs.ts`. `isFileIncluded` delegates to it; `readFileExecutor` uses it for the `NON_SOURCE_FILE` vs `EXCLUDED_FILE` discriminator. Drift-proof — any future change to include-pattern matching updates one function, not two.
+
+### Added — log-injection defense via `safeForLog` helper (Phase 1.3, project-wide)
+
+A `/6step` audit on Phase 1.2 surfaced that the new debug logger interpolated model-controlled values directly via template strings — a `\n` in the value forges a fake one-line log record (log injection). The pattern was pre-existing across 16 logger call sites in the codebase. v1.9.0 closes the entire pattern, not just the new line.
+
+- **New export** `safeForLog(value: unknown): string` from `src/utils/logger.ts`. Escapes `\n`, `\r`, `\t`, and the rest of the C0 control range as `\\n` / `\\r` / `\\t` / `\\xNN`. UTF-8 above the C0 range (emoji, CJK, accents) preserved untouched. Hard-caps each value at 2 000 chars with deterministic `…[+N more]` overflow suffix to prevent multi-MB error bodies from pinning a single log line at megabytes.
+- **Migrated** every untrusted-input logger interpolation across the project — 16 pre-existing call sites + 1 new (the `agentic dispatch refused` debug line introduced in this release) = **17 logger calls in 8 files** now wrap untrusted values in `safeForLog`: `server.ts`, `index.ts`, `ask*.tool.ts`, `code.tool.ts`, `cache-manager.ts`, `files-uploader.ts`, `ttl-watcher.ts`, `ask-agentic.tool.ts`. Logger calls with internal-only values (numeric counts, validated signal names, validated model IDs) left as-is.
+- **18 new tests** in `test/unit/logger.test.ts` pinning the threat model: log-injection escapes, flood-defense truncation, type coverage (`Error` / `null` / `undefined` / `number` / `boolean` / `object` dispatch), and safety-under-repeated-application (the helper documents that re-applying never introduces new injection vectors but is NOT byte-for-byte idempotent on inputs straddling the truncation cap — a corrected docstring claim caught by Phase 1.3's audit).
+
+### Added — `agentic dispatch refused` debug log (Phase 1.2)
+
+When an agentic tool call is refused (`EXCLUDED_FILE` / `EXCLUDED_DIR` / etc.), the dispatcher now writes a one-line debug log to stderr containing `tool=<name> code=<sandbox-code> requestedPath=<path>`. The user-visible (LLM-facing) error message stays generic to close the existence-probe oracle; this debug line gives operators a way to map "user reports my file is being blocked" to a specific path without writing custom instrumentation. **Path disclosure here is opt-in** via `GEMINI_CODE_CONTEXT_LOG_LEVEL=debug` — see the new note in [`docs/configuration.md`](./docs/configuration.md). All interpolated values flow through `safeForLog`.
+
+### Documentation
+
+- **[`docs/configuration.md`](./docs/configuration.md)** — `GEMINI_CODE_CONTEXT_LOG_LEVEL` entry expanded with explicit guidance on the debug-level path disclosure and the `safeForLog` escape contract.
+- **[`docs/ACCEPTED-RISKS.md`](./docs/ACCEPTED-RISKS.md)** — new entry documenting the symlink-bypass on user `excludeGlobs`. The user-supplied path is realpath-resolved before glob matching, so a symlink whose name matches an exclude but whose target doesn't (or vice versa) bypasses the user's filter via filesystem topology. Threat narrow (requires intentional symlink + matching exclude pattern + cooperative model), and `AGENTIC_SECRET_BASENAMES` still catches canonical secret names regardless of how the path was reached. Documented with revisit triggers and three available mitigations.
+
+### Tests
+
+568 → 598 (+30): glob-honouring contract pinned for all four executors (Phase 1, +8); top-level dir gate + privacy-aware error message + asymmetry pinned (Phase 1.1, +4); `safeForLog` threat-model coverage (Phase 1.3, +18). Phase 1.2 added no new tests — the existing Phase 1.1 `requestedPath` assertion now retroactively pins a load-bearing contract once Phase 1.2's `logger.debug` started consuming the field.
+
+### Notes
+
+- Zero breaking changes. All schema fields are additive and optional. All new error codes are additive to the `SandboxError` union (`EXCLUDED_FILE`, `EXCLUDED_DIR` are new; existing codes unchanged). Pre-v1.9.0 tests and direct executor callers see identical behaviour when no `matchConfig` is passed.
+- `ask` → `ask_agentic` auto-fallback (Phase 3 of the original v1.9.0 plan), `countTokens` accurate preflight (Phase 2), and the heartbeat-aware stall detector (Phase 4) ship in subsequent v1.x releases — Phase 1 is the privacy-hardening foundation those future releases depend on.
+
 ## [1.8.0] - 2026-04-27
 
 ### Added — T6: SIGTERM graceful-drain for in-flight tool calls

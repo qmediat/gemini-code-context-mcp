@@ -547,3 +547,225 @@ describe('round-4: listDirectoryExecutor ENOTDIR classification', () => {
     }
   });
 });
+
+// =============================================================================
+// v1.9.0 Phase 1 — user `includeGlobs` / `excludeGlobs` plumbed through every
+// agentic executor. PRIVACY contract: when `ask` falls back to `ask_agentic`
+// on `WORKSPACE_TOO_LARGE` (Phase 3), user-supplied filter globs MUST be
+// honoured by all four executors — otherwise a user who excluded `*.env*`
+// or `internal-secrets/` gets those paths walked anyway, leaking content
+// straight into the model. These tests pin the contract.
+// =============================================================================
+
+describe('agentic executors honour user excludeGlobs / includeGlobs (v1.9.0)', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-globs-')));
+    writeFileSync(join(root, 'app.ts'), 'export const app = 1;');
+    writeFileSync(join(root, 'app.test.ts'), 'import { app } from "./app";');
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'lib.ts'), 'export const lib = 2;');
+    mkdirSync(join(root, 'internal-secrets'), { recursive: true });
+    writeFileSync(join(root, 'internal-secrets', 'token.ts'), 'export const TOKEN = "abc";');
+    writeFileSync(join(root, 'custom.private.ts'), 'export const PRIVATE = 1;');
+  });
+
+  it('listDirectory: skips a directory matching user excludeGlobs', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    const result = await listDirectoryExecutor(root, '.', config);
+    const dirs = result.entries.filter((e) => e.type === 'dir').map((e) => e.relpath);
+    expect(dirs).toContain('src');
+    expect(dirs).not.toContain('internal-secrets');
+  });
+
+  it('listDirectory: skips files matching user excludeGlobs extension pattern', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['*.test.ts'] });
+
+    const result = await listDirectoryExecutor(root, '.', config);
+    const files = result.entries.filter((e) => e.type === 'file').map((e) => e.relpath);
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('app.test.ts');
+  });
+
+  it('findFiles: skips dirs matching user excludeGlobs (no recursion into them)', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    const result = await findFilesExecutor(root, '**/*.ts', config);
+    expect(result.matches).toContain('app.ts');
+    expect(result.matches).toContain('src/lib.ts');
+    // The token.ts file inside the excluded dir must not surface — the
+    // walk skipped the dir entirely.
+    expect(result.matches).not.toContain('internal-secrets/token.ts');
+  });
+
+  it('findFiles: skips files matching user excludeGlobs filename literal', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['custom.private.ts'] });
+
+    const result = await findFilesExecutor(root, '**/*.ts', config);
+    expect(result.matches).toContain('app.ts');
+    expect(result.matches).not.toContain('custom.private.ts');
+  });
+
+  it('readFile: rejects a file matching user excludeGlobs with EXCLUDED_FILE', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['custom.private.ts'] });
+
+    try {
+      await readFileExecutor(root, 'custom.private.ts', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
+    }
+  });
+
+  it('readFile: rejects a file inside a user-excluded directory', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    try {
+      await readFileExecutor(root, 'internal-secrets/token.ts', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      // dir-prefix excludes surface as EXCLUDED_FILE here (the file is
+      // structurally a source extension; it's the parent path that's
+      // excluded). The PRE-v1.9.0 sandbox layer's EXCLUDED_DIR is for
+      // default-excluded dirs (node_modules, .git, …); user-supplied
+      // dir excludes go through the same isFileIncluded path as filename
+      // excludes, hence EXCLUDED_FILE. The message is intentionally
+      // generic and path-free to avoid existence-probe oracles (Phase 1.1
+      // hardening, /6step Finding #2 — see the dedicated S2/S3 tests
+      // further down in this describe block); the path-explicit signal
+      // is preserved on `SandboxError.requestedPath` for ops debug logs
+      // only (see `dispatchToolCall` in `ask-agentic.tool.ts`). Caught
+      // by Copilot review on PR #39 — the comment used to claim the
+      // message cites the path, which was true pre-v1.9.0 only.
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
+    }
+  });
+
+  it('grep: skips dirs matching user excludeGlobs (no content scanning, no leak)', async () => {
+    // Without v1.9.0 plumbing this would scan `internal-secrets/token.ts`
+    // and return the line containing "TOKEN" — direct content leak from
+    // an excluded dir. With the plumbing, the walk skips the dir before
+    // reading any file content.
+    writeFileSync(
+      join(root, 'internal-secrets', 'token.ts'),
+      'export const SECRET_TOKEN_VALUE = "abc";',
+    );
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    const result = await grepExecutor(root, 'SECRET_TOKEN_VALUE', undefined, config);
+    expect(result.matches).toEqual([]);
+  });
+
+  it('omitting matchConfig preserves pre-v1.9.0 behaviour (defaults only)', async () => {
+    // Backwards-compat: existing tests + production callers that don't
+    // pass matchConfig must see identical behaviour to before. Verify by
+    // running one executor without a config and asserting the same
+    // observable outcome as a config built with no extra globs.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const a = await findFilesExecutor(root, '**/*.ts');
+    const b = await findFilesExecutor(root, '**/*.ts', defaultMatchConfig({}));
+    expect(a.matches.sort()).toEqual(b.matches.sort());
+  });
+
+  // -----------------------------------------------------------------------
+  // /6step Phase 1.1 hardening — top-level dir gate (Finding #1) +
+  // no-path-leak in error message (Finding #2). Both close path-existence
+  // probe oracles that survived the initial Phase 1 plumbing.
+  // -----------------------------------------------------------------------
+
+  it('Finding #1: listDirectory rejects the requested directory itself when in user excludeGlobs', async () => {
+    // Pre-fix: list_directory('internal-secrets', config) succeeded and
+    // returned a (filtered) child list — model could probe path existence.
+    // Post-fix: the requested dir is checked against `isPathExcluded`
+    // before readdir even fires, throwing SandboxError(EXCLUDED_DIR).
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    try {
+      await listDirectoryExecutor(root, 'internal-secrets', config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_DIR');
+      // Generic message — must NOT leak the excluded path so the error
+      // string itself can't be used as an existence oracle.
+      expect((err as Error).message).not.toContain('internal-secrets');
+    }
+  });
+
+  it('Finding #1: grep rejects pathPrefix matching user excludeGlobs', async () => {
+    // Same threat as the listDirectory oracle: grep("regex",
+    // "internal-secrets") would walk the dir's children (filtered) when
+    // the dir exists vs throw NOT_FOUND when it doesn't — existence probe.
+    // Post-fix: pathPrefix is gated against user excludes BEFORE the walk.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    try {
+      await grepExecutor(root, 'TOKEN', 'internal-secrets', config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_DIR');
+      expect((err as Error).message).not.toContain('internal-secrets');
+    }
+  });
+
+  it('Finding #2: readFile EXCLUDED_FILE error message does not leak the excluded path', async () => {
+    // Pre-fix: error message was `file matches an exclude pattern …:
+    // ${target.relpath}` — model could read the path back from the error
+    // string and confirm existence/structure of paths the user excluded.
+    // Post-fix: generic message, third constructor arg (`requestedPath`)
+    // preserved for ops logging but no longer in `.message`.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['custom.private.ts'] });
+
+    try {
+      await readFileExecutor(root, 'custom.private.ts', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
+      // Existence-probe defense: error.message must NOT contain any path
+      // component that could differentiate "exists+excluded" from
+      // "doesn't exist" (NOT_FOUND).
+      expect((err as Error).message).not.toContain('custom.private.ts');
+      expect((err as Error).message).not.toContain('private');
+      // Internal logging field preserved — the third constructor arg
+      // (relPath) is still recorded as `requestedPath`, just not surfaced
+      // through `.message` to the model.
+      expect((err as { requestedPath?: string }).requestedPath).toBe('custom.private.ts');
+    }
+  });
+
+  it('Finding #2: NON_SOURCE_FILE keeps the path in its message (different threat model)', async () => {
+    // NON_SOURCE_FILE is a "wrong tool" signal (binary / image / unknown
+    // extension), NOT a privacy-probe vector — the path string is utility
+    // information for the model, telling it which file in its own request
+    // is structurally non-readable. Verifies the discriminator from
+    // Finding #3's helper extraction works correctly.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    writeFileSync(join(root, 'binary.bin'), 'binary');
+    const config = defaultMatchConfig({});
+
+    try {
+      await readFileExecutor(root, 'binary.bin', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('NON_SOURCE_FILE');
+      expect((err as Error).message).toContain('binary.bin');
+    }
+  });
+});

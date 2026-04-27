@@ -19,7 +19,7 @@ import type { GoogleGenAI } from '@google/genai';
 import type { ScannedFile } from '../indexer/workspace-scanner.js';
 import type { ManifestDb } from '../manifest/db.js';
 import type { FileRow } from '../types.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 import type { ProgressEmitter } from '../utils/progress.js';
 
 const FILES_API_TTL_MS = 47 * 3600 * 1000; // 1 h safety margin before 48 h auto-delete
@@ -204,7 +204,7 @@ export async function uploadWorkspaceFiles(args: {
       const file = files[i];
       if (r?.status === 'rejected' && file) {
         const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
-        logger.warn(`upload failed for ${file.relpath}: ${message}`);
+        logger.warn(`upload failed for ${safeForLog(file.relpath)}: ${safeForLog(message)}`);
         failures.push({ relpath: file.relpath, error: message });
       }
     }

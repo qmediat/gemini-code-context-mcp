@@ -7,7 +7,7 @@
  *   (none)   Start the MCP server on stdio.
  */
 
-import { logger } from './utils/logger.js';
+import { logger, safeForLog } from './utils/logger.js';
 
 async function main(): Promise<void> {
   const [, , subcommand, ...rest] = process.argv;
@@ -56,7 +56,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((err: unknown) => {
-  logger.error(`fatal: ${err instanceof Error ? err.message : String(err)}`);
+  logger.error(`fatal: ${safeForLog(err)}`);
   if (err instanceof Error && err.stack) {
     process.stderr.write(`${err.stack}\n`);
   }

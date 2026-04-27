@@ -42,12 +42,13 @@ import { Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
+import { type MatchConfig, defaultMatchConfig } from '../indexer/globs.js';
 import {
   WorkspaceValidationError,
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
 import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { SandboxError, resolveInsideWorkspace, resolveWorkspaceRoot } from './agentic/sandbox.js';
 import {
@@ -76,6 +77,18 @@ export const askAgenticInputSchema = z
       .optional()
       .describe(
         "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash') or literal model ID. Defaults to `latest-pro-thinking`.",
+      ),
+    includeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Additional file extensions or filenames to include. Honoured by the four agentic tools (`list_directory`, `find_files`, `read_file`, `grep`) — the model never sees paths outside these globs. Mirrors the `ask` / `code` semantics so callers (or `ask` → `ask_agentic` fallback in v1.9.0+) get consistent filtering.',
+      ),
+    excludeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Additional patterns to exclude. Same three shapes as `ask` / `code`: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised. Case-insensitive. No mid-string `*` / `**` / `?`. **Privacy-relevant:** when `ask` falls back to `ask_agentic` on `WORKSPACE_TOO_LARGE`, the user-supplied excludes here are honoured by every executor: `read_file` rejects with `EXCLUDED_FILE` (generic message — does NOT echo the excluded path, so the error string cannot be used as a path-existence oracle); `list_directory` and `grep` reject the requested directory / `pathPrefix` itself with `EXCLUDED_DIR` when it matches an exclude (top-level gate, not just child filtering); `find_files` skips the dir during walk; child entries inside an unexcluded parent are still hidden when they themselves match an exclude.',
       ),
     thinkingBudget: z.number().int().min(-1).max(65_536).optional(),
     thinkingLevel: z.enum(THINKING_LEVELS).optional(),
@@ -260,6 +273,7 @@ async function dispatchToolCall(
   workspaceRoot: string,
   name: string,
   args: Record<string, unknown>,
+  matchConfig: MatchConfig,
 ): Promise<DispatchedToolResult> {
   const started = Date.now();
   try {
@@ -267,18 +281,20 @@ async function dispatchToolCall(
     switch (name) {
       case 'list_directory': {
         const path = String(args.path ?? '.');
-        response = (await listDirectoryExecutor(workspaceRoot, path)) as unknown as Record<
-          string,
-          unknown
-        >;
+        response = (await listDirectoryExecutor(
+          workspaceRoot,
+          path,
+          matchConfig,
+        )) as unknown as Record<string, unknown>;
         break;
       }
       case 'find_files': {
         const pattern = String(args.pattern ?? '');
-        response = (await findFilesExecutor(workspaceRoot, pattern)) as unknown as Record<
-          string,
-          unknown
-        >;
+        response = (await findFilesExecutor(
+          workspaceRoot,
+          pattern,
+          matchConfig,
+        )) as unknown as Record<string, unknown>;
         break;
       }
       case 'read_file': {
@@ -296,6 +312,7 @@ async function dispatchToolCall(
           path,
           startLine,
           endLine,
+          matchConfig,
         )) as unknown as Record<string, unknown>;
         break;
       }
@@ -305,10 +322,12 @@ async function dispatchToolCall(
           typeof args.pathPrefix === 'string' && args.pathPrefix.length > 0
             ? args.pathPrefix
             : undefined;
-        response = (await grepExecutor(workspaceRoot, pattern, pathPrefix)) as unknown as Record<
-          string,
-          unknown
-        >;
+        response = (await grepExecutor(
+          workspaceRoot,
+          pattern,
+          pathPrefix,
+          matchConfig,
+        )) as unknown as Record<string, unknown>;
         break;
       }
       default:
@@ -333,6 +352,32 @@ async function dispatchToolCall(
         : err instanceof Error
           ? err.message
           : String(err);
+    // Ops-side observability for excludeGlobs misconfigurations (v1.9.0
+    // Phase 1.2, /6step Finding B): the user-visible `.message` for
+    // `EXCLUDED_FILE` and `EXCLUDED_DIR` is deliberately path-free to
+    // close the existence-probe oracle (Phase 1.1 Findings #1 + #2).
+    // Without this debug log, an operator helping a user debug "why is
+    // ask_agentic refusing my file?" has no way to map the generic error
+    // back to a specific path. The `requestedPath` field on SandboxError
+    // was preserved for exactly this purpose; surface it at debug level
+    // so prod log volume stays unchanged but ops can opt in via
+    // `GEMINI_CODE_CONTEXT_LOG_LEVEL=debug`.
+    if (err instanceof SandboxError) {
+      // NOTE (v1.9.0 self-review S4): no direct regression test on this emit
+      // path. The Phase 1.1 test pins `requestedPath` is set on SandboxError
+      // (the input contract this branch consumes), and `safeForLog` has its
+      // own 18-test coverage in `test/unit/logger.test.ts`. But "the
+      // dispatcher actually CALLS logger.debug on SandboxError" is verified
+      // by visual review only — if you remove or refactor this block,
+      // existing tests will not catch the regression. If you change anything
+      // here, please add a `vi.spyOn(logger, 'debug')` test that runs an
+      // agentic scenario through `askAgenticTool.execute` with an
+      // excludeGlobs config and asserts the spy received a string starting
+      // with `agentic dispatch refused:`.
+      logger.debug(
+        `agentic dispatch refused: tool=${safeForLog(name)} code=${safeForLog(err.code)} requestedPath=${safeForLog(err.requestedPath)}`,
+      );
+    }
     return {
       name,
       response: { error: message },
@@ -347,6 +392,7 @@ async function dispatchToolCallsParallel(
   workspaceRoot: string,
   calls: Array<{ name: string; args: Record<string, unknown> }>,
   concurrency: number,
+  matchConfig: MatchConfig,
 ): Promise<DispatchedToolResult[]> {
   const results: DispatchedToolResult[] = new Array(calls.length);
   let next = 0;
@@ -356,7 +402,7 @@ async function dispatchToolCallsParallel(
       next += 1;
       const call = calls[i];
       if (!call) continue;
-      results[i] = await dispatchToolCall(workspaceRoot, call.name, call.args);
+      results[i] = await dispatchToolCall(workspaceRoot, call.name, call.args, matchConfig);
     }
   };
   const workers = Array.from({ length: Math.max(1, Math.min(concurrency, calls.length)) }, worker);
@@ -422,6 +468,16 @@ async function executeAskAgenticBody(
     const maxIterations = input.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const maxTotalInputTokens = input.maxTotalInputTokens ?? DEFAULT_MAX_TOTAL_INPUT_TOKENS;
     const maxFilesRead = input.maxFilesRead ?? DEFAULT_MAX_FILES_READ;
+
+    // Build the user-glob filter once at entry — the same `MatchConfig`
+    // gets threaded through every executor invocation in the loop. v1.9.0+
+    // Phase 1 closes the privacy gap that previously dropped user-supplied
+    // `excludeGlobs` whenever a caller (or an `ask` → `ask_agentic`
+    // fallback in Phase 3) targeted the agentic loop.
+    const matchConfig: MatchConfig = defaultMatchConfig({
+      ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
+      ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
+    });
 
     // Compatibility guard (mirror of ask.tool.ts): reject locally when
     // thinkingBudget + answer-reserve > maxOutputTokens so the model
@@ -567,6 +623,7 @@ async function executeAskAgenticBody(
           filesReadSet,
           maxFilesRead,
           abortSignal: iterTimeout.signal,
+          matchConfig,
         });
       } catch (iterErr) {
         // Release both reservations on failure before re-throwing.
@@ -574,7 +631,7 @@ async function executeAskAgenticBody(
           try {
             ctx.manifest.cancelBudgetReservation(reservationId);
           } catch (cancelErr) {
-            logger.error(`ask_agentic: cancelBudgetReservation failed: ${String(cancelErr)}`);
+            logger.error(`ask_agentic: cancelBudgetReservation failed: ${safeForLog(cancelErr)}`);
           }
         }
         if (throttleReservationId !== -1) {
@@ -724,7 +781,7 @@ async function executeAskAgenticBody(
       },
     );
   } catch (err) {
-    logger.error(`ask_agentic failed: ${String(err)}`);
+    logger.error(`ask_agentic failed: ${safeForLog(err)}`);
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
@@ -767,6 +824,10 @@ async function runAgenticIteration(args: {
   maxFilesRead: number;
   /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
   abortSignal: AbortSignal;
+  /** User glob filters (v1.9.0+). Honoured by all four agentic executors so
+   * a fallback from `ask` (which already applies the same globs to its
+   * eager scanner) preserves filter semantics — no privacy regression. */
+  matchConfig: MatchConfig;
 }): Promise<IterationResult> {
   const {
     ctx,
@@ -777,6 +838,7 @@ async function runAgenticIteration(args: {
     filesReadSet,
     maxFilesRead,
     abortSignal,
+    matchConfig,
   } = args;
 
   // Each agentic iteration is its own `generateContent` call; a transient
@@ -915,6 +977,7 @@ async function runAgenticIteration(args: {
     workspaceRoot,
     toDispatch,
     TOOL_EXECUTION_CONCURRENCY,
+    matchConfig,
   );
   // Check abort AFTER tool execution — local file I/O / large grep regex /
   // huge directory walk can take real wall-clock time, and without this

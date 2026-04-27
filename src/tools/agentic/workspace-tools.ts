@@ -23,11 +23,54 @@ import type { Dirent } from 'node:fs';
 import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  DEFAULT_EXCLUDE_DIRS_LOWER,
-  DEFAULT_EXCLUDE_FILE_NAMES_LOWER,
-  DEFAULT_INCLUDE_EXTENSIONS,
+  type MatchConfig,
+  defaultMatchConfig,
+  isFileIncluded,
+  isPathExcluded,
+  matchesAnyIncludeExtension,
 } from '../../indexer/globs.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
+
+/**
+ * Build a `MatchConfig` honouring the caller's `includeGlobs`/`excludeGlobs`
+ * (v1.9.0+). When `matchConfig` is undefined, returns the defaults — the same
+ * filter the eager `ask`/`code` scanner uses. The agentic executors below
+ * route every dir-recurse and file-include decision through this config so
+ * Phase 3's `ask` → `ask_agentic` fallback (v1.9.0) preserves the user's
+ * filter semantics — no privacy regression where excluded paths leak into
+ * the agentic loop's view.
+ *
+ * Falls back gracefully: existing test call-sites that don't pass a config
+ * see the same behaviour they did pre-v1.9.0.
+ */
+function resolveMatchConfig(matchConfig: MatchConfig | undefined): MatchConfig {
+  return matchConfig ?? defaultMatchConfig({});
+}
+
+/**
+ * Exclude-side check for `list_directory` (v1.9.0+). Returns `true` when the
+ * file should be hidden from a navigation listing — covers default filename
+ * denylist (lockfiles, `.env*`, etc.), default extension denylist
+ * (`.tsbuildinfo`), user `excludeGlobs` filename / extension entries, AND
+ * dir-prefix excludes that match the file's parent path. Deliberately does
+ * NOT enforce include-extension membership — `list_directory` is a
+ * navigation aid; the read-side gate lives in `readFileExecutor`.
+ *
+ * Implemented as a separate predicate (not `isFileIncluded` from `globs.ts`)
+ * because `isFileIncluded` REQUIRES an include-extension match to return
+ * true, which is correct for indexing but wrong for listing.
+ */
+function isFileExcludedByConfig(relpath: string, basename: string, config: MatchConfig): boolean {
+  if (isPathExcluded(relpath, config)) return true;
+  const lowerBase = basename.toLowerCase();
+  for (const name of config.excludeFileNames) {
+    if (lowerBase === name.toLowerCase()) return true;
+  }
+  for (const ext of config.excludeExtensions) {
+    if (lowerBase.endsWith(ext.toLowerCase())) return true;
+  }
+  return false;
+}
 
 /** Hard upper bound on any single `read_file` response body. Bigger files
  * get head-truncated + flagged — never fully expanded into the iteration.
@@ -139,8 +182,26 @@ export interface ListDirectoryResult {
 export async function listDirectoryExecutor(
   workspaceRoot: string,
   relPath: string,
+  matchConfig?: MatchConfig,
 ): Promise<ListDirectoryResult> {
   const target = await resolveInsideWorkspace(workspaceRoot, relPath);
+  const config = resolveMatchConfig(matchConfig);
+
+  // Top-level gate (v1.9.0 Phase 1.1, /6step Finding #1): the requested
+  // directory itself must be checked against user `excludeGlobs`. Without
+  // this, `list_directory("internal-secrets")` (where `internal-secrets`
+  // is in user excludes but NOT in `DEFAULT_EXCLUDE_DIRS`) succeeds and
+  // returns a filtered child list — the model can probe path existence
+  // by comparing success vs `NOT_FOUND` from `resolveInsideWorkspace`.
+  // The sandbox layer (`resolveInsideWorkspace`) checks default-excluded
+  // dirs only; user-supplied excludes were unenforced at this level.
+  // Generic message — no path interpolation — to avoid the same
+  // existence-leak via error string (see Finding #2 for the file-level
+  // analogue).
+  if (target.relpath && isPathExcluded(target.relpath, config)) {
+    throw new SandboxError('EXCLUDED_DIR', 'directory is excluded by configured policy', relPath);
+  }
+
   let rawEntries: Dirent<string>[];
   try {
     rawEntries = await readdir(target.absolutePath, { withFileTypes: true, encoding: 'utf8' });
@@ -170,16 +231,28 @@ export async function listDirectoryExecutor(
     const isDir = entry.isDirectory();
     if (!isFile && !isDir) continue; // skip symlinks / sockets / fifos / etc.
 
+    // Build the would-be relpath for this child so dir-prefix excludes
+    // (user-supplied `excludeGlobs`, e.g. `src/vendor/`) match against the
+    // full nested path, not just the basename.
+    const childRel = target.relpath ? `${target.relpath}/${entry.name}` : entry.name;
+
     // Skip excluded directories (user never gets to recurse into them).
-    if (isDir && DEFAULT_EXCLUDE_DIRS_LOWER.has(entry.name.toLowerCase())) continue;
-    // Skip denylisted filenames.
-    if (isFile && DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
+    // Defaults (`node_modules`, `.git`, …) are merged into `config.excludeDirs`
+    // by `defaultMatchConfig`; user `excludeGlobs` (dir-shaped) add to it.
+    if (isDir && isPathExcluded(childRel, config)) continue;
+    // Skip files the user's excludes filter out — exclude-side ONLY.
+    // Deliberately NOT requiring include-extension match: `list_directory`
+    // is a navigation aid, not a content-access gate, so a `LICENSE` /
+    // image / binary should still appear in the listing even though
+    // `read_file` would later reject it. The privacy-relevant cases are
+    // the exclude-side ones.
+    if (isFile && isFileExcludedByConfig(childRel, entry.name, config)) continue;
 
     totalEntries += 1;
     if (entries.length >= MAX_LIST_ENTRIES) continue; // count but don't push
 
     const child: DirEntry = {
-      relpath: target.relpath ? `${target.relpath}/${entry.name}` : entry.name,
+      relpath: childRel,
       type: isDir ? 'dir' : 'file',
     };
     if (isFile) {
@@ -221,11 +294,13 @@ export interface FindFilesResult {
 export async function findFilesExecutor(
   workspaceRoot: string,
   pattern: string,
+  matchConfig?: MatchConfig,
 ): Promise<FindFilesResult> {
   if (typeof pattern !== 'string' || pattern.trim().length === 0) {
     throw new SandboxError('INVALID_INPUT', 'pattern is empty', pattern);
   }
   const regex = globToRegExp(pattern.trim());
+  const config = resolveMatchConfig(matchConfig);
 
   const matches: string[] = [];
   let totalMatches = 0;
@@ -255,38 +330,26 @@ export async function findFilesExecutor(
       return;
     }
     for (const entry of entries) {
+      const childRel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (DEFAULT_EXCLUDE_DIRS_LOWER.has(entry.name.toLowerCase())) continue;
-        await walk(
-          join(currentAbs, entry.name),
-          currentRel ? `${currentRel}/${entry.name}` : entry.name,
-          depth + 1,
-        );
+        // Honour user `excludeGlobs` dir entries in addition to defaults
+        // — `isPathExcluded` checks the full nested path, so multi-segment
+        // globs like `src/vendor` work even when we hit them mid-walk.
+        if (isPathExcluded(childRel, config)) continue;
+        await walk(join(currentAbs, entry.name), childRel, depth + 1);
         continue;
       }
       if (!entry.isFile()) continue;
-      if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
 
-      const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+      // Unified filter: covers default filename / extension excludes,
+      // user `excludeGlobs` filename / extension entries, AND requires
+      // an include-extension match (default + user). Same predicate the
+      // eager scanner uses — no agentic / eager divergence.
+      if (!isFileIncluded(childRel, config)) continue;
 
-      // Only surface paths with at least one include-ext match — otherwise
-      // binary / generated files slip through find_files into the model's
-      // conversation even though `read_file` would reject them.
-      //
-      // Case-insensitive to mirror `readFileExecutor` (PR #24 round-4
-      // review by Gemini P2): otherwise `App.TS` / `Page.JSX` are readable
-      // but hidden from find_files/grep, leaving the model with an
-      // inconsistent view of the workspace.
-      const lowerName = entry.name.toLowerCase();
-      const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
-        if (ext.startsWith('.')) return lowerName.endsWith(ext);
-        return lowerName === ext;
-      });
-      if (!hasIncludeExt) continue;
-
-      if (!regex.test(rel)) continue;
+      if (!regex.test(childRel)) continue;
       totalMatches += 1;
-      if (matches.length < MAX_FIND_MATCHES) matches.push(rel);
+      if (matches.length < MAX_FIND_MATCHES) matches.push(childRel);
     }
   }
 
@@ -330,23 +393,46 @@ export async function readFileExecutor(
   relPath: string,
   startLine?: number,
   endLine?: number,
+  matchConfig?: MatchConfig,
 ): Promise<ReadFileResult> {
   const target = await resolveInsideWorkspace(workspaceRoot, relPath);
+  const config = resolveMatchConfig(matchConfig);
 
-  // Extension gate — mirror of `DEFAULT_INCLUDE_EXTENSIONS` + block things
-  // that clearly aren't analyzable text. Avoid leaking binary blobs.
-  const lowerBase = target.relpath.toLowerCase();
-  const nameOnly = lowerBase.substring(lowerBase.lastIndexOf('/') + 1);
-  const looksLikeSource = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
-    if (ext.startsWith('.')) return lowerBase.endsWith(ext);
-    return nameOnly === ext.toLowerCase();
-  });
-  if (!looksLikeSource) {
-    throw new SandboxError(
-      'NON_SOURCE_FILE',
-      `file extension not in allowed source set: ${target.relpath}`,
-      relPath,
-    );
+  // Unified gate (v1.9.0+). `isFileIncluded` enforces:
+  //   - path not under any excluded dir (default + user `excludeGlobs`)
+  //   - basename not on filename denylist (default + user)
+  //   - extension not on exclude-ext list (default + user)
+  //   - extension IS on include-ext list (default + user `includeGlobs`)
+  //
+  // Phase 3 (`ask` → `ask_agentic` fallback) depends on this: a user who
+  // passed `excludeGlobs: ['*.env*']` to `ask` must see the same files
+  // refused by `ask_agentic.read_file` — otherwise silently dropping their
+  // filter on fallback would be a privacy regression. The `EXCLUDED_FILE`
+  // taxonomy code is new in v1.9.0; the `NON_SOURCE_FILE` code stays for
+  // the more specific "extension not allowed at all" sub-case so callers
+  // can still distinguish "explicitly excluded by your config" from
+  // "default-rejected source-set membership".
+  if (!isFileIncluded(target.relpath, config)) {
+    // Discriminate the two failure modes via the shared helper (v1.9.0
+    // Phase 1.1, /6step Finding #3): if NO include-extension matches, the
+    // file is structurally non-source — keep the path in the message
+    // because the model needs to know which file it asked for is
+    // "wrong-tool" territory (binary, image, etc.) and the path is purely
+    // utility, not privacy-bearing. If an include-extension DOES match,
+    // the file is excluded by some other rule (filename / extension
+    // exclude / dir-prefix exclude) — emit a generic message with NO path
+    // (Finding #2) so the error string can't be used as an existence
+    // oracle for paths the user explicitly excluded. The third
+    // `SandboxError` argument (`relPath`) is preserved either way for
+    // internal logging via `requestedPath`.
+    if (!matchesAnyIncludeExtension(target.relpath, config)) {
+      throw new SandboxError(
+        'NON_SOURCE_FILE',
+        `file extension not in allowed source set: ${target.relpath}`,
+        relPath,
+      );
+    }
+    throw new SandboxError('EXCLUDED_FILE', 'file is excluded by configured policy', relPath);
   }
 
   // Stat first so we never allocate a >200MB Buffer for a minified bundle.
@@ -482,6 +568,7 @@ export async function grepExecutor(
   workspaceRoot: string,
   pattern: string,
   pathPrefix?: string,
+  matchConfig?: MatchConfig,
 ): Promise<GrepResult> {
   if (typeof pattern !== 'string' || pattern.length === 0) {
     throw new SandboxError('INVALID_INPUT', 'grep pattern is empty', pattern);
@@ -492,6 +579,7 @@ export async function grepExecutor(
   } catch (err) {
     throw new SandboxError('INVALID_INPUT', `invalid regex: ${String(err)}`, pattern);
   }
+  const config = resolveMatchConfig(matchConfig);
 
   const matches: GrepMatch[] = [];
   let totalMatches = 0;
@@ -506,6 +594,20 @@ export async function grepExecutor(
   let startRel = '';
   if (typeof pathPrefix === 'string' && pathPrefix.trim().length > 0) {
     const resolved = await resolveInsideWorkspace(workspaceRoot, pathPrefix);
+    // Top-level gate (v1.9.0 Phase 1.1, /6step Finding #1 ext): same threat
+    // as `listDirectoryExecutor` — the requested pathPrefix must be checked
+    // against user `excludeGlobs` BEFORE walking it. Without this,
+    // `grep("regex", "internal-secrets")` (where the dir is in user
+    // excludes but NOT in DEFAULT_EXCLUDE_DIRS) succeeds-with-zero-results
+    // when the dir exists vs throws NOT_FOUND when it doesn't — same
+    // existence-probe oracle. Generic message, no path leak.
+    if (resolved.relpath && isPathExcluded(resolved.relpath, config)) {
+      throw new SandboxError(
+        'EXCLUDED_DIR',
+        'pathPrefix is excluded by configured policy',
+        pathPrefix,
+      );
+    }
     try {
       const s = await stat(resolved.absolutePath);
       if (!s.isDirectory()) {
@@ -551,26 +653,24 @@ export async function grepExecutor(
     }
     for (const entry of entries) {
       if (respBytes >= MAX_RESPONSE_BYTES) return;
+      const childRel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (DEFAULT_EXCLUDE_DIRS_LOWER.has(entry.name.toLowerCase())) continue;
-        await walk(
-          join(currentAbs, entry.name),
-          currentRel ? `${currentRel}/${entry.name}` : entry.name,
-          depth + 1,
-        );
+        // Honour user `excludeGlobs` dir entries in addition to defaults
+        // (mirror of `findFilesExecutor`). Critical for grep specifically:
+        // dropping the user's filter here means the regex would scan files
+        // they explicitly excluded — and grep returns matched LINES, so
+        // a regex like `password|secret|api_key` could leak content from
+        // an excluded `internal-config/` dir straight into the model.
+        if (isPathExcluded(childRel, config)) continue;
+        await walk(join(currentAbs, entry.name), childRel, depth + 1);
         continue;
       }
       if (!entry.isFile()) continue;
-      if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(entry.name.toLowerCase())) continue;
 
-      const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
-      // Case-insensitive ext gating — same rationale as findFilesExecutor.
-      const lowerName = entry.name.toLowerCase();
-      const hasIncludeExt = DEFAULT_INCLUDE_EXTENSIONS.some((ext) => {
-        if (ext.startsWith('.')) return lowerName.endsWith(ext);
-        return lowerName === ext;
-      });
-      if (!hasIncludeExt) continue;
+      // Unified filter — same predicate as `findFilesExecutor` and the
+      // eager scanner. Honours default + user excludes; requires include
+      // extension. v1.9.0 closes the agentic / eager divergence.
+      if (!isFileIncluded(childRel, config)) continue;
 
       // Read full file (bounded by MAX_READ_BYTES via soft stat check).
       const absFile = join(currentAbs, entry.name);
@@ -598,7 +698,7 @@ export async function grepExecutor(
         // Cap line length in the payload to 500 chars — minified files
         // can have multi-megabyte single lines.
         const trimmed = line.length > 500 ? `${line.slice(0, 500)}…` : line;
-        const match: GrepMatch = { relpath: rel, line: i + 1, text: trimmed };
+        const match: GrepMatch = { relpath: childRel, line: i + 1, text: trimmed };
         matches.push(match);
         // Use UTF-8 byte length (not .length which is UTF-16 code units)
         // so the 500k cap holds on CJK / emoji-heavy matches. `+32` is

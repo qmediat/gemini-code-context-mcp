@@ -19,7 +19,7 @@ import {
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
@@ -761,7 +761,7 @@ async function executeAskBody(
 
     return textResult(text, metadata);
   } catch (err) {
-    logger.error(`ask failed: ${String(err)}`);
+    logger.error(`ask failed: ${safeForLog(err)}`);
     // T22a — extract Gemini's `retryInfo.retryDelay` from 429 bodies and
     // seed the throttle's per-model hint before we release the
     // reservation. Google's hint is typically shorter (2-16s) than our
