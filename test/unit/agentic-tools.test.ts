@@ -639,8 +639,14 @@ describe('agentic executors honour user excludeGlobs / includeGlobs (v1.9.0)', (
       // excluded). The PRE-v1.9.0 sandbox layer's EXCLUDED_DIR is for
       // default-excluded dirs (node_modules, .git, …); user-supplied
       // dir excludes go through the same isFileIncluded path as filename
-      // excludes, hence EXCLUDED_FILE. Good enough for the model — the
-      // message body cites the path explicitly.
+      // excludes, hence EXCLUDED_FILE. The message is intentionally
+      // generic and path-free to avoid existence-probe oracles (Phase 1.1
+      // hardening, /6step Finding #2 — see the dedicated S2/S3 tests
+      // further down in this describe block); the path-explicit signal
+      // is preserved on `SandboxError.requestedPath` for ops debug logs
+      // only (see `dispatchToolCall` in `ask-agentic.tool.ts`). Caught
+      // by Copilot review on PR #39 — the comment used to claim the
+      // message cites the path, which was true pre-v1.9.0 only.
       expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
     }
   });

@@ -363,6 +363,17 @@ async function dispatchToolCall(
     // so prod log volume stays unchanged but ops can opt in via
     // `GEMINI_CODE_CONTEXT_LOG_LEVEL=debug`.
     if (err instanceof SandboxError) {
+      // NOTE (v1.9.0 self-review S4): no direct regression test on this emit
+      // path. The Phase 1.1 test pins `requestedPath` is set on SandboxError
+      // (the input contract this branch consumes), and `safeForLog` has its
+      // own 18-test coverage in `test/unit/logger.test.ts`. But "the
+      // dispatcher actually CALLS logger.debug on SandboxError" is verified
+      // by visual review only — if you remove or refactor this block,
+      // existing tests will not catch the regression. If you change anything
+      // here, please add a `vi.spyOn(logger, 'debug')` test that runs an
+      // agentic scenario through `askAgenticTool.execute` with an
+      // excludeGlobs config and asserts the spy received a string starting
+      // with `agentic dispatch refused:`.
       logger.debug(
         `agentic dispatch refused: tool=${safeForLog(name)} code=${safeForLog(err.code)} requestedPath=${safeForLog(err.requestedPath)}`,
       );
