@@ -42,6 +42,7 @@ import { Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
+import { type MatchConfig, defaultMatchConfig } from '../indexer/globs.js';
 import {
   WorkspaceValidationError,
   validateWorkspacePath,
@@ -76,6 +77,18 @@ export const askAgenticInputSchema = z
       .optional()
       .describe(
         "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash') or literal model ID. Defaults to `latest-pro-thinking`.",
+      ),
+    includeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Additional file extensions or filenames to include. Honoured by the four agentic tools (`list_directory`, `find_files`, `read_file`, `grep`) — the model never sees paths outside these globs. Mirrors the `ask` / `code` semantics so callers (or `ask` → `ask_agentic` fallback in v1.9.0+) get consistent filtering.',
+      ),
+    excludeGlobs: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'Additional patterns to exclude. Same three shapes as `ask` / `code`: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised. Case-insensitive. No mid-string `*` / `**` / `?`. **Privacy-relevant:** when `ask` falls back to `ask_agentic` on `WORKSPACE_TOO_LARGE`, the user-supplied excludes here are honoured by every executor — `read_file` rejects with `EXCLUDED_FILE`, `find_files` / `grep` skip the path entirely, `list_directory` hides it.',
       ),
     thinkingBudget: z.number().int().min(-1).max(65_536).optional(),
     thinkingLevel: z.enum(THINKING_LEVELS).optional(),
@@ -260,6 +273,7 @@ async function dispatchToolCall(
   workspaceRoot: string,
   name: string,
   args: Record<string, unknown>,
+  matchConfig: MatchConfig,
 ): Promise<DispatchedToolResult> {
   const started = Date.now();
   try {
@@ -267,18 +281,20 @@ async function dispatchToolCall(
     switch (name) {
       case 'list_directory': {
         const path = String(args.path ?? '.');
-        response = (await listDirectoryExecutor(workspaceRoot, path)) as unknown as Record<
-          string,
-          unknown
-        >;
+        response = (await listDirectoryExecutor(
+          workspaceRoot,
+          path,
+          matchConfig,
+        )) as unknown as Record<string, unknown>;
         break;
       }
       case 'find_files': {
         const pattern = String(args.pattern ?? '');
-        response = (await findFilesExecutor(workspaceRoot, pattern)) as unknown as Record<
-          string,
-          unknown
-        >;
+        response = (await findFilesExecutor(
+          workspaceRoot,
+          pattern,
+          matchConfig,
+        )) as unknown as Record<string, unknown>;
         break;
       }
       case 'read_file': {
@@ -296,6 +312,7 @@ async function dispatchToolCall(
           path,
           startLine,
           endLine,
+          matchConfig,
         )) as unknown as Record<string, unknown>;
         break;
       }
@@ -305,10 +322,12 @@ async function dispatchToolCall(
           typeof args.pathPrefix === 'string' && args.pathPrefix.length > 0
             ? args.pathPrefix
             : undefined;
-        response = (await grepExecutor(workspaceRoot, pattern, pathPrefix)) as unknown as Record<
-          string,
-          unknown
-        >;
+        response = (await grepExecutor(
+          workspaceRoot,
+          pattern,
+          pathPrefix,
+          matchConfig,
+        )) as unknown as Record<string, unknown>;
         break;
       }
       default:
@@ -347,6 +366,7 @@ async function dispatchToolCallsParallel(
   workspaceRoot: string,
   calls: Array<{ name: string; args: Record<string, unknown> }>,
   concurrency: number,
+  matchConfig: MatchConfig,
 ): Promise<DispatchedToolResult[]> {
   const results: DispatchedToolResult[] = new Array(calls.length);
   let next = 0;
@@ -356,7 +376,7 @@ async function dispatchToolCallsParallel(
       next += 1;
       const call = calls[i];
       if (!call) continue;
-      results[i] = await dispatchToolCall(workspaceRoot, call.name, call.args);
+      results[i] = await dispatchToolCall(workspaceRoot, call.name, call.args, matchConfig);
     }
   };
   const workers = Array.from({ length: Math.max(1, Math.min(concurrency, calls.length)) }, worker);
@@ -422,6 +442,16 @@ async function executeAskAgenticBody(
     const maxIterations = input.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const maxTotalInputTokens = input.maxTotalInputTokens ?? DEFAULT_MAX_TOTAL_INPUT_TOKENS;
     const maxFilesRead = input.maxFilesRead ?? DEFAULT_MAX_FILES_READ;
+
+    // Build the user-glob filter once at entry — the same `MatchConfig`
+    // gets threaded through every executor invocation in the loop. v1.9.0+
+    // Phase 1 closes the privacy gap that previously dropped user-supplied
+    // `excludeGlobs` whenever a caller (or an `ask` → `ask_agentic`
+    // fallback in Phase 3) targeted the agentic loop.
+    const matchConfig: MatchConfig = defaultMatchConfig({
+      ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
+      ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
+    });
 
     // Compatibility guard (mirror of ask.tool.ts): reject locally when
     // thinkingBudget + answer-reserve > maxOutputTokens so the model
@@ -567,6 +597,7 @@ async function executeAskAgenticBody(
           filesReadSet,
           maxFilesRead,
           abortSignal: iterTimeout.signal,
+          matchConfig,
         });
       } catch (iterErr) {
         // Release both reservations on failure before re-throwing.
@@ -767,6 +798,10 @@ async function runAgenticIteration(args: {
   maxFilesRead: number;
   /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
   abortSignal: AbortSignal;
+  /** User glob filters (v1.9.0+). Honoured by all four agentic executors so
+   * a fallback from `ask` (which already applies the same globs to its
+   * eager scanner) preserves filter semantics — no privacy regression. */
+  matchConfig: MatchConfig;
 }): Promise<IterationResult> {
   const {
     ctx,
@@ -777,6 +812,7 @@ async function runAgenticIteration(args: {
     filesReadSet,
     maxFilesRead,
     abortSignal,
+    matchConfig,
   } = args;
 
   // Each agentic iteration is its own `generateContent` call; a transient
@@ -915,6 +951,7 @@ async function runAgenticIteration(args: {
     workspaceRoot,
     toDispatch,
     TOOL_EXECUTION_CONCURRENCY,
+    matchConfig,
   );
   // Check abort AFTER tool execution — local file I/O / large grep regex /
   // huge directory walk can take real wall-clock time, and without this

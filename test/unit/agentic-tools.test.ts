@@ -547,3 +547,128 @@ describe('round-4: listDirectoryExecutor ENOTDIR classification', () => {
     }
   });
 });
+
+// =============================================================================
+// v1.9.0 Phase 1 — user `includeGlobs` / `excludeGlobs` plumbed through every
+// agentic executor. PRIVACY contract: when `ask` falls back to `ask_agentic`
+// on `WORKSPACE_TOO_LARGE` (Phase 3), user-supplied filter globs MUST be
+// honoured by all four executors — otherwise a user who excluded `*.env*`
+// or `internal-secrets/` gets those paths walked anyway, leaking content
+// straight into the model. These tests pin the contract.
+// =============================================================================
+
+describe('agentic executors honour user excludeGlobs / includeGlobs (v1.9.0)', () => {
+  let root: string;
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-globs-')));
+    writeFileSync(join(root, 'app.ts'), 'export const app = 1;');
+    writeFileSync(join(root, 'app.test.ts'), 'import { app } from "./app";');
+    mkdirSync(join(root, 'src'), { recursive: true });
+    writeFileSync(join(root, 'src', 'lib.ts'), 'export const lib = 2;');
+    mkdirSync(join(root, 'internal-secrets'), { recursive: true });
+    writeFileSync(join(root, 'internal-secrets', 'token.ts'), 'export const TOKEN = "abc";');
+    writeFileSync(join(root, 'custom.private.ts'), 'export const PRIVATE = 1;');
+  });
+
+  it('listDirectory: skips a directory matching user excludeGlobs', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    const result = await listDirectoryExecutor(root, '.', config);
+    const dirs = result.entries.filter((e) => e.type === 'dir').map((e) => e.relpath);
+    expect(dirs).toContain('src');
+    expect(dirs).not.toContain('internal-secrets');
+  });
+
+  it('listDirectory: skips files matching user excludeGlobs extension pattern', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['*.test.ts'] });
+
+    const result = await listDirectoryExecutor(root, '.', config);
+    const files = result.entries.filter((e) => e.type === 'file').map((e) => e.relpath);
+    expect(files).toContain('app.ts');
+    expect(files).not.toContain('app.test.ts');
+  });
+
+  it('findFiles: skips dirs matching user excludeGlobs (no recursion into them)', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    const result = await findFilesExecutor(root, '**/*.ts', config);
+    expect(result.matches).toContain('app.ts');
+    expect(result.matches).toContain('src/lib.ts');
+    // The token.ts file inside the excluded dir must not surface — the
+    // walk skipped the dir entirely.
+    expect(result.matches).not.toContain('internal-secrets/token.ts');
+  });
+
+  it('findFiles: skips files matching user excludeGlobs filename literal', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['custom.private.ts'] });
+
+    const result = await findFilesExecutor(root, '**/*.ts', config);
+    expect(result.matches).toContain('app.ts');
+    expect(result.matches).not.toContain('custom.private.ts');
+  });
+
+  it('readFile: rejects a file matching user excludeGlobs with EXCLUDED_FILE', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['custom.private.ts'] });
+
+    try {
+      await readFileExecutor(root, 'custom.private.ts', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
+    }
+  });
+
+  it('readFile: rejects a file inside a user-excluded directory', async () => {
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    try {
+      await readFileExecutor(root, 'internal-secrets/token.ts', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      // dir-prefix excludes surface as EXCLUDED_FILE here (the file is
+      // structurally a source extension; it's the parent path that's
+      // excluded). The PRE-v1.9.0 sandbox layer's EXCLUDED_DIR is for
+      // default-excluded dirs (node_modules, .git, …); user-supplied
+      // dir excludes go through the same isFileIncluded path as filename
+      // excludes, hence EXCLUDED_FILE. Good enough for the model — the
+      // message body cites the path explicitly.
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
+    }
+  });
+
+  it('grep: skips dirs matching user excludeGlobs (no content scanning, no leak)', async () => {
+    // Without v1.9.0 plumbing this would scan `internal-secrets/token.ts`
+    // and return the line containing "TOKEN" — direct content leak from
+    // an excluded dir. With the plumbing, the walk skips the dir before
+    // reading any file content.
+    writeFileSync(
+      join(root, 'internal-secrets', 'token.ts'),
+      'export const SECRET_TOKEN_VALUE = "abc";',
+    );
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    const result = await grepExecutor(root, 'SECRET_TOKEN_VALUE', undefined, config);
+    expect(result.matches).toEqual([]);
+  });
+
+  it('omitting matchConfig preserves pre-v1.9.0 behaviour (defaults only)', async () => {
+    // Backwards-compat: existing tests + production callers that don't
+    // pass matchConfig must see identical behaviour to before. Verify by
+    // running one executor without a config and asserting the same
+    // observable outcome as a config built with no extra globs.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const a = await findFilesExecutor(root, '**/*.ts');
+    const b = await findFilesExecutor(root, '**/*.ts', defaultMatchConfig({}));
+    expect(a.matches.sort()).toEqual(b.matches.sort());
+  });
+});

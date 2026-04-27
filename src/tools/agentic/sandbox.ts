@@ -80,6 +80,7 @@ export type SandboxErrorCode =
   | 'PATH_TRAVERSAL'
   | 'SECRET_DENYLIST'
   | 'EXCLUDED_DIR'
+  | 'EXCLUDED_FILE'
   | 'EXCLUDED_FILENAME'
   | 'NON_SOURCE_FILE'
   | 'NOT_A_DIRECTORY'
