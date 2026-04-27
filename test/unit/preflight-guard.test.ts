@@ -87,6 +87,29 @@ function buildCtx(opts: {
           }
           return gen();
         }),
+        // v1.10.0: `countForPreflight` may call `client.models.countTokens`
+        // when the workspace is >50% of `inputTokenLimit`. We mock it with
+        // the same `bytes/4` heuristic the production heuristic uses, so
+        // tests authored against the v1.5.0-v1.9.x heuristic-only preflight
+        // see identical behaviour by default. Per-test overrides via
+        // `vi.spyOn(client.models, 'countTokens').mockResolvedValueOnce(...)`
+        // are still possible (see `token-counter.test.ts` for the spy
+        // pattern).
+        countTokens: vi.fn(
+          async (params: { contents: Array<{ parts?: Array<{ text?: string }> }> }) => {
+            // Mirror countForPreflight's payload shape (sum text lengths
+            // across all parts × 0.25). Doesn't have to be exact; just has
+            // to give the SAME tier-2 verdict the heuristic does so the
+            // test assertion stays stable.
+            let totalBytes = 0;
+            for (const content of params.contents ?? []) {
+              for (const part of content.parts ?? []) {
+                if (typeof part.text === 'string') totalBytes += part.text.length;
+              }
+            }
+            return { totalTokens: Math.ceil(totalBytes / 4) };
+          },
+        ),
       },
     } as unknown as ToolContext['client'],
     manifest: {

@@ -1,6 +1,6 @@
 {
   "name": "@qmediat.io/gemini-code-context-mcp",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "mcpName": "io.github.qmediat/gemini-code-context-mcp",
   "description": "MCP server that gives Claude Code persistent memory of your codebase, backed by Gemini's 2M-token context. Includes eager `ask`/`code` for cached repo Q&A and `ask_agentic` for agentic file access on repos that exceed the model's input-token limit.",
   "keywords": [

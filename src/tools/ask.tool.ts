@@ -13,6 +13,7 @@ import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
+import { countForPreflight } from '../gemini/token-counter.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -117,6 +118,12 @@ export const askInputSchema = z
       .optional()
       .describe(
         'Per-call wall-clock timeout in ms (1s–30min). Aborts the in-flight `generateContent` request via `AbortController` if Gemini takes longer than this. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled (no timeout). Returns `errorCode: "TIMEOUT"` on abort. Note: `AbortSignal` is client-only — Gemini still finishes the request server-side and bills tokens for completed work.',
+      ),
+    preflightMode: z
+      .enum(['heuristic', 'exact', 'auto'])
+      .optional()
+      .describe(
+        "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model)). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -316,16 +323,20 @@ async function executeAskBody(
     // (dollars) and the TPM throttle reservation (rate). Hoisted here so
     // both consumers share one fingerprint — no drift between what the $
     // ledger thinks we'll spend and what the rate-limiter thinks we'll
-    // send to Gemini. Matches `estimatePreCallCostUsd`'s `Math.ceil(bytes/4)`
-    // tokenisation on purpose; see `docs/FOLLOW-UP-PRS.md` T17 for the
-    // known UTF-8 / CJK undercount.
+    // send to Gemini. Budget reservation still uses the bytes/4 heuristic
+    // (cheap; `estimatePreCallCostUsd` already takes raw bytes), but the
+    // PREFLIGHT against `inputTokenLimit` now goes through the v1.10.0
+    // two-tier `countForPreflight` (Tier 1 = heuristic for small repos;
+    // Tier 2 = real `countTokens` call when near the cliff). Closes T17
+    // (`bytes/4` undercount on dense Unicode). See `src/gemini/token-counter.ts`.
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
     const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4);
 
-    // v1.5.0 preflight — refuse immediately if the estimated input doesn't
-    // fit under the model's advertised `inputTokenLimit * workspaceGuardRatio`.
-    // Before this guard we would dispatch the request, Gemini would reject
-    // with `400 INVALID_ARGUMENT "exceeds maximum ..."`, and the calling
+    // v1.5.0 preflight (rebuilt in v1.10.0 on top of `countTokens`) — refuse
+    // immediately if the estimated input doesn't fit under the model's
+    // advertised `inputTokenLimit * workspaceGuardRatio`. Before this
+    // guard we would dispatch the request, Gemini would reject with
+    // `400 INVALID_ARGUMENT "exceeds maximum ..."`, and the calling
     // sub-agent would interpret the 400 as retryable (the error body is
     // indistinguishable from transient quota errors at the string level)
     // → unbounded retry storm. Cheap pre-flight with a structured
@@ -339,15 +350,30 @@ async function executeAskBody(
     // block a legitimate call on missing metadata.
     const contextWindow = resolved.inputTokenLimit;
     if (typeof contextWindow === 'number' && contextWindow > 0) {
+      const preflight = await countForPreflight(ctx.client, {
+        files: scan.files,
+        prompt: input.prompt,
+        model: resolved.resolved,
+        filesHash: scan.filesHash,
+        ...(input.includeGlobs !== undefined || input.excludeGlobs !== undefined
+          ? {
+              globsHash: `${(input.includeGlobs ?? []).join(',')}|${(input.excludeGlobs ?? []).join(',')}`,
+            }
+          : {}),
+        ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
+        inputTokenLimit: contextWindow,
+      });
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
-      if (estimatedInputTokens > threshold) {
+      if (preflight.effectiveTokens > threshold) {
         const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
         return errorResult(
-          `Workspace too large: ~${estimatedInputTokens.toLocaleString()} input tokens exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
+          `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
             retryable: false,
-            estimatedInputTokens,
+            estimatedInputTokens: preflight.effectiveTokens,
+            tokenCountMethod: preflight.method,
+            rawTokenCount: preflight.rawTokens,
             contextWindowTokens: contextWindow,
             thresholdTokens: threshold,
             guardRatio: ctx.config.workspaceGuardRatio,
@@ -358,7 +384,7 @@ async function executeAskBody(
       }
     } else {
       logger.warn(
-        `ask: resolved model ${resolved.resolved} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
+        `ask: resolved model ${safeForLog(resolved.resolved)} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
       );
     }
 

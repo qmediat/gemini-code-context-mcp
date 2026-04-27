@@ -5,6 +5,32 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-04-26
+
+### Added — accurate `countTokens`-based preflight (Phase 2 of the v1.9.0 plan; T17 closure)
+
+The v1.5.0 workspace-size preflight used `Math.ceil(bytes/4)` as a token estimate. That heuristic undercounts dense Unicode (CJK, emoji, minified JS) by 30-50 % — a workspace estimated as "fits" can in fact exceed `inputTokenLimit`, the request fires, Gemini returns `400 INVALID_ARGUMENT`, and the user has paid for the round-trip plus the eager Files API upload that preceded it. v1.10.0 replaces the heuristic with a two-tier strategy that calls Gemini's `models.countTokens` API for an exact count when accuracy matters, and falls back gracefully when the API is unavailable.
+
+- **New module** `src/gemini/token-counter.ts` exporting `countForPreflight()` — a two-tier preflight token counter:
+  - **Tier 1 — heuristic gate (fast path).** If the `bytes/4 + prompt/4` estimate is well under the cliff (< 50 % of the model's `inputTokenLimit`), skip the API call and accept the heuristic. Saves a round-trip on small repos that obviously fit. The 50 % cutoff guarantees we never trust the heuristic near the threshold.
+  - **Tier 2 — exact count.** Otherwise call `client.models.countTokens({ model, contents })` with the same payload shape we'll send to `generateContent`. Use `totalTokens` for the threshold check. Per the v1.9.0 probe (run against a paid key, results documented in the v1.10.0 internal plan), `countTokens` is billed at $0, shares no RPM quota with `generateContent` (30 calls in 2.9 s, zero 429s), and accepts at least 7 MB payloads (1.8M-token workspaces fit comfortably).
+  - **In-process LRU cache.** Keyed on `SHA256(filesHash + promptHash + model + globsHash)` — `filesHash` is already computed by the workspace scanner and auto-invalidates on file change. 256-entry capacity (~20 KB resident). TTL = process lifetime; no manifest persistence needed because the upstream `filesHash` already covers staleness.
+  - **`SYSTEM_INSTRUCTION_RESERVE = 1 000` tokens.** The Gemini Developer API rejects `systemInstruction` on `countTokens` (probe Q3) — the SDK exposes the field but the wire-level API returns a 400. We add 1 000 tokens to the comparison threshold to cover system instructions + tool declarations that the exact count misses on the Developer API path. Vertex API behaviour pending verification; the reserve is a conservative upper bound for both tiers.
+  - **Graceful degradation.** On any API failure (HTTP 429 / 500 / network error / SDK shape mismatch / non-numeric `totalTokens`), log warn (with all interpolated values flowing through `safeForLog` per v1.9.0) and fall back to `Math.ceil(bytes / 3)` — a 1.33× safety multiplier vs the legacy heuristic, sized to cover the empirical 30-50 % CJK undercount. Never throws; never makes the user re-run.
+- **New `preflightMode` schema field on `ask` and `code`:** `'heuristic'` | `'exact'` | `'auto'` (default `'auto'`). `'heuristic'` and `'exact'` are escape hatches for users who want predictable behaviour (CI pipelines, deterministic tests) or want to skip the API round-trip cost. `'auto'` matches today's behaviour for small repos and adds the exact-count guard for repos near the cliff.
+- **New structured-content metadata fields on success and on `WORKSPACE_TOO_LARGE`:** `tokenCountMethod: 'heuristic' | 'exact' | 'fallback'` and `rawTokenCount: number` (the count before `SYSTEM_INSTRUCTION_RESERVE` is added). Visible in tool output for orchestrators that want to make policy decisions on which path produced the count.
+- **23 new tests** in `test/unit/token-counter.test.ts`: tier-1 / tier-2 / cache hit / cache key invalidation on each input axis (`filesHash`, `prompt`, `model`, `globsHash`) / 429 fallback / network error fallback / malformed `totalTokens` shapes (missing, non-numeric, negative, NaN) / fallback-not-cached invariant (so transient 429s retry cleanly) / payload shape (one user-role content with file parts + prompt part, no `config.systemInstruction`).
+
+### Changed — `WORKSPACE_TOO_LARGE` is now exact, not heuristic
+
+Pre-v1.10.0, `structuredContent.estimatedInputTokens` was always the `bytes/4` heuristic. v1.10.0 reports the exact `countTokens` result on the tier-2 path — meaning a CJK-heavy repo that previously slipped past the v1.5.0 guard and hit a Gemini 400 is now caught client-side with an actionable error before any billable round-trip fires. Users on `preflightMode: 'heuristic'` (opt-in) or workspaces below the 50 % auto cutoff retain the old behaviour. **No breaking schema change** — `estimatedInputTokens` field shape unchanged; only its accuracy improves on the relevant code path.
+
+### Notes
+
+- The v1.5.0 workspace guard's failure mode (eager Files API upload before the preflight check) is unchanged in v1.10.0. The eager-upload path is closed by Phase 3 (the `ask` → `ask_agentic` auto-fallback on `WORKSPACE_TOO_LARGE`), tracked for a subsequent release.
+- Phase 4 (heartbeat-aware stall detector replacing the wall-clock `timeoutMs` semantics) deferred to a subsequent release.
+- Zero breaking changes. All schema fields additive and optional. The `preflightMode` field defaults to `'auto'` which preserves the v1.9.0 fast path on small repos.
+
 ## [1.9.0] - 2026-04-27
 
 ### Added — `ask_agentic` glob parity with `ask`/`code` (Phase 1 of the v1.9.0 plan)
