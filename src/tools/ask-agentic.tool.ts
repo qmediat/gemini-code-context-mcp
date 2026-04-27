@@ -352,6 +352,21 @@ async function dispatchToolCall(
         : err instanceof Error
           ? err.message
           : String(err);
+    // Ops-side observability for excludeGlobs misconfigurations (v1.9.0
+    // Phase 1.2, /6step Finding B): the user-visible `.message` for
+    // `EXCLUDED_FILE` and `EXCLUDED_DIR` is deliberately path-free to
+    // close the existence-probe oracle (Phase 1.1 Findings #1 + #2).
+    // Without this debug log, an operator helping a user debug "why is
+    // ask_agentic refusing my file?" has no way to map the generic error
+    // back to a specific path. The `requestedPath` field on SandboxError
+    // was preserved for exactly this purpose; surface it at debug level
+    // so prod log volume stays unchanged but ops can opt in via
+    // `GEMINI_CODE_CONTEXT_LOG_LEVEL=debug`.
+    if (err instanceof SandboxError) {
+      logger.debug(
+        `agentic dispatch refused: tool=${name} code=${err.code} requestedPath=${err.requestedPath}`,
+      );
+    }
     return {
       name,
       response: { error: message },

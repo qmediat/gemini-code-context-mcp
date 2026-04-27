@@ -90,3 +90,32 @@ This list is the flip side of `docs/KNOWN-DEFICITS.md`: deficits are issues we'l
 **Why we accept:** Transparency > sanitization. The planning document demonstrates how the product was shaped; erasing the brainstorming phase makes the repo look like polished marketing output rather than honest engineering. The disclaimer at the top of `PLAN.md` makes the artefact nature explicit.
 
 **Revisit trigger:** A specific complaint from a named party quoted in the document. We'd redact the quote in place and replace it with a paraphrase.
+
+---
+
+## User-supplied `excludeGlobs` matched on realpath-resolved paths (symlink bypass surface)
+
+**Source:** `/6step` adversarial review of v1.9.0 Phase 1.1, April 2026 (Finding D).
+
+**Risk claim:** When a user passes `excludeGlobs: ['internal-secrets']` to `ask` / `code` / `ask_agentic`, the filter is applied to the resolved (post-`realpath`) path of the target. If `internal-secrets/` is a symlink inside the workspace that points to `vendor/sensitive/`, the model can access the data via `read_file('internal-secrets/api-key.ts')` because `target.relpath` resolves to `vendor/sensitive/api-key.ts` and the user's `'internal-secrets'` exclude does not match that string. The user's filter is bypassed by filesystem topology.
+
+**Scope of impact:** Affects both the eager `ask`/`code` workspace scanner (`src/indexer/workspace-scanner.ts` via `isFileIncluded`) AND every agentic executor (`src/tools/agentic/workspace-tools.ts`). The bypass exists wherever `MatchConfig` is consulted against a `relpath` that has already been canonicalised by `realpath` — which is everywhere, because realpath is a security-critical step (it's how `PATH_TRAVERSAL` is enforced on symlinks).
+
+**Why we accept (for now):**
+
+1. **Threat is narrow.** Triggering the bypass requires (a) a symlink inside the workspace pointing to sensitive content, (b) the user excluding the symlink-name (not the target name), AND (c) the model deciding to access the symlinked path. Most workspaces don't have sensitive symlinks; users who set up such a structure intentionally generally know about it.
+2. **Pre-existing protections still apply.** `AGENTIC_SECRET_BASENAMES` (`src/tools/agentic/sandbox.ts:36`) catches `.env*`, `secrets.json`, `credentials*`, etc. by basename regardless of how the path was reached — symlink or not. `PATH_TRAVERSAL` jail still rejects symlinks pointing OUTSIDE the workspace. So the canonical "leak credentials via symlink" attack is already blocked.
+3. **The fix has cost.** A two-tier check (compare both pre-realpath request path AND post-realpath canonical path against `excludeGlobs`) requires plumbing the original request path through `resolveInsideWorkspace` and exposing it on the `target` return — touches every executor + the eager scanner. Easy to get wrong (which path do we expose to the model? both? case-sensitive? case-insensitive?).
+4. **Consistency over patching.** The eager scanner and agentic executors share the same filtering predicate. Fixing only the agentic side creates divergence; fixing both in one PR widens scope. Better to land the fix as a deliberate v1.x effort, not a Phase 1.1 add-on.
+
+**Revisit trigger:**
+
+- A user reports that their `excludeGlobs` is being silently bypassed in production, or
+- We see an exploit demonstration in the wild (prompt-injected file says "read internal-secrets/" → model reads the symlink target), or
+- v2.0 hardening pass treats the eager + agentic scanner symmetry holistically.
+
+**Mitigation available now:**
+
+- Exclude the symlink TARGET path, not the symlink NAME (`excludeGlobs: ['vendor/sensitive']` not `'internal-secrets'`).
+- Don't create symlinks inside the workspace whose names suggest they hold sensitive content.
+- Use OS-level mount restrictions if the threat model is "model + repo-cooperative attacker can't be trusted". The MCP server is not a sandbox boundary — it's a productivity layer.
