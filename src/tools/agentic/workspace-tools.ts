@@ -27,6 +27,7 @@ import {
   defaultMatchConfig,
   isFileIncluded,
   isPathExcluded,
+  matchesAnyIncludeExtension,
 } from '../../indexer/globs.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
 
@@ -185,6 +186,22 @@ export async function listDirectoryExecutor(
 ): Promise<ListDirectoryResult> {
   const target = await resolveInsideWorkspace(workspaceRoot, relPath);
   const config = resolveMatchConfig(matchConfig);
+
+  // Top-level gate (v1.9.0 Phase 1.1, /6step Finding #1): the requested
+  // directory itself must be checked against user `excludeGlobs`. Without
+  // this, `list_directory("internal-secrets")` (where `internal-secrets`
+  // is in user excludes but NOT in `DEFAULT_EXCLUDE_DIRS`) succeeds and
+  // returns a filtered child list — the model can probe path existence
+  // by comparing success vs `NOT_FOUND` from `resolveInsideWorkspace`.
+  // The sandbox layer (`resolveInsideWorkspace`) checks default-excluded
+  // dirs only; user-supplied excludes were unenforced at this level.
+  // Generic message — no path interpolation — to avoid the same
+  // existence-leak via error string (see Finding #2 for the file-level
+  // analogue).
+  if (target.relpath && isPathExcluded(target.relpath, config)) {
+    throw new SandboxError('EXCLUDED_DIR', 'directory is excluded by configured policy', relPath);
+  }
+
   let rawEntries: Dirent<string>[];
   try {
     rawEntries = await readdir(target.absolutePath, { withFileTypes: true, encoding: 'utf8' });
@@ -396,27 +413,26 @@ export async function readFileExecutor(
   // can still distinguish "explicitly excluded by your config" from
   // "default-rejected source-set membership".
   if (!isFileIncluded(target.relpath, config)) {
-    const lowerBase = target.relpath.toLowerCase();
-    const nameOnly = lowerBase.substring(lowerBase.lastIndexOf('/') + 1);
-    // Distinguish error code: if NO include-extension matches, the file
-    // is structurally non-source. Otherwise it's a user-config exclude.
-    const matchesAnyIncludeExt = config.includeExtensions.some((ext) => {
-      const extLower = ext.toLowerCase();
-      if (ext.startsWith('.')) return lowerBase.endsWith(extLower);
-      return nameOnly === extLower;
-    });
-    if (!matchesAnyIncludeExt) {
+    // Discriminate the two failure modes via the shared helper (v1.9.0
+    // Phase 1.1, /6step Finding #3): if NO include-extension matches, the
+    // file is structurally non-source — keep the path in the message
+    // because the model needs to know which file it asked for is
+    // "wrong-tool" territory (binary, image, etc.) and the path is purely
+    // utility, not privacy-bearing. If an include-extension DOES match,
+    // the file is excluded by some other rule (filename / extension
+    // exclude / dir-prefix exclude) — emit a generic message with NO path
+    // (Finding #2) so the error string can't be used as an existence
+    // oracle for paths the user explicitly excluded. The third
+    // `SandboxError` argument (`relPath`) is preserved either way for
+    // internal logging via `requestedPath`.
+    if (!matchesAnyIncludeExtension(target.relpath, config)) {
       throw new SandboxError(
         'NON_SOURCE_FILE',
         `file extension not in allowed source set: ${target.relpath}`,
         relPath,
       );
     }
-    throw new SandboxError(
-      'EXCLUDED_FILE',
-      `file matches an exclude pattern (default or user-supplied): ${target.relpath}`,
-      relPath,
-    );
+    throw new SandboxError('EXCLUDED_FILE', 'file is excluded by configured policy', relPath);
   }
 
   // Stat first so we never allocate a >200MB Buffer for a minified bundle.
@@ -578,6 +594,20 @@ export async function grepExecutor(
   let startRel = '';
   if (typeof pathPrefix === 'string' && pathPrefix.trim().length > 0) {
     const resolved = await resolveInsideWorkspace(workspaceRoot, pathPrefix);
+    // Top-level gate (v1.9.0 Phase 1.1, /6step Finding #1 ext): same threat
+    // as `listDirectoryExecutor` — the requested pathPrefix must be checked
+    // against user `excludeGlobs` BEFORE walking it. Without this,
+    // `grep("regex", "internal-secrets")` (where the dir is in user
+    // excludes but NOT in DEFAULT_EXCLUDE_DIRS) succeeds-with-zero-results
+    // when the dir exists vs throws NOT_FOUND when it doesn't — same
+    // existence-probe oracle. Generic message, no path leak.
+    if (resolved.relpath && isPathExcluded(resolved.relpath, config)) {
+      throw new SandboxError(
+        'EXCLUDED_DIR',
+        'pathPrefix is excluded by configured policy',
+        pathPrefix,
+      );
+    }
     try {
       const s = await stat(resolved.absolutePath);
       if (!s.isDirectory()) {

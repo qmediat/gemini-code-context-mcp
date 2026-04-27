@@ -467,6 +467,26 @@ export function isFileIncluded(relpath: string, config: MatchConfig): boolean {
     if (filenameLower.endsWith(ext.toLowerCase())) return false;
   }
 
+  return matchesAnyIncludeExtension(relpath, config);
+}
+
+/**
+ * The "is this file's name covered by an include pattern?" half of
+ * `isFileIncluded`. Extracted (v1.9.0) so consumers that already know the
+ * path is not under any exclude can reuse the include-side logic without
+ * re-implementing it locally — `readFileExecutor` was the offender, with a
+ * verbatim copy of the loop below to discriminate `NON_SOURCE_FILE` (no
+ * include-extension match) from `EXCLUDED_FILE` (include-extension match
+ * but excluded by some other rule).
+ *
+ * Single source of truth for include-side matching. Drift-proof: any future
+ * change to how include patterns map (case-fold, regex, new bucket types,
+ * etc.) updates one function, not two.
+ */
+export function matchesAnyIncludeExtension(relpath: string, config: MatchConfig): boolean {
+  const filenameLower = (
+    relpath.includes('/') ? relpath.slice(relpath.lastIndexOf('/') + 1) : relpath
+  ).toLowerCase();
   for (const ext of config.includeExtensions) {
     const extLower = ext.toLowerCase();
     if (ext.startsWith('.')) {

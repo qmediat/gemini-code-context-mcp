@@ -671,4 +671,95 @@ describe('agentic executors honour user excludeGlobs / includeGlobs (v1.9.0)', (
     const b = await findFilesExecutor(root, '**/*.ts', defaultMatchConfig({}));
     expect(a.matches.sort()).toEqual(b.matches.sort());
   });
+
+  // -----------------------------------------------------------------------
+  // /6step Phase 1.1 hardening — top-level dir gate (Finding #1) +
+  // no-path-leak in error message (Finding #2). Both close path-existence
+  // probe oracles that survived the initial Phase 1 plumbing.
+  // -----------------------------------------------------------------------
+
+  it('Finding #1: listDirectory rejects the requested directory itself when in user excludeGlobs', async () => {
+    // Pre-fix: list_directory('internal-secrets', config) succeeded and
+    // returned a (filtered) child list — model could probe path existence.
+    // Post-fix: the requested dir is checked against `isPathExcluded`
+    // before readdir even fires, throwing SandboxError(EXCLUDED_DIR).
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    try {
+      await listDirectoryExecutor(root, 'internal-secrets', config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_DIR');
+      // Generic message — must NOT leak the excluded path so the error
+      // string itself can't be used as an existence oracle.
+      expect((err as Error).message).not.toContain('internal-secrets');
+    }
+  });
+
+  it('Finding #1: grep rejects pathPrefix matching user excludeGlobs', async () => {
+    // Same threat as the listDirectory oracle: grep("regex",
+    // "internal-secrets") would walk the dir's children (filtered) when
+    // the dir exists vs throw NOT_FOUND when it doesn't — existence probe.
+    // Post-fix: pathPrefix is gated against user excludes BEFORE the walk.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['internal-secrets'] });
+
+    try {
+      await grepExecutor(root, 'TOKEN', 'internal-secrets', config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_DIR');
+      expect((err as Error).message).not.toContain('internal-secrets');
+    }
+  });
+
+  it('Finding #2: readFile EXCLUDED_FILE error message does not leak the excluded path', async () => {
+    // Pre-fix: error message was `file matches an exclude pattern …:
+    // ${target.relpath}` — model could read the path back from the error
+    // string and confirm existence/structure of paths the user excluded.
+    // Post-fix: generic message, third constructor arg (`requestedPath`)
+    // preserved for ops logging but no longer in `.message`.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    const config = defaultMatchConfig({ excludeGlobs: ['custom.private.ts'] });
+
+    try {
+      await readFileExecutor(root, 'custom.private.ts', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');
+      // Existence-probe defense: error.message must NOT contain any path
+      // component that could differentiate "exists+excluded" from
+      // "doesn't exist" (NOT_FOUND).
+      expect((err as Error).message).not.toContain('custom.private.ts');
+      expect((err as Error).message).not.toContain('private');
+      // Internal logging field preserved — the third constructor arg
+      // (relPath) is still recorded as `requestedPath`, just not surfaced
+      // through `.message` to the model.
+      expect((err as { requestedPath?: string }).requestedPath).toBe('custom.private.ts');
+    }
+  });
+
+  it('Finding #2: NON_SOURCE_FILE keeps the path in its message (different threat model)', async () => {
+    // NON_SOURCE_FILE is a "wrong tool" signal (binary / image / unknown
+    // extension), NOT a privacy-probe vector — the path string is utility
+    // information for the model, telling it which file in its own request
+    // is structurally non-readable. Verifies the discriminator from
+    // Finding #3's helper extraction works correctly.
+    const { defaultMatchConfig } = await import('../../src/indexer/globs.js');
+    writeFileSync(join(root, 'binary.bin'), 'binary');
+    const config = defaultMatchConfig({});
+
+    try {
+      await readFileExecutor(root, 'binary.bin', undefined, undefined, config);
+      throw new Error('should have thrown');
+    } catch (err) {
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as { code?: string }).code).toBe('NON_SOURCE_FILE');
+      expect((err as Error).message).toContain('binary.bin');
+    }
+  });
 });
