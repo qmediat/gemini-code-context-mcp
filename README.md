@@ -8,6 +8,10 @@
 [![TypeScript strict](https://img.shields.io/badge/TypeScript-strict-blue.svg)](./tsconfig.json)
 [![Node ≥22](https://img.shields.io/badge/node-%3E%3D22-brightgreen)](./package.json)
 
+> **Built and maintained by [Quantum Media Technologies sp. z o.o.](https://www.qmediat.io/) — a registered Polish technology company (qmediat.io).** Production-deployed inside qmediat's own developer workflows; commercial backing means this MCP server is on the long-term roadmap, not a weekend project. ~1-2 week release cadence since launch — see [CHANGELOG.md](./CHANGELOG.md).
+>
+> **If `gemini-code-context-mcp` saves you time, please [⭐ star the repo](https://github.com/qmediat/gemini-code-context-mcp).** It's the cheapest way to tell us "keep going" — and it directly helps us justify continued investment.
+
 ---
 
 ## Why this server?
@@ -16,7 +20,7 @@ An MCP (Model Context Protocol) server that wraps Google's Gemini API with **per
 
 |  | [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool) | **`@qmediat.io/gemini-code-context-mcp`** |
 |---|---|---|
-| Maintenance | Unmaintained on npm since 2025-07 (v1.1.4); last commit on `main` 2025-07-23; no maintainer reply on 2026 issues (#49/#62/#64 at time of writing) | Actively maintained |
+| Maintenance | Unmaintained on npm since 2025-07 (v1.1.4); last commit on `main` 2025-07-23; no maintainer reply on 2026 issues (#49/#62/#64 at time of writing) | Actively maintained — backed by [Quantum Media Technologies sp. z o.o.](https://www.qmediat.io/) (qmediat.io). Production-deployed in qmediat's internal developer workflows; ~1-2 week release cadence since launch. |
 | Default model | Hardcoded `gemini-2.5-pro` (main) — no runtime override | Dynamic `latest-pro` alias — resolves against your API key tier at startup |
 | Backend | Shells out to `gemini` CLI (subprocess per call) | Direct `@google/genai` SDK |
 | Repeat queries | No caching layer — each call re-tokenises referenced files | **Files API + Context Cache** — repeat queries reuse the indexed codebase; cached input tokens billed at ~25 % of the uncached rate |
@@ -199,6 +203,15 @@ Per-tool cost breakdown, free-tier guidance, and all the knobs: [`docs/cost-mode
 ```
 
 More: [`docs/architecture.md`](./docs/architecture.md).
+
+## Maintenance & support
+
+This project is built and maintained by **[Quantum Media Technologies sp. z o.o.](https://www.qmediat.io/)** — a registered Polish technology company (qmediat.io) — that uses `gemini-code-context-mcp` daily in its own developer workflows. The practical consequences for users:
+
+- **Bugs that affect real coding sessions get fixed first.** Examples: v1.5.1 retry on transient Node `fetch failed` (caught during a real `/coderev` run on a large repo), v1.7.0 streaming heartbeat (silent 60-180 s pauses on HIGH thinking were friction for our own team), v1.7.2 fake-timer race in CI (broke the release pipeline — diagnosed via 3-tool model consult, fixed and shipped same day).
+- **Long-term roadmap, not a weekend project.** Commercial backing means the project sits on qmediat.io's product roadmap with allocated engineering time. We are not going to disappear. The full release history is in [CHANGELOG.md](./CHANGELOG.md); current cadence is ~1-2 weeks per release since launch.
+- **Issues and PRs welcome.** File at [github.com/qmediat/gemini-code-context-mcp/issues](https://github.com/qmediat/gemini-code-context-mcp/issues) — we triage on a 48-hour response SLA. For commercial inquiries (custom integrations, support contracts, on-prem deployments): [contact@qmt.email](mailto:contact@qmt.email).
+- **If this saves you time, please [⭐ star the repo](https://github.com/qmediat/gemini-code-context-mcp).** It is the simplest signal you can send that the work is worth continuing, and it directly helps us justify continued investment.
 
 ## Contributing
 

@@ -16,6 +16,10 @@ Closes the reliability triangle started in v1.5.1 (`withNetworkRetry`) → v1.6.
 - **Configurable budget via `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS`.** Default 5000 ms. Range `[0, 60000]` (clamped). Invalid values (non-finite, negative, >60000) emit a startup warning and fall back to default — typo-resistant. Set to `0` to revert to v1.7.x's "exit immediately" behaviour.
 - **`drainInFlight` exported from `src/server.ts`** for unit testability without booting a real server. 6 new test cases in `test/unit/server-drain.test.ts` cover: empty set, all-settled within budget, partial-abandoned timeout, rejected promises (counted as settled), zero budget, negative budget defensive handling.
 
+### Documentation
+
+- **README — corporate-backing callout + maintenance commitment + star ask.** A new top-of-README banner makes the project's commercial backing explicit ("Built and maintained by [Quantum Media Technologies sp. z o.o.](https://www.qmediat.io/) — qmediat.io"), pairs with a new "Maintenance & support" section before Contributing that documents (a) the dogfooding feedback loop ("bugs that affect real coding sessions get fixed first", with concrete v1.5.1 / v1.7.0 / v1.7.2 examples), (b) the long-term roadmap commitment ("not going to disappear"), (c) issue / PR / commercial inquiry routes, (d) a star ask. The comparison table's "Actively maintained" cell is also expanded to cite the corporate backing and the ~1-2 week release cadence since launch.
+
 ### Notes
 
 - **Not breaking.** Default behaviour change is "shutdown waits up to 5 s instead of exiting immediately" — strictly more user-friendly. Operators who depend on instant exit (rare) can set `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS=0`.
