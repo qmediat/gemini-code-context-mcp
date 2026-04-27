@@ -13,7 +13,7 @@ import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
-import { countForPreflight } from '../gemini/token-counter.js';
+import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -348,9 +348,15 @@ async function executeAskBody(
     // seen). In that case we fall through without blocking but warn —
     // better to let the request hit the API and fail noisily than to
     // block a legitimate call on missing metadata.
+    // Hoisted past the `if (contextWindow > 0)` block so the success-path
+    // metadata (lines below) can surface `tokenCountMethod` /
+    // `rawTokenCount` / `tokenCountCacheHit` regardless of whether the
+    // preflight actually ran. Stays `undefined` only when the resolved
+    // model has no advertised `inputTokenLimit`.
+    let preflight: PreflightTokenResult | undefined;
     const contextWindow = resolved.inputTokenLimit;
     if (typeof contextWindow === 'number' && contextWindow > 0) {
-      const preflight = await countForPreflight(ctx.client, {
+      preflight = await countForPreflight(ctx.client, {
         files: scan.files,
         prompt: input.prompt,
         model: resolved.resolved,
@@ -362,6 +368,12 @@ async function executeAskBody(
           : {}),
         ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
         inputTokenLimit: contextWindow,
+        // Thread the user's `timeoutMs` AbortSignal so a hung countTokens
+        // call doesn't bleed past the user's stated wall-clock budget. The
+        // SDK's `CountTokensConfig` accepts `abortSignal`; on cancellation
+        // the SDK throws AbortError and `countForPreflight` falls through
+        // to the `bytes/3` graceful-degradation path.
+        signal: abortSignal,
       });
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
       if (preflight.effectiveTokens > threshold) {
@@ -374,6 +386,7 @@ async function executeAskBody(
             estimatedInputTokens: preflight.effectiveTokens,
             tokenCountMethod: preflight.method,
             rawTokenCount: preflight.rawTokens,
+            tokenCountCacheHit: preflight.cacheHit,
             contextWindowTokens: contextWindow,
             thresholdTokens: threshold,
             guardRatio: ctx.config.workspaceGuardRatio,
@@ -781,6 +794,19 @@ async function executeAskBody(
         : {}),
       workspaceTruncated: scan.truncated,
       maxFilesCap: ctx.config.maxFilesPerWorkspace,
+      // Preflight token-count provenance — surfaces on every successful
+      // call so orchestrators / observability layers can see which path
+      // produced the count (`'heuristic'`, `'exact'`, `'fallback'`),
+      // whether the LRU saved an API round-trip, and the raw count
+      // before `SYSTEM_INSTRUCTION_RESERVE` was applied. Omitted when
+      // the resolved model had no `inputTokenLimit` (preflight skipped).
+      ...(preflight !== undefined
+        ? {
+            tokenCountMethod: preflight.method,
+            rawTokenCount: preflight.rawTokens,
+            tokenCountCacheHit: preflight.cacheHit,
+          }
+        : {}),
       durationMs,
       ...(thinkingSummary ? { thinkingSummary } : {}),
     };

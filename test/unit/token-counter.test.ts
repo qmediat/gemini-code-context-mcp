@@ -383,7 +383,221 @@ describe('countForPreflight — payload shape', () => {
     await countForPreflight(client, baseInput([file], { preflightMode: 'exact' }));
 
     const call = countTokens.mock.calls[0]?.[0] as Record<string, unknown>;
-    // The reserve is added to the threshold at the call site, not via SDK config.
+    // The reserve is added to the count at the call site, not via SDK config.
+    // When no `signal` is passed in PreflightInput, no `config` is sent at all.
     expect(call.config).toBeUndefined();
+  });
+});
+
+describe('countForPreflight — cacheHit field (F7)', () => {
+  it('returns cacheHit:false on heuristic path', async () => {
+    const { client } = buildClient();
+    const result = await countForPreflight(
+      client,
+      baseInput([fakeFile('a.ts', 1_000)], { preflightMode: 'heuristic' }),
+    );
+    expect(result.cacheHit).toBe(false);
+  });
+
+  it('returns cacheHit:false on fresh-API exact path', async () => {
+    const { client } = buildClient(async () => ({ totalTokens: 42 }));
+    const file = await realFile(tmpDir, 'a.ts', 'hello');
+    const result = await countForPreflight(client, baseInput([file], { preflightMode: 'exact' }));
+    expect(result.method).toBe('exact');
+    expect(result.cacheHit).toBe(false);
+  });
+
+  it('returns cacheHit:true on cached exact path', async () => {
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 42 }));
+    const file = await realFile(tmpDir, 'a.ts', 'hello');
+    const input = baseInput([file], { preflightMode: 'exact' });
+    await countForPreflight(client, input);
+    const second = await countForPreflight(client, input);
+    expect(countTokens).toHaveBeenCalledTimes(1);
+    expect(second.method).toBe('exact');
+    expect(second.cacheHit).toBe(true);
+    expect(second.rawTokens).toBe(42);
+  });
+
+  it('returns cacheHit:false on fallback path', async () => {
+    const { client } = buildClient(async () => {
+      throw new Error('429');
+    });
+    const file = await realFile(tmpDir, 'big.ts', 'y'.repeat(2_400_000));
+    const result = await countForPreflight(client, baseInput([file], { preflightMode: 'exact' }));
+    expect(result.method).toBe('fallback');
+    expect(result.cacheHit).toBe(false);
+  });
+});
+
+describe('countForPreflight — AbortSignal threading (F1)', () => {
+  it('passes config.abortSignal to countTokens when signal provided', async () => {
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 42 }));
+    const file = await realFile(tmpDir, 'a.ts', 'hello');
+    const controller = new AbortController();
+    await countForPreflight(
+      client,
+      baseInput([file], { preflightMode: 'exact', signal: controller.signal }),
+    );
+
+    const call = countTokens.mock.calls[0]?.[0] as { config?: { abortSignal?: AbortSignal } };
+    expect(call.config?.abortSignal).toBe(controller.signal);
+  });
+
+  it('omits config entirely when signal not provided', async () => {
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 42 }));
+    const file = await realFile(tmpDir, 'a.ts', 'hello');
+    await countForPreflight(client, baseInput([file], { preflightMode: 'exact' }));
+
+    const call = countTokens.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(call.config).toBeUndefined();
+  });
+
+  it('falls back gracefully when SDK throws AbortError on signal abort', async () => {
+    const { client } = buildClient(async () => {
+      const err = new Error('Request aborted');
+      err.name = 'AbortError';
+      throw err;
+    });
+    const file = await realFile(tmpDir, 'big.ts', 'y'.repeat(2_400_000));
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await countForPreflight(
+      client,
+      baseInput([file], { preflightMode: 'exact', signal: controller.signal }),
+    );
+    expect(result.method).toBe('fallback');
+    expect(result.cacheHit).toBe(false);
+  });
+});
+
+describe('countForPreflight — payload-size cap (F4)', () => {
+  it('falls back to heuristic when assembled payload exceeds 32 MB', async () => {
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
+    // 40 files × 1 MB each = 40 MB assembled — over the 32 MB cap.
+    // Use fakeFile so we don't actually write 40 MB to disk; the
+    // 'a'.repeat(file.size) placeholder fires per file.
+    const files = Array.from({ length: 40 }, (_, i) => fakeFile(`f${i}.ts`, 1_000_000));
+    const result = await countForPreflight(
+      client,
+      baseInput(files, { preflightMode: 'exact', inputTokenLimit: 1_000_000_000 }),
+    );
+
+    // Cap fired before all files were assembled — countTokens NEVER called.
+    expect(countTokens).not.toHaveBeenCalled();
+    expect(result.method).toBe('fallback');
+    expect(result.cacheHit).toBe(false);
+  });
+});
+
+describe("countForPreflight — boundary at 'auto' cutoff (F8)", () => {
+  it("uses heuristic strictly BELOW 50% of inputTokenLimit (uses '<', not '<=')", async () => {
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
+    // inputTokenLimit = 1_000_000; HEURISTIC_CUTOFF_FRACTION = 0.5 → cutoff = 500_000.
+    // heuristicCount = bytes/4 + prompt/4. With prompt 'analyse this code' (17 chars),
+    // promptTokens = ceil(17/4) = 5. So we need bytes/4 = 499_994 → bytes = 1_999_976.
+    // Total heuristic = 499_994 + 5 = 499_999 < 500_000 → heuristic path.
+    const justBelow = fakeFile('below.ts', 1_999_976);
+    const result = await countForPreflight(
+      client,
+      baseInput([justBelow], { preflightMode: 'auto', inputTokenLimit: 1_000_000 }),
+    );
+    expect(result.method).toBe('heuristic');
+    expect(countTokens).not.toHaveBeenCalled();
+  });
+
+  it('crosses to exact AT or ABOVE the 50% cutoff', async () => {
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 500_000 }));
+    // bytes/4 = 499_995 + 5 = 500_000 = exactly cutoff → tier-2 (`<` is strict).
+    const file = await realFile(tmpDir, 'at.ts', 'a'.repeat(1_999_980));
+    const result = await countForPreflight(
+      client,
+      baseInput([file], { preflightMode: 'auto', inputTokenLimit: 1_000_000 }),
+    );
+    expect(result.method).toBe('exact');
+    expect(countTokens).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('countForPreflight — LRU eviction (F8)', () => {
+  it('evicts the oldest entry when capacity exceeded (cache size cap = 256)', async () => {
+    // The LRU is module-level so we can fill it across many calls. Use
+    // distinct cache keys (different filesHash per call). After 257
+    // distinct entries, the very first should evict; calling with that
+    // first key again must miss → fresh API call.
+    let totalTokensCounter = 1_000_000;
+    const { client, countTokens } = buildClient(async () => ({
+      totalTokens: totalTokensCounter++,
+    }));
+    const file = await realFile(tmpDir, 'a.ts', 'hello');
+
+    // Insert 257 distinct cache entries (1 over capacity).
+    for (let i = 0; i < 257; i++) {
+      await countForPreflight(
+        client,
+        baseInput([file], { preflightMode: 'exact', filesHash: `hash-${i}` }),
+      );
+    }
+    // 257 fresh API calls so far.
+    expect(countTokens).toHaveBeenCalledTimes(257);
+
+    // The very first key (`hash-0`) should have been evicted as oldest.
+    // Calling it again must trigger a fresh API call → 258 total.
+    const re0 = await countForPreflight(
+      client,
+      baseInput([file], { preflightMode: 'exact', filesHash: 'hash-0' }),
+    );
+    expect(countTokens).toHaveBeenCalledTimes(258);
+    expect(re0.cacheHit).toBe(false);
+
+    // The most-recently-inserted key (`hash-256`) should still be cached.
+    const re256 = await countForPreflight(
+      client,
+      baseInput([file], { preflightMode: 'exact', filesHash: 'hash-256' }),
+    );
+    // No additional API call — cache hit.
+    expect(countTokens).toHaveBeenCalledTimes(258);
+    expect(re256.cacheHit).toBe(true);
+  });
+});
+
+describe('countForPreflight — concurrent calls with same key (F8)', () => {
+  it('two concurrent calls both miss the cache, both fire API (no in-flight de-dupe)', async () => {
+    // Pinning current behaviour: two concurrent `await countForPreflight(...)`
+    // on the same cache key both miss because neither has populated the
+    // cache yet. Result: 2 API calls per concurrent burst. Not a bug
+    // today (countTokens is free) but pinned so a future de-dupe layer
+    // is a deliberate, observable change.
+    const resolveFns: Array<() => void> = [];
+    const { client, countTokens } = buildClient(
+      () =>
+        new Promise<{ totalTokens: number }>((resolve) => {
+          resolveFns.push(() => resolve({ totalTokens: 700_000 }));
+        }),
+    );
+    // Tiny file content — keep the file-read phase fast so we can
+    // observe the API-call phase. exact mode forces tier-2 regardless.
+    const file = await realFile(tmpDir, 'concurrent.ts', 'x');
+    const input = baseInput([file], { preflightMode: 'exact' });
+
+    const p1 = countForPreflight(client, input);
+    const p2 = countForPreflight(client, input);
+
+    // Wait for the file-read phase to settle on both flights, then
+    // assert both have called the API. 50 ms is generous for a 1-byte
+    // readFile + the few synchronous steps before the SDK call.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(countTokens).toHaveBeenCalledTimes(2);
+
+    // Resolve both.
+    for (const fn of resolveFns) fn();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect(r1.method).toBe('exact');
+    expect(r2.method).toBe('exact');
+    // After both settled, the cache is populated — a third call hits it.
+    const r3 = await countForPreflight(client, input);
+    expect(countTokens).toHaveBeenCalledTimes(2);
+    expect(r3.cacheHit).toBe(true);
   });
 });

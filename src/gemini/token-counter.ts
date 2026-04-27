@@ -52,14 +52,19 @@ import type { GoogleGenAI } from '@google/genai';
 import type { ScannedFile } from '../indexer/workspace-scanner.js';
 import { logger, safeForLog } from '../utils/logger.js';
 
-/** Token reserve subtracted from the comparison threshold to account for
- * `systemInstruction` + tool declarations that countTokens doesn't count
- * on the Gemini Developer API path. See Q3 in
- * `.claude/local-PLAN-v1.10.0.md`. The 1 000-token reserve is generous —
- * empirical agentic systemInstruction is ~600 tokens; tool declarations
+/** Token reserve added to the count before the threshold comparison
+ * (`effectiveTokens = rawTokens + SYSTEM_INSTRUCTION_RESERVE`). Accounts for
+ * `systemInstruction` + tool declarations that `countTokens` doesn't count
+ * on the Gemini Developer API path. The 1 000-token reserve is generous —
+ * empirical agentic `systemInstruction` is ~600 tokens; tool declarations
  * for the four `ask_agentic` functions are ~200-400 tokens. `ask` and
  * `code` typically pass no system instruction so the reserve is pure
- * safety margin there. */
+ * safety margin there.
+ *
+ * Applied ONLY on the `'exact'` path (fresh-API and cache-hit). Skipped on
+ * `'heuristic'` (already coarse — adding the reserve to a coarse number
+ * pretends we know more than we do) and on `'fallback'` (`bytes/3` already
+ * carries 33 % over-pad which absorbs the reserve and then some). */
 export const SYSTEM_INSTRUCTION_RESERVE = 1_000;
 
 /** Heuristic-vs-exact tier boundary. Below this fraction of the model's
@@ -75,6 +80,20 @@ const HEURISTIC_CUTOFF_FRACTION = 0.5;
  * (handful of workspaces × handful of distinct prompts). */
 const LRU_MAX_ENTRIES = 256;
 
+/** Defensive cap on the assembled tier-2 `contents` payload (file content
+ * concatenation). The v1.9.0 probe Q2 confirmed countTokens accepts at
+ * least 7 MB; we set the bound conservatively above that with headroom for
+ * future SDK / API changes. When the assembled payload would exceed this
+ * cap, we skip the API call and fall through to the `bytes/3` fallback —
+ * counter intuitively, a heuristic is more reliable than a request that's
+ * about to 413. Today's defaults (`maxFilesPerWorkspace: 2_000`,
+ * `maxFileSizeBytes: 1_000_000`) cap worst-case workspace at ~2 GB, but
+ * the heuristic-tier gate (50 % of `inputTokenLimit`) means tier-2 only
+ * sees workspaces approaching `inputTokenLimit × 4` raw bytes (~4 MB on a
+ * 1 M-token model). The cap is a future-proof defensive measure, not a
+ * limit you're expected to hit. */
+const MAX_TIER_2_PAYLOAD_BYTES = 32 * 1024 * 1024; // 32 MB
+
 export type TokenCountMethod = 'heuristic' | 'exact' | 'fallback';
 
 export interface PreflightTokenResult {
@@ -82,11 +101,18 @@ export interface PreflightTokenResult {
   effectiveTokens: number;
   /** Which path produced the count. Surfaces in tool metadata. */
   method: TokenCountMethod;
-  /** Raw count from the source — for diagnostics. Same as `effectiveTokens`
-   * minus `SYSTEM_INSTRUCTION_RESERVE` for `'exact'` / `'fallback'` paths;
-   * equal to `effectiveTokens` for `'heuristic'` (the heuristic already
-   * has slop). */
+  /** Raw count from the source — for diagnostics. Differs from
+   * `effectiveTokens` by `SYSTEM_INSTRUCTION_RESERVE` ONLY on the `'exact'`
+   * path (fresh-API and cache-hit). Equal to `effectiveTokens` on
+   * `'heuristic'` and `'fallback'` paths (the coarse heuristic and
+   * `bytes/3` over-pad respectively absorb the reserve as slop, so adding
+   * it twice would double-count). */
   rawTokens: number;
+  /** Whether the `'exact'` count came from the in-process LRU cache rather
+   * than a fresh `countTokens` API call. `false` on every non-`'exact'`
+   * path. Surfaces in tool metadata so operators can distinguish "we paid
+   * the API round-trip" from "we hit the LRU." */
+  cacheHit: boolean;
 }
 
 /** Inputs to the preflight count. Mirror what `ask` / `code` already
@@ -106,6 +132,14 @@ export interface PreflightInput {
   /** The model's advertised input token limit. The cutoff fraction is
    * applied to this. */
   inputTokenLimit: number;
+  /** Wall-clock abort signal threaded into the SDK's `countTokens`
+   * `config.abortSignal`. When the caller's `timeoutMs` budget fires (or
+   * any upstream cancellation), the SDK's HTTP request is aborted. The
+   * caller's abort propagates as `AbortError` from the `await` and the
+   * outer `try/catch` falls through to the `bytes/3` fallback — same
+   * graceful-degradation path used for 429s and network errors. Optional;
+   * omit for callers without timeout semantics. */
+  signal?: AbortSignal;
 }
 
 /** Simple LRU implemented atop `Map`'s insertion-order semantics. Two
@@ -195,18 +229,28 @@ export async function countForPreflight(
   const heuristicCount = computeHeuristic(input.files, input.prompt);
   const mode = input.preflightMode ?? 'auto';
 
-  // Pure-heuristic mode bypasses the API entirely. No reserve subtracted —
+  // Pure-heuristic mode bypasses the API entirely. No reserve added —
   // the heuristic is already a coarse estimate; users opting into this
   // mode prioritize predictability over accuracy.
   if (mode === 'heuristic') {
-    return { effectiveTokens: heuristicCount, method: 'heuristic', rawTokens: heuristicCount };
+    return {
+      effectiveTokens: heuristicCount,
+      method: 'heuristic',
+      rawTokens: heuristicCount,
+      cacheHit: false,
+    };
   }
 
   // Auto-tier decision: if the heuristic count is well under the cliff,
   // skip the API call. The cutoff fraction (0.5) ensures we never trust
   // the heuristic near the threshold.
   if (mode === 'auto' && heuristicCount < input.inputTokenLimit * HEURISTIC_CUTOFF_FRACTION) {
-    return { effectiveTokens: heuristicCount, method: 'heuristic', rawTokens: heuristicCount };
+    return {
+      effectiveTokens: heuristicCount,
+      method: 'heuristic',
+      rawTokens: heuristicCount,
+      cacheHit: false,
+    };
   }
 
   // Exact mode (or auto + near-cliff). Try the cache first.
@@ -217,6 +261,7 @@ export async function countForPreflight(
       effectiveTokens: cached + SYSTEM_INSTRUCTION_RESERVE,
       method: 'exact',
       rawTokens: cached,
+      cacheHit: true,
     };
   }
 
@@ -233,6 +278,7 @@ export async function countForPreflight(
   // for safety.
   type CountTokensContent = { role: 'user'; parts: Array<{ text: string }> };
   const fileParts: Array<{ text: string }> = [];
+  let assembledBytes = 0;
   for (const file of input.files) {
     let text: string;
     try {
@@ -246,6 +292,26 @@ export async function countForPreflight(
       text = 'a'.repeat(file.size);
     }
     fileParts.push({ text: `// ${file.relpath}\n${text}` });
+    assembledBytes += text.length + file.relpath.length + 4; // `// ` + relpath + `\n` + text
+
+    // Defensive payload-size cap. If we've assembled more than the cap
+    // (today: future-proof against config bumps that lift `maxFileSizeBytes`
+    // or `maxFilesPerWorkspace` past the API's body-size acceptance), abort
+    // tier-2 and fall through to `bytes/3` — a fast heuristic beats a
+    // request that's about to 413. The cap also bounds `'a'.repeat()`
+    // memory pressure on degenerate workspaces.
+    if (assembledBytes > MAX_TIER_2_PAYLOAD_BYTES) {
+      logger.warn(
+        `countTokens preflight payload exceeded ${MAX_TIER_2_PAYLOAD_BYTES} bytes; falling back to heuristic × 1.33 (assembled ${assembledBytes} bytes from ${fileParts.length} of ${input.files.length} files before cap)`,
+      );
+      const fallback = computeFallback(input.files, input.prompt);
+      return {
+        effectiveTokens: fallback,
+        method: 'fallback',
+        rawTokens: fallback,
+        cacheHit: false,
+      };
+    }
   }
   const contents: CountTokensContent[] = [
     { role: 'user', parts: [...fileParts, { text: input.prompt }] },
@@ -255,9 +321,19 @@ export async function countForPreflight(
   // it's available. The Gemini Developer API rejects it on countTokens
   // (probe Q3); the Vertex API accepts it. Rather than branching on auth
   // tier, we accept the undercount and add `SYSTEM_INSTRUCTION_RESERVE`
-  // to the threshold subtractor — uniform behaviour across both tiers.
+  // to the count — uniform behaviour across both tiers.
+  //
+  // The `signal` (when provided by the caller's `timeoutMs`) flows in via
+  // `config.abortSignal` per the SDK's `CountTokensConfig`. Cancellation
+  // propagates as an `AbortError` thrown from the `await` and falls
+  // through to the `bytes/3` graceful-degradation path — same handling as
+  // 429s and network errors.
   try {
-    const response = await client.models.countTokens({ model: input.model, contents });
+    const response = await client.models.countTokens({
+      model: input.model,
+      contents,
+      ...(input.signal !== undefined ? { config: { abortSignal: input.signal } } : {}),
+    });
     const totalTokens = response.totalTokens;
     if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens < 0) {
       // Defensive: countTokens response shape is documented but we've
@@ -268,19 +344,30 @@ export async function countForPreflight(
         `countTokens returned unexpected totalTokens=${safeForLog(totalTokens)} for model=${safeForLog(input.model)}; falling back to heuristic`,
       );
       const fallback = computeFallback(input.files, input.prompt);
-      return { effectiveTokens: fallback, method: 'fallback', rawTokens: fallback };
+      return {
+        effectiveTokens: fallback,
+        method: 'fallback',
+        rawTokens: fallback,
+        cacheHit: false,
+      };
     }
     cache.set(cacheKey, totalTokens);
     return {
       effectiveTokens: totalTokens + SYSTEM_INSTRUCTION_RESERVE,
       method: 'exact',
       rawTokens: totalTokens,
+      cacheHit: false,
     };
   } catch (err) {
     logger.warn(
       `countTokens preflight failed for model=${safeForLog(input.model)}: ${safeForLog(err)} — falling back to heuristic × 1.33 (safety multiplier for the empirical 30-50% CJK undercount)`,
     );
     const fallback = computeFallback(input.files, input.prompt);
-    return { effectiveTokens: fallback, method: 'fallback', rawTokens: fallback };
+    return {
+      effectiveTokens: fallback,
+      method: 'fallback',
+      rawTokens: fallback,
+      cacheHit: false,
+    };
   }
 }

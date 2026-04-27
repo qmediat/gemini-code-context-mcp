@@ -15,7 +15,7 @@ import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
-import { countForPreflight } from '../gemini/token-counter.js';
+import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
@@ -348,10 +348,12 @@ async function executeCodeBody(
     const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
 
     // v1.5.0 preflight (rebuilt v1.10.0 atop countTokens) — mirror of
-    // ask.tool.ts guard. See there for rationale.
+    // ask.tool.ts guard. See there for rationale. Hoisted so the
+    // success-path metadata can surface preflight provenance.
+    let preflight: PreflightTokenResult | undefined;
     const contextWindow = resolved.inputTokenLimit;
     if (typeof contextWindow === 'number' && contextWindow > 0) {
-      const preflight = await countForPreflight(ctx.client, {
+      preflight = await countForPreflight(ctx.client, {
         files: scan.files,
         prompt: input.task,
         model: resolved.resolved,
@@ -363,6 +365,7 @@ async function executeCodeBody(
           : {}),
         ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
         inputTokenLimit: contextWindow,
+        signal: abortSignal,
       });
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
       if (preflight.effectiveTokens > threshold) {
@@ -375,6 +378,7 @@ async function executeCodeBody(
             estimatedInputTokens: preflight.effectiveTokens,
             tokenCountMethod: preflight.method,
             rawTokenCount: preflight.rawTokens,
+            tokenCountCacheHit: preflight.cacheHit,
             contextWindowTokens: contextWindow,
             thresholdTokens: threshold,
             guardRatio: ctx.config.workspaceGuardRatio,
@@ -772,6 +776,15 @@ async function executeCodeBody(
         ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
         : {}),
       inlineOnly: activePrep.inlineOnly,
+      // Preflight token-count provenance — surfaces on every successful
+      // call. See ask.tool.ts for the contract; same fields apply here.
+      ...(preflight !== undefined
+        ? {
+            tokenCountMethod: preflight.method,
+            rawTokenCount: preflight.rawTokens,
+            tokenCountCacheHit: preflight.cacheHit,
+          }
+        : {}),
       ...(thinkingSummary ? { thinkingSummary } : {}),
       ...(executedCode.length > 0 ? { executedCode } : {}),
       ...(executionOutput.length > 0 ? { executionOutput } : {}),
