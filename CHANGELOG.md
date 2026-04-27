@@ -5,6 +5,23 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-04-27
+
+### Added — T6: SIGTERM graceful-drain for in-flight tool calls
+
+Closes the reliability triangle started in v1.5.1 (`withNetworkRetry`) → v1.6.0 (`AbortController` timeout) → v1.7.0 (`generateContentStream` + heartbeat) with the last missing piece: **clean shutdown does not lose in-flight responses**.
+
+- **The MCP server now waits up to 5 s for `tool.execute(...)` calls to settle before tearing down the transport.** Before v1.8.0, `SIGINT` / `SIGTERM` ran `ttlWatcher.stop() → manifest.close() → server.close() → process.exit(0)` immediately. A user mid-`ask` (especially long HIGH-thinking calls of 60-180 s) when Claude Code restarted the server lost the response — Gemini finished the work, billed the user, but the response stream never reached them.
+- **Implementation:** `server.ts` tracks each `CallToolRequestSchema` handler's `tool.execute(...)` promise in an `inFlightCalls: Set<Promise<CallToolResult>>`. The set is `add`-ed on entry and `delete`-d in a `finally` block regardless of resolve / reject path. On shutdown signal, `drainInFlight(inFlightCalls, drainBudgetMs)` races `Promise.allSettled` against a `setTimeout(drainBudgetMs)` — every settled call's response makes it back to the client; abandoned calls are logged at WARN, not silently dropped.
+- **Configurable budget via `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS`.** Default 5000 ms. Range `[0, 60000]` (clamped). Invalid values (non-finite, negative, >60000) emit a startup warning and fall back to default — typo-resistant. Set to `0` to revert to v1.7.x's "exit immediately" behaviour.
+- **`drainInFlight` exported from `src/server.ts`** for unit testability without booting a real server. 6 new test cases in `test/unit/server-drain.test.ts` cover: empty set, all-settled within budget, partial-abandoned timeout, rejected promises (counted as settled), zero budget, negative budget defensive handling.
+
+### Notes
+
+- **Not breaking.** Default behaviour change is "shutdown waits up to 5 s instead of exiting immediately" — strictly more user-friendly. Operators who depend on instant exit (rare) can set `GEMINI_CODE_CONTEXT_SHUTDOWN_DRAIN_MS=0`.
+- **Hard timeout cannot block shutdown.** A hung call (e.g. `generateContent` server-side processing 5 minutes of HIGH thinking and the host already SIGTERM'd) cannot delay process exit beyond `drainBudgetMs`. Same `AbortSignal` client-only caveat from v1.6.0 applies — Gemini may still finish server-side and bill, but our process won't wait for it.
+- Test count: 562 → 568 (+6). Production code: `src/server.ts` only (no tool-level changes).
+
 ## [1.7.3] - 2026-04-26
 
 ### Fixed — /6step adversarial follow-ups on the v1.7.2 fakes-timer cascade fix
