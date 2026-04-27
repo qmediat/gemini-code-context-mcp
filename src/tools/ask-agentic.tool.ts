@@ -48,7 +48,7 @@ import {
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
 import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { SandboxError, resolveInsideWorkspace, resolveWorkspaceRoot } from './agentic/sandbox.js';
 import {
@@ -364,7 +364,7 @@ async function dispatchToolCall(
     // `GEMINI_CODE_CONTEXT_LOG_LEVEL=debug`.
     if (err instanceof SandboxError) {
       logger.debug(
-        `agentic dispatch refused: tool=${name} code=${err.code} requestedPath=${err.requestedPath}`,
+        `agentic dispatch refused: tool=${safeForLog(name)} code=${safeForLog(err.code)} requestedPath=${safeForLog(err.requestedPath)}`,
       );
     }
     return {
@@ -620,7 +620,7 @@ async function executeAskAgenticBody(
           try {
             ctx.manifest.cancelBudgetReservation(reservationId);
           } catch (cancelErr) {
-            logger.error(`ask_agentic: cancelBudgetReservation failed: ${String(cancelErr)}`);
+            logger.error(`ask_agentic: cancelBudgetReservation failed: ${safeForLog(cancelErr)}`);
           }
         }
         if (throttleReservationId !== -1) {
@@ -770,7 +770,7 @@ async function executeAskAgenticBody(
       },
     );
   } catch (err) {
-    logger.error(`ask_agentic failed: ${String(err)}`);
+    logger.error(`ask_agentic failed: ${safeForLog(err)}`);
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',

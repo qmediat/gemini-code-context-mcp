@@ -8,7 +8,7 @@
 
 import type { GoogleGenAI } from '@google/genai';
 import type { ManifestDb } from '../manifest/db.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 
 const TICK_MS = 5 * 60 * 1000; // 5 minutes
 const HOT_WINDOW_MS = 10 * 60 * 1000; // used in last 10 minutes
@@ -95,7 +95,7 @@ export class TtlWatcher {
           });
           const newExpires = now + entry.ttlSeconds * 1000;
           this.manifest.upsertWorkspace({ ...ws, cacheExpiresAt: newExpires, updatedAt: now });
-          logger.debug(`refreshed TTL for ${entry.cacheId}`);
+          logger.debug(`refreshed TTL for ${safeForLog(entry.cacheId)}`);
         } catch (err) {
           // Evict the entry when Gemini reports the cache is gone (deleted
           // externally, admin quota action, etc). Without this, we'd retry
@@ -112,7 +112,7 @@ export class TtlWatcher {
               updatedAt: now,
             });
           } else {
-            logger.debug(`ttl refresh failed for ${entry.cacheId}: ${String(err)}`);
+            logger.debug(`ttl refresh failed for ${safeForLog(entry.cacheId)}: ${safeForLog(err)}`);
           }
         }
       }

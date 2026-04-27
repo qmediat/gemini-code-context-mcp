@@ -31,7 +31,7 @@ import {
   errorResult,
 } from './tools/registry.js';
 import { createTpmThrottle } from './tools/shared/throttle.js';
-import { logger } from './utils/logger.js';
+import { logger, safeForLog } from './utils/logger.js';
 
 import { readFileSync } from 'node:fs';
 import { dirname as pathDirname, join as pathJoin } from 'node:path';
@@ -199,7 +199,7 @@ export async function runServer(): Promise<void> {
         return result as CallToolResult;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        logger.error(`tool '${name}' threw: ${message}`);
+        logger.error(`tool '${safeForLog(name)}' threw: ${safeForLog(message)}`);
         return errorResult(`${name} threw: ${message}`) as CallToolResult;
       }
     })();

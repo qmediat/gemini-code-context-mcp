@@ -23,7 +23,7 @@ import type { Content, GoogleGenAI, Part } from '@google/genai';
 import type { ScanResult } from '../indexer/workspace-scanner.js';
 import type { ManifestDb } from '../manifest/db.js';
 import type { ResolvedModel, WorkspaceRow } from '../types.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 import type { ProgressEmitter } from '../utils/progress.js';
 import { type UploadResult, uploadWorkspaceFiles } from './files-uploader.js';
 
@@ -169,7 +169,7 @@ async function buildInlineContentFromDisk(scan: ScanResult): Promise<Content[]> 
     try {
       content = await readFile(f.absolutePath, 'utf8');
     } catch (err) {
-      logger.warn(`failed to read ${f.relpath}: ${String(err)}`);
+      logger.warn(`failed to read ${safeForLog(f.relpath)}: ${safeForLog(err)}`);
       continue;
     }
     parts.push({ text: `\n\n--- FILE: ${f.relpath} ---\n${content}\n` });
@@ -278,7 +278,7 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   //    Google's side). Reordering from the previous build->reuse order was
   //    flagged by GPT review.
   if (isUsableExistingCache(existing, scan, model, systemPromptHash, now)) {
-    logger.debug(`cache hit: ${existing?.cacheId}`);
+    logger.debug(`cache hit: ${safeForLog(existing?.cacheId)}`);
     return {
       cacheId: existing?.cacheId ?? null,
       cacheExpiresAt: existing?.cacheExpiresAt ?? null,
@@ -361,9 +361,11 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   if (existing?.cacheId) {
     try {
       await client.caches.delete({ name: existing.cacheId });
-      logger.debug(`deleted stale cache ${existing.cacheId} before rebuild`);
+      logger.debug(`deleted stale cache ${safeForLog(existing.cacheId)} before rebuild`);
     } catch (err) {
-      logger.debug(`pre-rebuild cache delete (${existing.cacheId}) failed: ${String(err)}`);
+      logger.debug(
+        `pre-rebuild cache delete (${safeForLog(existing.cacheId)}) failed: ${safeForLog(err)}`,
+      );
     }
   }
 
@@ -413,7 +415,7 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       inlineOnly: false,
     };
   } catch (err) {
-    logger.warn(`cache build failed — falling back to inline parts: ${String(err)}`);
+    logger.warn(`cache build failed — falling back to inline parts: ${safeForLog(err)}`);
     manifest.upsertWorkspace({
       workspaceRoot: scan.workspaceRoot,
       filesHash: scan.filesHash,
@@ -463,7 +465,7 @@ export async function invalidateWorkspaceCache(args: {
     try {
       await args.client.caches.delete({ name: ws.cacheId });
     } catch (err) {
-      logger.debug(`cache delete (${ws.cacheId}) failed: ${String(err)}`);
+      logger.debug(`cache delete (${safeForLog(ws.cacheId)}) failed: ${safeForLog(err)}`);
     }
   }
 
@@ -502,7 +504,9 @@ export async function invalidateWorkspaceCache(args: {
           try {
             await args.client.files.delete({ name: deleteName });
           } catch (err) {
-            logger.debug(`files.delete (${deleteName}, stored as ${id}) failed: ${String(err)}`);
+            logger.debug(
+              `files.delete (${safeForLog(deleteName)}, stored as ${safeForLog(id)}) failed: ${safeForLog(err)}`,
+            );
           }
         }
       }),

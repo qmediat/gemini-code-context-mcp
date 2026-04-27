@@ -21,7 +21,7 @@ import {
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
-import { logger } from '../utils/logger.js';
+import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
@@ -753,7 +753,7 @@ async function executeCodeBody(
 
     return textResult(text, structured);
   } catch (err) {
-    logger.error(`code failed: ${String(err)}`);
+    logger.error(`code failed: ${safeForLog(err)}`);
     // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
     // bodies, gated on `isGemini429` (ApiError instance + status===429)
     // to prevent hint-poisoning. Mirror of ask.tool.ts — see there for
