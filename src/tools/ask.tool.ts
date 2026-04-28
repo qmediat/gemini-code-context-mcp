@@ -419,17 +419,30 @@ async function executeAskBody(
           // collapse both knobs onto the per-iteration cap and use the
           // TIGHTER of the two as the bound. The CHANGELOG documents the
           // semantic divergence on `timeoutMs` (total → per-iteration).
-          const tightestPerIterCap = ((): number | undefined => {
+          //
+          // v1.12.2 — `iterTimeoutSource` is surfaced in metadata AND emitted
+          // in the warn-log so users can see WHICH knob bound their call
+          // (one of: 'timeoutMs', 'stallMs', or 'min(timeoutMs,stallMs)').
+          // Pre-v1.12.2 the log only fired when stallMs was set alone; the
+          // both-set case had no signal explaining the pick.
+          const iterTimeoutPick = ((): {
+            cap: number | undefined;
+            source: 'timeoutMs' | 'stallMs' | 'min(timeoutMs,stallMs)' | 'none';
+          } => {
             const a = input.timeoutMs;
             const b = input.stallMs;
-            if (a !== undefined && b !== undefined) return Math.min(a, b);
-            if (a !== undefined) return a;
-            if (b !== undefined) return b;
-            return undefined;
+            if (a !== undefined && b !== undefined) {
+              const cap = Math.min(a, b);
+              return { cap, source: 'min(timeoutMs,stallMs)' };
+            }
+            if (a !== undefined) return { cap: a, source: 'timeoutMs' };
+            if (b !== undefined) return { cap: b, source: 'stallMs' };
+            return { cap: undefined, source: 'none' };
           })();
-          if (input.stallMs !== undefined && input.timeoutMs === undefined) {
+          const tightestPerIterCap = iterTimeoutPick.cap;
+          if (iterTimeoutPick.source !== 'none') {
             logger.warn(
-              `ask: fallback to ask_agentic — \`stallMs\` (${input.stallMs}ms) translated to \`iterationTimeoutMs\` since the agentic loop uses non-streaming generateContent (no chunk stream to reset on). To preserve the original semantics, set \`timeoutMs\` instead on calls that may fall back.`,
+              `ask: fallback to ask_agentic — \`iterationTimeoutMs\` set to ${tightestPerIterCap}ms (source: ${iterTimeoutPick.source}). The agentic loop uses non-streaming \`generateContent\` so there's no chunk stream to reset on; \`stallMs\` (when set) is treated as a per-iteration wall-clock cap, the same way \`timeoutMs\` is. Total wall-clock for the agentic call can reach \`maxIterations × iterationTimeoutMs\`.`,
             );
           }
           const agenticInput: AskAgenticInput = {
@@ -495,6 +508,17 @@ async function executeAskBody(
               cacheHit: preflight.cacheHit,
               rawTokens: preflight.rawTokens,
             },
+            // v1.12.2 — surface the per-iteration cap selection so callers
+            // can audit which knob bound the fallback call. Useful when the
+            // user passed both `timeoutMs` and `stallMs` (we use the tighter
+            // of the two — `iterTimeoutSource: 'min(timeoutMs,stallMs)'`).
+            // Omitted when neither knob was set (`source: 'none'`).
+            ...(iterTimeoutPick.source !== 'none'
+              ? {
+                  iterTimeoutMs: tightestPerIterCap,
+                  iterTimeoutSource: iterTimeoutPick.source,
+                }
+              : {}),
             // Lift top-level error metadata from the agentic call's
             // structuredContent so orchestrator policies (e.g. retry on
             // BUDGET_EXHAUSTED, retry on stall but not total) keep working

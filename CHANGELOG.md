@@ -5,6 +5,32 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.2] - 2026-04-28
+
+### Added — observability for the `ask` → `ask_agentic` fallback timeout selection
+
+When `ask` falls back to `ask_agentic` on `WORKSPACE_TOO_LARGE`, both `timeoutMs` and `stallMs` collapse onto the agentic per-iteration cap (`iterationTimeoutMs`) using the tighter of the two. v1.12.2 makes this selection visible to operators and orchestrators:
+
+- A warn-level log line now fires whenever fallback applies a per-iteration cap, identifying the chosen value AND the source (one of `'timeoutMs'`, `'stallMs'`, or `'min(timeoutMs,stallMs)'`). Pre-v1.12.2 the log fired only when `stallMs` alone was set — the both-set case was silent.
+- The wrapped `structuredContent` on a fallback-served response now includes two new fields:
+  - `iterTimeoutMs: number` — the effective per-iteration cap used by the agentic call.
+  - `iterTimeoutSource: 'timeoutMs' | 'stallMs' | 'min(timeoutMs,stallMs)'` — which knob the cap came from.
+
+Both fields are omitted when the user passed neither `timeoutMs` nor `stallMs` (no per-iteration cap was set). No schema changes; metadata is additive on the existing `structuredContent` envelope.
+
+### Fixed — test coverage for the v1.12.1 abort-propagation hardening
+
+The v1.12.1 patch added pre-flight, mid-pool, and post-pool abort checks in `uploadWorkspaceFiles` (closing the Copilot COP-2 finding where `runPool`'s settled-results pattern silently swallowed per-task abort throws). The fix shipped without unit tests covering those code paths; v1.12.2 adds three pin tests so future regressions are caught:
+
+- **Pre-flight short-circuit**: when `signal` is already aborted before `uploadWorkspaceFiles` is invoked, the function rejects with `signal.reason` and never calls `client.files.upload`.
+- **Post-`runPool` abort propagation**: when abort fires mid-pool (during a per-task upload), the post-pool abort check re-throws the canonical `signal.reason` (e.g. a `TimeoutError` `DOMException` carrying `timeoutKind: 'total'`) so the outer tool layer maps it to `errorCode: 'TIMEOUT'`. Previously this case bypassed the test suite entirely.
+- **Defensive non-Error reason fallback**: when `controller.abort('string-reason')` is used, the post-pool block falls back to a synthetic `DOMException('Operation aborted during file upload', 'AbortError')` instead of throwing a bare string.
+
+### Notes
+
+- Patch-level release. No breaking changes. No schema changes. The new metadata fields on the fallback `structuredContent` are additive.
+- The three new test pins bring `test/unit/files-uploader.test.ts` to 11 tests.
+
 ## [1.12.1] - 2026-04-28
 
 ### Fixed — cumulative-review hardening across Phase 2+3+4
