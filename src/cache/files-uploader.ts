@@ -214,11 +214,28 @@ export async function uploadWorkspaceFiles(args: {
     emitProgress(entry.file.relpath);
   }).then((settled) => {
     // Collect failures after the pool finishes — don't lose the mapping to files.
+    //
+    // v1.13.0 post-review (FN3, gemini P1): abort-induced rejections are NOT
+    // genuine upload failures — they're cooperative bail-outs from the per-task
+    // abort guard at the top of the worker. Treating them as "failed" pollutes
+    // stderr with N-completed warns AND inflates `failures`, both of which
+    // mislead the user before the post-pool re-throw at line ~246 surfaces the
+    // real `signal.reason` (typically a TimeoutError that maps to
+    // `errorCode: 'TIMEOUT'`). On a 400-file repo with concurrency 10 and an
+    // abort fired at completed=12, this could spew ~388 warn lines.
+    const aborted = signal?.aborted === true;
     for (let i = 0; i < settled.length; i += 1) {
       const r = settled[i];
       const file = files[i];
       if (r?.status === 'rejected' && file) {
-        const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        const reason = r.reason;
+        if (
+          aborted &&
+          (reason === signal?.reason || (reason instanceof Error && reason.name === 'AbortError'))
+        ) {
+          continue;
+        }
+        const message = reason instanceof Error ? reason.message : String(reason);
         logger.warn(`upload failed for ${safeForLog(file.relpath)}: ${safeForLog(message)}`);
         failures.push({ relpath: file.relpath, error: message });
       }

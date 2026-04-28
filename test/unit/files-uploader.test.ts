@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { uploadWorkspaceFiles } from '../../src/cache/files-uploader.js';
 import type { ScannedFile } from '../../src/indexer/workspace-scanner.js';
 import { ManifestDb } from '../../src/manifest/db.js';
+import { logger } from '../../src/utils/logger.js';
 import type { ProgressEmitter } from '../../src/utils/progress.js';
 
 function mkEmitter(): ProgressEmitter {
@@ -440,5 +441,103 @@ describe('uploadWorkspaceFiles', () => {
         signal: controller.signal,
       }),
     ).rejects.toThrow(/Operation aborted/);
+  });
+
+  // v1.13.0 round-2 (FN3, gemini P1): mid-pool aborts must NOT spam
+  // `logger.warn('upload failed for X')` for every queued task that didn't
+  // start. Pre-fix a 100-file workspace aborted at completed=10 produced
+  // ~90 misleading warns before the post-pool guard re-threw signal.reason.
+  it('FN3 fix: mid-pool abort suppresses per-task warn-log + failures-collection spam', async () => {
+    let uploadCount = 0;
+    const controller = new AbortController();
+    const canonicalReason = new DOMException('Timed out', 'TimeoutError');
+    Object.assign(canonicalReason, { timeoutKind: 'total' as const });
+
+    const upload = vi.fn(async (_params: unknown) => {
+      uploadCount += 1;
+      if (uploadCount === 1) {
+        controller.abort(canonicalReason);
+      }
+      return { uri: `https://example.invalid/files/${uploadCount}` };
+    });
+    const client = mkClient(upload);
+
+    // 30 files, concurrency 1 — first upload fires abort, remaining ~29 hit
+    // the per-task guard. Pre-fix: 29 warns. Post-fix: 0 warns.
+    const files = Array.from({ length: 30 }, (_, i) => {
+      const f = join(tmp, `spam${i}.ts`);
+      writeFileSync(f, String(i));
+      return mkScanned(`spam${i}.ts`, `spam${i}`, f);
+    });
+
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    await expect(
+      uploadWorkspaceFiles({
+        client,
+        manifest: db,
+        workspaceRoot,
+        files,
+        emitter: mkEmitter(),
+        concurrency: 1,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(canonicalReason);
+
+    // CORE assertion: zero "upload failed" warns from abort-induced rejections.
+    const uploadFailedWarns = warnSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((msg) => msg.startsWith('upload failed for '));
+    expect(uploadFailedWarns).toHaveLength(0);
+
+    warnSpy.mockRestore();
+  });
+
+  // FN3 follow-up: discrimination must NOT swallow GENUINE upload failures
+  // when the signal is also aborted. (Edge case: an upload throws a
+  // legitimate 5xx Error AT THE SAME TIME the user aborts — we still want
+  // to know about the network failure.) The current discrimination keys on
+  // `reason === signal.reason || reason.name === 'AbortError'` so a real
+  // `Error('500 server error')` survives.
+  it('FN3 discrimination: genuine non-abort upload errors still surface as warns', async () => {
+    const controller = new AbortController();
+
+    const upload = vi.fn(async (params: unknown) => {
+      const file = (params as { file: string }).file;
+      if (file.endsWith('boom.ts')) {
+        throw new Error('500 internal server error');
+      }
+      return { uri: `https://example.invalid/files/${file}` };
+    });
+    const client = mkClient(upload);
+
+    const files = [
+      mkScanned('ok.ts', 'ok', join(tmp, 'ok.ts')),
+      mkScanned('boom.ts', 'boom', join(tmp, 'boom.ts')),
+    ];
+    writeFileSync(join(tmp, 'ok.ts'), 'ok');
+    writeFileSync(join(tmp, 'boom.ts'), 'boom');
+
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    // No abort fires here — pure upload failure path.
+    const result = await uploadWorkspaceFiles({
+      client,
+      manifest: db,
+      workspaceRoot,
+      files,
+      emitter: mkEmitter(),
+      concurrency: 1,
+      signal: controller.signal,
+    });
+
+    expect(result.failedCount).toBe(1);
+    expect(result.failures[0]?.relpath).toBe('boom.ts');
+    const uploadFailedWarns = warnSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((msg) => msg.startsWith('upload failed for boom.ts'));
+    expect(uploadFailedWarns.length).toBe(1);
+
+    warnSpy.mockRestore();
   });
 });

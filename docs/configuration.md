@@ -81,11 +81,12 @@ The stream collector preserves all existing behaviour — `text`, `usageMetadata
 
 The new `cachingMode` field surfaces a `caching` block on `status` so operators can see how their workspace is being served:
 
-- `caching.mode` — dominant caching strategy in the last 24 h (`"explicit"` / `"implicit"` / `"mixed"` / `null`).
+- `caching.mode` — dominant caching strategy in the last 24 h (`"explicit"` / `"implicit"` / `"inline"` / `"mixed"` / `null`).
 - `caching.callCount` — `ask` + `code` calls in the window. `ask_agentic` is excluded from this aggregation (it doesn't use a workspace cache); `cache.create` infrastructure rows are tallied separately under `explicitRebuildCount`.
 - `caching.implicitCallsTotal` / `caching.implicitCallsWithHit` — coverage-style hit rate at the call level (Gemini's automatic implicit cache fired at all on this call vs not at all).
 - `caching.implicitHitRate` — token-weighted hit rate: `cachedContentTokenCount / (cachedContentTokenCount + uncachedTokens)` across implicit-mode calls. The status tool's human text renders this as a percentage and warns inline if it's < 50 %.
 - `caching.explicitRebuildCount` — number of `caches.create` calls that fired in the window. The v1.13.0 implicit-mode pivot's whole point is to drive this number toward zero for review→edit→review workflows.
+- `caching.inlineCallCount` *(v1.13.0 round-2 FN2 fix)* — number of forced-inline calls in the window. A forced-inline call is one that user requested as `'explicit'` but the runtime forbade caching for (e.g. `code({ codeExecution: true })` — Gemini rejects `cachedContent` + `tools` simultaneously, so the cache build is skipped). Tracked separately so the implicit-adoption telemetry isn't polluted by codeExecution traffic. The status tool prints `forced-inline calls: N` when non-zero.
 
 The block is hidden when there are no calls in the window — fresh installs / unused workspaces don't see noise.
 

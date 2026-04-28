@@ -93,10 +93,12 @@ export const statusTool: ToolDefinition<StatusInput> = {
         },
         // v1.13.0+: caching telemetry over the last 24 h. `mode` summarises
         // dominant caching strategy in use (`'explicit'` | `'implicit'` |
-        // `'mixed'` | `null` if no calls). `implicitHitRate` is the share of
-        // input tokens served from Gemini's automatic implicit cache on
-        // implicit-mode calls — operators tracking the v1.14.0 default-flip
-        // gate watch this number.
+        // `'inline'` | `'mixed'` | `null` if no calls). `implicitHitRate` is
+        // the share of input tokens served from Gemini's automatic implicit
+        // cache on implicit-mode calls — operators tracking the v1.14.0
+        // default-flip gate watch this number. `inlineCallCount` (round-2 FN2
+        // fix) surfaces forced-inline calls separately from `'explicit'` so
+        // codeExecution traffic doesn't bias the explicit-adoption metric.
         caching: {
           mode: cacheStats.mode,
           callCount: cacheStats.callCount,
@@ -106,6 +108,7 @@ export const statusTool: ToolDefinition<StatusInput> = {
           implicitCachedTokens: cacheStats.implicitCachedTokens,
           implicitUncachedTokens: cacheStats.implicitUncachedTokens,
           explicitRebuildCount: cacheStats.explicitRebuildCount,
+          inlineCallCount: cacheStats.inlineCallCount,
         },
       };
 
@@ -142,6 +145,12 @@ export const statusTool: ToolDefinition<StatusInput> = {
         }
         if (cacheStats.explicitRebuildCount > 0) {
           cachingLines.push(`  explicit rebuilds: ${cacheStats.explicitRebuildCount}`);
+        }
+        if (cacheStats.inlineCallCount > 0) {
+          // v1.13.0 round-2 FN2: forced-inline calls (e.g. codeExecution).
+          // Surface separately so operators understand why explicit-call
+          // count > explicit-rebuild count when codeExecution is in use.
+          cachingLines.push(`  forced-inline calls: ${cacheStats.inlineCallCount}`);
         }
       }
 

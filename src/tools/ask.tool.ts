@@ -640,11 +640,13 @@ async function executeAskBody(
       .digest('hex')
       .slice(0, 16);
 
-    // v1.13.0 — record the resolved caching mode for telemetry. Defaults to
-    // `'explicit'` so pre-1.13 behaviour is unchanged. The status tool's
-    // `cacheStatsLast24h` aggregation reads this column to compute
-    // implicit-cache hit rate, dominant mode, and rebuild count.
-    const effectiveCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
+    // v1.13.0 — caching mode the user requested. The ACTUAL mode that lands
+    // in telemetry is computed AFTER `prepareContext` returns, derived from
+    // `activePrep.inlineOnly` so forced-inline flows (workspace below
+    // cacheMinTokens, allowCaching=false from `noCache`) are recorded as
+    // `'inline'` instead of being conflated with explicit-cache adoption.
+    // FN2 fix from /6step round-2 review.
+    const requestedCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
 
     const ctxPrep = await prepareContext({
       client: ctx.client,
@@ -945,6 +947,16 @@ async function executeAskBody(
       thinkingTokens: thinking,
     });
     const costMicros = toMicrosUsd(cost);
+
+    // v1.13.0 round-2 (FN2 fix): see code.tool.ts for the full rationale.
+    // - cacheId !== null      → 'explicit'
+    // - inlineOnly && implicit-requested → 'implicit'
+    // - inlineOnly && other   → 'inline' (forced — noCache, below cacheMinTokens)
+    const effectiveCachingMode: 'explicit' | 'implicit' | 'inline' = activePrep.inlineOnly
+      ? requestedCachingMode === 'implicit'
+        ? 'implicit'
+        : 'inline'
+      : 'explicit';
 
     const durationMs = Date.now() - started;
     if (reservationId !== null) {

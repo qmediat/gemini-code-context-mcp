@@ -410,6 +410,72 @@ describe('ManifestDb', () => {
       expect(rows[0]?.size ?? null).toBeNull();
     });
 
+    it('records cachingMode="inline" distinctly from "explicit" (FN2 round-2 fix)', () => {
+      // codeExecution forces inline path even when user requested explicit;
+      // pre-fix we tagged those rows as 'explicit', biasing the v1.14.0
+      // default-flip telemetry. Post-fix the tools record the actual outcome.
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'code',
+        model: 'gemini-3-pro-preview',
+        cachedTokens: 0,
+        uncachedTokens: 5_000,
+        costUsdMicro: 5_000,
+        durationMs: 1_500,
+        occurredAt: t,
+        cachingMode: 'inline',
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.mode).toBe('inline');
+      expect(cs.inlineCallCount).toBe(1);
+      // Inline calls are NOT counted as explicit calls (would skew adoption %).
+      expect(cs.implicitCallsTotal).toBe(0);
+    });
+
+    it('mode = "mixed" when explicit + implicit + inline all appear (FN2)', () => {
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'explicit',
+      });
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'implicit',
+        cachedContentTokenCount: 800,
+      });
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'code',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'inline',
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.mode).toBe('mixed');
+      expect(cs.callCount).toBe(3);
+      expect(cs.implicitCallsTotal).toBe(1);
+      expect(cs.inlineCallCount).toBe(1);
+    });
+
     it('records cachingMode + cachedContentTokenCount via insertUsageMetric', () => {
       const t = Date.now();
       db.insertUsageMetric({

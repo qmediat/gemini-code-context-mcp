@@ -224,6 +224,47 @@ export class ManifestDb {
     return rows.map(rowToFile);
   }
 
+  /**
+   * v1.13.0+ memo-seeder. Used by `prepareContext`'s inline / implicit /
+   * small-workspace branches — those paths skip the uploader entirely (which
+   * is the only writer of `upsertFile`), so without this the scan memo would
+   * silently degrade to cold every call (every file re-hashes — defeating
+   * the v1.13.0 perf headline).
+   *
+   * Crucially this method **does not touch** `file_id` / `uploaded_at` /
+   * `expires_at` on conflict — those are populated only by genuine uploads
+   * via `uploadWorkspaceFiles`, and a later switch back to `cachingMode:
+   * 'explicit'` should be able to reuse a still-fresh upload from a prior
+   * explicit run. Touching them here would orphan that capability.
+   */
+  refreshFileFingerprints(
+    rows: ReadonlyArray<{
+      workspaceRoot: string;
+      relpath: string;
+      contentHash: string;
+      mtimeMs: number;
+      size: number;
+    }>,
+  ): void {
+    if (rows.length === 0) return;
+    const stmt = this.db.prepare(
+      `INSERT INTO files(
+         workspace_root, relpath, content_hash, file_id, uploaded_at, expires_at,
+         mtime_ms, size
+       ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
+       ON CONFLICT(workspace_root, relpath) DO UPDATE SET
+         content_hash = excluded.content_hash,
+         mtime_ms = excluded.mtime_ms,
+         size = excluded.size`,
+    );
+    const tx = this.db.transaction((batch: ReadonlyArray<(typeof rows)[number]>): void => {
+      for (const r of batch) {
+        stmt.run(r.workspaceRoot, r.relpath, r.contentHash, r.mtimeMs, r.size);
+      }
+    });
+    tx(rows);
+  }
+
   upsertFile(file: FileRow): void {
     this.db
       .prepare(
@@ -384,8 +425,14 @@ export class ManifestDb {
       uncachedTokens: number;
       costUsdMicro: number;
       durationMs: number;
-      /** v1.13.0+: caching mode used for the call (`'explicit'` / `'implicit'`). */
-      cachingMode?: 'explicit' | 'implicit' | null;
+      /**
+       * v1.13.0+: caching mode used for the call. `'inline'` is the
+       * forced-inline outcome (e.g. `code({ codeExecution: true })`), added in
+       * the v1.13.0 round-2 review fix (FN2) so telemetry distinguishes
+       * "user asked for explicit and got it" from "user asked for explicit but
+       * the runtime forced inline".
+       */
+      cachingMode?: 'explicit' | 'implicit' | 'inline' | null;
       /** v1.13.0+: `usage_metadata.cachedContentTokenCount` from the Gemini response. */
       cachedContentTokenCount?: number | null;
     },
@@ -529,15 +576,22 @@ export class ManifestDb {
    * `mode` is the dominant caching mode in the window:
    *   - `'explicit'` if all metric rows used explicit (or no caching mode set)
    *   - `'implicit'` if all metric rows used implicit
-   *   - `'mixed'`    if both modes appear (operator changed defaults mid-day,
-   *                  or per-call override in use)
+   *   - `'inline'`   if all metric rows used the forced-inline path (e.g.
+   *                  `code({ codeExecution: true })` — the user requested
+   *                  explicit but the runtime forbade `cachedContent` + tools
+   *                  simultaneously). Distinguished from `'explicit'` so the
+   *                  v1.14.0 default-flip telemetry isn't biased toward
+   *                  "explicit adoption" by codeExecution traffic.
+   *   - `'mixed'`    if 2+ of the above modes appear (operator changed
+   *                  defaults mid-day, codeExecution + non-codeExecution
+   *                  traffic, etc.)
    *   - `null`       if no calls in the window
    *
    * Rows older than v1.13.0 lack `caching_mode` (NULL) and are treated as
    * `'explicit'` for the dominant-mode tally.
    */
   cacheStatsLast24h(nowMs: number): {
-    mode: 'explicit' | 'implicit' | 'mixed' | null;
+    mode: 'explicit' | 'implicit' | 'inline' | 'mixed' | null;
     callCount: number;
     implicitCallsTotal: number;
     implicitCallsWithHit: number;
@@ -545,6 +599,11 @@ export class ManifestDb {
     implicitUncachedTokens: number;
     implicitHitRate: number;
     explicitRebuildCount: number;
+    /** v1.13.0 round-2 (FN2 fix): forced-inline call count. Useful for
+     *  understanding why explicit-rebuild count differs from explicit-call
+     *  count (codeExecution calls request explicit, get inline, never trigger
+     *  caches.create). */
+    inlineCallCount: number;
   } {
     const since = nowMs - 24 * 3600 * 1000;
     // Restricted to `ask` + `code` rows: those are the calls that flow through
@@ -558,6 +617,7 @@ export class ManifestDb {
            COUNT(*) AS call_count,
            COALESCE(SUM(CASE WHEN COALESCE(caching_mode, 'explicit') = 'explicit' THEN 1 ELSE 0 END), 0) AS explicit_count,
            COALESCE(SUM(CASE WHEN caching_mode = 'implicit' THEN 1 ELSE 0 END), 0) AS implicit_count,
+           COALESCE(SUM(CASE WHEN caching_mode = 'inline' THEN 1 ELSE 0 END), 0) AS inline_count,
            COALESCE(SUM(CASE WHEN caching_mode = 'implicit' AND COALESCE(cached_content_token_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS implicit_hit_count,
            COALESCE(SUM(CASE WHEN caching_mode = 'implicit' THEN cached_content_token_count ELSE 0 END), 0) AS implicit_cached_tokens,
            COALESCE(SUM(CASE WHEN caching_mode = 'implicit' THEN uncached_tokens ELSE 0 END), 0) AS implicit_uncached_tokens
@@ -569,6 +629,7 @@ export class ManifestDb {
       call_count: number;
       explicit_count: number;
       implicit_count: number;
+      inline_count: number;
       implicit_hit_count: number;
       implicit_cached_tokens: number;
       implicit_uncached_tokens: number;
@@ -585,10 +646,18 @@ export class ManifestDb {
       )
       .get(since) as { n: number };
 
-    let mode: 'explicit' | 'implicit' | 'mixed' | null;
+    // Dominant mode: 'mixed' if 2+ of the three actual modes appear; else the
+    // one mode that did. v1.13.0 round-2 (FN2 fix) widened this to include
+    // 'inline' alongside 'explicit' / 'implicit'.
+    const explicitN = row.explicit_count;
+    const implicitN = row.implicit_count;
+    const inlineN = row.inline_count;
+    const presentModes = [explicitN > 0, implicitN > 0, inlineN > 0].filter(Boolean).length;
+    let mode: 'explicit' | 'implicit' | 'inline' | 'mixed' | null;
     if (row.call_count === 0) mode = null;
-    else if (row.explicit_count > 0 && row.implicit_count > 0) mode = 'mixed';
-    else if (row.implicit_count > 0) mode = 'implicit';
+    else if (presentModes >= 2) mode = 'mixed';
+    else if (implicitN > 0) mode = 'implicit';
+    else if (inlineN > 0) mode = 'inline';
     else mode = 'explicit';
 
     const denom = row.implicit_cached_tokens + row.implicit_uncached_tokens;
@@ -603,6 +672,7 @@ export class ManifestDb {
       implicitUncachedTokens: row.implicit_uncached_tokens,
       implicitHitRate,
       explicitRebuildCount: rebuilds.n,
+      inlineCallCount: row.inline_count,
     };
   }
 }

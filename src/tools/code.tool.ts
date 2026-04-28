@@ -453,12 +453,11 @@ async function executeCodeBody(
       .digest('hex')
       .slice(0, 16);
 
-    // v1.13.0 — telemetry: record the caching mode the user requested.
-    // `code` currently always falls back to inline content when codeExecution
-    // is enabled (Gemini rejects cachedContent + tools), but the user-stated
-    // preference is what we record so the status tool can compare modes
-    // apples-to-apples across `ask` and `code` calls.
-    const effectiveCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
+    // v1.13.0 — caching mode the user requested (used by `prepareContext`).
+    // The ACTUAL mode that ends up in telemetry is derived later from
+    // `activePrep.inlineOnly` + `activePrep.cacheId` so codeExecution-forced
+    // inline calls don't get tagged as `'explicit'` (FN2 review fix).
+    const requestedCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
 
     const ctxPrep = await prepareContext({
       client: ctx.client,
@@ -742,6 +741,20 @@ async function executeCodeBody(
       thinkingTokens: thinking,
     });
     const costMicros = toMicrosUsd(cost);
+
+    // v1.13.0 round-2 (FN2 fix): compute the ACTUAL caching mode for telemetry.
+    // - `cacheId !== null`               → caches.create resolved → 'explicit'
+    // - `inlineOnly && requested implicit` → 'implicit' (intended Gemini auto-cache path)
+    // - `inlineOnly && other`             → 'inline' (forced — codeExecution incompatibility,
+    //                                       below cacheMinTokens, allowCaching=false)
+    // The earlier code recorded `requestedCachingMode` directly, which inflated
+    // 'explicit' counts for every codeExecution call (those force inline but never
+    // build a cache). Now the v1.14.0 default-flip telemetry isn't biased.
+    const effectiveCachingMode: 'explicit' | 'implicit' | 'inline' = activePrep.inlineOnly
+      ? requestedCachingMode === 'implicit'
+        ? 'implicit'
+        : 'inline'
+      : 'explicit';
 
     const durationMs = Date.now() - started;
     if (reservationId !== null) {

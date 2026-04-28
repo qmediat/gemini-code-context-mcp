@@ -86,10 +86,16 @@ export interface UsageMetricRow {
    * - `'explicit'`: Gemini Context Cache built/reused via `caches.create`.
    * - `'implicit'`: skipped explicit cache; content sent inline; relies on
    *   Gemini 2.5+/3 Pro's automatic implicit caching.
+   * - `'inline'`: forced-inline path — caller requested explicit but
+   *   `prepareContext` couldn't honour it (e.g. `code({ codeExecution: true })`
+   *   forbids `cachedContent` + `tools` simultaneously, or the workspace was
+   *   below `cacheMinTokens`). Recorded distinctly so the implicit-cache
+   *   adoption telemetry (FN2 fix in v1.13.0 round-2) doesn't double-count
+   *   forced-inline calls as `'explicit'`.
    * - `null`: rows written before v1.13.0 (no caching-mode column) — treated
    *   as `'explicit'` for backwards-compat aggregations.
    */
-  cachingMode?: 'explicit' | 'implicit' | null;
+  cachingMode?: 'explicit' | 'implicit' | 'inline' | null;
   /**
    * Tokens served from Gemini's cache (explicit OR implicit) on this call,
    * as reported by `usage_metadata.cachedContentTokenCount` (v1.13.0+).

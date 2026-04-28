@@ -215,3 +215,28 @@ Any `TypeError` whose message is outside this list is routed to `operation.stop(
 **Impact today:** None for users running v1.5.1+ — `withNetworkRetry` covers the gap. Older releases would drop a long `ask_agentic` run on a single transient network blip (empirical ~18–26 % per invocation at 20–30 iterations with 1 % per-call transient rate).
 
 **Revisit trigger:** `@google/genai` bumps its `p-retry` dependency to 6.x (which uses the `is-network-error` package and recognises Node undici errors natively). At that point the app-layer retry can be narrowed — either to HTTP status codes the SDK still misses, or removed entirely. Track upstream via `@google/genai` release notes.
+
+---
+
+## v1.13.0 scan memo: `(mtime_ms, size)` collision on atomic file replace **WATCH**
+
+**Source:** PR #45 / 6step round-2 review, finding FN6 (Grok P1 PARTIAL).
+
+**Status:** Identified in review, escape hatch documented, full fix deferred behind operator-reported demand.
+
+**What is the issue?** The v1.13.0 scan memo at `src/indexer/workspace-scanner.ts:182-189` keys per-file fingerprints on `(mtime_ms, size)`. Both must match the previously-stored values for the scanner to reuse the cached `content_hash` instead of re-reading and re-hashing the file.
+
+If a file is replaced atomically — `mv tmp.ts foo.ts`, `git checkout` with mtime preservation, archive extraction with `--touch -r`, build steps that `touch -r` files to a known timestamp, or filesystems with low mtime resolution (FAT/ExFAT: 1-second granularity) — the new file may end up with **the same mtime AND the same size** as the previous version. The memo would then declare a hit and reuse the stale `content_hash`. Downstream, `mergeHashes` over `(relpath, contentHash)` produces an identical `filesHash`, so the explicit-cache path reuses the existing `cacheId` even though the underlying file content has changed. Silent context staleness — the user gets answers based on stale code.
+
+The probability per call is very low (requires either deliberate mtime preservation at the byte level or pathological resolution-rounding plus a coincident size match), but the consequence when triggered is wrong-answer-no-error, which is the worst class of failure mode for a code-review tool.
+
+**Impact today:** Theoretical. No operator reports of stale-context answers attributed to this. Realistic triggers in the wild:
+- `git checkout` on a tree where the new branch's `foo.ts` has the same byte count and the FS rounded mtime to the same second.
+- `tar -xf` an archive that preserves mtimes onto a tree where a file was being edited at the same logical timestamp.
+- A build pipeline that touches generated files to a fixed timestamp for reproducibility.
+
+**Mitigation today:** The `forceRescan` escape hatch — per-call `ask({ forceRescan: true })` / `code({ forceRescan: true })` or env-wide `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` — bypasses the memo entirely and re-hashes every file. `reindex` always force-rescans regardless. Use this when you suspect mtime preservation across the working tree.
+
+**Why we do not fix immediately:** Adding a third gate (inode / SHA-shadow / xxhash quick check) requires either a schema migration (`ino INTEGER` column on `files`) plus cross-platform inode handling (Windows-NTFS file IDs differ from POSIX `ino`), or a full re-hash on every memo hit (which defeats the memo's purpose). Both are non-trivial and the trigger is exotic enough that operator data should drive the prioritisation rather than speculative cost.
+
+**Revisit trigger:** First operator report of stale-context answers correlated with mtime preservation, OR adoption of any deliberate-build-step pattern that resets mtimes to a fixed value. Pre-emptive fix candidate: add `ino` to `ScanMemoEntry` + `files` schema; require all three to match for memo hits. Estimated effort: one schema migration + ~30 lines of platform-aware stat handling. Tracked as T29 in [`FOLLOW-UP-PRS.md`](./FOLLOW-UP-PRS.md).

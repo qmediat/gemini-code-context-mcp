@@ -193,6 +193,34 @@ function buildContentFromUploaded(files: { fileId: string | null; relpath: strin
  */
 const MAX_INLINE_TOTAL_BYTES = 20 * 1024 * 1024; // 20 MB aggregate inline content
 
+/**
+ * v1.13.0 post-review fix: seed the scan memo from a ScanResult on the
+ * inline-return paths (`!allowCaching`, `cachingMode: 'implicit'`,
+ * small-workspace). The uploader is the only OTHER writer of the memo
+ * columns; on these paths the uploader is skipped, so without this seed
+ * the memo Map next call comes back empty and every file re-hashes.
+ *
+ * Defensive vs `manifest.upsertFile`: this calls the dedicated
+ * `refreshFileFingerprints` method which preserves any existing
+ * `file_id` / `uploaded_at` / `expires_at` from a prior explicit-cache
+ * run. Switching back from `cachingMode: 'implicit'` to `'explicit'` on
+ * a workspace that previously uploaded files should still hit the
+ * Files-API dedup; orphaning that capability would silently force
+ * re-uploads on every mode flip.
+ */
+function seedScanMemo(manifest: ManifestDb, scan: ScanResult): void {
+  if (scan.files.length === 0) return;
+  manifest.refreshFileFingerprints(
+    scan.files.map((f) => ({
+      workspaceRoot: scan.workspaceRoot,
+      relpath: f.relpath,
+      contentHash: f.contentHash,
+      mtimeMs: f.mtimeMs,
+      size: f.size,
+    })),
+  );
+}
+
 async function buildInlineContentFromDisk(scan: ScanResult): Promise<Content[]> {
   const parts: Part[] = [];
   let total = 0;
@@ -307,6 +335,13 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     });
+    // v1.13.0 memo-seed (post-review fix): the inline path skips
+    // `uploadWorkspaceFiles`, which is the only other site that calls
+    // `upsertFile`. Without this seed, `mtime_ms` / `size` columns stay
+    // NULL on every file row, `buildScanMemo` filters them out next call,
+    // and the v1.13.0 scan memo silently degrades to cold-every-call —
+    // exactly defeating the perf headline for implicit-mode users.
+    seedScanMemo(manifest, scan);
     return {
       cacheId: null,
       cacheExpiresAt: null,
@@ -362,6 +397,9 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     });
+    // v1.13.0 memo-seed (post-review fix): see the same call upstream in
+    // the inline / implicit branch for full rationale.
+    seedScanMemo(manifest, scan);
     return {
       cacheId: null,
       cacheExpiresAt: null,

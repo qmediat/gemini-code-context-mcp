@@ -96,6 +96,10 @@ describe('prepareContext', () => {
         absolutePath: abs,
         size: f.size,
         contentHash: `h-${f.relpath}`,
+        // v1.13.0+: ScannedFile carries mtimeMs/memoHit so the scan memo
+        // can hydrate after an inline-path call (FN1 fix).
+        mtimeMs: Date.now(),
+        memoHit: false,
       };
     });
     return {
@@ -104,6 +108,7 @@ describe('prepareContext', () => {
       filesHash: 'fh-1',
       skippedTooLarge: 0,
       truncated: false,
+      memoHitCount: 0,
     };
   }
 
@@ -215,6 +220,99 @@ describe('prepareContext', () => {
     const ws = db.getWorkspace(workspaceRoot);
     expect(ws).not.toBeNull();
     expect(ws?.cacheId).toBeNull();
+
+    // FN1 regression pin (post-review): the implicit-mode inline path MUST
+    // seed mtime_ms / size on file rows so the next-call scan memo can
+    // short-circuit hashing. Pre-fix this branch never called upsertFile,
+    // and the v1.13.0 perf headline silently degraded to cold-every-call.
+    const fileRows = db.getFiles(workspaceRoot);
+    expect(fileRows.length).toBe(1);
+    expect(fileRows[0]?.mtimeMs).toEqual(expect.any(Number));
+    expect(fileRows[0]?.size).toEqual(expect.any(Number));
+    expect(fileRows[0]?.contentHash).toBe('h-big.ts');
+    // file_id / uploaded_at / expires_at MUST stay null on the inline path —
+    // refreshFileFingerprints preserves whatever was there (here: nothing,
+    // since this is a fresh DB). Switching to explicit later would re-upload
+    // and populate these.
+    expect(fileRows[0]?.fileId).toBeNull();
+    expect(fileRows[0]?.uploadedAt).toBeNull();
+  });
+
+  it('v1.13.0 FN1 fix: small-workspace inline path also seeds mtime_ms / size for memo reuse', async () => {
+    const client = mkClient({});
+
+    const result = await prepareContext({
+      client,
+      manifest: db,
+      // Below default cacheMinTokens=1024 → small-workspace inline branch.
+      scan: mkScan([{ relpath: 'tiny.ts', size: 100, content: 'a' }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+    });
+
+    expect(result.inlineOnly).toBe(true);
+    expect(result.cacheId).toBeNull();
+    expect(client.caches.create).not.toHaveBeenCalled();
+
+    const fileRows = db.getFiles(workspaceRoot);
+    expect(fileRows.length).toBe(1);
+    expect(fileRows[0]?.mtimeMs).toEqual(expect.any(Number));
+    expect(fileRows[0]?.size).toEqual(expect.any(Number));
+  });
+
+  it('v1.13.0 FN1 fix: refreshFileFingerprints preserves prior fileId/uploadedAt/expiresAt across explicit→implicit switch', async () => {
+    // Simulates the "user starts on explicit, switches to implicit" path:
+    // explicit upload populates fileId+uploadedAt+expiresAt; subsequent
+    // implicit call must NOT clobber those, so a future switch BACK to
+    // explicit can still hit the Files-API dedup window.
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-prev',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-prev',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    // Pretend an earlier explicit run uploaded big.ts and the row carries
+    // populated dedup metadata.
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'big.ts',
+      contentHash: 'h-big.ts-OLD',
+      fileId: 'files/abc123',
+      uploadedAt: now - 60_000,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: 1700000000000,
+      size: 9000,
+    });
+
+    const client = mkClient({});
+    await prepareContext({
+      client,
+      manifest: db,
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+      cachingMode: 'implicit',
+    });
+
+    const fileRows = db.getFiles(workspaceRoot);
+    expect(fileRows[0]?.fileId).toBe('files/abc123'); // preserved
+    expect(fileRows[0]?.uploadedAt).toBe(now - 60_000); // preserved
+    expect(fileRows[0]?.expiresAt).toBe(now + 47 * 3600 * 1000); // preserved
+    // But mtime / size / contentHash refresh to the new scan's values.
+    expect(fileRows[0]?.contentHash).toBe('h-big.ts');
+    expect(fileRows[0]?.mtimeMs).not.toBe(1700000000000);
   });
 
   it('v1.13.0 async caches.delete: stale cache cleanup happens AFTER caches.create succeeds', async () => {

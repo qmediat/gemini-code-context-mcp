@@ -533,3 +533,49 @@ Matters more than it looks: the MCP is **fundamentally useless for code review**
 - A separate dedicated `docs/wire-format.md` — the rationale lives in `src/tools/registry.ts` comments where the code lives; a standalone doc would drift from the implementation.
 
 ---
+
+## T29. Add inode (or 3-tuple) gate to scan memo to close the (mtime, size) collision class
+
+**Source:** PR #45 / 6step round-2 review, finding FN6 (Grok P1 PARTIAL). See [`KNOWN-DEFICITS.md`](./KNOWN-DEFICITS.md) → "v1.13.0 scan memo: `(mtime_ms, size)` collision on atomic file replace".
+
+**Why:** v1.13.0's scan memo at `src/indexer/workspace-scanner.ts:182-189` keys per-file fingerprints on `(mtime_ms, size)` only. Atomic file replacement (`mv`, `git checkout` with mtime preservation, `tar -xf`, build steps with `touch -r`) plus same-byte-count files plus 1-second mtime resolution (FAT/ExFAT) can land on a same-mtime + same-size collision. The memo declares a hit, reuses the stale `content_hash`, and the explicit-cache path silently serves stale workspace context to the model.
+
+**Scope:**
+- Schema migration: add `ino INTEGER` column to `files` (additive, nullable; pre-1.13/14 rows always re-hash on the next scan).
+- Update `ScanMemoEntry` (`src/indexer/workspace-scanner.ts:61-66`) with `ino: number`. Memo hits require all THREE values to match.
+- Update `buildScanMemo` to drop rows where `ino` is null (same pattern as `mtime_ms`/`size`).
+- Update the inline-path memo seeder in `src/cache/cache-manager.ts` (`seedScanMemo` helper, FN1 fix) and the uploader's `upsertFile` callers to pass `ino`.
+- Cross-platform `stats.ino` semantics: POSIX (Linux/macOS APFS) is straightforward; Windows-NTFS `fs.Stats.ino` is derived from `fileId` and is stable per file but the meaning of "stable" varies on shared drives. Document the platform caveat in code comments + `docs/configuration.md` or the scanner's module header.
+- Test: scan memo MISS when ino changes (atomic-replace simulation: `unlink` + `writeFileSync` with the same content size, mtime touched back to original).
+
+**Sizing:** ~3-4 hours. Schema migration + ~30 lines of platform-aware stat handling + 1-2 tests + docs.
+
+**Blocked on:** Operator demand. The trigger is exotic enough that adding a third gate pre-emptively is speculative cost. Revisit when:
+- A user reports stale-context answers correlated with `git checkout` / archive extract / build-step `touch -r`.
+- Adoption of any deliberate-build-step pattern that resets mtimes to a fixed value (build reproducibility, deterministic-archive workflows).
+
+Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` escape hatches cover known-stale scenarios.
+
+**Do NOT include in this PR:**
+- Re-hashing every memo hit defensively (defeats the whole memo).
+- Switching to a content-derived quick-check (xxhash on first 4 KB) as a memo gate — non-trivial perf characteristics, and the existing approach already covers ~95 % of the warm-rescan win without that complexity.
+
+---
+
+## T30. Bump SCHEMA_VERSION to "2" on the next destructive migration
+
+**Source:** PR #45 / 6step round-2 review, finding FN4 (Gemini P2 ACCEPTED). Reviewer noted: v1.13.0 added 4 columns via `addColumnIfMissing` (idempotent ALTER TABLE) but `SCHEMA_VERSION` (in `src/manifest/db.ts:15`) stayed at `'1'`. The pattern works fine for additive migrations — but the next destructive change (drop/rename column, add NOT NULL, etc.) needs a real version-pivot.
+
+**Why:** SQLite has no `DROP COLUMN` until 3.35; we'll need a version-anchored migration path when a future PR removes the deprecated `file_ids` column on `workspaces` (already flagged in `db.ts:88`) or any other destructive change. Without a version boundary today, the future destructive migration code has to probe-and-pivot per column.
+
+**Scope (when triggered):**
+- Bump `SCHEMA_VERSION` to `'2'`.
+- Wrap destructive ALTERs in `if (currentVersion < '2') { ...; setVersion('2') }`.
+- Add a one-line migration test confirming `'1' → '2'` upgrades preserve existing rows.
+- Document the migration in `CHANGELOG.md` for that release.
+
+**Sizing:** ~1-2 hours coupled with whatever destructive change triggers it.
+
+**Blocked on:** Need for a destructive migration. The `addColumnIfMissing` idempotent pattern is sufficient until a column needs to disappear or change shape.
+
+---

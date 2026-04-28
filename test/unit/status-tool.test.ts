@@ -60,6 +60,7 @@ describe('status tool — caching block (v1.13.0+)', () => {
       implicitCachedTokens: 0,
       implicitUncachedTokens: 0,
       explicitRebuildCount: 0,
+      inlineCallCount: 0,
     });
     const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
     expect(text).not.toContain('caching (24h)');
