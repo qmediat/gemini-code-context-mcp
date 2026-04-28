@@ -22,6 +22,7 @@ import {
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
+import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
@@ -124,6 +125,12 @@ export const askInputSchema = z
       .optional()
       .describe(
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
+      ),
+    onWorkspaceTooLarge: z
+      .enum(['error', 'fallback-to-agentic'])
+      .optional()
+      .describe(
+        "Behaviour when the v1.5.0 preflight detects the workspace exceeds the model's `inputTokenLimit × workspaceGuardRatio` (v1.11.0+). `'error'` (default — preserves v1.5.0 behaviour) returns a structured `errorCode: 'WORKSPACE_TOO_LARGE'` and lets the caller decide how to recover. `'fallback-to-agentic'` opt-in: the server transparently re-routes through `ask_agentic` (sandboxed file-access loop — no eager upload, scales to arbitrarily large repos), wraps the agentic result, and surfaces `fallbackApplied: 'ask_agentic'` in `structuredContent` so callers can audit the swap. **Semantic divergence:** `ask_agentic` runs as a multi-iteration loop, so `timeoutMs` (ask's wall-clock cap) translates to `iterationTimeoutMs` (per-iteration cap); total wall-clock can be N × timeoutMs. Cost shape also changes (multiple smaller calls vs one big eager call). Recommended setting for orchestrators that prioritise getting an answer over a single round-trip; default stays `'error'` so existing callers see no behaviour change. **`code` does NOT support this field** — `code`'s OLD/NEW edit format is load-bearing for Claude's Edit pipeline, and `ask_agentic` returns prose only.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -377,8 +384,114 @@ async function executeAskBody(
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
       if (preflight.effectiveTokens > threshold) {
         const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
+
+        // v1.11.0 — opt-in transparent fallback to `ask_agentic` when the
+        // caller explicitly asked for it via `onWorkspaceTooLarge:
+        // 'fallback-to-agentic'`. Default stays `'error'` so pre-v1.11.0
+        // callers see identical behaviour. The fallback re-uses this
+        // tool's resolved inputs (model / globs / thinking config /
+        // workspace) and re-translates `timeoutMs` to `iterationTimeoutMs`
+        // (per-iteration cap; total wall-clock can be N × that). Cost +
+        // timing shape genuinely changes — opt-in is the right default.
+        if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
+          logger.warn(
+            `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
+          );
+          const agenticInput: AskAgenticInput = {
+            prompt: input.prompt,
+            ...(input.workspace !== undefined ? { workspace: input.workspace } : {}),
+            ...(input.model !== undefined ? { model: input.model } : {}),
+            ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
+            ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
+            ...(input.thinkingBudget !== undefined ? { thinkingBudget: input.thinkingBudget } : {}),
+            ...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
+            ...(input.maxOutputTokens !== undefined
+              ? { maxOutputTokens: input.maxOutputTokens }
+              : {}),
+            // `timeoutMs` (ask wall-clock cap) → `iterationTimeoutMs`
+            // (ask_agentic per-iteration cap). Total wall-clock for the
+            // agentic call can be `maxIterations × iterationTimeoutMs`.
+            // This semantic divergence is documented in the
+            // `onWorkspaceTooLarge` schema description.
+            ...(input.timeoutMs !== undefined ? { iterationTimeoutMs: input.timeoutMs } : {}),
+          };
+          const agenticResult = await askAgenticTool.execute(agenticInput, ctx);
+
+          // Wrap the agentic result so callers can audit the swap.
+          // The text content (`content[0].text`) is the agentic prose
+          // verbatim — same shape any direct `ask_agentic` caller would
+          // see. The structuredContent is enriched with fallback-trail
+          // metadata so orchestrators can distinguish a fallback-served
+          // response from a direct one.
+          //
+          // Two load-bearing contracts the wrapper must preserve:
+          //   1. `structuredContent.responseText` — the T23 wire-format
+          //      invariant (`textResult` / `errorResult` always write it
+          //      LAST; sub-agent orchestrators extract from this key
+          //      ONLY). We pull it from the agentic result's
+          //      `structuredContent.responseText` (or the prose text from
+          //      `content[0].text` as a fallback) and write it LAST so
+          //      it can't be clobbered.
+          //   2. Top-level `errorCode` / `retryable` — orchestrator retry
+          //      policies switch on these. When the agentic call itself
+          //      fails (e.g. iteration budget exhausted), the failure
+          //      code lives in `agenticResult.structuredContent.errorCode`;
+          //      we lift it to the top level of `wrappedStructured` so
+          //      consumer policies see it without descending into nested
+          //      `agenticResult.errorCode` (which they wouldn't know
+          //      about pre-v1.11.0).
+          const agenticStructured =
+            (agenticResult.structuredContent as Record<string, unknown> | undefined) ?? {};
+          const promptResponseText =
+            typeof agenticStructured.responseText === 'string'
+              ? agenticStructured.responseText
+              : agenticResult.content?.[0]?.type === 'text'
+                ? agenticResult.content[0].text
+                : '';
+
+          const wrappedStructured: Record<string, unknown> = {
+            fallbackApplied: 'ask_agentic',
+            fallbackReason: 'WORKSPACE_TOO_LARGE',
+            preflightEstimate: {
+              tokens: preflight.effectiveTokens,
+              threshold,
+              source: preflight.method,
+              cacheHit: preflight.cacheHit,
+              rawTokens: preflight.rawTokens,
+            },
+            // Lift top-level error metadata from the agentic call's
+            // structuredContent so orchestrator policies (e.g. retry on
+            // BUDGET_EXHAUSTED) keep working without descending into
+            // `.agenticResult.errorCode`.
+            ...(agenticResult.isError && typeof agenticStructured.errorCode === 'string'
+              ? { errorCode: agenticStructured.errorCode }
+              : {}),
+            ...(agenticResult.isError && typeof agenticStructured.retryable === 'boolean'
+              ? { retryable: agenticStructured.retryable }
+              : {}),
+            ...(Object.keys(agenticStructured).length > 0
+              ? { agenticResult: agenticStructured }
+              : {}),
+            // T23 wire-format invariant — `responseText` is written LAST
+            // so any caller-supplied / nested key with the same name is
+            // intentionally clobbered by the canonical value. Sub-agent
+            // orchestrators read the prose from this exact key.
+            responseText: promptResponseText,
+          };
+
+          // `isError` lives at the ROOT of the MCP CallToolResult per spec
+          // (sibling to `structuredContent`, not nested inside it). The
+          // spread on the return statement carries the agentic root-level
+          // `isError` automatically — no need to mirror it inside
+          // `structuredContent`.
+          return {
+            ...agenticResult,
+            structuredContent: wrappedStructured,
+          };
+        }
+
         return errorResult(
-          `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
+          `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
             retryable: false,
