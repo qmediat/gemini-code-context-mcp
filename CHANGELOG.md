@@ -73,11 +73,25 @@ A second `/coderev` pass on the round-2 fix delta (HEAD~2..HEAD), plus Copilot's
 
 2 ACCEPTED LOW findings tracked as follow-ups in [`docs/FOLLOW-UP-PRS.md`](./docs/FOLLOW-UP-PRS.md): T31 (skip memo-hit rows in `refreshFileFingerprints` to avoid WAL churn on monorepos) + T32 (`isAbortLike(reason, signal)` helper for future wrapped-error rejection paths).
 
+### Round-3 verification polish (post-adversarial /6step)
+
+After landing the round-3 HIGH fix, an adversarial /6step verification pass (workspace `/tmp/coderev/20260428-140123-51773/round3-verify-sixstep.md`) explicitly counter-cased BOTH leak directions on 13 plausible gaps in the round-3 fix. All 12 correctness gaps verified clean by an empirical `better-sqlite3` probe — confirming SQLite CASE-clause OLD/NEW semantics, end-to-end Scenario B closure (cross-file leak via shared content_hash), WAL snapshot isolation across concurrent connections, and `findFileRowByHash`'s correctness under the post-fix manifest state. The fix is empirically complete.
+
+Three defense-in-depth polish items applied:
+
+- **CASE hardening with `COALESCE(files.content_hash, '')`** — closes a latent regression footprint where a future migration that relaxes `content_hash`'s NOT NULL constraint would silently re-introduce the corruption (because SQL `NULL <> 'x'` is NULL/falsy → CASE falls through to ELSE → stale fileId preserved). With the COALESCE guard, a NULL existing hash compares as `'' <> 'new-hash'` → TRUE → fileId cleared. Schema-infeasible today; pure forward-defense at zero runtime cost.
+- **Explicit Scenario B regression test** in `cache-manager.test.ts` — before this commit, only Scenario A (same-relpath self-corruption) had a dedicated test; Scenario B (cross-file leak via shared content_hash — file2.ts new content hashes to the same value as file1.ts's new content, attempting dedup against file1.ts's stale fileId) was closed by the same SQL invariant but undocumented in tests. The new pin asserts `findFileRowByHash(ws, H_BAR, now) === null` after a hash-change refresh, plus that a fresh upload of file2.ts gets its OWN distinct fileId.
+- **Clarifying comment** on the "PRESERVES" test's mtime assertion noting that `mtime_ms` is OUTSIDE the round-3 conditional CASE (refreshes unconditionally) — pre-empts future-reader confusion where a regression that wraps every column in CASE would surface here rather than silently freezing mtime updates.
+
+The CHANGELOG's prior round-3 block stated the lesson learned in passing; [`docs/KNOWN-DEFICITS.md`](./docs/KNOWN-DEFICITS.md) now also carries it as a process record under "Process lesson: /6step step-4 must counter-case BOTH leak directions" — for future contributors auditing discriminator-filter / cache-key / dedup-query designs.
+
+Final coverage: 700 passed | 9 skipped (was 699 | 9 after round-3; +1 net new Scenario B regression pin). Lint, typecheck, double-test, build all green.
+
 ### Notes
 
 - Minor-level release. New schema field (`cachingMode`); new structured-content metadata fields on `status`; new SQLite columns (additive, nullable). Default behaviour unchanged.
 - The implicit-caching pivot is the architectural answer to the v1.6-v1.7 streaming refactor's "review→edit→review" pain point: no more 60–180 s rebuild wait when files change between queries on Gemini 2.5+/3.
-- Coverage additions: 27 cache-manager tests (was 21 → 23 + 2 round-2 FN1 pins + 1 round-2 dedup-preserve [later flipped] + 2 round-3 hash-changed/unchanged pins + 1 round-3 dedup-regression test), 34 manifest-db tests (was 23 → 32 + 2 round-2 FN2 pins), 19 workspace-scanner tests (was 14 + 5 v1.13 scan-memo tests), 4-test `status-tool.test.ts`, 4 round-2/3 pins on `files-uploader.test.ts` (2 FN3 + 1 round-3 truly-aborted-discrimination + 1 round-3 trailing-flush). Total suite: 699 passed | 9 skipped (was 663 | 9 in v1.12.2; +36 net new tests).
+- Coverage additions: 28 cache-manager tests (was 21 → 23 + 2 round-2 FN1 pins + 1 round-2 dedup-preserve [later flipped] + 2 round-3 hash-changed/unchanged pins + 1 round-3 dedup-regression test + 1 round-3-verify Scenario B pin), 34 manifest-db tests (was 23 → 32 + 2 round-2 FN2 pins), 19 workspace-scanner tests (was 14 + 5 v1.13 scan-memo tests), 4-test `status-tool.test.ts`, 4 round-2/3 pins on `files-uploader.test.ts` (2 FN3 + 1 round-3 truly-aborted-discrimination + 1 round-3 trailing-flush). Total suite: 700 passed | 9 skipped (was 663 | 9 in v1.12.2; +37 net new tests).
 
 ## [1.12.2] - 2026-04-28
 

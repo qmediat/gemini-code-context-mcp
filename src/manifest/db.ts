@@ -267,15 +267,35 @@ export class ManifestDb {
     }>,
   ): void {
     if (rows.length === 0) return;
+    // SQL semantics anchored by an empirical better-sqlite3 probe (round-3
+    // verification, /tmp/coderev/.../round3-verify-sixstep.md finding #2):
+    //
+    //   - `files.X` in the SET clause references the OLD (pre-conflict) row
+    //     value, so `files.content_hash <> excluded.content_hash` correctly
+    //     compares OLD vs NEW. Confirmed by probe.
+    //   - The conditional CASE columns are listed BEFORE the unconditional
+    //     `content_hash = excluded.content_hash` overwrite — but per SQLite
+    //     UPDATE semantics, all RHS expressions are evaluated using OLD row
+    //     values regardless of column order, so order is purely cosmetic.
+    //
+    // Defensive `COALESCE(files.content_hash, '')` guard: SQL `NULL <> 'x'`
+    // is NULL (falsy), which would let the CASE fall into the ELSE branch
+    // and PRESERVE a stale fileId paired with the new content_hash — exactly
+    // the corruption shape this fix closes. Schema declares `content_hash
+    // TEXT NOT NULL` so today the NULL case is unreachable, but if a future
+    // migration ever relaxes the constraint or a botched manual DB edit
+    // produces a NULL content_hash, the COALESCE forces the comparison to
+    // succeed (`'' <> 'new-hash'` → TRUE) and the stale fileId is cleared.
+    // Defense-in-depth, zero runtime cost.
     const stmt = this.db.prepare(
       `INSERT INTO files(
          workspace_root, relpath, content_hash, file_id, uploaded_at, expires_at,
          mtime_ms, size
        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
        ON CONFLICT(workspace_root, relpath) DO UPDATE SET
-         file_id     = CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.file_id     END,
-         uploaded_at = CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.uploaded_at END,
-         expires_at  = CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.expires_at  END,
+         file_id     = CASE WHEN COALESCE(files.content_hash, '') <> excluded.content_hash THEN NULL ELSE files.file_id     END,
+         uploaded_at = CASE WHEN COALESCE(files.content_hash, '') <> excluded.content_hash THEN NULL ELSE files.uploaded_at END,
+         expires_at  = CASE WHEN COALESCE(files.content_hash, '') <> excluded.content_hash THEN NULL ELSE files.expires_at  END,
          content_hash = excluded.content_hash,
          mtime_ms     = excluded.mtime_ms,
          size         = excluded.size`,

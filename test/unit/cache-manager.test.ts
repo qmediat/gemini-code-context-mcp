@@ -371,7 +371,11 @@ describe('prepareContext', () => {
     expect(fileRows[0]?.fileId).toBe('files/abc123');
     expect(fileRows[0]?.uploadedAt).toBe(now - 60_000);
     expect(fileRows[0]?.expiresAt).toBe(now + 47 * 3600 * 1000);
-    // mtime / size refresh; contentHash matches the seeded value.
+    // mtime / size / contentHash always refresh — they sit OUTSIDE the
+    // round-3 conditional CASE in refreshFileFingerprints' SET clause.
+    // This assertion pins that mtime is unconditional, so a future
+    // "improvement" that wraps every column in CASE would surface here
+    // rather than silently freezing mtime updates.
     expect(fileRows[0]?.contentHash).toBe('h-big.ts');
     expect(fileRows[0]?.mtimeMs).not.toBe(1700000000000);
   });
@@ -425,6 +429,88 @@ describe('prepareContext', () => {
     // Post-fix: returns null (file_id is now NULL on the row).
     const dedupHit = db.findFileRowByHash(workspaceRoot, 'h-big.ts', now);
     expect(dedupHit).toBeNull();
+  });
+
+  it('v1.13.0 round-3 regression: cross-file leak via shared content_hash (Scenario B) is closed', async () => {
+    // The harder corruption shape from /6step round-3 finding #1:
+    //   1. Explicit upload of file1.ts populates fileId='files/foo' for hash H_FOO.
+    //   2. User edits file1.ts → content hashes to H_BAR.
+    //   3. Implicit run; refreshFileFingerprints fires.
+    //   4. User adds file2.ts whose content ALSO hashes to H_BAR (e.g. they
+    //      copy-pasted file1.ts's new contents into file2.ts).
+    //   5. Explicit run uploads. uploader's findFileRowByHash(ws, H_BAR, now)
+    //      MUST NOT return the file1.ts row's stale fileId — otherwise
+    //      file2.ts gets routed through 'files/foo' on Google's servers
+    //      (which holds H_FOO bytes), and Gemini's prompt sees OLD content
+    //      under file2.ts's relpath. Silent wrong-answer-no-error.
+    // Post-fix: refreshFileFingerprints nulls the fileId when H_FOO ≠ H_BAR,
+    // so even though the row matches H_BAR by content_hash, the dedup query's
+    // `file_id IS NOT NULL` filter excludes it.
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-prev',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-prev',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    // Step 1: explicit upload — file1.ts at hash H_FOO with fileId='files/foo'.
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'file1.ts',
+      contentHash: 'H_FOO',
+      fileId: 'files/foo',
+      uploadedAt: now - 60_000,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: 1700000000000,
+      size: 200,
+    });
+
+    // Step 2-3: user edits file1.ts → H_BAR; implicit run fires
+    // refreshFileFingerprints. Use the public method directly (avoid the
+    // mkScan helper's contentHash convention so we control the hash names).
+    db.refreshFileFingerprints([
+      {
+        workspaceRoot,
+        relpath: 'file1.ts',
+        contentHash: 'H_BAR',
+        mtimeMs: now,
+        size: 200,
+      },
+    ]);
+
+    // After refresh, file1.ts row has content_hash=H_BAR + fileId=null
+    // (cleared by the conditional CASE since H_FOO ≠ H_BAR).
+    const file1After = db.getFiles(workspaceRoot).find((r) => r.relpath === 'file1.ts');
+    expect(file1After?.contentHash).toBe('H_BAR');
+    expect(file1After?.fileId).toBeNull();
+
+    // Step 4-5: a NEW file2.ts with content that ALSO hashes to H_BAR runs
+    // through the explicit upload path. The dedup query for H_BAR MUST NOT
+    // return file1.ts's poisoned row. Empirically: query returns null because
+    // the only H_BAR row in the system has file_id=null after step 3.
+    const dedupHit = db.findFileRowByHash(workspaceRoot, 'H_BAR', now);
+    expect(dedupHit).toBeNull();
+
+    // Sanity: a fresh upload of file2.ts would create its OWN fileId; no
+    // cross-file leak. (Simulated here by upsertFile; in prod the uploader
+    // would do this after dedup miss.)
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'file2.ts',
+      contentHash: 'H_BAR',
+      fileId: 'files/file2-fresh',
+      uploadedAt: now,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: now,
+      size: 200,
+    });
+    const file2 = db.getFiles(workspaceRoot).find((r) => r.relpath === 'file2.ts');
+    expect(file2?.fileId).toBe('files/file2-fresh'); // distinct from file1's old 'files/foo'
   });
 
   it('v1.13.0 async caches.delete: stale cache cleanup happens AFTER caches.create succeeds', async () => {
