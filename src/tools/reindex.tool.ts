@@ -57,9 +57,13 @@ export const reindexTool: ToolDefinition<ReindexInput> = {
       }
 
       emitter.emit('rescanning workspace…');
+      // v1.13.0 — `reindex` is the operator's explicit "blow away the memo"
+      // tool, so force a fresh hash for every file regardless of the
+      // mtime+size shortcut. Other tools (ask/code) use the memo by default.
       const scan = await scanWorkspace(workspaceRoot, {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
+        forceRescan: true,
       });
 
       const structured = {

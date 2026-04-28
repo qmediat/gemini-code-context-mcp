@@ -1,9 +1,14 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { clearHashCache } from '../../src/indexer/hasher.js';
-import { scanWorkspace } from '../../src/indexer/workspace-scanner.js';
+import {
+  type ScanMemoEntry,
+  buildScanMemo,
+  scanWorkspace,
+} from '../../src/indexer/workspace-scanner.js';
+import type { FileRow } from '../../src/types.js';
 
 describe('workspace scanner', () => {
   let root: string;
@@ -183,5 +188,217 @@ describe('workspace scanner', () => {
     const result = await scanWorkspace(root, { maxFiles: 100, maxFileSizeBytes: 100_000 });
     const paths = result.files.map((f) => f.relpath).sort();
     expect(paths).toEqual(['App.TS', 'helper.ts']);
+  });
+
+  // v1.13.0 — scan memo: skip per-file hashing when (mtime_ms, size) match
+  // the previously-stored values. Memo hits reuse the stored content hash
+  // verbatim — even when the file's actual content has drifted, IF mtime
+  // and size are unchanged. That's the documented trade-off; an explicit
+  // forceRescan or `reindex` invocation breaks the memo.
+  describe('scan memo (v1.13.0+)', () => {
+    it('reuses stored contentHash when mtime and size match', async () => {
+      writeFileSync(join(root, 'a.ts'), 'export const a = 1;');
+      const cold = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+      });
+      expect(cold.files).toHaveLength(1);
+      expect(cold.memoHitCount).toBe(0);
+      const [coldFile] = cold.files;
+      if (!coldFile) throw new Error('cold scan produced no files');
+
+      // Simulate the manifest having a row for this file with matching
+      // mtime+size. The scanner should reuse the contentHash and report
+      // memoHit=true even though the file is physically there to read.
+      const memo = new Map<string, ScanMemoEntry>([
+        [
+          coldFile.relpath,
+          {
+            contentHash: 'sentinel-hash',
+            mtimeMs: coldFile.mtimeMs,
+            size: coldFile.size,
+          },
+        ],
+      ]);
+      const warm = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+        manifestMemo: memo,
+      });
+      expect(warm.memoHitCount).toBe(1);
+      expect(warm.files[0]?.contentHash).toBe('sentinel-hash');
+      expect(warm.files[0]?.memoHit).toBe(true);
+    });
+
+    it('rehashes when size changes even if mtime would still match', async () => {
+      const path = join(root, 'a.ts');
+      writeFileSync(path, 'export const a = 1;');
+      const cold = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+      });
+      const [coldFile] = cold.files;
+      if (!coldFile) throw new Error('cold scan produced no files');
+
+      // Lie about size: pretend the manifest had stored a different size.
+      // Scanner must reject the memo entry and re-hash from disk.
+      const memo = new Map<string, ScanMemoEntry>([
+        [
+          coldFile.relpath,
+          {
+            contentHash: 'sentinel-hash',
+            mtimeMs: coldFile.mtimeMs,
+            size: coldFile.size + 1,
+          },
+        ],
+      ]);
+      const warm = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+        manifestMemo: memo,
+      });
+      expect(warm.memoHitCount).toBe(0);
+      expect(warm.files[0]?.contentHash).toBe(coldFile.contentHash);
+      expect(warm.files[0]?.contentHash).not.toBe('sentinel-hash');
+    });
+
+    it('rehashes when mtime changes even if size would still match', async () => {
+      const path = join(root, 'a.ts');
+      writeFileSync(path, 'export const a = 1;');
+      const cold = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+      });
+      const [coldFile] = cold.files;
+      if (!coldFile) throw new Error('cold scan produced no files');
+
+      // Bump the file's mtime forward by 1 second on disk; scanner sees
+      // a new mtime and the memo (which has the OLD mtime) misses.
+      const newMtimeSec = Math.floor(coldFile.mtimeMs / 1000) + 5;
+      utimesSync(path, newMtimeSec, newMtimeSec);
+
+      const memo = new Map<string, ScanMemoEntry>([
+        [
+          coldFile.relpath,
+          {
+            contentHash: 'sentinel-hash',
+            mtimeMs: coldFile.mtimeMs, // old mtime
+            size: coldFile.size,
+          },
+        ],
+      ]);
+      const warm = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+        manifestMemo: memo,
+      });
+      expect(warm.memoHitCount).toBe(0);
+      expect(warm.files[0]?.contentHash).not.toBe('sentinel-hash');
+    });
+
+    it('forceRescan: true bypasses the memo even on a perfect match', async () => {
+      writeFileSync(join(root, 'a.ts'), 'export const a = 1;');
+      const cold = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+      });
+      const [coldFile] = cold.files;
+      if (!coldFile) throw new Error('cold scan produced no files');
+
+      const memo = new Map<string, ScanMemoEntry>([
+        [
+          coldFile.relpath,
+          {
+            contentHash: 'sentinel-hash',
+            mtimeMs: coldFile.mtimeMs,
+            size: coldFile.size,
+          },
+        ],
+      ]);
+      const warm = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+        manifestMemo: memo,
+        forceRescan: true,
+      });
+      expect(warm.memoHitCount).toBe(0);
+      expect(warm.files[0]?.contentHash).not.toBe('sentinel-hash');
+    });
+
+    it('verifies the merged filesHash is stable across cold→warm rescans', async () => {
+      writeFileSync(join(root, 'a.ts'), 'export const a = 1;');
+      writeFileSync(join(root, 'b.ts'), 'export const b = 2;');
+      const cold = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+      });
+
+      const memo = new Map<string, ScanMemoEntry>(
+        cold.files.map((f) => [
+          f.relpath,
+          {
+            contentHash: f.contentHash,
+            mtimeMs: f.mtimeMs,
+            size: f.size,
+          },
+        ]),
+      );
+      const warm = await scanWorkspace(root, {
+        maxFiles: 100,
+        maxFileSizeBytes: 100_000,
+        manifestMemo: memo,
+      });
+      expect(warm.filesHash).toBe(cold.filesHash);
+      expect(warm.memoHitCount).toBe(2);
+    });
+  });
+
+  describe('buildScanMemo (v1.13.0+)', () => {
+    it('drops rows lacking mtimeMs or size (pre-1.13 manifests)', () => {
+      const rows: FileRow[] = [
+        // Pre-1.13 row — no mtimeMs/size. Drops.
+        {
+          workspaceRoot: '/ws',
+          relpath: 'old.ts',
+          contentHash: 'hh1',
+          fileId: null,
+          uploadedAt: null,
+          expiresAt: null,
+        },
+        // Post-1.13 row — full fingerprint. Kept.
+        {
+          workspaceRoot: '/ws',
+          relpath: 'new.ts',
+          contentHash: 'hh2',
+          fileId: null,
+          uploadedAt: null,
+          expiresAt: null,
+          mtimeMs: 1000,
+          size: 50,
+        },
+      ];
+      const memo = buildScanMemo(rows);
+      expect(memo.size).toBe(1);
+      expect(memo.get('new.ts')?.contentHash).toBe('hh2');
+      expect(memo.has('old.ts')).toBe(false);
+    });
+
+    it('returns an empty map on an empty input (first-run case)', () => {
+      const memo = buildScanMemo([]);
+      expect(memo.size).toBe(0);
+    });
+  });
+
+  // v1.13.0 — ScannedFile now carries mtimeMs alongside size, so the
+  // uploader can persist them to the manifest for the next memo lookup.
+  it('ScannedFile exposes mtimeMs and matches stat() output', async () => {
+    const path = join(root, 'a.ts');
+    writeFileSync(path, 'x');
+    const stats = statSync(path);
+    const result = await scanWorkspace(root, {
+      maxFiles: 100,
+      maxFileSizeBytes: 100_000,
+    });
+    expect(result.files[0]?.mtimeMs).toBe(stats.mtimeMs);
   });
 });

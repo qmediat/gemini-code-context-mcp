@@ -21,6 +21,7 @@ import type { ManifestDb } from '../manifest/db.js';
 import type { FileRow } from '../types.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import type { ProgressEmitter } from '../utils/progress.js';
+import { runPool } from '../utils/run-pool.js';
 
 const FILES_API_TTL_MS = 47 * 3600 * 1000; // 1 h safety margin before 48 h auto-delete
 /**
@@ -62,39 +63,6 @@ export interface UploadResult {
   failures: UploadFailure[];
 }
 
-/**
- * Run `task` over `items` with up to `concurrency` in flight. Order of
- * results matches order of items. Never throws — every failure is captured
- * as a rejected `PromiseSettledResult` in the returned array.
- */
-async function runPool<T, R>(
-  items: T[],
-  concurrency: number,
-  task: (item: T, index: number) => Promise<R>,
-): Promise<PromiseSettledResult<R>[]> {
-  const results: PromiseSettledResult<R>[] = new Array(items.length);
-  let next = 0;
-  const workers = Array.from(
-    { length: Math.max(1, Math.min(concurrency, items.length || 1)) },
-    async () => {
-      while (next < items.length) {
-        const i = next;
-        next += 1;
-        const item = items[i];
-        if (item === undefined) continue;
-        try {
-          const value = await task(item, i);
-          results[i] = { status: 'fulfilled', value };
-        } catch (err) {
-          results[i] = { status: 'rejected', reason: err };
-        }
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results;
-}
-
 export async function uploadWorkspaceFiles(args: {
   client: GoogleGenAI;
   manifest: ManifestDb;
@@ -123,6 +91,28 @@ export async function uploadWorkspaceFiles(args: {
   let reusedCount = 0;
   let completed = 0;
   const failures: UploadFailure[] = [];
+
+  // v1.13.0 progress-emit throttle. On a 500-file workspace, the previous
+  // per-file emit dispatched 500 MCP notifications inside ~3 s — most of
+  // them serialised over stdio for the same effective UI state ("X/500
+  // indexed"). Cap the emit cadence at ≥250 ms apart OR ≥25 files of
+  // progress, whichever comes first; ALWAYS emit the final completion so
+  // the progress UI doesn't hang at e.g. 475/500. Only the index
+  // notifications are throttled — abort/error events stay immediate.
+  const PROGRESS_EMIT_INTERVAL_MS = 250;
+  const PROGRESS_EMIT_FILE_STEP = 25;
+  let lastEmitTimeMs = 0;
+  let lastEmitCompleted = 0;
+  const emitProgress = (relpath: string): void => {
+    const isFinal = completed === files.length;
+    const tNow = Date.now();
+    const stepReached = completed - lastEmitCompleted >= PROGRESS_EMIT_FILE_STEP;
+    const intervalReached = tNow - lastEmitTimeMs >= PROGRESS_EMIT_INTERVAL_MS;
+    if (!(isFinal || stepReached || intervalReached)) return;
+    lastEmitTimeMs = tNow;
+    lastEmitCompleted = completed;
+    emitter.emit(`indexed ${completed}/${files.length}: ${relpath}`, completed, files.length);
+  };
 
   // Pre-flight: don't start the pool at all if abort already fired.
   if (signal?.aborted) {
@@ -167,15 +157,13 @@ export async function uploadWorkspaceFiles(args: {
         fileId: entry.existing.fileId,
         uploadedAt: entry.existing.uploadedAt,
         expiresAt: entry.existing.expiresAt,
+        mtimeMs: entry.file.mtimeMs,
+        size: entry.file.size,
       };
       manifest.upsertFile(row);
       out[i] = row;
       completed += 1;
-      emitter.emit(
-        `indexed ${completed}/${files.length}: ${entry.file.relpath}`,
-        completed,
-        files.length,
-      );
+      emitProgress(entry.file.relpath);
       return;
     }
 
@@ -216,28 +204,56 @@ export async function uploadWorkspaceFiles(args: {
       fileId,
       uploadedAt: now,
       expiresAt: now + FILES_API_TTL_MS,
+      mtimeMs: entry.file.mtimeMs,
+      size: entry.file.size,
     };
     manifest.upsertFile(row);
     out[i] = row;
     if (isDuplicate) reusedCount += 1;
     completed += 1;
-    emitter.emit(
-      `indexed ${completed}/${files.length}: ${entry.file.relpath}`,
-      completed,
-      files.length,
-    );
+    emitProgress(entry.file.relpath);
   }).then((settled) => {
     // Collect failures after the pool finishes — don't lose the mapping to files.
+    //
+    // v1.13.0 post-review (FN3, gemini P1): abort-induced rejections are NOT
+    // genuine upload failures — they're cooperative bail-outs from the per-task
+    // abort guard at the top of the worker. Treating them as "failed" pollutes
+    // stderr with N-completed warns AND inflates `failures`, both of which
+    // mislead the user before the post-pool re-throw at line ~246 surfaces the
+    // real `signal.reason` (typically a TimeoutError that maps to
+    // `errorCode: 'TIMEOUT'`). On a 400-file repo with concurrency 10 and an
+    // abort fired at completed=12, this could spew ~388 warn lines.
+    const aborted = signal?.aborted === true;
     for (let i = 0; i < settled.length; i += 1) {
       const r = settled[i];
       const file = files[i];
       if (r?.status === 'rejected' && file) {
-        const message = r.reason instanceof Error ? r.reason.message : String(r.reason);
+        const reason = r.reason;
+        if (
+          aborted &&
+          (reason === signal?.reason || (reason instanceof Error && reason.name === 'AbortError'))
+        ) {
+          continue;
+        }
+        const message = reason instanceof Error ? reason.message : String(reason);
         logger.warn(`upload failed for ${safeForLog(file.relpath)}: ${safeForLog(message)}`);
         failures.push({ relpath: file.relpath, error: message });
       }
     }
   });
+
+  // v1.13.0 round-3 fix (Copilot finding): `emitProgress` only force-emits
+  // when `completed === files.length`, but `completed` only increments on
+  // task SUCCESS — a tail of failed uploads (rejections) leaves `completed
+  // < files.length`, the throttle's `isFinal` predicate never trips, and
+  // the last successful indexed-file message can stay buffered behind the
+  // 250 ms / 25-file gates indefinitely. UI hangs at e.g. 490/500 even
+  // though the operation is fully finished. Trailing flush guarantees the
+  // emitter sees the final true `completed` value.
+  if (completed > lastEmitCompleted) {
+    emitter.emit(`indexed ${completed}/${files.length}`, completed, files.length);
+    lastEmitCompleted = completed;
+  }
 
   // Post-pool abort propagation (v1.12.1). `runPool` catches per-task
   // errors and returns a settled-results array, so the in-task abort

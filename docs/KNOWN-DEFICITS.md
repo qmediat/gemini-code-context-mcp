@@ -215,3 +215,60 @@ Any `TypeError` whose message is outside this list is routed to `operation.stop(
 **Impact today:** None for users running v1.5.1+ — `withNetworkRetry` covers the gap. Older releases would drop a long `ask_agentic` run on a single transient network blip (empirical ~18–26 % per invocation at 20–30 iterations with 1 % per-call transient rate).
 
 **Revisit trigger:** `@google/genai` bumps its `p-retry` dependency to 6.x (which uses the `is-network-error` package and recognises Node undici errors natively). At that point the app-layer retry can be narrowed — either to HTTP status codes the SDK still misses, or removed entirely. Track upstream via `@google/genai` release notes.
+
+---
+
+## v1.13.0 scan memo: `(mtime_ms, size)` collision on atomic file replace **WATCH**
+
+**Source:** PR #45 / 6step round-2 review, finding FN6 (Grok P1 PARTIAL).
+
+**Status:** Identified in review, escape hatch documented, full fix deferred behind operator-reported demand.
+
+**What is the issue?** The v1.13.0 scan memo at `src/indexer/workspace-scanner.ts:182-189` keys per-file fingerprints on `(mtime_ms, size)`. Both must match the previously-stored values for the scanner to reuse the cached `content_hash` instead of re-reading and re-hashing the file.
+
+If a file is replaced atomically — `mv tmp.ts foo.ts`, `git checkout` with mtime preservation, archive extraction with `--touch -r`, build steps that `touch -r` files to a known timestamp, or filesystems with low mtime resolution (FAT/ExFAT: 1-second granularity) — the new file may end up with **the same mtime AND the same size** as the previous version. The memo would then declare a hit and reuse the stale `content_hash`. Downstream, `mergeHashes` over `(relpath, contentHash)` produces an identical `filesHash`, so the explicit-cache path reuses the existing `cacheId` even though the underlying file content has changed. Silent context staleness — the user gets answers based on stale code.
+
+The probability per call is very low (requires either deliberate mtime preservation at the byte level or pathological resolution-rounding plus a coincident size match), but the consequence when triggered is wrong-answer-no-error, which is the worst class of failure mode for a code-review tool.
+
+**Impact today:** Theoretical. No operator reports of stale-context answers attributed to this. Realistic triggers in the wild:
+- `git checkout` on a tree where the new branch's `foo.ts` has the same byte count and the FS rounded mtime to the same second.
+- `tar -xf` an archive that preserves mtimes onto a tree where a file was being edited at the same logical timestamp.
+- A build pipeline that touches generated files to a fixed timestamp for reproducibility.
+
+**Mitigation today:** The `forceRescan` escape hatch — per-call `ask({ forceRescan: true })` / `code({ forceRescan: true })` or env-wide `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` — bypasses the memo entirely and re-hashes every file. `reindex` always force-rescans regardless. Use this when you suspect mtime preservation across the working tree.
+
+**Why we do not fix immediately:** Adding a third gate (inode / SHA-shadow / xxhash quick check) requires either a schema migration (`ino INTEGER` column on `files`) plus cross-platform inode handling (Windows-NTFS file IDs differ from POSIX `ino`), or a full re-hash on every memo hit (which defeats the memo's purpose). Both are non-trivial and the trigger is exotic enough that operator data should drive the prioritisation rather than speculative cost.
+
+**Revisit trigger:** First operator report of stale-context answers correlated with mtime preservation, OR adoption of any deliberate-build-step pattern that resets mtimes to a fixed value. Pre-emptive fix candidate: add `ino` to `ScanMemoEntry` + `files` schema; require all three to match for memo hits. Estimated effort: one schema migration + ~30 lines of platform-aware stat handling. Tracked as T29 in [`FOLLOW-UP-PRS.md`](./FOLLOW-UP-PRS.md).
+
+---
+
+## Process lesson: /6step step-4 must counter-case BOTH leak directions
+
+**Source:** PR #45 / v1.13.0 development — three-round /6step + /coderev iteration cycle, finalized 2026-04-28.
+
+**Status:** Process documentation. No code change; this is a record so future contributors avoid the same mistake.
+
+**What is the issue?** During the v1.13.0 release cycle, a HIGH silent-context-corruption bug shipped in commit 4af25e6, sat through one /6step self-audit (which marked it as a false positive at finding R2-1), and was ultimately caught only when an external 3-way `/coderev` (gpt + gemini + grok) plus a Copilot review independently flagged the same defect. The bug — `refreshFileFingerprints` preserved a stale `file_id` across a `content_hash` change in the manifest, letting a later `findFileRowByHash` query route NEW file content through an OLD Files-API upload — was empirically confirmed via a `better-sqlite3` probe in round-3 verification.
+
+The audit failure mode: R2-1 challenged the dedup query's `file_id IS NOT NULL` filter and concluded "the filter rejects NULL fileIds, so no leak path exists." That's correct as far as it goes. But it counter-cased the *wrong leak direction*. The real bug was about **non-NULL but STALE** fileIds — values that PASS the filter but should have been cleared. The audit asked "could a NULL fileId leak through?" and never asked "could a non-NULL but wrong fileId leak through?"
+
+**Generalised principle:** when verifying a discriminator field that decides "is this row valid?", `/6step` step-4 (challenge your own verdict) MUST counter-case BOTH leak directions:
+
+1. **Could a value that SHOULD be excluded leak through?** (the easy direction — the one R2-1 caught)
+2. **Could a value that SHOULD be included be incorrectly excluded?** (the over-clear / false-cleanup direction)
+3. **Could a value with the right SHAPE but wrong SEMANTICS leak through?** (the harder direction — non-NULL but stale, structurally-valid but wrong, etc.)
+
+The third question is where this bug class hides. The discriminator filter (`file_id IS NOT NULL`) verifies SHAPE (non-null) but not SEMANTICS (does this fileId actually correspond to the requested content_hash?). When the SET clause that writes the row preserves `file_id` unconditionally on `content_hash` change, it produces rows that pass the SHAPE check but violate the SEMANTIC invariant. Step-4 must explicitly construct a counter-case where the shape passes but the semantic fails.
+
+**Application checklist for future /6step audits:**
+
+- For every "X correctly filters bad inputs" claim, ask:
+  - Could a bad input PASS the filter due to a shape match (not semantic)?
+  - Are the producer-side writes ever correlated with the filter's semantic invariant, or do they just satisfy shape?
+  - Is there a column that records "this fileId WAS uploaded for THIS content_hash" — or is the content_hash field doing double duty as both "current" and "uploaded-as"?
+- Run an empirical probe (better-sqlite3 in `node -e "..."` or a one-shot test) before declaring an FP — documentation reading is not enough, especially for SQL semantics around `excluded.X` vs `table.X` references.
+
+**Verification trail for the round-3 fix:** the round-3 verification pass at [SIXSTEP-r2.md](#) (workspace `20260428-140123-51773`) ran an empirical SQLite probe via better-sqlite3 — confirming (a) `files.X` in CASE references OLD row values, (b) Scenario B (cross-file leak via shared content_hash) is closed by the same SQL invariant, (c) WAL snapshot isolation prevents partial-state leaks across concurrent connections. 13 potential gaps were enumerated and counter-cased in both leak directions; 12 verified clean (FP), 1 cosmetic (ACCEPTED). The pattern of "enumerate every plausible gap, then counter-case both directions for each, then probe empirically" is the auditing standard this lesson establishes.
+
+**Revisit trigger:** N/A — this is process documentation. Re-read before any future /6step audit on a discriminator-filter / cache-key / dedup-query design.

@@ -16,7 +16,7 @@ import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cach
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
-import { scanWorkspace } from '../indexer/workspace-scanner.js';
+import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
   validateWorkspacePath,
@@ -123,6 +123,18 @@ export const codeInputSchema = z
       .optional()
       .describe(
         'Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Recommended setting: `60_000` (60s). When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_STALL_MS`, then to disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.',
+      ),
+    cachingMode: z
+      .enum(['explicit', 'implicit'])
+      .optional()
+      .describe(
+        "Cache strategy for the workspace context (v1.13.0+). `'explicit'` (default) builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays a 60–180 s rebuild cost whenever any file changes. `'implicit'` skips the explicit cache entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. **Best fit for edit→review→edit cycles** at the cost of probabilistic rather than guaranteed savings (Gemini's docs note 'no cost saving guarantee' for implicit caching). Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. The default may flip to `'implicit'` in v1.14.0 pending dogfood telemetry.",
+      ),
+    forceRescan: z
+      .boolean()
+      .optional()
+      .describe(
+        'Bypass the v1.13.0 scan memo and re-hash every file in the workspace (default `false`). The scan memo skips per-file SHA256 when `mtime_ms` and `size` match the previously-stored values. Set this when you suspect the manifest is stale (e.g. files mutated outside the dev workflow). Equivalent to setting env `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` for a single call.',
       ),
     preflightMode: z
       .enum(['heuristic', 'exact', 'auto'])
@@ -265,11 +277,15 @@ async function executeCodeBody(
     resolvedModelKey = resolved.resolved;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
+    // v1.13.0 — see ask.tool.ts for the scan-memo rationale. Same pattern.
+    const scanMemo = buildScanMemo(ctx.manifest.getFiles(workspaceRoot));
     const scan = await scanWorkspace(workspaceRoot, {
       ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
       ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
       maxFiles: ctx.config.maxFilesPerWorkspace,
       maxFileSizeBytes: ctx.config.maxFileSizeBytes,
+      manifestMemo: scanMemo,
+      forceRescan: input.forceRescan === true || ctx.config.forceRescan === true,
     });
 
     // Output-cap strategy (v1.4.0) — see ask.tool.ts for full rationale
@@ -437,6 +453,12 @@ async function executeCodeBody(
       .digest('hex')
       .slice(0, 16);
 
+    // v1.13.0 — caching mode the user requested (used by `prepareContext`).
+    // The ACTUAL mode that ends up in telemetry is derived later from
+    // `activePrep.inlineOnly` + `activePrep.cacheId` so codeExecution-forced
+    // inline calls don't get tagged as `'explicit'` (FN2 review fix).
+    const requestedCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
+
     const ctxPrep = await prepareContext({
       client: ctx.client,
       manifest: ctx.manifest,
@@ -454,6 +476,8 @@ async function executeCodeBody(
       allowCaching: scan.files.length > 0 && !codeExecution,
       // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
       signal: abortSignal,
+      // v1.13.0 — opt-in implicit caching path (skip caches.create).
+      ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
     });
 
     // TPM throttle — placed AFTER `prepareContext`, immediately before
@@ -606,6 +630,8 @@ async function executeCodeBody(
             allowCaching: scan.files.length > 0 && !codeExecution,
             // v1.12.1 — propagate signal into stale-cache rebuild too.
             signal: abortSignal,
+            // v1.13.0 — keep cachingMode consistent across happy + retry paths.
+            ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
           });
           // Cancel stale reservation (tsMs was stamped before first
           // dispatch, now seconds old after rebuild) and re-reserve so
@@ -716,6 +742,20 @@ async function executeCodeBody(
     });
     const costMicros = toMicrosUsd(cost);
 
+    // v1.13.0 round-2 (FN2 fix): compute the ACTUAL caching mode for telemetry.
+    // - `cacheId !== null`               → caches.create resolved → 'explicit'
+    // - `inlineOnly && requested implicit` → 'implicit' (intended Gemini auto-cache path)
+    // - `inlineOnly && other`             → 'inline' (forced — codeExecution incompatibility,
+    //                                       below cacheMinTokens, allowCaching=false)
+    // The earlier code recorded `requestedCachingMode` directly, which inflated
+    // 'explicit' counts for every codeExecution call (those force inline but never
+    // build a cache). Now the v1.14.0 default-flip telemetry isn't biased.
+    const effectiveCachingMode: 'explicit' | 'implicit' | 'inline' = activePrep.inlineOnly
+      ? requestedCachingMode === 'implicit'
+        ? 'implicit'
+        : 'inline'
+      : 'explicit';
+
     const durationMs = Date.now() - started;
     if (reservationId !== null) {
       // Defensive: if `finalize` throws (disk full / lock contention), keep
@@ -728,6 +768,8 @@ async function executeCodeBody(
           uncachedTokens: uncached,
           costUsdMicro: costMicros,
           durationMs,
+          cachingMode: effectiveCachingMode,
+          cachedContentTokenCount: cached,
         });
       } catch (finalizeErr) {
         logger.error(
@@ -745,6 +787,8 @@ async function executeCodeBody(
         costUsdMicro: costMicros,
         durationMs,
         occurredAt: Date.now(),
+        cachingMode: effectiveCachingMode,
+        cachedContentTokenCount: cached,
       });
     }
 

@@ -35,6 +35,13 @@ CREATE TABLE IF NOT EXISTS files (
   file_id              TEXT,
   uploaded_at          INTEGER,
   expires_at           INTEGER,
+  -- v1.13.0+: scan-memo columns. Allow re-using a stored content_hash when
+  -- the file's mtime + size haven't changed since the last scan, skipping
+  -- the read+SHA256 cost for ~95% of files on a typical warm code-review.
+  -- Nullable for rows written before v1.13.0; the scanner forces a fresh
+  -- hash whenever either column is null.
+  mtime_ms             INTEGER,
+  size                 INTEGER,
   PRIMARY KEY (workspace_root, relpath),
   FOREIGN KEY (workspace_root) REFERENCES workspaces(workspace_root) ON DELETE CASCADE
 );
@@ -50,7 +57,15 @@ CREATE TABLE IF NOT EXISTS usage_metrics (
   uncached_tokens      INTEGER,
   cost_usd_micro       INTEGER,
   duration_ms          INTEGER NOT NULL,
-  occurred_at          INTEGER NOT NULL
+  occurred_at          INTEGER NOT NULL,
+  -- v1.13.0+: caching-mode telemetry. caching_mode records whether this
+  -- call used "explicit" (caches.create) or "implicit" (Gemini's automatic
+  -- cache for 2.5+/3 Pro). cached_content_token_count mirrors
+  -- usage_metadata.cachedContentTokenCount from the Gemini response and
+  -- is used by the status tool to compute cache-hit rate. Nullable for
+  -- rows written before v1.13.0 (treated as "explicit" for aggregations).
+  caching_mode               TEXT,
+  cached_content_token_count INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_occurred_at ON usage_metrics(occurred_at);
@@ -98,7 +113,28 @@ function rowToFile(row: Record<string, unknown>): FileRow {
     fileId: (row.file_id as string | null) ?? null,
     uploadedAt: (row.uploaded_at as number | null) ?? null,
     expiresAt: (row.expires_at as number | null) ?? null,
+    mtimeMs: (row.mtime_ms as number | null) ?? null,
+    size: (row.size as number | null) ?? null,
   };
+}
+
+/**
+ * v1.13.0+ additive column migrations. Each invocation runs `ALTER TABLE …
+ * ADD COLUMN` for one new column and swallows the "duplicate column name"
+ * error so the call is idempotent — re-running the binary on an already-
+ * migrated DB is a no-op. Every other SQLite error rethrows so genuine
+ * schema corruption surfaces.
+ *
+ * SQLite has no `ADD COLUMN IF NOT EXISTS`, hence the catch dance.
+ */
+function addColumnIfMissing(db: DatabaseType, table: string, column: string, type: string): void {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('duplicate column name')) return;
+    throw err;
+  }
 }
 
 export class ManifestDb {
@@ -115,6 +151,16 @@ export class ManifestDb {
     this.db.pragma('foreign_keys = ON');
 
     this.db.exec(SCHEMA_SQL);
+
+    // v1.13.0 additive migrations. `CREATE TABLE IF NOT EXISTS` above defines
+    // the post-1.13 schema for fresh DBs; for DBs already created by v1.12.x
+    // these `ADD COLUMN` calls bring the existing tables up to spec. Both
+    // calls are no-ops on a fresh DB (the columns already exist) thanks to
+    // `addColumnIfMissing`'s duplicate-column swallow.
+    addColumnIfMissing(this.db, 'files', 'mtime_ms', 'INTEGER');
+    addColumnIfMissing(this.db, 'files', 'size', 'INTEGER');
+    addColumnIfMissing(this.db, 'usage_metrics', 'caching_mode', 'TEXT');
+    addColumnIfMissing(this.db, 'usage_metrics', 'cached_content_token_count', 'INTEGER');
 
     const meta = this.db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('version');
     if (!meta) {
@@ -178,17 +224,104 @@ export class ManifestDb {
     return rows.map(rowToFile);
   }
 
+  /**
+   * v1.13.0+ memo-seeder. Used by `prepareContext`'s inline / implicit /
+   * small-workspace branches — those paths skip the uploader entirely (which
+   * is the only writer of `upsertFile`), so without this the scan memo would
+   * silently degrade to cold every call (every file re-hashes — defeating
+   * the v1.13.0 perf headline).
+   *
+   * Conditional preservation of `file_id` / `uploaded_at` / `expires_at`
+   * (round-3 fix for the v1.13.0 silent-corruption HIGH found by Gemini /
+   * GPT / Copilot in the round-2 review):
+   *
+   *   - **content_hash UNCHANGED** → preserve the upload metadata. A prior
+   *     explicit-cache run uploaded these bytes to Files API; a switch back
+   *     to `cachingMode: 'explicit'` should hit dedup and skip re-upload.
+   *   - **content_hash CHANGED** → null out `file_id` / `uploaded_at` /
+   *     `expires_at`. The previous fileId points to an upload of OLD bytes
+   *     on Google's servers; preserving it would let `findFileRowByHash`
+   *     return that stale fileId for the NEW content — silently feeding
+   *     OLD bytes into Gemini under the file's NEW relpath.
+   *
+   * The pre-fix version preserved unconditionally, locking in a stale-fileId
+   * row whenever an edit landed between an explicit run and an implicit run.
+   * Two corruption scenarios were reachable:
+   *   (A) same-relpath self-corruption: file edited mid-session, subsequent
+   *       explicit run reuses the stale fileId for the changed file.
+   *   (B) cross-file leak: a different file with the same NEW content_hash
+   *       hits the dedup query and gets routed through the stale fileId.
+   *
+   * The CASE-based clear closes both. Confirmed by /6step round-3 analysis:
+   * `findFileRowByHash` returns rows where `content_hash = ?` and `file_id IS
+   * NOT NULL` — the conditional null-out ensures any stale fileId is gone
+   * BEFORE the dedup query could return it.
+   */
+  refreshFileFingerprints(
+    rows: ReadonlyArray<{
+      workspaceRoot: string;
+      relpath: string;
+      contentHash: string;
+      mtimeMs: number;
+      size: number;
+    }>,
+  ): void {
+    if (rows.length === 0) return;
+    // SQL semantics anchored by an empirical better-sqlite3 probe (round-3
+    // verification, /tmp/coderev/.../round3-verify-sixstep.md finding #2):
+    //
+    //   - `files.X` in the SET clause references the OLD (pre-conflict) row
+    //     value, so `files.content_hash <> excluded.content_hash` correctly
+    //     compares OLD vs NEW. Confirmed by probe.
+    //   - The conditional CASE columns are listed BEFORE the unconditional
+    //     `content_hash = excluded.content_hash` overwrite — but per SQLite
+    //     UPDATE semantics, all RHS expressions are evaluated using OLD row
+    //     values regardless of column order, so order is purely cosmetic.
+    //
+    // Defensive `COALESCE(files.content_hash, '')` guard: SQL `NULL <> 'x'`
+    // is NULL (falsy), which would let the CASE fall into the ELSE branch
+    // and PRESERVE a stale fileId paired with the new content_hash — exactly
+    // the corruption shape this fix closes. Schema declares `content_hash
+    // TEXT NOT NULL` so today the NULL case is unreachable, but if a future
+    // migration ever relaxes the constraint or a botched manual DB edit
+    // produces a NULL content_hash, the COALESCE forces the comparison to
+    // succeed (`'' <> 'new-hash'` → TRUE) and the stale fileId is cleared.
+    // Defense-in-depth, zero runtime cost.
+    const stmt = this.db.prepare(
+      `INSERT INTO files(
+         workspace_root, relpath, content_hash, file_id, uploaded_at, expires_at,
+         mtime_ms, size
+       ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
+       ON CONFLICT(workspace_root, relpath) DO UPDATE SET
+         file_id     = CASE WHEN COALESCE(files.content_hash, '') <> excluded.content_hash THEN NULL ELSE files.file_id     END,
+         uploaded_at = CASE WHEN COALESCE(files.content_hash, '') <> excluded.content_hash THEN NULL ELSE files.uploaded_at END,
+         expires_at  = CASE WHEN COALESCE(files.content_hash, '') <> excluded.content_hash THEN NULL ELSE files.expires_at  END,
+         content_hash = excluded.content_hash,
+         mtime_ms     = excluded.mtime_ms,
+         size         = excluded.size`,
+    );
+    const tx = this.db.transaction((batch: ReadonlyArray<(typeof rows)[number]>): void => {
+      for (const r of batch) {
+        stmt.run(r.workspaceRoot, r.relpath, r.contentHash, r.mtimeMs, r.size);
+      }
+    });
+    tx(rows);
+  }
+
   upsertFile(file: FileRow): void {
     this.db
       .prepare(
         `INSERT INTO files(
-           workspace_root, relpath, content_hash, file_id, uploaded_at, expires_at
-         ) VALUES (?, ?, ?, ?, ?, ?)
+           workspace_root, relpath, content_hash, file_id, uploaded_at, expires_at,
+           mtime_ms, size
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(workspace_root, relpath) DO UPDATE SET
            content_hash = excluded.content_hash,
            file_id = excluded.file_id,
            uploaded_at = excluded.uploaded_at,
-           expires_at = excluded.expires_at`,
+           expires_at = excluded.expires_at,
+           mtime_ms = excluded.mtime_ms,
+           size = excluded.size`,
       )
       .run(
         file.workspaceRoot,
@@ -197,6 +330,8 @@ export class ManifestDb {
         file.fileId,
         file.uploadedAt,
         file.expiresAt,
+        file.mtimeMs ?? null,
+        file.size ?? null,
       );
   }
 
@@ -234,8 +369,9 @@ export class ManifestDb {
       .prepare(
         `INSERT INTO usage_metrics(
            workspace_root, tool_name, model, cached_tokens, uncached_tokens,
-           cost_usd_micro, duration_ms, occurred_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           cost_usd_micro, duration_ms, occurred_at,
+           caching_mode, cached_content_token_count
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         metric.workspaceRoot,
@@ -246,6 +382,8 @@ export class ManifestDb {
         metric.costUsdMicro,
         metric.durationMs,
         metric.occurredAt,
+        metric.cachingMode ?? null,
+        metric.cachedContentTokenCount ?? null,
       );
   }
 
@@ -330,6 +468,16 @@ export class ManifestDb {
       uncachedTokens: number;
       costUsdMicro: number;
       durationMs: number;
+      /**
+       * v1.13.0+: caching mode used for the call. `'inline'` is the
+       * forced-inline outcome (e.g. `code({ codeExecution: true })`), added in
+       * the v1.13.0 round-2 review fix (FN2) so telemetry distinguishes
+       * "user asked for explicit and got it" from "user asked for explicit but
+       * the runtime forced inline".
+       */
+      cachingMode?: 'explicit' | 'implicit' | 'inline' | null;
+      /** v1.13.0+: `usage_metadata.cachedContentTokenCount` from the Gemini response. */
+      cachedContentTokenCount?: number | null;
     },
   ): void {
     // D#7 (v1.7.0) belt-and-suspenders: D#7's settled-vs-in-flight split
@@ -345,7 +493,8 @@ export class ManifestDb {
     this.db
       .prepare(
         `UPDATE usage_metrics
-         SET cached_tokens = ?, uncached_tokens = ?, cost_usd_micro = ?, duration_ms = ?
+         SET cached_tokens = ?, uncached_tokens = ?, cost_usd_micro = ?, duration_ms = ?,
+             caching_mode = ?, cached_content_token_count = ?
          WHERE id = ?`,
       )
       .run(
@@ -353,6 +502,8 @@ export class ManifestDb {
         data.uncachedTokens,
         data.costUsdMicro,
         safeDurationMs,
+        data.cachingMode ?? null,
+        data.cachedContentTokenCount ?? null,
         reservationId,
       );
   }
@@ -451,6 +602,128 @@ export class ManifestDb {
       totalCostMicros: row.total_cost,
       inFlightReservedMicros: row.in_flight,
       last24hCostMicros: last24h.total,
+    };
+  }
+
+  /**
+   * v1.13.0+: caching telemetry aggregation for the `status` tool.
+   *
+   * Surfaces caching mode adoption, implicit-cache hit rate (when applicable),
+   * and explicit-cache rebuild count over the last 24 h. Hit rate is computed
+   * as `sum(cached_content_token_count) / (sum(cached_content_token_count) +
+   * sum(uncached_tokens))` across implicit-mode calls — the ratio of input
+   * tokens that Gemini's automatic implicit cache served vs the ones we paid
+   * full input rate for. Settled rows only (`duration_ms > 0`) so in-flight
+   * reservations don't skew the hit rate downward.
+   *
+   * `mode` is the dominant caching mode in the window:
+   *   - `'explicit'` if all metric rows used explicit (or no caching mode set)
+   *   - `'implicit'` if all metric rows used implicit
+   *   - `'inline'`   if all metric rows used the forced-inline path (e.g.
+   *                  `code({ codeExecution: true })` — the user requested
+   *                  explicit but the runtime forbade `cachedContent` + tools
+   *                  simultaneously). Distinguished from `'explicit'` so the
+   *                  v1.14.0 default-flip telemetry isn't biased toward
+   *                  "explicit adoption" by codeExecution traffic.
+   *   - `'mixed'`    if 2+ of the above modes appear (operator changed
+   *                  defaults mid-day, codeExecution + non-codeExecution
+   *                  traffic, etc.)
+   *   - `null`       if no calls in the window
+   *
+   * Rows older than v1.13.0 lack `caching_mode` (NULL) and are treated as
+   * `'explicit'` for the dominant-mode tally.
+   *
+   * Upgrade-day note (v1.12.x → v1.13.0): if pre-upgrade calls landed inside
+   * the 24h window AND post-upgrade traffic is exclusively forced-inline
+   * (e.g. `code({ codeExecution: true })`), `mode` returns `'mixed'` because
+   * the legacy NULL rows COALESCE into the explicit tally. This self-corrects
+   * once the legacy rows fall out of the 24h window. Operators surprised by
+   * `'mixed'` post-upgrade should look at `inlineCallCount` and
+   * `explicitRebuildCount` to confirm the actual post-upgrade traffic shape.
+   */
+  cacheStatsLast24h(nowMs: number): {
+    mode: 'explicit' | 'implicit' | 'inline' | 'mixed' | null;
+    callCount: number;
+    implicitCallsTotal: number;
+    implicitCallsWithHit: number;
+    implicitCachedTokens: number;
+    implicitUncachedTokens: number;
+    implicitHitRate: number;
+    explicitRebuildCount: number;
+    /** v1.13.0 round-2 (FN2 fix): forced-inline call count. Useful for
+     *  understanding why explicit-rebuild count differs from explicit-call
+     *  count (codeExecution calls request explicit, get inline, never trigger
+     *  caches.create). */
+    inlineCallCount: number;
+  } {
+    const since = nowMs - 24 * 3600 * 1000;
+    // Restricted to `ask` + `code` rows: those are the calls that flow through
+    // `prepareContext` and have a meaningful caching mode. `ask_agentic` (NULL
+    // caching_mode by design — no workspace cache) and `cache.create` (infra
+    // rebuild marker — counted separately below) are excluded so they don't
+    // skew the dominant-mode tally toward 'explicit'.
+    const row = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) AS call_count,
+           COALESCE(SUM(CASE WHEN COALESCE(caching_mode, 'explicit') = 'explicit' THEN 1 ELSE 0 END), 0) AS explicit_count,
+           COALESCE(SUM(CASE WHEN caching_mode = 'implicit' THEN 1 ELSE 0 END), 0) AS implicit_count,
+           COALESCE(SUM(CASE WHEN caching_mode = 'inline' THEN 1 ELSE 0 END), 0) AS inline_count,
+           COALESCE(SUM(CASE WHEN caching_mode = 'implicit' AND COALESCE(cached_content_token_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS implicit_hit_count,
+           COALESCE(SUM(CASE WHEN caching_mode = 'implicit' THEN cached_content_token_count ELSE 0 END), 0) AS implicit_cached_tokens,
+           COALESCE(SUM(CASE WHEN caching_mode = 'implicit' THEN uncached_tokens ELSE 0 END), 0) AS implicit_uncached_tokens
+         FROM usage_metrics
+         WHERE occurred_at >= ? AND duration_ms > 0
+           AND tool_name IN ('ask', 'code')`,
+      )
+      .get(since) as {
+      call_count: number;
+      explicit_count: number;
+      implicit_count: number;
+      inline_count: number;
+      implicit_hit_count: number;
+      implicit_cached_tokens: number;
+      implicit_uncached_tokens: number;
+    };
+
+    // `tool_name = 'cache.create'` rows are emitted by cache-manager when a
+    // fresh `caches.create` call lands on the explicit path. Counting them
+    // gives the operator a direct rebuild tally — the v1.13.0 motivation for
+    // pivoting toward implicit caching is to drive this number toward zero.
+    const rebuilds = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM usage_metrics
+         WHERE occurred_at >= ? AND duration_ms > 0 AND tool_name = 'cache.create'`,
+      )
+      .get(since) as { n: number };
+
+    // Dominant mode: 'mixed' if 2+ of the three actual modes appear; else the
+    // one mode that did. v1.13.0 round-2 (FN2 fix) widened this to include
+    // 'inline' alongside 'explicit' / 'implicit'.
+    const explicitN = row.explicit_count;
+    const implicitN = row.implicit_count;
+    const inlineN = row.inline_count;
+    const presentModes = [explicitN > 0, implicitN > 0, inlineN > 0].filter(Boolean).length;
+    let mode: 'explicit' | 'implicit' | 'inline' | 'mixed' | null;
+    if (row.call_count === 0) mode = null;
+    else if (presentModes >= 2) mode = 'mixed';
+    else if (implicitN > 0) mode = 'implicit';
+    else if (inlineN > 0) mode = 'inline';
+    else mode = 'explicit';
+
+    const denom = row.implicit_cached_tokens + row.implicit_uncached_tokens;
+    const implicitHitRate = denom > 0 ? row.implicit_cached_tokens / denom : 0;
+
+    return {
+      mode,
+      callCount: row.call_count,
+      implicitCallsTotal: row.implicit_count,
+      implicitCallsWithHit: row.implicit_hit_count,
+      implicitCachedTokens: row.implicit_cached_tokens,
+      implicitUncachedTokens: row.implicit_uncached_tokens,
+      implicitHitRate,
+      explicitRebuildCount: rebuilds.n,
+      inlineCallCount: row.inline_count,
     };
   }
 }

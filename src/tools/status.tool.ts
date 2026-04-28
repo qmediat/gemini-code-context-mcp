@@ -39,6 +39,7 @@ export const statusTool: ToolDefinition<StatusInput> = {
       const stats = ctx.manifest.workspaceStats(workspaceRoot);
       const todayTotalMicros = ctx.manifest.todaysCostMicros(now);
       const todayInFlightMicros = ctx.manifest.todaysInFlightReservedMicros(now);
+      const cacheStats = ctx.manifest.cacheStatsLast24h(now);
       // D#7 (v1.7.0): split settled vs in-flight so users running `status`
       // mid-call see why total looks higher than completed work would
       // suggest. Total still includes in-flight (so it's a true budget cap
@@ -90,6 +91,25 @@ export const statusTool: ToolDefinition<StatusInput> = {
           inFlightReservedUsd: microsToDollars(stats.inFlightReservedMicros),
           last24hCostUsd: microsToDollars(stats.last24hCostMicros),
         },
+        // v1.13.0+: caching telemetry over the last 24 h. `mode` summarises
+        // dominant caching strategy in use (`'explicit'` | `'implicit'` |
+        // `'inline'` | `'mixed'` | `null` if no calls). `implicitHitRate` is
+        // the share of input tokens served from Gemini's automatic implicit
+        // cache on implicit-mode calls — operators tracking the v1.14.0
+        // default-flip gate watch this number. `inlineCallCount` (round-2 FN2
+        // fix) surfaces forced-inline calls separately from `'explicit'` so
+        // codeExecution traffic doesn't bias the explicit-adoption metric.
+        caching: {
+          mode: cacheStats.mode,
+          callCount: cacheStats.callCount,
+          implicitCallsTotal: cacheStats.implicitCallsTotal,
+          implicitCallsWithHit: cacheStats.implicitCallsWithHit,
+          implicitHitRate: cacheStats.implicitHitRate,
+          implicitCachedTokens: cacheStats.implicitCachedTokens,
+          implicitUncachedTokens: cacheStats.implicitUncachedTokens,
+          explicitRebuildCount: cacheStats.explicitRebuildCount,
+          inlineCallCount: cacheStats.inlineCallCount,
+        },
       };
 
       // Render the in-flight delta only when there IS one; mid-call status
@@ -103,6 +123,36 @@ export const statusTool: ToolDefinition<StatusInput> = {
         stats.inFlightReservedMicros > 0
           ? ` (settled $${microsToDollars(wsSettledMicros).toFixed(4)} + $${microsToDollars(stats.inFlightReservedMicros).toFixed(4)} in-flight reserved)`
           : '';
+
+      // v1.13.0 caching block. Only render when there's something to say
+      // (skip on a brand-new manifest with zero calls — would be an empty
+      // section). Implicit hit rate < 50% on implicit-mode operators gets a
+      // gentle warn so they can revisit the trade-off, but we never error.
+      const cachingLines: string[] = [];
+      if (cacheStats.callCount > 0 && cacheStats.mode !== null) {
+        cachingLines.push('', 'caching (24h):');
+        cachingLines.push(`  mode:          ${cacheStats.mode}`);
+        cachingLines.push(`  calls:         ${cacheStats.callCount}`);
+        if (cacheStats.implicitCallsTotal > 0) {
+          const hitPct = (cacheStats.implicitHitRate * 100).toFixed(1);
+          const lowHit = cacheStats.implicitHitRate < 0.5;
+          cachingLines.push(
+            `  implicit hits: ${cacheStats.implicitCallsWithHit}/${cacheStats.implicitCallsTotal} calls`,
+          );
+          cachingLines.push(
+            `  implicit hit-rate (input tokens): ${hitPct}%${lowHit ? '  ← below 50%; consider explicit mode for guaranteed savings' : ''}`,
+          );
+        }
+        if (cacheStats.explicitRebuildCount > 0) {
+          cachingLines.push(`  explicit rebuilds: ${cacheStats.explicitRebuildCount}`);
+        }
+        if (cacheStats.inlineCallCount > 0) {
+          // v1.13.0 round-2 FN2: forced-inline calls (e.g. codeExecution).
+          // Surface separately so operators understand why explicit-call
+          // count > explicit-rebuild count when codeExecution is in use.
+          cachingLines.push(`  forced-inline calls: ${cacheStats.inlineCallCount}`);
+        }
+      }
 
       const human = [
         `workspace:       ${workspaceRoot}`,
@@ -134,6 +184,7 @@ export const statusTool: ToolDefinition<StatusInput> = {
         `  input tokens:  ${stats.totalUncachedTokens.toLocaleString()}`,
         `  total cost:    $${microsToDollars(stats.totalCostMicros).toFixed(4)}${wsInFlightSuffix}`,
         `  last 24h:      $${microsToDollars(stats.last24hCostMicros).toFixed(4)}`,
+        ...cachingLines,
       ].join('\n');
 
       return textResult(human, structured);

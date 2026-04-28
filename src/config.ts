@@ -35,6 +35,17 @@ export interface Config {
    */
   forceMaxOutputTokens: boolean;
   /**
+   * v1.13.0+: when `true`, every `ask` / `code` call bypasses the scan memo
+   * and re-hashes every file in the workspace. The scan memo (default
+   * behaviour) skips per-file SHA256 when `mtime_ms` and `size` match the
+   * previously-stored values — typically ~95% of files on a warm rescan.
+   * Per-call `input.forceRescan` is ORed with this flag; either one being
+   * `true` forces a fresh hash. Default `false`. Controlled by env var
+   * `GEMINI_CODE_CONTEXT_FORCE_RESCAN`. Use this if you've observed scan
+   * results going stale after filesystem mutations outside the dev workflow.
+   */
+  forceRescan: boolean;
+  /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
    * `0` disables the throttle entirely; positive integer caps how many input
    * tokens (cached + uncached) we'll let fly to Gemini inside any 60-second
@@ -142,5 +153,6 @@ export function loadConfig(): Config {
     tpmThrottleLimit,
     workspaceGuardRatio,
     forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
+    forceRescan: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_RESCAN'),
   };
 }

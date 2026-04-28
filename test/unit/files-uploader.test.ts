@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { uploadWorkspaceFiles } from '../../src/cache/files-uploader.js';
 import type { ScannedFile } from '../../src/indexer/workspace-scanner.js';
 import { ManifestDb } from '../../src/manifest/db.js';
+import { logger } from '../../src/utils/logger.js';
 import type { ProgressEmitter } from '../../src/utils/progress.js';
 
 function mkEmitter(): ProgressEmitter {
@@ -24,7 +25,13 @@ function mkEmitter(): ProgressEmitter {
 }
 
 function mkScanned(relpath: string, hash: string, abs: string, size = 100): ScannedFile {
-  return { relpath, contentHash: hash, absolutePath: abs, size };
+  // v1.13.0 round-2 polish (R2-7): include `mtimeMs` and `memoHit` so the
+  // fixture matches the `ScannedFile` interface shape. Tests are excluded
+  // from typecheck (`tsconfig.json:exclude`), so omitting these fields used
+  // to silently survive — but a future test that reads `entry.file.mtimeMs`
+  // (e.g. asserting the uploader populates `files.mtime_ms`) would otherwise
+  // surprise contributors with a NULL column on these fixtures.
+  return { relpath, contentHash: hash, absolutePath: abs, size, mtimeMs: 0, memoHit: false };
 }
 
 function mkClient(uploadImpl: (params: unknown) => Promise<{ uri?: string; name?: string }>) {
@@ -440,5 +447,244 @@ describe('uploadWorkspaceFiles', () => {
         signal: controller.signal,
       }),
     ).rejects.toThrow(/Operation aborted/);
+  });
+
+  // v1.13.0 round-2 (FN3, gemini P1): mid-pool aborts must NOT spam
+  // `logger.warn('upload failed for X')` for every queued task that didn't
+  // start. Pre-fix a 100-file workspace aborted at completed=10 produced
+  // ~90 misleading warns before the post-pool guard re-threw signal.reason.
+  it('FN3 fix: mid-pool abort suppresses per-task warn-log + failures-collection spam', async () => {
+    let uploadCount = 0;
+    const controller = new AbortController();
+    const canonicalReason = new DOMException('Timed out', 'TimeoutError');
+    Object.assign(canonicalReason, { timeoutKind: 'total' as const });
+
+    const upload = vi.fn(async (_params: unknown) => {
+      uploadCount += 1;
+      if (uploadCount === 1) {
+        controller.abort(canonicalReason);
+      }
+      return { uri: `https://example.invalid/files/${uploadCount}` };
+    });
+    const client = mkClient(upload);
+
+    // 30 files, concurrency 1 — first upload fires abort, remaining ~29 hit
+    // the per-task guard. Pre-fix: 29 warns. Post-fix: 0 warns.
+    const files = Array.from({ length: 30 }, (_, i) => {
+      const f = join(tmp, `spam${i}.ts`);
+      writeFileSync(f, String(i));
+      return mkScanned(`spam${i}.ts`, `spam${i}`, f);
+    });
+
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    await expect(
+      uploadWorkspaceFiles({
+        client,
+        manifest: db,
+        workspaceRoot,
+        files,
+        emitter: mkEmitter(),
+        concurrency: 1,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(canonicalReason);
+
+    // CORE assertion: zero "upload failed" warns from abort-induced rejections.
+    const uploadFailedWarns = warnSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((msg) => msg.startsWith('upload failed for '));
+    expect(uploadFailedWarns).toHaveLength(0);
+
+    warnSpy.mockRestore();
+  });
+
+  // FN3 follow-up: discrimination must NOT swallow GENUINE upload failures
+  // when the signal is also aborted. (Edge case: an upload throws a
+  // legitimate 5xx Error AT THE SAME TIME the user aborts — we still want
+  // to know about the network failure.) The current discrimination keys on
+  // `reason === signal.reason || reason.name === 'AbortError'` so a real
+  // `Error('500 server error')` survives.
+  it('FN3 discrimination: genuine non-abort upload errors still surface as warns', async () => {
+    const controller = new AbortController();
+
+    const upload = vi.fn(async (params: unknown) => {
+      const file = (params as { file: string }).file;
+      if (file.endsWith('boom.ts')) {
+        throw new Error('500 internal server error');
+      }
+      return { uri: `https://example.invalid/files/${file}` };
+    });
+    const client = mkClient(upload);
+
+    const files = [
+      mkScanned('ok.ts', 'ok', join(tmp, 'ok.ts')),
+      mkScanned('boom.ts', 'boom', join(tmp, 'boom.ts')),
+    ];
+    writeFileSync(join(tmp, 'ok.ts'), 'ok');
+    writeFileSync(join(tmp, 'boom.ts'), 'boom');
+
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    // No abort fires here — pure upload failure path.
+    const result = await uploadWorkspaceFiles({
+      client,
+      manifest: db,
+      workspaceRoot,
+      files,
+      emitter: mkEmitter(),
+      concurrency: 1,
+      signal: controller.signal,
+    });
+
+    expect(result.failedCount).toBe(1);
+    expect(result.failures[0]?.relpath).toBe('boom.ts');
+    const uploadFailedWarns = warnSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((msg) => msg.startsWith('upload failed for boom.ts'));
+    expect(uploadFailedWarns.length).toBe(1);
+
+    warnSpy.mockRestore();
+  });
+
+  // /6step round-3 finding #2: the existing FN3 discrimination test (above)
+  // never aborts the signal, so the LOAD-BEARING branch of the abort
+  // discrimination — `aborted=true && reason !== signal.reason && reason.name
+  // !== 'AbortError'` — stays untested. A future regression that flips the
+  // boolean operator or widens the name match (e.g. `name?.endsWith('Error')`)
+  // would silently swallow real upload failures while CI stays green. This
+  // test exercises that exact branch: abort fires AND a non-abort 5xx fires
+  // in the same task; the warn for the 5xx must surface.
+  it('FN3 discrimination (truly): aborted + concurrent 5xx in same task still surfaces a warn', async () => {
+    const controller = new AbortController();
+    const canonicalReason = new DOMException('Timed out', 'TimeoutError');
+    Object.assign(canonicalReason, { timeoutKind: 'total' as const });
+
+    const upload = vi.fn(async (params: unknown) => {
+      const file = (params as { file: string }).file;
+      if (file.endsWith('boom.ts')) {
+        // Race: fire the abort AND throw a real 5xx in the same task body.
+        // Per-task guard at the top of the worker has NOT fired yet (this is
+        // the first task), so we land in the body. Throwing here makes the
+        // pool record a rejected entry whose `reason` is the 5xx Error —
+        // distinct from `signal.reason` (canonicalReason) and named '' /
+        // 'Error', NOT 'AbortError'. The discrimination MUST let this warn
+        // through despite `signal.aborted === true`.
+        controller.abort(canonicalReason);
+        throw new Error('503 service unavailable');
+      }
+      return { uri: `https://example.invalid/files/${file}` };
+    });
+    const client = mkClient(upload);
+
+    writeFileSync(join(tmp, 'boom.ts'), 'boom');
+    writeFileSync(join(tmp, 'ok.ts'), 'ok');
+    const files = [
+      mkScanned('boom.ts', 'boom', join(tmp, 'boom.ts')),
+      mkScanned('ok.ts', 'ok', join(tmp, 'ok.ts')),
+    ];
+
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    // Concurrency 1 keeps the order deterministic: boom.ts goes first
+    // (throws + aborts) → ok.ts hits the per-task guard and gets suppressed
+    // (correctly, since reason === signal.reason) → post-pool re-throws
+    // canonicalReason. boom.ts's 5xx must NOT be suppressed.
+    await expect(
+      uploadWorkspaceFiles({
+        client,
+        manifest: db,
+        workspaceRoot,
+        files,
+        emitter: mkEmitter(),
+        concurrency: 1,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(canonicalReason);
+
+    const bommWarns = warnSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((msg) => msg.startsWith('upload failed for boom.ts'));
+    // The 5xx for boom.ts MUST surface — discrimination's correctness check.
+    expect(bommWarns.length).toBe(1);
+    expect(bommWarns[0]).toMatch(/503 service unavailable/);
+
+    // ok.ts's per-task abort SHOULD be suppressed (reason === signal.reason
+    // path of the discrimination). Sanity-check no warn for ok.ts.
+    const okWarns = warnSpy.mock.calls
+      .map((args) => String(args[0] ?? ''))
+      .filter((msg) => msg.startsWith('upload failed for ok.ts'));
+    expect(okWarns.length).toBe(0);
+
+    warnSpy.mockRestore();
+  });
+
+  // /6step round-3 finding #3 (Copilot): when tail tasks fail, `completed`
+  // never reaches files.length, so emitProgress's "isFinal" check never
+  // fires and the UI hangs at e.g. 490/500. The trailing flush after the
+  // failure-collection loop guarantees the emitter sees the actual completed
+  // count even when the throttle suppressed the last in-pool emit.
+  it('round-3 fix: emitProgress trailing flush fires even when tail uploads fail', async () => {
+    const controller = new AbortController();
+    let upCount = 0;
+
+    // 3 files, last one fails. Concurrency 1 → strict ordering. With the
+    // throttle gates (250 ms interval, 25-file step), files 1 and 2 emit
+    // (file 1: stepReached=false but intervalReached=true on first call;
+    // file 2 within 250 ms gets throttled). Tail file fails — `completed`
+    // stays at 2, `lastEmitCompleted` may lag. Trailing flush must fire
+    // a final emit when `completed > lastEmitCompleted`.
+    const upload = vi.fn(async (params: unknown) => {
+      upCount += 1;
+      const file = (params as { file: string }).file;
+      if (file.endsWith('tail.ts')) {
+        throw new Error('upload pipe broke');
+      }
+      return { uri: `https://example.invalid/files/${file}` };
+    });
+    const client = mkClient(upload);
+
+    writeFileSync(join(tmp, 'a.ts'), 'a');
+    writeFileSync(join(tmp, 'b.ts'), 'b');
+    writeFileSync(join(tmp, 'tail.ts'), 't');
+    const files = [
+      mkScanned('a.ts', 'a', join(tmp, 'a.ts')),
+      mkScanned('b.ts', 'b', join(tmp, 'b.ts')),
+      mkScanned('tail.ts', 't', join(tmp, 'tail.ts')),
+    ];
+
+    // Capture emitter calls so we can assert the trailing flush.
+    const emits: Array<{ msg: string; completed?: number; total?: number }> = [];
+    const emitter = {
+      emit: (msg: string, completed?: number, total?: number): void => {
+        const entry: { msg: string; completed?: number; total?: number } = { msg };
+        if (completed !== undefined) entry.completed = completed;
+        if (total !== undefined) entry.total = total;
+        emits.push(entry);
+      },
+      stop: vi.fn(),
+    };
+
+    const result = await uploadWorkspaceFiles({
+      client,
+      manifest: db,
+      workspaceRoot,
+      files,
+      emitter,
+      concurrency: 1,
+      signal: controller.signal,
+    });
+
+    // Sanity: 2 succeeded, 1 failed.
+    expect(result.failedCount).toBe(1);
+    expect(result.failures[0]?.relpath).toBe('tail.ts');
+    expect(upCount).toBe(3);
+
+    // Trailing flush: the final emit MUST reflect the true `completed=2`
+    // (the last 2 files successfully indexed). Without the flush, the
+    // emitter's last entry could lag behind the actual count.
+    const lastEmit = emits[emits.length - 1];
+    expect(lastEmit?.completed).toBe(2);
+    expect(lastEmit?.total).toBe(3);
   });
 });

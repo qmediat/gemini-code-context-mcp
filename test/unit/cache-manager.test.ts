@@ -96,6 +96,10 @@ describe('prepareContext', () => {
         absolutePath: abs,
         size: f.size,
         contentHash: `h-${f.relpath}`,
+        // v1.13.0+: ScannedFile carries mtimeMs/memoHit so the scan memo
+        // can hydrate after an inline-path call (FN1 fix).
+        mtimeMs: Date.now(),
+        memoHit: false,
       };
     });
     return {
@@ -104,6 +108,7 @@ describe('prepareContext', () => {
       filesHash: 'fh-1',
       skippedTooLarge: 0,
       truncated: false,
+      memoHitCount: 0,
     };
   }
 
@@ -186,6 +191,379 @@ describe('prepareContext', () => {
     expect(result.cacheId).toBeNull();
     expect(client.files.upload).not.toHaveBeenCalled();
     expect(client.caches.create).not.toHaveBeenCalled();
+  });
+
+  it('v1.13.0 cachingMode="implicit": skips caches.create, returns inline contents (rely on Gemini auto-cache)', async () => {
+    const client = mkClient({});
+
+    const result = await prepareContext({
+      client,
+      manifest: db,
+      // Big enough to trip the explicit-cache path under default behaviour.
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true, // would normally cache; mode override forces inline
+      cachingMode: 'implicit',
+    });
+
+    expect(result.inlineOnly).toBe(true);
+    expect(result.cacheId).toBeNull();
+    expect(result.inlineContents.length).toBeGreaterThan(0);
+    expect(client.caches.create).not.toHaveBeenCalled();
+    expect(client.files.upload).not.toHaveBeenCalled();
+
+    // Manifest still gets a workspace row so subsequent calls see the
+    // current filesHash (preserves invalidation semantics).
+    const ws = db.getWorkspace(workspaceRoot);
+    expect(ws).not.toBeNull();
+    expect(ws?.cacheId).toBeNull();
+
+    // FN1 regression pin (post-review): the implicit-mode inline path MUST
+    // seed mtime_ms / size on file rows so the next-call scan memo can
+    // short-circuit hashing. Pre-fix this branch never called upsertFile,
+    // and the v1.13.0 perf headline silently degraded to cold-every-call.
+    const fileRows = db.getFiles(workspaceRoot);
+    expect(fileRows.length).toBe(1);
+    expect(fileRows[0]?.mtimeMs).toEqual(expect.any(Number));
+    expect(fileRows[0]?.size).toEqual(expect.any(Number));
+    expect(fileRows[0]?.contentHash).toBe('h-big.ts');
+    // file_id / uploaded_at / expires_at MUST stay null on the inline path —
+    // refreshFileFingerprints preserves whatever was there (here: nothing,
+    // since this is a fresh DB). Switching to explicit later would re-upload
+    // and populate these.
+    expect(fileRows[0]?.fileId).toBeNull();
+    expect(fileRows[0]?.uploadedAt).toBeNull();
+  });
+
+  it('v1.13.0 FN1 fix: small-workspace inline path also seeds mtime_ms / size for memo reuse', async () => {
+    const client = mkClient({});
+
+    const result = await prepareContext({
+      client,
+      manifest: db,
+      // Below default cacheMinTokens=1024 → small-workspace inline branch.
+      scan: mkScan([{ relpath: 'tiny.ts', size: 100, content: 'a' }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+    });
+
+    expect(result.inlineOnly).toBe(true);
+    expect(result.cacheId).toBeNull();
+    expect(client.caches.create).not.toHaveBeenCalled();
+
+    const fileRows = db.getFiles(workspaceRoot);
+    expect(fileRows.length).toBe(1);
+    expect(fileRows[0]?.mtimeMs).toEqual(expect.any(Number));
+    expect(fileRows[0]?.size).toEqual(expect.any(Number));
+  });
+
+  it('v1.13.0 round-3 (HIGH): refreshFileFingerprints CLEARS stale fileId/uploadedAt/expiresAt when content_hash changes across explicit→implicit switch', async () => {
+    // ROUND-3 corrected pin (replaces the round-2 test that locked in the
+    // pre-fix corruption). Scenario A from /6step round-3:
+    //   1. Explicit upload: row carries fileId='files/abc123' for OLD content
+    //      (hash 'h-big.ts-OLD').
+    //   2. User edits big.ts so the hash becomes 'h-big.ts'.
+    //   3. User runs implicit; refreshFileFingerprints fires.
+    // After fix: file_id MUST be NULL, because the old fileId points at OLD
+    // bytes on Google's servers — preserving it would let a later
+    // findFileRowByHash(ws, 'h-big.ts', now) hand back the stale fileId and
+    // route NEW content through the OLD upload (silent context corruption).
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-prev',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-prev',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'big.ts',
+      contentHash: 'h-big.ts-OLD',
+      fileId: 'files/abc123',
+      uploadedAt: now - 60_000,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: 1700000000000,
+      size: 9000,
+    });
+
+    const client = mkClient({});
+    await prepareContext({
+      client,
+      manifest: db,
+      // mkScan generates contentHash = `h-${relpath}` = 'h-big.ts' — a HASH
+      // CHANGE from the seeded 'h-big.ts-OLD'.
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+      cachingMode: 'implicit',
+    });
+
+    const fileRows = db.getFiles(workspaceRoot);
+    // CONTENT-HASH CHANGED → upload metadata cleared.
+    expect(fileRows[0]?.fileId).toBeNull();
+    expect(fileRows[0]?.uploadedAt).toBeNull();
+    expect(fileRows[0]?.expiresAt).toBeNull();
+    // mtime / size / contentHash refresh to the new scan's values.
+    expect(fileRows[0]?.contentHash).toBe('h-big.ts');
+    expect(fileRows[0]?.mtimeMs).not.toBe(1700000000000);
+  });
+
+  it('v1.13.0 round-3 (HIGH): refreshFileFingerprints PRESERVES fileId/uploadedAt/expiresAt when content_hash unchanged', async () => {
+    // The legitimate cross-mode reuse path. Scenario:
+    //   1. Explicit upload: row carries fileId='files/abc123' for content
+    //      hash 'h-big.ts'.
+    //   2. User flips to implicit WITHOUT editing big.ts.
+    //   3. refreshFileFingerprints sees same hash; preserves fileId so a
+    //      future switch BACK to explicit can hit Files-API dedup.
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-prev',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-prev',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'big.ts',
+      // SAME hash that mkScan will produce — content is stable across the mode flip.
+      contentHash: 'h-big.ts',
+      fileId: 'files/abc123',
+      uploadedAt: now - 60_000,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: 1700000000000,
+      size: 9000,
+    });
+
+    const client = mkClient({});
+    await prepareContext({
+      client,
+      manifest: db,
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+      cachingMode: 'implicit',
+    });
+
+    const fileRows = db.getFiles(workspaceRoot);
+    // CONTENT-HASH UNCHANGED → upload metadata preserved (the reuse path).
+    expect(fileRows[0]?.fileId).toBe('files/abc123');
+    expect(fileRows[0]?.uploadedAt).toBe(now - 60_000);
+    expect(fileRows[0]?.expiresAt).toBe(now + 47 * 3600 * 1000);
+    // mtime / size / contentHash always refresh — they sit OUTSIDE the
+    // round-3 conditional CASE in refreshFileFingerprints' SET clause.
+    // This assertion pins that mtime is unconditional, so a future
+    // "improvement" that wraps every column in CASE would surface here
+    // rather than silently freezing mtime updates.
+    expect(fileRows[0]?.contentHash).toBe('h-big.ts');
+    expect(fileRows[0]?.mtimeMs).not.toBe(1700000000000);
+  });
+
+  it('v1.13.0 round-3 regression: findFileRowByHash does NOT return a stale fileId after content edit', async () => {
+    // End-to-end regression for the silent-corruption scenario from /6step
+    // round-3 finding #1. Pre-fix: dedup query returns a row with NEW
+    // content_hash + OLD fileId, routing new content through old bytes.
+    // Post-fix: the stale fileId is nulled when content_hash changes, so
+    // the dedup query (which filters file_id IS NOT NULL) returns null.
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-prev',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-prev',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    // Step 1: pretend an explicit run uploaded big.ts with OLD content.
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'big.ts',
+      contentHash: 'h-OLD',
+      fileId: 'files/poisoned',
+      uploadedAt: now - 60_000,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: 1700000000000,
+      size: 9000,
+    });
+
+    // Step 2: user edits big.ts (new hash) and runs implicit. Memo seed fires.
+    const client = mkClient({});
+    await prepareContext({
+      client,
+      manifest: db,
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+      cachingMode: 'implicit',
+    });
+
+    // Step 3: dedup query for the NEW content hash MUST NOT return the
+    // stale fileId. Pre-fix: returns row with fileId='files/poisoned'.
+    // Post-fix: returns null (file_id is now NULL on the row).
+    const dedupHit = db.findFileRowByHash(workspaceRoot, 'h-big.ts', now);
+    expect(dedupHit).toBeNull();
+  });
+
+  it('v1.13.0 round-3 regression: cross-file leak via shared content_hash (Scenario B) is closed', async () => {
+    // The harder corruption shape from /6step round-3 finding #1:
+    //   1. Explicit upload of file1.ts populates fileId='files/foo' for hash H_FOO.
+    //   2. User edits file1.ts → content hashes to H_BAR.
+    //   3. Implicit run; refreshFileFingerprints fires.
+    //   4. User adds file2.ts whose content ALSO hashes to H_BAR (e.g. they
+    //      copy-pasted file1.ts's new contents into file2.ts).
+    //   5. Explicit run uploads. uploader's findFileRowByHash(ws, H_BAR, now)
+    //      MUST NOT return the file1.ts row's stale fileId — otherwise
+    //      file2.ts gets routed through 'files/foo' on Google's servers
+    //      (which holds H_FOO bytes), and Gemini's prompt sees OLD content
+    //      under file2.ts's relpath. Silent wrong-answer-no-error.
+    // Post-fix: refreshFileFingerprints nulls the fileId when H_FOO ≠ H_BAR,
+    // so even though the row matches H_BAR by content_hash, the dedup query's
+    // `file_id IS NOT NULL` filter excludes it.
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-prev',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-prev',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    // Step 1: explicit upload — file1.ts at hash H_FOO with fileId='files/foo'.
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'file1.ts',
+      contentHash: 'H_FOO',
+      fileId: 'files/foo',
+      uploadedAt: now - 60_000,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: 1700000000000,
+      size: 200,
+    });
+
+    // Step 2-3: user edits file1.ts → H_BAR; implicit run fires
+    // refreshFileFingerprints. Use the public method directly (avoid the
+    // mkScan helper's contentHash convention so we control the hash names).
+    db.refreshFileFingerprints([
+      {
+        workspaceRoot,
+        relpath: 'file1.ts',
+        contentHash: 'H_BAR',
+        mtimeMs: now,
+        size: 200,
+      },
+    ]);
+
+    // After refresh, file1.ts row has content_hash=H_BAR + fileId=null
+    // (cleared by the conditional CASE since H_FOO ≠ H_BAR).
+    const file1After = db.getFiles(workspaceRoot).find((r) => r.relpath === 'file1.ts');
+    expect(file1After?.contentHash).toBe('H_BAR');
+    expect(file1After?.fileId).toBeNull();
+
+    // Step 4-5: a NEW file2.ts with content that ALSO hashes to H_BAR runs
+    // through the explicit upload path. The dedup query for H_BAR MUST NOT
+    // return file1.ts's poisoned row. Empirically: query returns null because
+    // the only H_BAR row in the system has file_id=null after step 3.
+    const dedupHit = db.findFileRowByHash(workspaceRoot, 'H_BAR', now);
+    expect(dedupHit).toBeNull();
+
+    // Sanity: a fresh upload of file2.ts would create its OWN fileId; no
+    // cross-file leak. (Simulated here by upsertFile; in prod the uploader
+    // would do this after dedup miss.)
+    db.upsertFile({
+      workspaceRoot,
+      relpath: 'file2.ts',
+      contentHash: 'H_BAR',
+      fileId: 'files/file2-fresh',
+      uploadedAt: now,
+      expiresAt: now + 47 * 3600 * 1000,
+      mtimeMs: now,
+      size: 200,
+    });
+    const file2 = db.getFiles(workspaceRoot).find((r) => r.relpath === 'file2.ts');
+    expect(file2?.fileId).toBe('files/file2-fresh'); // distinct from file1's old 'files/foo'
+  });
+
+  it('v1.13.0 async caches.delete: stale cache cleanup happens AFTER caches.create succeeds', async () => {
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-OLD',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-1',
+      cacheId: 'cachedContents/stale',
+      cacheExpiresAt: now + 30 * 60 * 1000,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const callOrder: string[] = [];
+    const client = mkClient({
+      cachesCreate: async () => {
+        callOrder.push('create');
+        return { name: 'cachedContents/fresh' };
+      },
+      cachesDelete: async (params: unknown) => {
+        callOrder.push(`delete:${(params as { name: string }).name}`);
+        return {};
+      },
+    });
+
+    await prepareContext({
+      client,
+      manifest: db,
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+    });
+
+    // Drain microtask queue so the void-fired delete runs.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Order check: create MUST happen before delete (manifest swap is the
+    // commit point; if delete ran first and create then failed, we'd lose
+    // both caches with no rollback).
+    const createIdx = callOrder.indexOf('create');
+    const deleteIdx = callOrder.indexOf('delete:cachedContents/stale');
+    expect(createIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteIdx).toBeGreaterThan(createIdx);
+
+    // Manifest already points at the new cache when the delete fires.
+    const after = db.getWorkspace(workspaceRoot);
+    expect(after?.cacheId).toBe('cachedContents/fresh');
   });
 
   it('cache REBUILD: filesHash mismatch → uploads + creates new cache + deletes old', async () => {

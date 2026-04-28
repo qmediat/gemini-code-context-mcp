@@ -32,6 +32,7 @@ vi.mock('../../src/indexer/workspace-validation.js', () => ({
 }));
 vi.mock('../../src/indexer/workspace-scanner.js', () => ({
   scanWorkspace: mocks.scanWorkspace,
+  buildScanMemo: () => new Map<string, never>(),
 }));
 vi.mock('../../src/gemini/models.js', () => ({
   resolveModel: mocks.resolveModel,
@@ -65,6 +66,8 @@ function buildCtx(): {
       finalizeBudgetReservation: vi.fn(),
       cancelBudgetReservation: vi.fn(),
       insertUsageMetric: vi.fn(),
+      // v1.13.0: ask/code now read manifest.getFiles to seed the scan memo.
+      getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
     ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,

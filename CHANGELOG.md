@@ -5,6 +5,94 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-04-27
+
+### Added — implicit-cache opt-in (per-call `cachingMode` field on `ask` / `code`)
+
+Gemini 2.5+ and Gemini 3 Pro have automatic implicit caching enabled by default (per [ai.google.dev/gemini-api/docs/caching](https://ai.google.dev/gemini-api/docs/caching), 4 096-token minimum prefix). v1.13.0 lets callers opt into a cache strategy that skips the explicit `caches.create` build entirely and relies on Gemini's automatic implicit cache for the workspace prefix.
+
+- New optional schema field on `ask` / `code`: `cachingMode: 'explicit' | 'implicit'`. Default `'explicit'` — pre-1.13 behaviour preserved.
+  - **`'explicit'`** (default): builds a Gemini Context Cache via `caches.create` — guaranteed ~75 % discount on cached input tokens, but pays a 60–180 s rebuild cost whenever any file changes.
+  - **`'implicit'`**: skips the explicit cache; file content is sent inline every call. Gemini 2.5+/3 Pro applies its automatic implicit caching when prefix matches across calls. Best fit for review→edit→review workflows (no rebuild wait when files change between queries) at the cost of probabilistic rather than guaranteed savings — Gemini's docs note "no cost saving guarantee" for implicit caching.
+  - Hit rate is observable per workspace via `status.structuredContent.caching.implicitHitRate` (see telemetry below).
+  - The default may flip to `'implicit'` in v1.14.0 pending dogfood telemetry.
+
+### Added — caching telemetry on `usage_metrics` + `status` tool
+
+Two additive nullable columns land on `usage_metrics` so operators can see how the new caching mode is performing in production:
+
+- `caching_mode` (TEXT, nullable): `'explicit'` / `'implicit'` per call. NULL on rows written before v1.13.0 (treated as `'explicit'` for aggregations) or on `ask_agentic` calls (which don't fit the explicit/implicit model — they use agentic file-access, no workspace cache).
+- `cached_content_token_count` (INTEGER, nullable): mirrors `usage_metadata.cachedContentTokenCount` from the Gemini response. Used to compute the implicit cache hit rate.
+
+New aggregation method on `ManifestDb`: `cacheStatsLast24h(nowMs)` — returns `{mode, callCount, implicitCallsTotal, implicitCallsWithHit, implicitCachedTokens, implicitUncachedTokens, implicitHitRate, explicitRebuildCount}`. The `status` tool surfaces this under `structuredContent.caching` and renders a human-readable "caching (24h)" block when there's something to report. Implicit hit rate < 50 % gets a gentle inline warning (no error) so operators on implicit mode can revisit the trade-off.
+
+### Added — scan memo (warm rescans skip ~95 % of file hashing)
+
+Two additive nullable columns land on `files`: `mtime_ms` (INTEGER) and `size` (INTEGER). The scanner now consults these on subsequent rescans — when the file's stat-reported mtime AND size match the previously-stored values, the scanner reuses the stored content hash and skips the read+SHA256 step entirely. Both columns must match for the memo to fire (size guards the rare same-mtime-different-content case caused by sub-second writes within a 1-second resolution window).
+
+- New per-call schema field: `forceRescan: boolean` (default `false`) — bypasses the memo and re-hashes every file. Use when you suspect the manifest is stale (filesystem mutated outside the dev workflow, NTP clock-skew, etc.).
+- New env var: `GEMINI_CODE_CONTEXT_FORCE_RESCAN` — operator-level override that's ORed with the per-call flag.
+- The `reindex` tool always passes `forceRescan: true` (consistent with its "blow away the memo" semantics).
+- New helper: `buildScanMemo(rows)` builds the memo lookup map from the manifest's stored `FileRow[]`. Pre-1.13 rows lacking `mtimeMs`/`size` are dropped — they always re-hash on the next scan.
+- `ScannedFile` now exposes `mtimeMs: number` and `memoHit: boolean`. `ScanResult` exposes `memoHitCount: number` so operators can see how often the warm path is exercised.
+
+### Changed — parallel scan/hash + throttled progress notifications
+
+- **Parallel scan/hash.** The per-file `stat`+`hashFile` loop in `workspace-scanner.ts` now runs as a bounded-concurrency pool (default `hashConcurrency: 20`), measured ~6× faster than the prior serial loop on a 670k-token workspace. Memo hits drain the pool nearly instantly.
+- **Throttled progress emits.** `files-uploader.ts`'s per-file progress notifications now throttle to ≥ 250 ms apart OR ≥ 25 files of progress, whichever comes first. The final completion always emits so progress UIs don't hang at e.g. 475/500.
+- **Shared `runPool` utility.** Extracted from `cache/files-uploader.ts` to `utils/run-pool.ts` so the scanner and uploader share the same primitive.
+
+### Changed — `caches.delete` on stale-cache rebuild now async (saves 5–15 s per rebuild)
+
+When the explicit cache path detects a stale cache id and triggers `caches.create`, the previous `caches.delete` call ran SYNCHRONOUSLY before the rebuild — adding 5–15 s of round-trip time to every cache rebuild for users on `cachingMode: 'explicit'`. v1.13.0 swaps this for an async post-create delete: the manifest's `cacheId` pointer is updated to the new cache as soon as `caches.create` returns, then the stale-cache delete fires in the background with 3× retry (1 s, 3 s, 9 s back-off). On permanent failure the orphan auto-expires at Google's TTL — bounded storage cost only.
+
+### Migration
+
+Both schema additions are additive ALTER TABLE migrations on existing v1.12.x databases — `mtime_ms`, `size` (on `files`); `caching_mode`, `cached_content_token_count` (on `usage_metrics`). Migration is idempotent: opening the same DB twice swallows "duplicate column name" errors. No data conversion required; pre-1.13 rows lacking the new columns are read as NULL.
+
+### Round-2 review fixes (post-`/coderev` cumulative chain)
+
+3-way `/coderev` (gpt + gemini + grok) + `/6step` deep analysis on the v1.13.0 PR surfaced 4 true-positive findings. All fixed before publish — no deferrals.
+
+- **FN1 — Scan memo never refreshed on inline / implicit / small-workspace paths (HIGH; gpt P1 + gemini P0 consensus).** The implicit-mode and below-`cacheMinTokens` branches in `prepareContext` skipped the uploader entirely (the only writer of `mtime_ms` / `size`), so `buildScanMemo` returned an empty Map every call and the v1.13.0 perf headline silently degraded to cold-every-call for the workflow it was built for. **Fix:** new `manifest.refreshFileFingerprints(...)` method (UPDATE-only on conflict — preserves any prior `file_id` / `uploaded_at` / `expires_at` so a switch back to explicit mode can still hit Files-API dedup) called from both inline-return branches via a `seedScanMemo` helper.
+- **FN2 — Telemetry recorded requested `cachingMode`, not actual (MEDIUM; gpt P1).** When `code({ codeExecution: true })` forced inline mode (Gemini rejects `cachedContent` + `tools` simultaneously), the column tagged the call as `'explicit'` even though no `caches.create` ever fired. Inflated explicit-adoption count, biasing the v1.14.0 default-flip telemetry. **Fix:** widened the column union with a third value `'inline'`; `effectiveCachingMode` now derives from `activePrep.inlineOnly` (forced-inline → `'inline'`, explicit → `'explicit'`, implicit-requested + inline → `'implicit'`). New `inlineCallCount` field on `cacheStatsLast24h` so operators can see codeExecution traffic separately from explicit adoption.
+- **FN3 — Mid-pool abort triggered per-task warn-log spam (MEDIUM; gemini P1).** A `timeoutMs` abort on a 400-file workspace at completed=12 fired the per-task abort guard for ~388 not-yet-started tasks; each rejection landed in `failures` and produced a `logger.warn('upload failed for X')` line, polluting stderr with N misleading warns before the post-pool guard re-threw the canonical `signal.reason`. **Fix:** discriminate abort-induced rejections in the failure-collection block (`reason === signal.reason || reason.name === 'AbortError'` → continue, no warn, no failures push). Genuine non-abort upload errors continue to surface as warns.
+- **FN8 — Missing tests for memo-hit growth + telemetry mode-vs-actual (MEDIUM; gpt+gemini META-PR C).** Three new pin tests in `cache-manager.test.ts` and `manifest-db.test.ts` cover: (1) implicit-mode call seeds `mtime_ms`/`size` on file rows, (2) small-workspace inline path also seeds, (3) `refreshFileFingerprints` preserves prior dedup metadata across explicit→implicit switches, (4) `cachingMode='inline'` distinct from `'explicit'` in aggregation, (5) `mode='mixed'` when 3 modes appear. Plus two new pin tests in `files-uploader.test.ts` covering FN3's discrimination logic (zero abort-induced warns; genuine non-abort errors still surface).
+- **FN6 — `(mtime_ms, size)` collision on atomic file replace (LOW PARTIAL; grok P1).** Documented as a tracked deficit in [`docs/KNOWN-DEFICITS.md`](./docs/KNOWN-DEFICITS.md) with the trigger conditions and `forceRescan` workaround. Future inode/3-tuple gate tracked as T29 in [`docs/FOLLOW-UP-PRS.md`](./docs/FOLLOW-UP-PRS.md) — pre-emptive fix is speculative cost given the exotic trigger.
+- **FN4 — Additive ALTER TABLE without `SCHEMA_VERSION` bump (LOW ACCEPTED; gemini P2).** Reviewer themselves rated as housekeeping. Tracked as T30 in [`docs/FOLLOW-UP-PRS.md`](./docs/FOLLOW-UP-PRS.md) for the next destructive migration.
+
+3 false positives dismissed (all from Grok, all citing code elements that don't exist in this codebase per empirical grep — Grok's own caveat declared its citations unverified due to MCP shell-substitution failure during the review).
+
+### Round-3 review fixes (post-`/coderev round2` + Copilot)
+
+A second `/coderev` pass on the round-2 fix delta (HEAD~2..HEAD), plus Copilot's PR-level review, surfaced **one HIGH that the round-2 self-audit missed** plus 2 LOWs. Critical lesson — the round-2 self-audit's R2-1 finding examined `refreshFileFingerprints` for "could a NULL fileId leak into the dedup query?" and confirmed the `file_id IS NOT NULL` filter rejects NULLs. But it failed to counter-case the *opposite* leak direction: "could a non-NULL but stale fileId leak in?" The dedup query happily returns rows where `content_hash = NEW_HASH` AND `file_id = OLD_FILEID` (uploaded for OLD content). Step 4 of /6step requires challenging both leak directions; missing the harder direction is the failure mode this round corrects.
+
+- **R3-FN1 — `refreshFileFingerprints` preserves stale `file_id` across `content_hash` change → silent context corruption (HIGH; gemini P0 + gpt P1 + copilot, missed by grok).** When a file's content changes between an explicit run (which uploaded the OLD bytes to Files API at `fileId='files/foo'`) and an implicit run (which calls `seedScanMemo`), the round-2 SQL preserved `file_id` unconditionally on conflict. Result: the row stored `(NEW_HASH, OLD_FILEID)` — and a subsequent explicit run's `findFileRowByHash(workspace, NEW_HASH, now)` returned that row, routing NEW content through the OLD upload. **Fix:** ON CONFLICT SET clause now uses `CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.file_id END` (and same for `uploaded_at` / `expires_at`). Content unchanged → preserve dedup metadata (the legitimate cross-mode reuse). Content changed → null out, forcing the next explicit run to re-upload. Replaces the round-2 test that locked in the buggy behavior with three new pin tests: hash-changed clears, hash-unchanged preserves, and `findFileRowByHash` regression covering the end-to-end corruption path.
+- **R3-FN2 — `files-uploader.test.ts:508` discrimination test never aborts the signal (LOW; gpt P2).** The "FN3 discrimination: genuine non-abort upload errors still surface as warns" test created an `AbortController` but never called `controller.abort(...)` — leaving the load-bearing `aborted=true && reason !== signal.reason && reason.name !== 'AbortError'` branch untested. **Fix:** new `'FN3 discrimination (truly): aborted + concurrent 5xx in same task still surfaces a warn'` test that aborts the controller AND throws a real 503 in the same task; asserts the 5xx warn surfaces while the abort-induced rejection on the second file IS suppressed.
+- **R3-FN3 — `emitProgress` "final emit always fires" comment falsified when tail tasks fail → UI hangs at 490/500 (LOW; copilot).** `completed` only increments on task SUCCESS, so a tail of failed uploads (rejection inside the per-file uploader) leaves `completed < files.length`, the throttle's `isFinal` predicate never triggers, and the last successful indexed-file message stays buffered indefinitely. **Fix:** trailing flush after the failure-collection `.then()` block — `if (completed > lastEmitCompleted) emit(\`indexed ${completed}/${files.length}\`)`. New test mocks 3 files with the last one failing; asserts emitter received a final emit with `completed=2, total=3` rather than lagging behind.
+
+2 ACCEPTED LOW findings tracked as follow-ups in [`docs/FOLLOW-UP-PRS.md`](./docs/FOLLOW-UP-PRS.md): T31 (skip memo-hit rows in `refreshFileFingerprints` to avoid WAL churn on monorepos) + T32 (`isAbortLike(reason, signal)` helper for future wrapped-error rejection paths).
+
+### Round-3 verification polish (post-adversarial /6step)
+
+After landing the round-3 HIGH fix, an adversarial /6step verification pass (workspace `/tmp/coderev/20260428-140123-51773/round3-verify-sixstep.md`) explicitly counter-cased BOTH leak directions on 13 plausible gaps in the round-3 fix. All 12 correctness gaps verified clean by an empirical `better-sqlite3` probe — confirming SQLite CASE-clause OLD/NEW semantics, end-to-end Scenario B closure (cross-file leak via shared content_hash), WAL snapshot isolation across concurrent connections, and `findFileRowByHash`'s correctness under the post-fix manifest state. The fix is empirically complete.
+
+Three defense-in-depth polish items applied:
+
+- **CASE hardening with `COALESCE(files.content_hash, '')`** — closes a latent regression footprint where a future migration that relaxes `content_hash`'s NOT NULL constraint would silently re-introduce the corruption (because SQL `NULL <> 'x'` is NULL/falsy → CASE falls through to ELSE → stale fileId preserved). With the COALESCE guard, a NULL existing hash compares as `'' <> 'new-hash'` → TRUE → fileId cleared. Schema-infeasible today; pure forward-defense at zero runtime cost.
+- **Explicit Scenario B regression test** in `cache-manager.test.ts` — before this commit, only Scenario A (same-relpath self-corruption) had a dedicated test; Scenario B (cross-file leak via shared content_hash — file2.ts new content hashes to the same value as file1.ts's new content, attempting dedup against file1.ts's stale fileId) was closed by the same SQL invariant but undocumented in tests. The new pin asserts `findFileRowByHash(ws, H_BAR, now) === null` after a hash-change refresh, plus that a fresh upload of file2.ts gets its OWN distinct fileId.
+- **Clarifying comment** on the "PRESERVES" test's mtime assertion noting that `mtime_ms` is OUTSIDE the round-3 conditional CASE (refreshes unconditionally) — pre-empts future-reader confusion where a regression that wraps every column in CASE would surface here rather than silently freezing mtime updates.
+
+The CHANGELOG's prior round-3 block stated the lesson learned in passing; [`docs/KNOWN-DEFICITS.md`](./docs/KNOWN-DEFICITS.md) now also carries it as a process record under "Process lesson: /6step step-4 must counter-case BOTH leak directions" — for future contributors auditing discriminator-filter / cache-key / dedup-query designs.
+
+Final coverage: 700 passed | 9 skipped (was 699 | 9 after round-3; +1 net new Scenario B regression pin). Lint, typecheck, double-test, build all green.
+
+### Notes
+
+- Minor-level release. New schema field (`cachingMode`); new structured-content metadata fields on `status`; new SQLite columns (additive, nullable). Default behaviour unchanged.
+- The implicit-caching pivot is the architectural answer to the v1.6-v1.7 streaming refactor's "review→edit→review" pain point: no more 60–180 s rebuild wait when files change between queries on Gemini 2.5+/3.
+- Coverage additions: 28 cache-manager tests (was 21 → 23 + 2 round-2 FN1 pins + 1 round-2 dedup-preserve [later flipped] + 2 round-3 hash-changed/unchanged pins + 1 round-3 dedup-regression test + 1 round-3-verify Scenario B pin), 34 manifest-db tests (was 23 → 32 + 2 round-2 FN2 pins), 19 workspace-scanner tests (was 14 + 5 v1.13 scan-memo tests), 4-test `status-tool.test.ts`, 4 round-2/3 pins on `files-uploader.test.ts` (2 FN3 + 1 round-3 truly-aborted-discrimination + 1 round-3 trailing-flush). Total suite: 700 passed | 9 skipped (was 663 | 9 in v1.12.2; +37 net new tests).
+
 ## [1.12.2] - 2026-04-28
 
 ### Added — observability for the `ask` → `ask_agentic` fallback timeout selection
