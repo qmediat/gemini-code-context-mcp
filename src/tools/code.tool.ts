@@ -452,6 +452,8 @@ async function executeCodeBody(
       // when codeExecution is requested so we have actual inline file parts
       // to embed alongside the prompt.
       allowCaching: scan.files.length > 0 && !codeExecution,
+      // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
+      signal: abortSignal,
     });
 
     // TPM throttle — placed AFTER `prepareContext`, immediately before
@@ -602,6 +604,8 @@ async function executeCodeBody(
             cacheMinTokens: ctx.config.cacheMinTokens,
             emitter,
             allowCaching: scan.files.length > 0 && !codeExecution,
+            // v1.12.1 — propagate signal into stale-cache rebuild too.
+            signal: abortSignal,
           });
           // Cancel stale reservation (tsMs was stamped before first
           // dispatch, now seconds old after rebuild) and re-reserve so
