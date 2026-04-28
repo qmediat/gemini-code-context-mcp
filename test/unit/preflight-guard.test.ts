@@ -628,6 +628,65 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     expect(loadConfig().cachingMode).toBe('implicit');
     vi.unstubAllEnvs();
   });
+
+  // v1.14.0 round-1 fix (F9, Grok P1): whitespace-only env values are
+  // morally equivalent to "unset" — they should short-circuit to the
+  // default silently, NOT trigger the "not a recognised value" warning.
+  // Pre-fix the empty-check happened BEFORE `.trim()`, so '   ' fell
+  // through to the warn path with a confusing message.
+  it('whitespace-only env value silently defaults to implicit (no warn)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', '   '); // whitespace only
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+    // No warn should fire for whitespace-only — that's the F9 fix.
+    const warnText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
+    expect(warnText).not.toMatch(/not a recognised value/);
+    errSpy.mockRestore();
+    vi.unstubAllEnvs();
+  });
+
+  // v1.14.0 round-1 fix (F3+F4, Copilot + GPT P1): log injection via
+  // raw env interpolation. Pre-fix, a value containing newlines or ANSI
+  // escapes was echoed verbatim into a stderr line — downstream log
+  // analyzers parsing line-by-line could see forged separate records.
+  // Post-fix uses `safeForLog` which escapes C0 control chars to
+  // printable form and caps length at 2000 chars.
+  it('log-injection guard: control chars in env value escape to printable form (no record-splitting)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Forge attempt: newline + fake CRITICAL log record with ANSI red.
+    const malicious = 'foo\n[CRITICAL] forged record[31mansi-red';
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', malicious);
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit'); // fallback fired
+
+    // safeForLog escapes \n → '\\n' and  → '\\x1b' (or similar
+    // printable form). Critical assertion: the warn payload contains NO
+    // raw newline character — record-splitting attempts collapse to one
+    // line.
+    expect(errSpy).toHaveBeenCalled();
+    const warnPayload = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('|');
+    // Empirical check: the malicious input had a literal '\n', the
+    // sanitised version should NOT.
+    expect(warnPayload).not.toMatch(/foo\n\[CRITICAL\]/);
+    // The printable prefix MUST still be visible to operators (so they
+    // see what they typed and can fix it). 'foo' should appear; the
+    // escaped form of newline (e.g. '\\n' or ''-escape) should
+    // also appear in the same single-line record.
+    expect(warnPayload).toMatch(/foo/);
+    // ANSI sequences MUST not survive — operator's terminal can't be
+    // hijacked via a forged colour code. Pattern uses string-form regex
+    // (NOT literal-regex syntax) to keep biome's noControlCharactersInRegex
+    // rule happy: `\x1b` is the JS string-escape for the ESC byte (0x1b);
+    // `RegExp(...)` then sees a literal ESC followed by `[31m` and the
+    // assertion fires only if that exact byte sequence survived sanitisation.
+    expect(warnPayload.includes(`${String.fromCharCode(0x1b)}[31m`)).toBe(false);
+
+    errSpy.mockRestore();
+    vi.unstubAllEnvs();
+  });
 });
 
 describe('workspaceGuardRatio env clamping', () => {

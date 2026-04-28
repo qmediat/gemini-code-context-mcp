@@ -3,6 +3,7 @@
  */
 
 import { type ResolvedAuth, resolveAuth } from './auth/profile-loader.js';
+import { safeForLog } from './utils/logger.js';
 
 export interface Config {
   auth: ResolvedAuth;
@@ -139,14 +140,31 @@ function readBoolEnv(name: string): boolean {
  */
 function readCachingModeEnv(): 'explicit' | 'implicit' {
   const raw = process.env.GEMINI_CODE_CONTEXT_CACHING_MODE;
-  if (raw === undefined || raw === '') return 'implicit';
+  if (raw === undefined) return 'implicit';
+  // v1.14.0 round-1 fix (F9, Grok P1): trim BEFORE the empty-check so
+  // whitespace-only values (`'   '`, `'\t'`) short-circuit to default
+  // silently instead of falling into the warn path. Whitespace-only is
+  // morally equivalent to "unset" — operators shouldn't get a misleading
+  // "not a recognised value" warning when they paste a value containing
+  // only whitespace (a common shell-quoting mistake).
   const v = raw.trim().toLowerCase();
+  if (v === '') return 'implicit';
   if (v === 'explicit' || v === 'implicit') return v;
   // Stderr-only warning so MCP host log pipelines surface the mistype.
   // Falling back to 'implicit' (the v1.14.0 default) keeps behaviour safe.
+  //
+  // v1.14.0 round-1 fix (F3+F4, Copilot + GPT P1): wrap `raw` in
+  // `safeForLog` so a malicious or accidental env value containing
+  // newlines / control chars / ANSI escapes can't forge a separate log
+  // record (record-splitting / log injection). `safeForLog` escapes C0
+  // control chars (LF/CR/TAB/ESC) into printable form (`\\n`/`\\r`/...)
+  // and caps length at 2000 chars — preserves the printable prefix so
+  // operators still see what they typed (`EXPLICITT`-style typos remain
+  // diagnosable), but multi-line forgery attempts collapse to a single
+  // safe log line.
   // eslint-disable-next-line no-console
   console.error(
-    `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_CACHING_MODE="${raw}" is not a recognised value (expected 'explicit' or 'implicit'); falling back to 'implicit'.`,
+    `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_CACHING_MODE="${safeForLog(raw)}" is not a recognised value (expected 'explicit' or 'implicit'); falling back to 'implicit'.`,
   );
   return 'implicit';
 }

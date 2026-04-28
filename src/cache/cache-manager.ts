@@ -247,14 +247,22 @@ async function buildInlineContentFromDisk(scan: ScanResult): Promise<Content[]> 
 
 /**
  * In-process mutex. Concurrent `prepareContext` calls for the SAME
- * `(workspaceRoot, filesHash, model, systemPromptHash, allowCaching, cacheMinTokens)`
- * fingerprint coalesce onto a single in-flight promise, avoiding duplicate
- * cache creation (which would leak orphaned Gemini caches at $$$/M-token-hour).
+ * `(workspaceRoot, filesHash, model, systemPromptHash, allowCaching,
+ *   cacheMinTokens, cachingMode)` fingerprint coalesce onto a single
+ * in-flight promise, avoiding duplicate cache creation (which would leak
+ * orphaned Gemini caches at $$$/M-token-hour).
  *
  * Keying on the full fingerprint is critical: `ask` and `code` tools use
  * different system instructions, so their `systemPromptHash` differs. Coalescing
  * on workspaceRoot alone would serve one tool's PreparedContext to the other —
  * wrong cache / system-instruction mismatch. This bug was flagged by GPT + Copilot.
+ *
+ * v1.14.0 round-1 added `cachingMode` to the fingerprint after Copilot
+ * caught a HIGH concurrency race (`/6step` F1): pre-fix, two concurrent
+ * calls with different `cachingMode` values produced identical keys, sharing
+ * one PreparedContext between them. v1.14.0's default flip transformed this
+ * from a niche edge case into the mainline collision shape — see the F1
+ * comment inside `inFlightKey()` below for the full failure scenario.
  *
  * Scope: single Node process. Cross-process races (two MCP servers sharing the
  * same manifest DB) are not covered — documented in docs/KNOWN-DEFICITS.md.
@@ -269,6 +277,19 @@ function inFlightKey(opts: BuildOptions): string {
     opts.systemPromptHash,
     String(opts.allowCaching),
     String(opts.cacheMinTokens ?? ''),
+    // v1.14.0 round-1 fix (F1, Copilot HIGH): `cachingMode` MUST be in the
+    // key. Pre-fix, two concurrent calls — one with `'explicit'` (per-call
+    // override), one with `'implicit'` (the v1.14.0 default) — produced
+    // identical keys and shared the SAME PreparedContext via the coalescing
+    // map below. Whichever raced first determined the return shape; the
+    // loser got the wrong caching strategy. Same shape as the v1.13.0
+    // round-3 stale-fileId bug — a missing dimension on an equality-keyed
+    // lookup. v1.14.0's default flip turned this from a niche edge case
+    // into the mainline collision shape because per-call `'explicit'`
+    // overrides routinely race the new default. `?? ''` keeps `undefined`
+    // distinct from `'explicit'` so a future third caching mode can't
+    // silently coalesce with undefined-legacy callers.
+    String(opts.cachingMode ?? ''),
   ].join('\u241E'); // record-separator sentinel unlikely to appear in any field
 }
 

@@ -774,6 +774,120 @@ describe('prepareContext', () => {
     expect(result.inlineContents.length).toBeGreaterThan(0);
     expect(result.inlineOnly).toBe(false); // distinguishes "fallback after upload" from "small workspace"
   });
+
+  // v1.14.0 round-1 review fix (F1, Copilot HIGH): the in-flight coalescing
+  // key MUST include `cachingMode`. Pre-fix, two concurrent prepareContext
+  // calls with different cachingModes produced identical keys → shared one
+  // PreparedContext → loser got the wrong caching strategy (e.g. 'implicit'
+  // caller received an explicit cacheId, or vice versa). v1.14.0's default
+  // flip transformed this from a niche edge to the mainline collision shape.
+  // This test fires both modes concurrently and asserts each receives the
+  // shape it asked for.
+  it('v1.14.0 F1 fix: concurrent prepareContext with different cachingModes do NOT coalesce', async () => {
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-1',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-1',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const client = mkClient({
+      cachesCreate: async () => ({ name: 'cachedContents/explicit-built' }),
+    });
+
+    // Same workspace, same model, same systemPromptHash, same allowCaching,
+    // same cacheMinTokens — only `cachingMode` differs.
+    const sharedScan = mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]);
+    const sharedOpts = {
+      client,
+      manifest: db,
+      scan: sharedScan,
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+    };
+
+    // Fire both concurrently. Pre-fix: both keys collide → one PreparedContext
+    // shared → assertions diverge (one of the two won't match its requested mode).
+    // Post-fix: the cachingMode dimension distinguishes them → each path runs
+    // independently → both receive the shape they asked for.
+    const [implicitResult, explicitResult] = await Promise.all([
+      prepareContext({ ...sharedOpts, cachingMode: 'implicit' }),
+      prepareContext({ ...sharedOpts, cachingMode: 'explicit' }),
+    ]);
+
+    // Implicit caller MUST get inlineOnly + cacheId=null.
+    expect(implicitResult.inlineOnly).toBe(true);
+    expect(implicitResult.cacheId).toBeNull();
+    expect(implicitResult.inlineContents.length).toBeGreaterThan(0);
+
+    // Explicit caller MUST get a real cacheId, no inline contents.
+    expect(explicitResult.cacheId).toBe('cachedContents/explicit-built');
+    expect(explicitResult.inlineOnly).toBe(false);
+    expect(explicitResult.inlineContents).toEqual([]);
+    expect(explicitResult.rebuilt).toBe(true);
+
+    // Empirical confirmation that the explicit branch ran caches.create
+    // — this would NOT have fired if the implicit branch had won the
+    // coalescing race and returned its inlineOnly result for both callers.
+    expect(client.caches.create).toHaveBeenCalledTimes(1);
+  });
+
+  // Companion regression: same-mode concurrent calls SHOULD still coalesce
+  // (the documented behaviour of the in-flight mutex — coalescing prevents
+  // duplicate cache builds that would leak orphan caches at $$$/h). This
+  // test pins that the F1 fix didn't accidentally break the legitimate
+  // coalescing path.
+  it('v1.14.0 F1 fix: concurrent same-mode calls STILL coalesce (mutex preserved)', async () => {
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-1',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-1',
+      cacheId: null,
+      cacheExpiresAt: null,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const client = mkClient({
+      cachesCreate: async () => ({ name: 'cachedContents/once' }),
+    });
+
+    const sharedScan = mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]);
+    const sharedOpts = {
+      client,
+      manifest: db,
+      scan: sharedScan,
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+      cachingMode: 'explicit' as const,
+    };
+
+    const [a, b] = await Promise.all([prepareContext(sharedOpts), prepareContext(sharedOpts)]);
+
+    // Both callers MUST receive the same cacheId.
+    expect(a.cacheId).toBe('cachedContents/once');
+    expect(b.cacheId).toBe('cachedContents/once');
+    // caches.create MUST have fired ONCE — coalescing is the whole point of
+    // the in-flight mutex. If F1's fix had over-keyed (e.g. on a non-stable
+    // dimension), this would fire twice and the test would surface the
+    // regression.
+    expect(client.caches.create).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('isStaleCacheError', () => {
