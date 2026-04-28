@@ -239,6 +239,24 @@ export async function uploadWorkspaceFiles(args: {
     }
   });
 
+  // Post-pool abort propagation (v1.12.1). `runPool` catches per-task
+  // errors and returns a settled-results array, so the in-task abort
+  // throw above just becomes "Upload failed for X" in `failures`. To
+  // honour the user's `timeoutMs` semantics — and surface a proper
+  // TIMEOUT errorCode at the tool layer instead of a generic
+  // "upload failed" — we re-check the signal AFTER the pool completes
+  // and throw `signal.reason` (the canonical TimeoutError DOMException
+  // with `timeoutKind` property). The outer `isTimeoutAbort` walk
+  // then maps it to `errorCode: 'TIMEOUT'` cleanly.
+  //
+  // Caught regression from /coderev v1.12.1 audit (Copilot finding
+  // COP-2): pre-fix the abort was silently swallowed by runPool.
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException('Operation aborted during file upload', 'AbortError');
+  }
+
   // Pack only the successful rows into the final contiguous array for callers.
   const files_out: FileRow[] = [];
   for (const row of out) if (row) files_out.push(row);

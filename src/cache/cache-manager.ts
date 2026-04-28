@@ -67,13 +67,21 @@ export interface BuildOptions {
   emitter: ProgressEmitter;
   allowCaching: boolean;
   /**
-   * Optional abort signal (v1.12.1+). When fired, in-flight Files API
-   * uploads are interrupted at the next poll point so the user's
-   * `timeoutMs` budget is honoured during the upload phase too.
-   * Pre-v1.12.1 the upload phase ignored aborts — the signal was only
-   * threaded into `generateContent`, so a 30s `timeoutMs` against a
-   * workspace whose upload took 90s would burn 60s of bandwidth before
-   * the abort took effect at `generateContent`-call time.
+   * Optional abort signal (v1.12.1+). When fired, the upload pool stops
+   * QUEUEING new per-file work and the post-pool abort check throws
+   * `signal.reason` so the caller's `timeoutMs` budget surfaces as a
+   * proper TIMEOUT errorCode. Already-flying `client.files.upload`
+   * calls complete on their own — the SDK doesn't expose abort plumbing
+   * on `files.upload`, so the abort honours user intent best-effort
+   * (stops scheduling new work, propagates the abort error after the
+   * in-flight tasks settle).
+   *
+   * Pre-v1.12.1 the upload phase ignored aborts entirely — the signal
+   * was only threaded into `generateContent`, so a 30s `timeoutMs`
+   * against a workspace whose upload took 90s would burn 60s of
+   * bandwidth before the abort took effect at `generateContent`-call
+   * time. The fix bounds the worst case to "in-flight pool size × max
+   * upload duration" instead of "total file count × max upload duration".
    */
   signal?: AbortSignal;
 }
