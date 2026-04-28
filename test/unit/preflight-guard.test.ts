@@ -673,7 +673,7 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     const { loadConfig } = await import('../../src/config.js');
     expect(loadConfig().cachingMode).toBe('implicit'); // fallback fired
 
-    // safeForLog escapes \n → '\\n' and  → '\\x1b' (or similar
+    // safeForLog escapes \n → '\\n' and ESC → '\\x1b' (or similar
     // printable form). Critical assertion: the warn payload contains NO
     // raw newline character — record-splitting attempts collapse to one
     // line.
@@ -684,7 +684,7 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     expect(warnPayload).not.toMatch(/foo\n\[CRITICAL\]/);
     // The printable prefix MUST still be visible to operators (so they
     // see what they typed and can fix it). 'foo' should appear; the
-    // escaped form of newline (e.g. '\\n' or ''-escape) should
+    // escaped form of newline (e.g. '\\n' or 'ESC'-escape) should
     // also appear in the same single-line record.
     expect(warnPayload).toMatch(/foo/);
     // ANSI sequences MUST not survive — operator's terminal can't be

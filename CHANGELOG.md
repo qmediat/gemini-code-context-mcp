@@ -80,6 +80,17 @@ Second 4-way `/coderev` (GPT + Gemini + Grok + Copilot) on the round-1 fix delta
 
 Round-2 coverage stays at 713 tests (3 fixes were in-place: 1 SQL/code, 2 test-fixture hygiene + 1 docs); no new pin tests required because the round-2 issues were doc-staleness + test-cleanup-hygiene + invisible-byte ergonomics, not new bugs needing regression coverage.
 
+### Round-3 review fixes (post-round-2 fix-delta review)
+
+Third 4-way `/coderev` (GPT + Gemini + Grok + Copilot via `mcp__github__request_copilot_review`). Gemini and Copilot cleared the PR (0 findings, "ship"). 2 TP-MED findings (per `/6step` severity calibration) closed in-place + 1 PARTIAL FP dismissed:
+
+- **G3-1 (TP MED, GPT P2 → /6step elevated):** the round-2 fix replaced the literal ESC byte in the `malicious` *string* but left raw 0x1b ESC bytes in two adjacent COMMENTS at `test/unit/preflight-guard.test.ts:676,687`. Same class as G2-4 (round-2) — invisible bytes in source files break `rg`/`grep`/editor tooling and make `git diff` render unpredictably. **Fix:** replaced both with the literal ASCII string `ESC` (in comment context the human-readable name is clearer than `\x1b`). Empirical confirmation: `grep -n $'\033' test/unit/preflight-guard.test.ts` returns no hits.
+- **G3-2 (TP MED, GPT P2 → /6step elevated):** `src/utils/logger.ts:71-72` had three raw control bytes (NUL 0x00, US 0x1f, DEL 0x7f) embedded inline as comment "examples". `file(1)` reported the source as `data` (binary), `rg` skipped the file by default. **Fix:** replaced with double-escaped `\\x00`-style notation that renders as the literal escape sequence in the comment (`\x00-\x1f`, `\x7f`) rather than raw bytes. Empirical confirmation via Python control-byte scan: 3 → 0 control bytes remaining.
+- **G3-3 (FP, Grok P1 → /6step refuted):** Grok claimed `safeForLog` truncation was not rune-aware (could split surrogate pairs) and that an ANSI-flood DoS vector survived the length cap. Empirically verified via Node execution: codepoint-aware `for..of` truncation correctly excludes a 2-code-unit codepoint when including it would exceed the cap (output ends at the BMP char before the surrogate, not a lone high surrogate). Length cap is enforced post-escape (newline-flood 3000→6000-escaped→2013-final, NUL-flood 1000→4000-escaped→2013-final). Grok also misidentified the file location (`config.ts` vs `utils/logger.ts`).
+- **G3-4 (ACCEPTED LOW, Grok P2):** doc gap on the `safeForLog(raw)` vs `safeForLog(v)` choice in `readCachingModeEnv` (intentional — preserves diagnostic case + whitespace for typo-spotting). Tracked but not blocking.
+
+Round-3 coverage stays at 713 tests (G3-1 + G3-2 were doc/comment ergonomics fixes — invisible-byte sanitisation, no behaviour change). Lint, typecheck, double-test, build all green.
+
 ## [1.13.0] - 2026-04-27
 
 ### Added — implicit-cache opt-in (per-call `cachingMode` field on `ask` / `code`)
