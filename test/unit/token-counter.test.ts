@@ -516,24 +516,59 @@ describe('countForPreflight — payload-size cap', () => {
     expect(result.cacheHit).toBe(false);
   });
 
-  it('cap accounting uses UTF-8 BYTES, not UTF-16 code units (F1 fix)', async () => {
-    // Critical for CJK / emoji repos. Without the F1 fix, `text.length`
-    // (UTF-16 code units) lets CJK content slip past the byte cap by 3×.
-    // This test pins the byte-accurate behaviour by constructing a
-    // workspace whose UTF-16 length stays well under the cap but whose
-    // UTF-8 byte count exceeds it, then asserting the cap fires.
+  it('cap accounting uses UTF-8 BYTES via file.size, not UTF-16 code units (F1 fix — projection path)', async () => {
+    // Pre-fix the cap projection used `text.length`; the F3 round-2 fix
+    // also moved the projection to use `file.size` (which is the stat
+    // byte count). This test pins THAT projection path. The post-iter
+    // accumulator is pinned separately by the CJK-real-file test below
+    // (which tests the genuinely-different `Buffer.byteLength(text)` vs
+    // `text.length` accounting on the read-success path).
     const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
-    // CJK char '中' = 1 UTF-16 unit, 3 UTF-8 bytes. 12 MB UTF-16 = 36 MB UTF-8.
-    // 12 fakeFiles × 1 MB CJK each (UTF-8 bytes), but file.size is the
-    // UTF-8 byte count we'd actually send. fakeFile uses the placeholder
-    // path which materializes 'a'.repeat(file.size) — ASCII at 1:1, so
-    // for byte-accurate testing we need file.size in UTF-8 bytes already.
+    // 12 fakeFiles × 3 MB each = 36 MB — over the 32 MB cap. fakeFile
+    // forces the placeholder path; projection uses `file.size` directly.
     const files = Array.from({ length: 12 }, (_, i) => fakeFile(`cjk-${i}.ts`, 3_000_000));
     const result = await countForPreflight(
       client,
       baseInput(files, { preflightMode: 'exact', inputTokenLimit: 1_000_000_000 }),
     );
-    // 12 × 3 MB = 36 MB > 32 MB cap → fallback before SDK call.
+    expect(countTokens).not.toHaveBeenCalled();
+    expect(result.method).toBe('fallback');
+  });
+
+  it('post-iter accumulator uses UTF-8 BYTES on real CJK content (F1 fix — read-success path; F11 closure)', async () => {
+    // The /6step round-3 audit caught a test-coverage gap: the previous
+    // F1 test used a fakeFile with ASCII `'a'.repeat(file.size)`
+    // placeholder, which has 1:1 UTF-16/UTF-8 ratio — so `text.length`
+    // and `Buffer.byteLength(text, 'utf8')` return the same number,
+    // and the test would pass with either implementation. To genuinely
+    // differentiate the buggy path from the fixed one, we need real CJK
+    // content where the two ratios diverge (1 UTF-16 unit = 3 UTF-8 bytes).
+    //
+    // Workspace: 1 real CJK file with 1M characters ('中'.repeat(1_000_000)).
+    //   `text.length` (UTF-16):   1_000_000
+    //   `Buffer.byteLength` UTF-8: 3_000_000
+    //   `file.size` (stat bytes):  3_000_000
+    //
+    // After the file iteration, plus a 30 MB ASCII prompt:
+    //   Fixed accumulator (Buffer.byteLength + prompt UTF-8 bytes):
+    //     3_000_024 + 31_457_280 = 34_457_304  →  > 32 MB cap  →  FALLBACK
+    //   Broken accumulator (text.length + prompt UTF-8 bytes):
+    //     1_000_024 + 31_457_280 = 32_457_304  →  < 32 MB cap  →  countTokens CALLED
+    //
+    // Asserting `countTokens` was NOT called pins the byte-accurate post-
+    // iteration accumulator path; a regression to `text.length` would
+    // fail the assertion.
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
+    const cjkFile = await realFile(tmpDir, 'cjk.ts', '中'.repeat(1_000_000));
+    const giantPrompt = 'a'.repeat(30 * 1024 * 1024); // 30 MB ASCII prompt
+    const result = await countForPreflight(
+      client,
+      baseInput([cjkFile], {
+        preflightMode: 'exact',
+        prompt: giantPrompt,
+        inputTokenLimit: 1_000_000_000,
+      }),
+    );
     expect(countTokens).not.toHaveBeenCalled();
     expect(result.method).toBe('fallback');
   });
