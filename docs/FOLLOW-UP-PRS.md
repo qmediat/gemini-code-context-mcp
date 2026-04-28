@@ -267,7 +267,11 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T17. Tokenizer-accurate pre-call cost estimate
+## ~~T17.~~ ✅ SHIPPED v1.10.0 — Tokenizer-accurate preflight via Gemini `countTokens`
+
+**Closed by:** v1.10.0 (PR #40). Preflight against `inputTokenLimit` now goes through the new `src/gemini/token-counter.ts` two-tier strategy (heuristic for small repos; real `countTokens` API near the cliff). The cost-estimator path (`src/utils/cost-estimator.ts`) still uses `bytes/4` for budget reservation — the heuristic is a documented "true upper bound" approximation for the cost ledger, where the trade-off (cheap, never an API round-trip) outweighs accuracy. The PREFLIGHT-against-context-window path was the genuine failure mode and is now exact.
+
+## T17-orig. (Original scope — preserved for context)
 
 **Source:** 2026-04-19 code review (gpt + grok, 2/3 consensus).
 
@@ -281,6 +285,20 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 **Sizing:** Option 1 — half a day (integration + test). Options 2 / 3 — under an hour.
 
 **Trigger:** First user report of a CJK-heavy repo blowing through `GEMINI_DAILY_BUDGET_USD` by more than the per-call estimate.
+
+---
+
+## T25. Telemetry surface for `tokenCountMethod` distribution
+
+**Source:** 2026-04-26 self-review of v1.10.0 (Phase 2 PR #40, finding F9).
+
+**Why:** v1.10.0 added `tokenCountMethod: 'heuristic' | 'exact' | 'fallback'` and `tokenCountCacheHit: boolean` to every `ask`/`code` structured-content response. Operators running the MCP at scale (or power users curious about preflight provenance) currently have no aggregate view — they have to grep logs for `countTokens preflight failed` lines or post-process structured-content metadata after the fact. A counter on the `status` MCP tool would give one-call visibility into "how often is the API path used?", "what fraction of exact counts hit the LRU?", and "is the fallback rate spiking?" (a leading indicator of `countTokens` API regression).
+
+**Scope:** Add four counters to `manifest` (in-memory or DB-backed): `preflightHeuristicCount`, `preflightExactFreshCount`, `preflightExactCachedCount`, `preflightFallbackCount`. Increment in `countForPreflight` per result branch. Surface in `status.structuredContent.preflight` as both raw counts and percentages. Optionally add a 24h sliding-window view if the manifest path is chosen.
+
+**Sizing:** ~2-3 hours including tests + docs.
+
+**Trigger:** First user / operator report wanting the data, OR first incident where the cause was an unexplained `countTokens` regression that grep-on-logs took too long to surface.
 
 ---
 
