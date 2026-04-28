@@ -25,7 +25,13 @@ function mkEmitter(): ProgressEmitter {
 }
 
 function mkScanned(relpath: string, hash: string, abs: string, size = 100): ScannedFile {
-  return { relpath, contentHash: hash, absolutePath: abs, size };
+  // v1.13.0 round-2 polish (R2-7): include `mtimeMs` and `memoHit` so the
+  // fixture matches the `ScannedFile` interface shape. Tests are excluded
+  // from typecheck (`tsconfig.json:exclude`), so omitting these fields used
+  // to silently survive — but a future test that reads `entry.file.mtimeMs`
+  // (e.g. asserting the uploader populates `files.mtime_ms`) would otherwise
+  // surprise contributors with a NULL column on these fixtures.
+  return { relpath, contentHash: hash, absolutePath: abs, size, mtimeMs: 0, memoHit: false };
 }
 
 function mkClient(uploadImpl: (params: unknown) => Promise<{ uri?: string; name?: string }>) {

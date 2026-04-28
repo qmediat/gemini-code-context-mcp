@@ -589,6 +589,14 @@ export class ManifestDb {
    *
    * Rows older than v1.13.0 lack `caching_mode` (NULL) and are treated as
    * `'explicit'` for the dominant-mode tally.
+   *
+   * Upgrade-day note (v1.12.x → v1.13.0): if pre-upgrade calls landed inside
+   * the 24h window AND post-upgrade traffic is exclusively forced-inline
+   * (e.g. `code({ codeExecution: true })`), `mode` returns `'mixed'` because
+   * the legacy NULL rows COALESCE into the explicit tally. This self-corrects
+   * once the legacy rows fall out of the 24h window. Operators surprised by
+   * `'mixed'` post-upgrade should look at `inlineCallCount` and
+   * `explicitRebuildCount` to confirm the actual post-upgrade traffic shape.
    */
   cacheStatsLast24h(nowMs: number): {
     mode: 'explicit' | 'implicit' | 'inline' | 'mixed' | null;
