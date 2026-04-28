@@ -25,7 +25,7 @@ import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/c
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
+import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
@@ -113,7 +113,16 @@ export const codeInputSchema = z
       .max(1_800_000)
       .optional()
       .describe(
-        'Per-call wall-clock timeout in ms (1s–30min). Aborts the in-flight `generateContent` request via `AbortController` if Gemini takes longer than this. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS`, then to disabled (no timeout). Returns `errorCode: "TIMEOUT"` on abort. Note: `AbortSignal` is client-only — Gemini still finishes the request server-side and bills tokens for completed work.',
+        'Per-call wall-clock TOTAL timeout in ms (1s–30min). The cost ceiling — aborts the in-flight `generateContent` request even if it is actively streaming. Gemini still finishes server-side and bills tokens for completed work. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS`, then to disabled. v1.12.0 RECOMMENDATION: prefer `stallMs` for liveness — `timeoutMs` is the cost cap, `stallMs` is the heartbeat-aware liveness watchdog that does NOT fire while the model is actively thinking. Both can be set simultaneously. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "total"` on abort.',
+      ),
+    stallMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(600_000)
+      .optional()
+      .describe(
+        'Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Recommended setting: `60_000` (60s). When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_STALL_MS`, then to disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.',
       ),
     preflightMode: z
       .enum(['heuristic', 'exact', 'auto'])
@@ -220,11 +229,14 @@ async function executeCodeBody(
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
-  // T19 — wall-clock timeout. See ask.tool.ts for rationale; same shape here.
-  const timeoutController = createTimeoutController(
-    input.timeoutMs,
-    'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
-  );
+  // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
+  // See ask.tool.ts for rationale; same shape here.
+  const timeoutController = createTimeoutController({
+    ...(input.timeoutMs !== undefined ? { totalMs: input.timeoutMs } : {}),
+    totalEnvVar: 'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
+    ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
+    stallEnvVar: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
+  });
   const abortSignal = timeoutController.signal;
   try {
     // Workspace validation inside try → reported as a regular tool error
@@ -566,6 +578,8 @@ async function executeCodeBody(
           const trimmed = text.trim().slice(0, 80);
           if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
         },
+        // v1.12.0 — stall watchdog reset on every chunk.
+        onChunkReceived: () => timeoutController.recordChunk(),
       });
     } catch (err) {
       if (activePrep.cacheId && isStaleCacheError(err)) {
@@ -626,6 +640,8 @@ async function executeCodeBody(
               const trimmed = text.trim().slice(0, 80);
               if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
             },
+            // v1.12.0 — stall watchdog reset on retry stream.
+            onChunkReceived: () => timeoutController.recordChunk(),
           });
           activePrep = rebuilt;
           retriedOnStaleCache = true;
@@ -814,13 +830,24 @@ async function executeCodeBody(
       ctx.throttle.cancel(throttleReservationId);
       throttleReservationId = -1;
     }
+    // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
     if (isTimeoutAbort(err)) {
       const ms = timeoutController.timeoutMs;
-      emitter.emit(`code: aborted after ${ms ?? '?'}ms timeout`);
-      return errorResult(
-        `code timed out after ${ms ?? '?'}ms. Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS\` higher; default disabled. Note: Gemini may still finish server-side and bill tokens for completed work (AbortSignal is client-only).`,
-        { errorCode: 'TIMEOUT', timeoutMs: ms, retryable: true },
-      );
+      const stallMs = timeoutController.stallMs;
+      const kind = getTimeoutKind(err);
+      const limitMs = kind === 'stall' ? stallMs : ms;
+      emitter.emit(`code: aborted after ${limitMs ?? '?'}ms ${kind ?? 'timeout'}`);
+      const message =
+        kind === 'stall'
+          ? `code timed out — no chunk received for ${stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`GEMINI_CODE_CONTEXT_CODE_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. Note: AbortSignal is client-only — Gemini still finishes server-side and bills for completed work.`
+          : `code timed out after ${ms ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. Note: AbortSignal is client-only — Gemini still finishes server-side and bills for completed work.`;
+      return errorResult(message, {
+        errorCode: 'TIMEOUT',
+        timeoutKind: kind ?? 'total',
+        timeoutMs: ms,
+        stallMs,
+        retryable: true,
+      });
     }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {

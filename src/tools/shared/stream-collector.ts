@@ -66,6 +66,18 @@ export interface StreamCollectorOptions {
   /** Minimum gap between `onThoughtChunk` emits. Default 1500ms — short
    * enough to feel live, long enough to avoid flooding MCP host throttles. */
   readonly thoughtEmitThrottleMs?: number;
+  /**
+   * Called on EVERY chunk arrival (Phase 4, v1.12.0). Used to reset the
+   * heartbeat-aware stall watchdog. Both text-bearing and thought-only
+   * chunks reset the timer — both prove the stream is alive. No-op when
+   * caller didn't supply one.
+   *
+   * Wire this from `createTimeoutController(...).recordChunk`. The
+   * controller's `recordChunk` is also a safe no-op when stall is
+   * disabled, so callers can pass the controller's `recordChunk`
+   * unconditionally.
+   */
+  readonly onChunkReceived?: () => void;
 }
 
 export interface CollectedResponse {
@@ -98,6 +110,7 @@ export async function collectStream(
 ): Promise<CollectedResponse> {
   const signal = opts.signal;
   const onThoughtChunk = opts.onThoughtChunk;
+  const onChunkReceived = opts.onChunkReceived;
   const throttleMs = opts.thoughtEmitThrottleMs ?? DEFAULT_THOUGHT_EMIT_THROTTLE_MS;
 
   // Pre-flight: never start consuming if abort already fired. Saves the cost
@@ -142,6 +155,13 @@ export async function collectStream(
       const now = Date.now();
       if (firstChunkAt === null) firstChunkAt = now;
       lastChunkAt = now;
+
+      // Reset the heartbeat-aware stall watchdog (Phase 4, v1.12.0).
+      // Both text-bearing and thought-only chunks reset — both prove the
+      // stream is alive. Called BEFORE the abort check below would
+      // re-fire to cover the (rare) race where stall fires AFTER the
+      // SDK yielded this chunk but BEFORE we processed it.
+      onChunkReceived?.();
 
       // Text concat. `chunk.text` is a getter on GenerateContentResponse
       // that joins parts.text from the first candidate; safe to read even
