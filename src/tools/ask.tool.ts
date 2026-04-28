@@ -24,7 +24,7 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
+import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
@@ -118,7 +118,16 @@ export const askInputSchema = z
       .max(1_800_000)
       .optional()
       .describe(
-        'Per-call wall-clock timeout in ms (1s–30min). Aborts the in-flight `generateContent` request via `AbortController` if Gemini takes longer than this. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled (no timeout). Returns `errorCode: "TIMEOUT"` on abort. Note: `AbortSignal` is client-only — Gemini still finishes the request server-side and bills tokens for completed work.',
+        'Per-call wall-clock TOTAL timeout in ms (1s–30min). The cost ceiling — aborts the in-flight `generateContent` request even if it is actively streaming. Gemini still finishes server-side and bills tokens for completed work. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled. v1.12.0 RECOMMENDATION: prefer `stallMs` for liveness — `timeoutMs` is the cost cap, `stallMs` is the heartbeat-aware liveness watchdog that does NOT fire while the model is actively thinking. Both can be set simultaneously. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "total"` on abort.',
+      ),
+    stallMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(600_000)
+      .optional()
+      .describe(
+        'Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking — the streaming heartbeat (every ~1500ms via `onThoughtChunk`) keeps the watchdog reset. This is the right knob for "kill dead sockets quickly without penalising deep reasoning." Recommended setting: `60_000` (60s) — Gemini Pro can pause 15-30s mid-reasoning between thought chunks under heavy thinking; 60s absorbs jitter while still killing truly dead sockets ~30× faster than the wall-clock alternative. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_STALL_MS`, then to disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.',
       ),
     preflightMode: z
       .enum(['heuristic', 'exact', 'auto'])
@@ -177,15 +186,19 @@ async function executeAskBody(
   // ("latest-pro-thinking") — different key, different bucket.
   let resolvedModelKey: string | null = null;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
-  // Timeout controller is wall-clock-bound on the WHOLE dispatch (workspace
-  // scan + cache prep + generateContent + stale-cache retry). Set up before
-  // any await so a `timeoutMs: 1000` against a slow scan still fires. The
-  // signal threads into both `withNetworkRetry({signal})` and the SDK's
-  // `config.abortSignal` — abort propagates through both layers cleanly.
-  const timeoutController = createTimeoutController(
-    input.timeoutMs,
-    'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
-  );
+  // Composite timeout controller — wall-clock-bound (`timeoutMs`) AND/OR
+  // heartbeat-aware stall watchdog (`stallMs`, v1.12.0). Set up before any
+  // await so a `timeoutMs: 1000` against a slow scan still fires. The
+  // unified signal threads into both `withNetworkRetry({signal})` and the
+  // SDK's `config.abortSignal` — whichever timer fires first aborts both
+  // layers cleanly. `recordChunk()` is wired into `collectStream` to reset
+  // the stall watchdog on every chunk arrival.
+  const timeoutController = createTimeoutController({
+    ...(input.timeoutMs !== undefined ? { totalMs: input.timeoutMs } : {}),
+    totalEnvVar: 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+    ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
+    stallEnvVar: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
+  });
   const abortSignal = timeoutController.signal;
   try {
     // Workspace path validation lives INSIDE the try so a
@@ -704,6 +717,10 @@ async function executeAskBody(
           const trimmed = text.trim().slice(0, 80);
           if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
         },
+        // v1.12.0 — reset the stall watchdog on every chunk (text or
+        // thought). Both prove the stream is alive. No-op when stall
+        // is disabled (env + per-call both unset).
+        onChunkReceived: () => timeoutController.recordChunk(),
       });
     } catch (err) {
       // Self-heal: if Gemini rejected our cached content (evicted, expired,
@@ -775,6 +792,8 @@ async function executeAskBody(
               const trimmed = text.trim().slice(0, 80);
               if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
             },
+            // v1.12.0 — stall watchdog reset on retry stream too.
+            onChunkReceived: () => timeoutController.recordChunk(),
           });
           activePrep = rebuilt;
           retriedOnStaleCache = true;
@@ -972,13 +991,26 @@ async function executeAskBody(
     }
     // Timeout-driven abort gets a dedicated errorCode so callers can
     // distinguish "Gemini was slow" from "schema invalid" / "auth failed".
+    // v1.12.0 — `timeoutKind` ('total' | 'stall') distinguishes the
+    // wall-clock cap from the heartbeat-aware stall watchdog so callers
+    // can apply different policies (e.g. retry on stall but not on total).
     if (isTimeoutAbort(err)) {
       const ms = timeoutController.timeoutMs;
-      emitter.emit(`ask: aborted after ${ms ?? '?'}ms timeout`);
-      return errorResult(
-        `ask timed out after ${ms ?? '?'}ms. Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS\` higher; default disabled. Note: Gemini may still finish server-side and bill tokens for completed work (AbortSignal is client-only).`,
-        { errorCode: 'TIMEOUT', timeoutMs: ms, retryable: true },
-      );
+      const stallMs = timeoutController.stallMs;
+      const kind = getTimeoutKind(err);
+      const limitMs = kind === 'stall' ? stallMs : ms;
+      emitter.emit(`ask: aborted after ${limitMs ?? '?'}ms ${kind ?? 'timeout'}`);
+      const message =
+        kind === 'stall'
+          ? `ask timed out — no chunk received for ${stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`GEMINI_CODE_CONTEXT_ASK_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. Note: AbortSignal is client-only — Gemini still finishes server-side and bills for completed work.`
+          : `ask timed out after ${ms ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. Note: AbortSignal is client-only — Gemini still finishes server-side and bills for completed work.`;
+      return errorResult(message, {
+        errorCode: 'TIMEOUT',
+        timeoutKind: kind ?? 'total',
+        timeoutMs: ms,
+        stallMs,
+        retryable: true,
+      });
     }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {

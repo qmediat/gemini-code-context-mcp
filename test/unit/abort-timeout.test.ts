@@ -4,7 +4,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createTimeoutController, isTimeoutAbort } from '../../src/tools/shared/abort-timeout.js';
+import {
+  createTimeoutController,
+  getTimeoutKind,
+  isTimeoutAbort,
+} from '../../src/tools/shared/abort-timeout.js';
 
 // File-level hard floor: every test in this file starts with real timers and a
 // clean env-stub state regardless of the previous test's exit path. The first
@@ -212,5 +216,243 @@ describe('abortableSleep — exported for tool-side throttle waits (T19 H1 fix)'
     const promise = abortableSleep(50, undefined);
     vi.advanceTimersByTime(60);
     await expect(promise).resolves.toBeUndefined();
+  });
+});
+
+// ===========================================================================
+// Phase 4 (v1.12.0) — heartbeat-aware stall detector + composite controller.
+//
+// Real timers throughout — fake timers can't simulate the chunk-arrival
+// stream events the stall watchdog resets on. Per the v1.7.2 lesson
+// (real `realpath` I/O racing fake timers), this whole describe block uses
+// real timers and short (50-300ms) durations to keep the suite fast.
+// ===========================================================================
+
+describe('createTimeoutController — composite (Phase 4)', () => {
+  beforeEach(() => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', undefined);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_STALL_MS', undefined);
+  });
+
+  describe('structured-options API', () => {
+    it('returns a never-firing controller when both totalMs and stallMs disabled', () => {
+      const c = createTimeoutController({
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS',
+        stallEnvVar: 'GEMINI_CODE_CONTEXT_TEST_STALL_MS',
+      });
+      expect(c.timeoutMs).toBeNull();
+      expect(c.stallMs).toBeNull();
+      expect(c.signal.aborted).toBe(false);
+      // recordChunk is a no-op when stall disabled.
+      c.recordChunk();
+      c.recordChunk();
+      expect(c.signal.aborted).toBe(false);
+      c.dispose();
+    });
+
+    it('reports both totalMs and stallMs when both are set', () => {
+      const c = createTimeoutController({
+        totalMs: 5_000,
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS',
+        stallMs: 2_000,
+        stallEnvVar: 'GEMINI_CODE_CONTEXT_TEST_STALL_MS',
+      });
+      expect(c.timeoutMs).toBe(5_000);
+      expect(c.stallMs).toBe(2_000);
+      c.dispose();
+    });
+
+    it('per-call stallMs wins over env var', () => {
+      vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_STALL_MS', '999');
+      const c = createTimeoutController({
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS',
+        stallMs: 30_000,
+        stallEnvVar: 'GEMINI_CODE_CONTEXT_TEST_STALL_MS',
+      });
+      expect(c.stallMs).toBe(30_000);
+      c.dispose();
+    });
+
+    it('clamps stallMs to [1_000, 600_000]', () => {
+      const tooSmall = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 100,
+        stallEnvVar: 'STALL',
+      });
+      expect(tooSmall.stallMs).toBe(1_000);
+      tooSmall.dispose();
+
+      const tooLarge = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 9_999_999,
+        stallEnvVar: 'STALL',
+      });
+      expect(tooLarge.stallMs).toBe(600_000);
+      tooLarge.dispose();
+    });
+  });
+
+  describe('legacy 2-arg signature (backward compat)', () => {
+    it('still works exactly as v1.6.0–v1.11.0', () => {
+      const c = createTimeoutController(5_000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      expect(c.timeoutMs).toBe(5_000);
+      // Stall is implicitly disabled in legacy mode.
+      expect(c.stallMs).toBeNull();
+      c.dispose();
+    });
+
+    it('legacy disabled (undefined per-call, missing env) returns never-firing controller', () => {
+      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      expect(c.timeoutMs).toBeNull();
+      expect(c.stallMs).toBeNull();
+    });
+  });
+
+  describe('stall watchdog firing', () => {
+    it('fires after `stallMs` of silence with no chunks recorded', async () => {
+      const c = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 1_000, // 1s — minimum allowed; lowest test value
+        stallEnvVar: 'STALL',
+      });
+      const start = Date.now();
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          c.signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        c.signal.addEventListener('abort', onAbort);
+      });
+      const elapsed = Date.now() - start;
+      // Tolerate a 5% lower-bound flake margin per v1.7.2 timer-precision policy.
+      expect(elapsed).toBeGreaterThanOrEqual(950);
+      expect(c.signal.aborted).toBe(true);
+      expect(c.signal.reason).toBeInstanceOf(DOMException);
+      expect(getTimeoutKind(c.signal.reason)).toBe('stall');
+      expect(isTimeoutAbort(c.signal.reason)).toBe(true);
+      c.dispose();
+    });
+
+    it('does NOT fire when `recordChunk` is called within stallMs', async () => {
+      const c = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 1_000,
+        stallEnvVar: 'STALL',
+      });
+      // Record a chunk every 200ms for 1.5s — total elapsed > stallMs but
+      // each gap < stallMs, so the watchdog should NOT fire.
+      const interval = setInterval(() => c.recordChunk(), 200);
+      await new Promise((r) => setTimeout(r, 1_500));
+      clearInterval(interval);
+      expect(c.signal.aborted).toBe(false);
+      c.dispose();
+    });
+
+    it('fires when chunks stop after some activity', async () => {
+      const c = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 1_000,
+        stallEnvVar: 'STALL',
+      });
+      // 2 chunks 200ms apart → gap → silence > stallMs → abort.
+      c.recordChunk();
+      await new Promise((r) => setTimeout(r, 200));
+      c.recordChunk();
+      // Now wait for the stall to fire.
+      const start = Date.now();
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          c.signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        c.signal.addEventListener('abort', onAbort);
+      });
+      const elapsed = Date.now() - start;
+      // Stall fires ~1s after the last recordChunk.
+      expect(elapsed).toBeGreaterThanOrEqual(950);
+      expect(getTimeoutKind(c.signal.reason)).toBe('stall');
+      c.dispose();
+    });
+  });
+
+  describe('total wall-clock firing (still works alongside stall)', () => {
+    it('fires after `totalMs` even when chunks are flowing', async () => {
+      const c = createTimeoutController({
+        totalMs: 1_500,
+        totalEnvVar: 'TOTAL',
+        stallMs: 5_000, // stall is much longer — total wins
+        stallEnvVar: 'STALL',
+      });
+      // Keep the stall watchdog reset so ONLY total can fire.
+      const interval = setInterval(() => c.recordChunk(), 200);
+      const start = Date.now();
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          c.signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        c.signal.addEventListener('abort', onAbort);
+      });
+      clearInterval(interval);
+      const elapsed = Date.now() - start;
+      expect(elapsed).toBeGreaterThanOrEqual(1_400);
+      expect(getTimeoutKind(c.signal.reason)).toBe('total');
+      c.dispose();
+    });
+  });
+
+  describe('whichever fires first wins', () => {
+    it('stall fires first when totalMs is far in the future and chunks stop', async () => {
+      const c = createTimeoutController({
+        totalMs: 60_000, // 60s — way out
+        totalEnvVar: 'TOTAL',
+        stallMs: 1_000, // 1s — fires first
+        stallEnvVar: 'STALL',
+      });
+      await new Promise<void>((resolve) => {
+        const onAbort = (): void => {
+          c.signal.removeEventListener('abort', onAbort);
+          resolve();
+        };
+        c.signal.addEventListener('abort', onAbort);
+      });
+      expect(getTimeoutKind(c.signal.reason)).toBe('stall');
+      c.dispose();
+    });
+  });
+});
+
+describe('getTimeoutKind', () => {
+  it("returns 'total' for total wall-clock timeout", () => {
+    const reason = new DOMException('Timed out after 5000 ms (total wall-clock)', 'TimeoutError');
+    expect(getTimeoutKind(reason)).toBe('total');
+  });
+
+  it("returns 'stall' for stall watchdog timeout", () => {
+    const reason = new DOMException(
+      'Timed out after 1000 ms (stall — no chunk received)',
+      'TimeoutError',
+    );
+    expect(getTimeoutKind(reason)).toBe('stall');
+  });
+
+  it("returns 'total' for legacy/pre-v1.12.0 TimeoutError messages without suffix (backward compat)", () => {
+    const reason = new DOMException('Timed out after 5000 ms', 'TimeoutError');
+    expect(getTimeoutKind(reason)).toBe('total');
+  });
+
+  it('returns null for non-timeout errors', () => {
+    expect(getTimeoutKind(new Error('regular error'))).toBeNull();
+    expect(getTimeoutKind('not an error')).toBeNull();
+    expect(getTimeoutKind(null)).toBeNull();
+  });
+
+  it('walks the cause chain', () => {
+    const inner = new DOMException(
+      'Timed out after 1000 ms (stall — no chunk received)',
+      'TimeoutError',
+    );
+    const outer = new Error('SDK error', { cause: inner });
+    expect(getTimeoutKind(outer)).toBe('stall');
   });
 });

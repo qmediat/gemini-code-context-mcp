@@ -5,6 +5,33 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-04-28
+
+### Added — heartbeat-aware stall detector for `ask` / `code` (Phase 4 of the v1.9.0 plan)
+
+The user's hard requirement for v1.6.0's `timeoutMs`: *"the timeout MUST NOT fire while the model is actively thinking and the streaming heartbeat shows the call is functioning."* v1.6.0's `timeoutMs` is a wall-clock cap that doesn't observe stream activity — a call heartbeating happily at minute 4 still gets killed at minute 5 if `timeoutMs: 300_000`. v1.12.0 adds a complementary **stall watchdog** (`stallMs`) that resets on every chunk (text or thought) and only fires when the stream goes silent.
+
+Both mechanisms are independent and BOTH supported simultaneously:
+- **`timeoutMs`** (existing, wall-clock) — cost ceiling. A stuck Gemini server-side process still bills the user until it self-terminates; a hard cap bounds the worst-case spend per call.
+- **`stallMs`** (new, heartbeat-aware) — liveness watchdog. Kills truly dead sockets ~30× faster than the wall-clock alternative. Does NOT fire while the model is actively thinking (the streaming heartbeat resets it, every ~1500ms via `onThoughtChunk`).
+
+When BOTH are set, whichever timer fires first wins. The error metadata distinguishes which kind fired via `timeoutKind: 'total' | 'stall'`.
+
+- **New schema field on `ask` and `code`:** `stallMs: number` (1s–10min, optional). Default DISABLED — same opt-in convention as `timeoutMs` (existing v1.6.0 callers see no behaviour change). Recommended setting documented in the schema description: `60_000` (60s) — Gemini Pro can pause 15-30s mid-reasoning between thought chunks under heavy thinking; 60s absorbs jitter while still killing dead sockets quickly.
+- **New env var fallbacks:** `GEMINI_CODE_CONTEXT_ASK_STALL_MS`, `GEMINI_CODE_CONTEXT_CODE_STALL_MS`. Resolution order: per-call > env > disabled.
+- **Composite `TimeoutController` in `src/tools/shared/abort-timeout.ts`.** New structured-options API: `createTimeoutController({ totalMs, totalEnvVar, stallMs, stallEnvVar })`. The controller's `signal` fires on EITHER timer; `recordChunk()` resets the stall watchdog and is called from `collectStream` on every chunk arrival. Legacy 2-arg signature `createTimeoutController(perCallMs, envVarName)` still accepted for backward compat (builds a controller with stall disabled).
+- **`isTimeoutAbort` + new `getTimeoutKind`** in the same module. Both walk the `error.cause` chain (cycle-safe, depth-capped). `getTimeoutKind` inspects the abort reason's message to return `'total' | 'stall' | null`.
+- **`stream-collector.ts`** gained an `onChunkReceived` callback in `StreamCollectorOptions`. Called on every chunk (text or thought) before the abort check. Wire from the controller's `recordChunk`.
+- **`ask.tool.ts` / `code.tool.ts`** updated to: pass the new structured-options to `createTimeoutController`, thread `recordChunk` into both happy-path and stale-cache-retry `collectStream` calls, and surface `timeoutKind` (and the relevant limit — `timeoutMs` or `stallMs`) on the TIMEOUT errorResult so orchestrators can apply different retry policies for stall vs total.
+- **`ask_agentic` interaction unchanged.** `ask_agentic` uses `generateContent` (not `generateContentStream`), so there's no chunk stream to reset on. `iterationTimeoutMs` continues to be the per-iteration wall-clock cap (existing behaviour). Future v1.x release may migrate the agentic per-iteration calls to streaming so the stall detector applies there too.
+- **Tests:** new cases in `test/unit/abort-timeout.test.ts` pin the composite controller (chunk-arrival resets stall, gap fires stall, continuous chunks but `timeoutMs` exceeded fires total, both disabled = never-firing signal, legacy 2-arg signature still works). Real timers (per the v1.7.2 lesson — fake timers can't simulate stream events).
+
+### Notes
+
+- Zero breaking changes. `stallMs` defaults to disabled. Existing `timeoutMs` callers see identical behaviour. The legacy 2-arg `createTimeoutController(perCallMs, envVarName)` signature still works (no source edits needed for v1.6.0–v1.11.0 callers).
+- New schema fields additive. New error-metadata fields (`timeoutKind`, `stallMs`) added; existing `timeoutMs` field unchanged.
+- The plan's stretch goal (flipping `stallMs` default to `60_000` in v2.0.0 after collecting feedback) is a future major-version decision, not part of v1.12.0.
+
 ## [1.11.0] - 2026-04-28
 
 ### Added — opt-in `ask` → `ask_agentic` auto-fallback on `WORKSPACE_TOO_LARGE` (Phase 3 of the v1.9.0 plan)
