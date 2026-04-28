@@ -12,7 +12,7 @@
  * tool-call budget — the observed "agent exhausted budget retrying".
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -577,6 +577,17 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
   });
 
+  // v1.14.0 round-2 fix (G2-2, Gemini P2): unconditional cleanup so a thrown
+  // assertion mid-test doesn't leak stubbed env vars / spy state into sibling
+  // tests. Pre-fix the inline `vi.unstubAllEnvs()` and `errSpy.mockRestore()`
+  // calls at the bottom of each test only ran on the happy path; an `expect`
+  // failure threw before they fired and contaminated downstream tests.
+  // `afterEach` runs in both pass-and-fail paths, closing the leak.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
   it('defaults to implicit when env var is unset', async () => {
     vi.unstubAllEnvs();
     vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
@@ -656,7 +667,7 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
   it('log-injection guard: control chars in env value escape to printable form (no record-splitting)', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     // Forge attempt: newline + fake CRITICAL log record with ANSI red.
-    const malicious = 'foo\n[CRITICAL] forged record[31mansi-red';
+    const malicious = 'foo\n[CRITICAL] forged record\x1b[31mansi-red';
     vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', malicious);
     vi.resetModules();
     const { loadConfig } = await import('../../src/config.js');

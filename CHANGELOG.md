@@ -13,7 +13,7 @@ v1.13.0 shipped `cachingMode: 'explicit' | 'implicit'` as opt-in (default `'expl
 
 - **Default for `ask` / `code`'s `cachingMode` field:** now `'implicit'` (was `'explicit'` in v1.13.0). Per-call `input.cachingMode` always wins; setting `'explicit'` explicitly reverts to v1.13.0 behaviour for that call.
 - **Operator-level override:** new env var `GEMINI_CODE_CONTEXT_CACHING_MODE` accepts `'explicit'` or `'implicit'` (case-insensitive). Unset → default `'implicit'`. Invalid value → falls back to `'implicit'` AND emits a stderr warning so operators see their mistype rather than silently shipping the wrong strategy.
-- **Strict env-var validation:** the warn path uses `console.error` (visible in MCP host log pipelines) and includes the offending raw value verbatim, so `GEMINI_CODE_CONTEXT_CACHING_MODE=EXPLICITT` produces a clear "not a recognised value" message instead of a silent fallback.
+- **Strict env-var validation:** the warn path uses `console.error` (visible in MCP host log pipelines) and surfaces the offending value through `safeForLog` — control characters (newlines, tabs, ANSI escapes) are escaped to printable form, length is capped at 2000 chars. Operators still see the printable prefix of their typo for triage (e.g. `EXPLICITT` produces a clear "not a recognised value" message), but multi-line / control-char forge attempts collapse to a single safe log line and cannot record-split the stderr stream. (Round-1 review fix for the F3+F4 log-injection finding.)
 
 ### Behavioural impact
 
@@ -63,6 +63,22 @@ Full `/coderev` chain (GPT + Gemini + Grok via 3-way + Copilot via `mcp__github_
 **Process lesson reinforced:** the first `/6step` pass skipped step-3 (empirical verify) and step-4 (counter-case both leak directions) for 7 of 13 findings — caught by the user via a `grep -E "^### Step [123456]"` header check. Remediation pass + final consolidation pass re-derived all 13 findings with full methodology; verdicts were unchanged but uncertainty was reduced. Lesson recorded in [`docs/KNOWN-DEFICITS.md`](./docs/KNOWN-DEFICITS.md) "Process lesson: /6step step-4 must counter-case BOTH leak directions". The empirical-header check is now part of the auditing standard.
 
 Total round-1 coverage: 713 passed | 9 skipped (was 709 | 9 pre-review fixes; +4 net new pin tests covering F1×2 + F3×1 + F9×1).
+
+### Round-2 review fixes (post-round-1 fix-delta review)
+
+Second 4-way `/coderev` (GPT + Gemini + Grok + Copilot) on the round-1 fix delta verified all 4 round-1 TPs (F1, F3, F4, F9) RESOLVED with file:line evidence from every reviewer. Three new LOW findings closed:
+
+- **G2-2 (Gemini P2):** test cleanup hygiene — `vi.unstubAllEnvs()` and `errSpy.mockRestore()` were inlined at the bottom of each test, leaking stubbed env / spy state into sibling tests on assertion failure (the inline calls only fired on the happy path). **Fix:** added `afterEach` to the `cachingMode env resolution` describe block; cleanup now runs in both pass-and-fail paths.
+- **G2-3 (Copilot):** CHANGELOG entry above said the warning "includes the offending raw value verbatim", but the F3+F4 fix wraps the value through `safeForLog` (control chars escaped to printable form, length capped at 2000 chars). **Fix:** updated wording to match the implementation.
+- **G2-4 (Copilot):** `test/unit/preflight-guard.test.ts:659` had a literal ESC byte (0x1b) in the malicious-input fixture — invisible in most editors, hard to grep, encoding-dependent. **Fix:** replaced with the explicit `\x1b` JS escape sequence; behaviour identical, source is now grep-able.
+
+1 PARTIAL deferred (G2-1, Grok P1): the headline claim "over-key counter-case not pinned" was technically wrong — the same-mode coalescing pin already exists at `cache-manager.test.ts:849-890` and asserts `caches.create` fires exactly once. Grok's sub-claim about an `undefined`-vs-concrete-string discrimination test gap is real but unreachable in current code (no callsite passes `cachingMode: undefined` post-v1.14.0; the type system narrows `requestedCachingMode` to `'explicit' | 'implicit'` at every callsite). Tracked as defer-followup; no current callsite triggers.
+
+1 ACCEPTED LOW (G2-5, Grok P2): `safeForLog` could be hardened to escape NBSP / smart quotes / BOM in addition to C0 control chars — defense-in-depth only, no current bug.
+
+1 FP (G2-6, Grok P2): "toLowerCase swallows original casing" — closed by the TypeScript literal union `'explicit' | 'implicit'` at `config.ts:68` and `db.ts:478` which narrows after the case-insensitive check.
+
+Round-2 coverage stays at 713 tests (3 fixes were in-place: 1 SQL/code, 2 test-fixture hygiene + 1 docs); no new pin tests required because the round-2 issues were doc-staleness + test-cleanup-hygiene + invisible-byte ergonomics, not new bugs needing regression coverage.
 
 ## [1.13.0] - 2026-04-27
 
