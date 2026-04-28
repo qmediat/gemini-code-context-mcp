@@ -123,7 +123,7 @@ export const askInputSchema = z
       .enum(['heuristic', 'exact', 'auto'])
       .optional()
       .describe(
-        "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model)). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
+        "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -360,19 +360,18 @@ async function executeAskBody(
         files: scan.files,
         prompt: input.prompt,
         model: resolved.resolved,
+        // `filesHash` is post-glob-filter (see `scanWorkspace`), so it
+        // already encodes user-supplied includeGlobs/excludeGlobs — no
+        // separate globsHash axis needed in the cache key.
         filesHash: scan.filesHash,
-        ...(input.includeGlobs !== undefined || input.excludeGlobs !== undefined
-          ? {
-              globsHash: `${(input.includeGlobs ?? []).join(',')}|${(input.excludeGlobs ?? []).join(',')}`,
-            }
-          : {}),
         ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
         inputTokenLimit: contextWindow,
         // Thread the user's `timeoutMs` AbortSignal so a hung countTokens
         // call doesn't bleed past the user's stated wall-clock budget. The
         // SDK's `CountTokensConfig` accepts `abortSignal`; on cancellation
-        // the SDK throws AbortError and `countForPreflight` falls through
-        // to the `bytes/3` graceful-degradation path.
+        // the SDK throws `AbortError`, which `countForPreflight` re-throws
+        // (rather than swallowing as a fallback) so this outer try/catch
+        // maps it to `errorCode: 'TIMEOUT'` immediately.
         signal: abortSignal,
       });
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);

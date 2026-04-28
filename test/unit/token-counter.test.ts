@@ -11,8 +11,10 @@
  *     `SYSTEM_INSTRUCTION_RESERVE`; populates cache.
  *   - `'exact'` mode: always calls countTokens regardless of size.
  *   - Cache hit: skip API call, return cached count + reserve.
- *   - Cache key: invalidates on `filesHash` / `prompt` / `model` / `globsHash`
- *     change.
+ *   - Cache key: invalidates on `filesHash` / `prompt` / `model` change.
+ *     `filesHash` is post-glob-filter so glob changes that resolve to a
+ *     different file set invalidate automatically — no separate
+ *     `globsHash` axis needed.
  *   - 429 / network failure: log warn, return `bytes/3` fallback,
  *     `method: 'fallback'`. Never throws.
  *   - Malformed `totalTokens` from API: same fallback path.
@@ -86,7 +88,6 @@ const baseInput = (
   prompt: 'analyse this code',
   model: 'gemini-3-pro-preview',
   filesHash: 'workspace-hash-1',
-  globsHash: '',
   inputTokenLimit: 1_048_576,
   ...overrides,
 });
@@ -177,7 +178,7 @@ describe("countForPreflight — 'exact' mode", () => {
     expect(result.effectiveTokens).toBe(42 + SYSTEM_INSTRUCTION_RESERVE);
   });
 
-  it('passes file content (not just filename) in the countTokens payload', async () => {
+  it('passes file content with the same `--- FILE: ---` marker that cache-manager uses', async () => {
     const { client, countTokens } = buildClient(async () => ({ totalTokens: 7 }));
     const file = await realFile(tmpDir, 'feature.ts', 'export const PI = 3.14;');
     await countForPreflight(client, baseInput([file], { preflightMode: 'exact' }));
@@ -189,9 +190,14 @@ describe("countForPreflight — 'exact' mode", () => {
     };
     expect(call.model).toBe('gemini-3-pro-preview');
     const parts = call.contents[0]?.parts ?? [];
-    // First part: file content with `// {relpath}\n` annotation.
-    expect(parts[0]?.text).toContain('// feature.ts');
+    // First part must use the same marker as `cache-manager.ts`'s
+    // `buildContentFromUploaded` / `buildInlineContentFromDisk` so the
+    // counted bytes match the bytes the real `generateContent` will see.
+    expect(parts[0]?.text).toContain('--- FILE: feature.ts ---');
     expect(parts[0]?.text).toContain('export const PI = 3.14;');
+    // Marker is the v1.10.0 fix for the systematic ~6-8 token/file
+    // undercount caused by the original `// ${relpath}\n` shape.
+    expect(parts[0]?.text).not.toContain('// feature.ts');
     // Last part: prompt itself.
     expect(parts[parts.length - 1]?.text).toBe('analyse this code');
   });
@@ -205,7 +211,7 @@ describe("countForPreflight — 'exact' mode", () => {
       contents: Array<{ parts: Array<{ text: string }> }>;
     };
     const firstPart = call.contents[0]?.parts[0]?.text ?? '';
-    expect(firstPart).toContain('// missing.ts');
+    expect(firstPart).toContain('--- FILE: missing.ts ---');
     expect(firstPart).toContain('a'.repeat(50));
   });
 });
@@ -258,19 +264,12 @@ describe('countForPreflight — cache', () => {
     expect(countTokens).toHaveBeenCalledTimes(2);
   });
 
-  it('cache key invalidates when globsHash changes', async () => {
-    const { client, countTokens } = buildClient(async () => ({ totalTokens: 500 }));
-    const file = await realFile(tmpDir, 'a.ts', 'z'.repeat(10));
-    await countForPreflight(
-      client,
-      baseInput([file], { preflightMode: 'exact', globsHash: 'glob-1' }),
-    );
-    await countForPreflight(
-      client,
-      baseInput([file], { preflightMode: 'exact', globsHash: 'glob-2' }),
-    );
-    expect(countTokens).toHaveBeenCalledTimes(2);
-  });
+  // NOTE: pre-v1.10.0 (round-2) the cache key also included a `globsHash`
+  // axis; that proved redundant because `filesHash` is computed
+  // post-glob-filter — so two glob configs resolving to the same file set
+  // share `filesHash` and any glob change that affects the file set
+  // already invalidates via `filesHash`. The redundant axis was dropped
+  // (no test pinning it here).
 
   it('clearTokenCounterCache evicts everything', async () => {
     const { client, countTokens } = buildClient(async () => ({ totalTokens: 500 }));
@@ -453,15 +452,41 @@ describe('countForPreflight — AbortSignal threading (F1)', () => {
     expect(call.config).toBeUndefined();
   });
 
-  it('falls back gracefully when SDK throws AbortError on signal abort', async () => {
+  it('RE-THROWS the SDK abort when the user-provided signal is aborted', async () => {
+    // Round-2 (v1.10.0) correction: pre-v1.10.0 round-2 the catch
+    // unconditionally fell back even on user-initiated abort. That
+    // silently extended the user's `timeoutMs` budget — `ask` would
+    // proceed to eager Files API upload before the abort eventually
+    // landed on `generateContent`. The fix re-throws when
+    // `input.signal?.aborted`, so the outer tool catch maps it to
+    // `errorCode: 'TIMEOUT'` immediately.
+    const sdkErr = new Error('Request aborted');
+    sdkErr.name = 'AbortError';
     const { client } = buildClient(async () => {
-      const err = new Error('Request aborted');
-      err.name = 'AbortError';
-      throw err;
+      throw sdkErr;
     });
     const file = await realFile(tmpDir, 'big.ts', 'y'.repeat(2_400_000));
     const controller = new AbortController();
     controller.abort();
+
+    await expect(
+      countForPreflight(
+        client,
+        baseInput([file], { preflightMode: 'exact', signal: controller.signal }),
+      ),
+    ).rejects.toBe(sdkErr);
+  });
+
+  it('still falls back to heuristic on non-abort errors even when a signal is provided', async () => {
+    // Defends the "abort-only re-throw" rule: a non-aborted signal must
+    // not cause 429s / network errors to propagate; they still fall
+    // through to bytes/3 graceful degradation.
+    const { client } = buildClient(async () => {
+      throw new Error('429 RESOURCE_EXHAUSTED');
+    });
+    const file = await realFile(tmpDir, 'big.ts', 'y'.repeat(2_400_000));
+    const controller = new AbortController();
+    // controller NOT aborted
 
     const result = await countForPreflight(
       client,
@@ -472,12 +497,13 @@ describe('countForPreflight — AbortSignal threading (F1)', () => {
   });
 });
 
-describe('countForPreflight — payload-size cap (F4)', () => {
-  it('falls back to heuristic when assembled payload exceeds 32 MB', async () => {
+describe('countForPreflight — payload-size cap', () => {
+  it('falls back to heuristic when projected payload exceeds 32 MB', async () => {
     const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
-    // 40 files × 1 MB each = 40 MB assembled — over the 32 MB cap.
+    // 40 files × 1 MB each = 40 MB projected — over the 32 MB cap.
     // Use fakeFile so we don't actually write 40 MB to disk; the
-    // 'a'.repeat(file.size) placeholder fires per file.
+    // pre-allocation cap check (F3 fix) fires BEFORE any 'a'.repeat
+    // placeholder is materialized, so memory peak stays bounded.
     const files = Array.from({ length: 40 }, (_, i) => fakeFile(`f${i}.ts`, 1_000_000));
     const result = await countForPreflight(
       client,
@@ -488,6 +514,50 @@ describe('countForPreflight — payload-size cap (F4)', () => {
     expect(countTokens).not.toHaveBeenCalled();
     expect(result.method).toBe('fallback');
     expect(result.cacheHit).toBe(false);
+  });
+
+  it('cap accounting uses UTF-8 BYTES, not UTF-16 code units (F1 fix)', async () => {
+    // Critical for CJK / emoji repos. Without the F1 fix, `text.length`
+    // (UTF-16 code units) lets CJK content slip past the byte cap by 3×.
+    // This test pins the byte-accurate behaviour by constructing a
+    // workspace whose UTF-16 length stays well under the cap but whose
+    // UTF-8 byte count exceeds it, then asserting the cap fires.
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
+    // CJK char '中' = 1 UTF-16 unit, 3 UTF-8 bytes. 12 MB UTF-16 = 36 MB UTF-8.
+    // 12 fakeFiles × 1 MB CJK each (UTF-8 bytes), but file.size is the
+    // UTF-8 byte count we'd actually send. fakeFile uses the placeholder
+    // path which materializes 'a'.repeat(file.size) — ASCII at 1:1, so
+    // for byte-accurate testing we need file.size in UTF-8 bytes already.
+    const files = Array.from({ length: 12 }, (_, i) => fakeFile(`cjk-${i}.ts`, 3_000_000));
+    const result = await countForPreflight(
+      client,
+      baseInput(files, { preflightMode: 'exact', inputTokenLimit: 1_000_000_000 }),
+    );
+    // 12 × 3 MB = 36 MB > 32 MB cap → fallback before SDK call.
+    expect(countTokens).not.toHaveBeenCalled();
+    expect(result.method).toBe('fallback');
+  });
+
+  it('cap accounting includes the prompt bytes (F6 fix)', async () => {
+    // Pre-fix: only file parts contributed to assembledBytes; a giant
+    // prompt could push the actual `contents` payload past the cap
+    // unnoticed. Post-fix: the prompt's UTF-8 byte length is added to
+    // the cap accounting before the final SDK call.
+    const { client, countTokens } = buildClient(async () => ({ totalTokens: 99 }));
+    // One small file (well under cap on its own), but a 33 MB prompt
+    // pushes the total over.
+    const file = fakeFile('small.ts', 1_000);
+    const giantPrompt = 'a'.repeat(33 * 1024 * 1024);
+    const result = await countForPreflight(
+      client,
+      baseInput([file], {
+        preflightMode: 'exact',
+        prompt: giantPrompt,
+        inputTokenLimit: 1_000_000_000,
+      }),
+    );
+    expect(countTokens).not.toHaveBeenCalled();
+    expect(result.method).toBe('fallback');
   });
 });
 

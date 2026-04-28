@@ -27,9 +27,12 @@
  *
  *   Cache.
  *     `LRUCache<string, number>` (in-process, simple). Key:
- *     `SHA256(filesHash + promptHash + model + globsHash)`. `filesHash` is
- *     already computed by the workspace scanner and auto-invalidates on
- *     file change. TTL = process lifetime; no manifest persistence.
+ *     `SHA256(filesHash + promptHash + model)`. `filesHash` is computed
+ *     post-glob-filter by `scanWorkspace`, so it already encodes the
+ *     filtered file set — including a separate `globsHash` axis would be
+ *     redundant (and risk join-collision via different glob arrays
+ *     serializing to the same string). TTL = process lifetime; no manifest
+ *     persistence.
  *
  *   Graceful degradation.
  *     On `countTokens` failure (HTTP error, network, SDK shape mismatch),
@@ -121,12 +124,11 @@ export interface PreflightInput {
   files: ScannedFile[];
   prompt: string;
   model: string;
-  /** Stable hash of the workspace's file content + extension membership.
-   * Already computed by `scanWorkspace` for cache-key purposes. */
+  /** Stable hash of the workspace's filtered file set + content. Already
+   * computed by `scanWorkspace` post-glob-filter, so two glob configs
+   * resolving to the same files share the same hash — no separate
+   * `globsHash` axis needed. */
   filesHash: string;
-  /** User-supplied globs, hashed for cache-key isolation. Pass `''` if
-   * no globs. */
-  globsHash?: string;
   /** Optional override of the heuristic-vs-exact cutoff. */
   preflightMode?: 'heuristic' | 'exact' | 'auto';
   /** The model's advertised input token limit. The cutoff fraction is
@@ -134,11 +136,11 @@ export interface PreflightInput {
   inputTokenLimit: number;
   /** Wall-clock abort signal threaded into the SDK's `countTokens`
    * `config.abortSignal`. When the caller's `timeoutMs` budget fires (or
-   * any upstream cancellation), the SDK's HTTP request is aborted. The
-   * caller's abort propagates as `AbortError` from the `await` and the
-   * outer `try/catch` falls through to the `bytes/3` fallback — same
-   * graceful-degradation path used for 429s and network errors. Optional;
-   * omit for callers without timeout semantics. */
+   * any upstream cancellation), the SDK's HTTP request is aborted and the
+   * `AbortError` is RE-THROWN to the caller (so the outer tool's catch
+   * can map it to `errorCode: 'TIMEOUT'`). Non-abort errors still fall
+   * through to the `bytes/3` graceful-degradation path. Optional; omit
+   * for callers without timeout semantics. */
   signal?: AbortSignal;
 }
 
@@ -189,9 +191,8 @@ export function clearTokenCounterCache(): void {
 
 function buildCacheKey(input: PreflightInput): string {
   const promptHash = createHash('sha256').update(input.prompt).digest('hex');
-  const globsHash = input.globsHash ?? '';
   return createHash('sha256')
-    .update(`${input.filesHash}|${promptHash}|${input.model}|${globsHash}`)
+    .update(`${input.filesHash}|${promptHash}|${input.model}`)
     .digest('hex');
 }
 
@@ -265,21 +266,50 @@ export async function countForPreflight(
     };
   }
 
-  // Build the actual payload we'll send to generateContent — full file
-  // contents, not just filename annotations. Tier-2 accuracy requires
-  // sending the same bytes the model will see. For files we can't read
+  // Build the payload we'll send to generateContent — full file contents
+  // wrapped in the SAME `\n\n--- FILE: <relpath> ---\n…\n` marker that
+  // `cache-manager.ts` (`buildContentFromUploaded` / `buildInlineContentFromDisk`)
+  // uses on the real call. Diverging from that marker would systematically
+  // undercount tokens (~6-8/file × file count). For files we can't read
   // (test mocks with fake `absolutePath`, deleted between scan and
   // preflight, permission errors, etc.), we substitute a placeholder
   // string of length `file.size` filled with `'a'` — Gemini's tokenizer
   // hits ~7-8 bytes/token on `'a'`-repetition (per v1.9.0 probe Q2:
   // 100 KB → 12 801 tokens), which UNDERCOUNTS real source by ~50%.
   // Combined with the `bytes/3` final fallback if the whole API call
-  // fails, the total estimate is still bounded above the heuristic
-  // for safety.
+  // fails, the total estimate is still bounded above the heuristic.
+  //
+  // Cap accounting in UTF-8 bytes — `string.length` is UTF-16 code units
+  // and would let CJK / emoji / surrogate-pair content slip past the cap
+  // (CJK BMP: 1 unit → 3 UTF-8 bytes; emoji: 2 units → 4 UTF-8 bytes).
+  // Also pre-checks the *projected* byte cost BEFORE materializing the
+  // unreadable-file placeholder, so a single huge unreadable file (e.g.
+  // future config bumps to `maxFileSizeBytes`) can't OOM the process.
   type CountTokensContent = { role: 'user'; parts: Array<{ text: string }> };
   const fileParts: Array<{ text: string }> = [];
+  const FILE_MARKER_OVERHEAD = '\n\n--- FILE:  ---\n\n'.length; // 18 bytes (ASCII) — the bytes added by the marker template, excluding `relpath` and `text` themselves.
   let assembledBytes = 0;
   for (const file of input.files) {
+    // Pre-check the cap against projected bytes BEFORE doing the I/O or
+    // allocating the placeholder. Defends against a single huge file
+    // (e.g. operator bumps `maxFileSizeBytes` past 32 MB) — would have
+    // allocated a `file.size`-long placeholder string before the
+    // post-allocation cap check fired on the next iteration.
+    const projectedBytes =
+      assembledBytes + file.size + Buffer.byteLength(file.relpath, 'utf8') + FILE_MARKER_OVERHEAD;
+    if (projectedBytes > MAX_TIER_2_PAYLOAD_BYTES) {
+      logger.warn(
+        `countTokens preflight payload would exceed ${MAX_TIER_2_PAYLOAD_BYTES} bytes; falling back to heuristic × 1.33 (projected ${projectedBytes} bytes after ${fileParts.length} of ${input.files.length} files)`,
+      );
+      const fallback = computeFallback(input.files, input.prompt);
+      return {
+        effectiveTokens: fallback,
+        method: 'fallback',
+        rawTokens: fallback,
+        cacheHit: false,
+      };
+    }
+
     let text: string;
     try {
       text = await readFile(file.absolutePath, 'utf8');
@@ -291,28 +321,29 @@ export async function countForPreflight(
       // through this path.
       text = 'a'.repeat(file.size);
     }
-    fileParts.push({ text: `// ${file.relpath}\n${text}` });
-    assembledBytes += text.length + file.relpath.length + 4; // `// ` + relpath + `\n` + text
-
-    // Defensive payload-size cap. If we've assembled more than the cap
-    // (today: future-proof against config bumps that lift `maxFileSizeBytes`
-    // or `maxFilesPerWorkspace` past the API's body-size acceptance), abort
-    // tier-2 and fall through to `bytes/3` — a fast heuristic beats a
-    // request that's about to 413. The cap also bounds `'a'.repeat()`
-    // memory pressure on degenerate workspaces.
-    if (assembledBytes > MAX_TIER_2_PAYLOAD_BYTES) {
-      logger.warn(
-        `countTokens preflight payload exceeded ${MAX_TIER_2_PAYLOAD_BYTES} bytes; falling back to heuristic × 1.33 (assembled ${assembledBytes} bytes from ${fileParts.length} of ${input.files.length} files before cap)`,
-      );
-      const fallback = computeFallback(input.files, input.prompt);
-      return {
-        effectiveTokens: fallback,
-        method: 'fallback',
-        rawTokens: fallback,
-        cacheHit: false,
-      };
-    }
+    fileParts.push({ text: `\n\n--- FILE: ${file.relpath} ---\n${text}\n` });
+    assembledBytes +=
+      Buffer.byteLength(text, 'utf8') +
+      Buffer.byteLength(file.relpath, 'utf8') +
+      FILE_MARKER_OVERHEAD;
   }
+
+  // Include the prompt in the cap accounting — a giant prompt could push
+  // the assembled payload past the cap even when file content stays under it.
+  const promptBytes = Buffer.byteLength(input.prompt, 'utf8');
+  if (assembledBytes + promptBytes > MAX_TIER_2_PAYLOAD_BYTES) {
+    logger.warn(
+      `countTokens preflight payload exceeded ${MAX_TIER_2_PAYLOAD_BYTES} bytes after adding prompt; falling back to heuristic × 1.33 (assembled ${assembledBytes} files + ${promptBytes} prompt = ${assembledBytes + promptBytes} bytes)`,
+    );
+    const fallback = computeFallback(input.files, input.prompt);
+    return {
+      effectiveTokens: fallback,
+      method: 'fallback',
+      rawTokens: fallback,
+      cacheHit: false,
+    };
+  }
+
   const contents: CountTokensContent[] = [
     { role: 'user', parts: [...fileParts, { text: input.prompt }] },
   ];
@@ -325,9 +356,10 @@ export async function countForPreflight(
   //
   // The `signal` (when provided by the caller's `timeoutMs`) flows in via
   // `config.abortSignal` per the SDK's `CountTokensConfig`. Cancellation
-  // propagates as an `AbortError` thrown from the `await` and falls
-  // through to the `bytes/3` graceful-degradation path — same handling as
-  // 429s and network errors.
+  // RE-THROWS the `AbortError` so the caller's outer `try/catch` (which
+  // maps it to `errorCode: 'TIMEOUT'`) sees it; non-abort errors (429,
+  // network, malformed response) still fall through to the `bytes/3`
+  // graceful-degradation path.
   try {
     const response = await client.models.countTokens({
       model: input.model,
@@ -359,6 +391,12 @@ export async function countForPreflight(
       cacheHit: false,
     };
   } catch (err) {
+    // If the user-supplied signal fired, propagate the abort instead of
+    // swallowing it as a fallback. Otherwise the caller's `timeoutMs`
+    // budget is silently extended — `ask` would proceed to eager Files
+    // API upload before the abort eventually lands on `generateContent`,
+    // wasting bandwidth/compute the user explicitly asked us to abort.
+    if (input.signal?.aborted) throw err;
     logger.warn(
       `countTokens preflight failed for model=${safeForLog(input.model)}: ${safeForLog(err)} — falling back to heuristic × 1.33 (safety multiplier for the empirical 30-50% CJK undercount)`,
     );

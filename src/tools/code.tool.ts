@@ -119,7 +119,7 @@ export const codeInputSchema = z
       .enum(['heuristic', 'exact', 'auto'])
       .optional()
       .describe(
-        "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + task + model)). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
+        "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + task + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -357,14 +357,12 @@ async function executeCodeBody(
         files: scan.files,
         prompt: input.task,
         model: resolved.resolved,
+        // `filesHash` is post-glob-filter — no separate globsHash needed.
         filesHash: scan.filesHash,
-        ...(input.includeGlobs !== undefined || input.excludeGlobs !== undefined
-          ? {
-              globsHash: `${(input.includeGlobs ?? []).join(',')}|${(input.excludeGlobs ?? []).join(',')}`,
-            }
-          : {}),
         ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
         inputTokenLimit: contextWindow,
+        // See ask.tool.ts for AbortSignal contract — abort propagates as
+        // `AbortError` to outer catch (mapped to `errorCode: 'TIMEOUT'`).
         signal: abortSignal,
       });
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
