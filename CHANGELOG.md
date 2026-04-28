@@ -5,6 +5,92 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-04-28
+
+### Changed — `cachingMode` default flipped to `'implicit'`
+
+v1.13.0 shipped `cachingMode: 'explicit' | 'implicit'` as opt-in (default `'explicit'`) with a plan to flip the default in v1.14.0 pending dogfood telemetry. The dogfood gate is hereby resolved by direct user directive — implicit caching is the optimisation that closes the v1.6-v1.7 review→edit→review pain point, and the marginal cost of probabilistic vs guaranteed savings is acceptable for the latency win.
+
+- **Default for `ask` / `code`'s `cachingMode` field:** now `'implicit'` (was `'explicit'` in v1.13.0). Per-call `input.cachingMode` always wins; setting `'explicit'` explicitly reverts to v1.13.0 behaviour for that call.
+- **Operator-level override:** new env var `GEMINI_CODE_CONTEXT_CACHING_MODE` accepts `'explicit'` or `'implicit'` (case-insensitive). Unset → default `'implicit'`. Invalid value → falls back to `'implicit'` AND emits a stderr warning so operators see their mistype rather than silently shipping the wrong strategy.
+- **Strict env-var validation:** the warn path uses `console.error` (visible in MCP host log pipelines) and surfaces the offending value through `safeForLog` — control characters (newlines, tabs, ANSI escapes) are escaped to printable form, length is capped at 2000 chars. Operators still see the printable prefix of their typo for triage (e.g. `EXPLICITT` produces a clear "not a recognised value" message), but multi-line / control-char forge attempts collapse to a single safe log line and cannot record-split the stderr stream. (Round-1 review fix for the F3+F4 log-injection finding.)
+
+### Behavioural impact
+
+- **First call cold:** ~80–110 s (single round-trip; Gemini caches during the call). Was 120–240 s in v1.13.0 explicit-default (60–180 s `caches.create` + 60 s query).
+- **Second call warm, same files:** ~14 s (implicit cache hits). Same as v1.13.0.
+- **Third call after editing 3 files:** ~14 s. Was 60–180 s rebuild + 14 s in v1.13.0 explicit-default — **the eliminated wait is the user-perceived speedup the v1.13.0 architectural pivot was designed to enable.**
+- **Cost trade-off:** Gemini's automatic implicit caching is documented as "no cost saving guarantee" (see ai.google.dev/gemini-api/docs/caching). When the implicit cache fires, savings are similar to explicit (~75 % discount); when it misses, the call pays full input rate. Operators who need predictable per-call billing can revert by setting `GEMINI_CODE_CONTEXT_CACHING_MODE=explicit` or per-call `cachingMode: 'explicit'`. Hit-rate observability remains available via `status.structuredContent.caching.implicitHitRate`.
+
+### Migration
+
+Operators upgrading from v1.13.0 see the default behaviour change on their first `ask`/`code` call after installing v1.14.0. To preserve v1.13.0 explicit-default semantics:
+
+```sh
+export GEMINI_CODE_CONTEXT_CACHING_MODE=explicit
+```
+
+Or per-call: `ask({ cachingMode: 'explicit' })` / `code({ cachingMode: 'explicit' })`.
+
+No schema migration required — the `caching_mode` column on `usage_metrics` already accepts both values (added in v1.13.0). Pre-1.14.0 rows that recorded `'explicit'` explicitly stay correct in aggregations.
+
+### Notes
+
+- Minor-level release. New env var (additive); behaviour change on the per-call default. No SQL schema changes.
+- `code({ codeExecution: true })` continues to force inline content regardless of `cachingMode` because Gemini rejects `cachedContent` + `tools` simultaneously. Telemetry tags those calls as `'inline'` (the v1.13.0 round-2 fix), distinguishing them from explicit-cache adoption.
+- The original v1.14.0 plan also included an `ask_agentic` streaming migration. That has been split into a follow-up (T33) so this release can ship the speed-driver default flip in a focused PR. The streaming migration is pure reliability — it doesn't affect speed and the release-pacing trade-off favours getting implicit-default to users sooner.
+
+### Coverage
+
+9 new tests in `test/unit/preflight-guard.test.ts`:
+- `cachingMode tool-level default flip (v1.14.0+)` — 4 tests covering `ask`/`code` with default + override + per-call override + ctx.config flow.
+- `cachingMode env resolution (v1.14.0+)` — 5 tests: default when unset, explicit honoured, implicit honoured, invalid-value fallback + stderr warning, case-insensitive parsing.
+
+Total suite: 709 passed | 9 skipped (was 700 | 9 in v1.13.0; +9 net new tests). Lint, typecheck, double-test, build all green.
+
+### Round-1 review fixes (4-way `/coderev` + Copilot)
+
+Full `/coderev` chain (GPT + Gemini + Grok via 3-way + Copilot via `mcp__github__request_copilot_review`) on the v1.14.0 PR plus full `/6step` on every finding (verified empirically that all 13 findings have all 6 steps written, after the user caught a partial first pass and demanded a remediation pass) surfaced:
+
+- **F1 — `prepareContext` in-flight coalescing key omits `cachingMode` (HIGH; Copilot 2× line comments + Grok P0).** `inFlightKey()` at `cache-manager.ts:264-273` did not include `opts.cachingMode` in the key array. Two concurrent `prepareContext` calls with different cachingModes (e.g. one with per-call `'explicit'` override + one defaulting to `'implicit'`) produced identical keys, collided into the same `Map<string, Promise>` slot, and shared one `PreparedContext` — whichever raced first determined the return shape, the loser got the wrong caching strategy (inline content under a request that asked for an explicit `cacheId`, or vice versa). Same shape as v1.13.0 round-3 stale-fileId bug — a missing dimension on an equality-keyed lookup. v1.14.0's default flip transformed this from a niche edge into the mainline collision shape because per-call `'explicit'` overrides routinely race the new `'implicit'` default. **Fix:** add `String(opts.cachingMode ?? '')` to the key array. Two new pin tests: `concurrent prepareContext with different cachingModes do NOT coalesce` (asserts each path receives the shape it asked for) + `concurrent same-mode calls STILL coalesce (mutex preserved)` (asserts the legitimate dedup behaviour was not over-keyed).
+- **F3 + F4 — log injection via raw env interpolation (LOW; Copilot + GPT P1, deduped to one fix).** `readCachingModeEnv()` at `config.ts:148-150` warned on invalid values but interpolated the raw env value verbatim into the stderr line — a value containing newlines / control chars / ANSI escapes could forge separate log records in downstream pipelines. **Fix:** wrap `raw` in `safeForLog()` (existing helper from `utils/logger.ts` that escapes C0 control chars to printable form and caps length at 2000 chars). New pin test asserts a multi-line + ANSI-escape forge attempt collapses to a single safe log line while still preserving the printable prefix for operator triage.
+- **F9 — whitespace-only env values fell into warn path (LOW; Grok P1).** Pre-fix, `if (raw === '')` happened BEFORE `.trim()`, so `"   "` (whitespace-only) reached the warn path with a confusing "not a recognised value" message. **Fix:** trim before the empty-check; whitespace-only short-circuits to default silently, semantically equivalent to "unset". New pin test asserts no warn fires for whitespace-only input.
+
+7 false positives dismissed, all empirically refuted: 5 from Gemini (hallucinated non-existent `src/config/defaults.{ts,test.ts}`, claimed `ask_agentic` accepts `cachingMode`, claimed CHANGELOG duplicates) + 2 from Grok (claimed `v1.13.0+` schema string was outdated — the v1.13.0 reference there is for `forceRescan`'s scan memo, accurate; claimed `Config.cachingMode` mandatory leaks into untouched call sites — `grep -rn "ctx.config.cachingMode" src/` shows only the two known consumers).
+
+2 ACCEPTED (by design): GPT's fail-closed-on-invalid-env preference (current warn+fallback matches every other `read*Env` helper in `config.ts` and fails to the safe v1.14.0 default; fail-closed would refuse server startup over a typo, worse UX) + GPT's audit-trail wording concern (CHANGELOG already contains concrete before/after latency numbers; v1.13.0 entry preserves the original "default may flip in v1.14.0 pending dogfood telemetry" gate wording for cross-version triangulation).
+
+**Process lesson reinforced:** the first `/6step` pass skipped step-3 (empirical verify) and step-4 (counter-case both leak directions) for 7 of 13 findings — caught by the user via a `grep -E "^### Step [123456]"` header check. Remediation pass + final consolidation pass re-derived all 13 findings with full methodology; verdicts were unchanged but uncertainty was reduced. Lesson recorded in [`docs/KNOWN-DEFICITS.md`](./docs/KNOWN-DEFICITS.md) "Process lesson: /6step step-4 must counter-case BOTH leak directions". The empirical-header check is now part of the auditing standard.
+
+Total round-1 coverage: 713 passed | 9 skipped (was 709 | 9 pre-review fixes; +4 net new pin tests covering F1×2 + F3×1 + F9×1).
+
+### Round-2 review fixes (post-round-1 fix-delta review)
+
+Second 4-way `/coderev` (GPT + Gemini + Grok + Copilot) on the round-1 fix delta verified all 4 round-1 TPs (F1, F3, F4, F9) RESOLVED with file:line evidence from every reviewer. Three new LOW findings closed:
+
+- **G2-2 (Gemini P2):** test cleanup hygiene — `vi.unstubAllEnvs()` and `errSpy.mockRestore()` were inlined at the bottom of each test, leaking stubbed env / spy state into sibling tests on assertion failure (the inline calls only fired on the happy path). **Fix:** added `afterEach` to the `cachingMode env resolution` describe block; cleanup now runs in both pass-and-fail paths.
+- **G2-3 (Copilot):** CHANGELOG entry above said the warning "includes the offending raw value verbatim", but the F3+F4 fix wraps the value through `safeForLog` (control chars escaped to printable form, length capped at 2000 chars). **Fix:** updated wording to match the implementation.
+- **G2-4 (Copilot):** `test/unit/preflight-guard.test.ts:659` had a literal ESC byte (0x1b) in the malicious-input fixture — invisible in most editors, hard to grep, encoding-dependent. **Fix:** replaced with the explicit `\x1b` JS escape sequence; behaviour identical, source is now grep-able.
+
+1 PARTIAL deferred (G2-1, Grok P1): the headline claim "over-key counter-case not pinned" was technically wrong — the same-mode coalescing pin already exists at `cache-manager.test.ts:849-890` and asserts `caches.create` fires exactly once. Grok's sub-claim about an `undefined`-vs-concrete-string discrimination test gap is real but unreachable in current code (no callsite passes `cachingMode: undefined` post-v1.14.0; the type system narrows `requestedCachingMode` to `'explicit' | 'implicit'` at every callsite). Tracked as defer-followup; no current callsite triggers.
+
+1 ACCEPTED LOW (G2-5, Grok P2): `safeForLog` could be hardened to escape NBSP / smart quotes / BOM in addition to C0 control chars — defense-in-depth only, no current bug.
+
+1 FP (G2-6, Grok P2): "toLowerCase swallows original casing" — closed by the TypeScript literal union `'explicit' | 'implicit'` at `config.ts:68` and `db.ts:478` which narrows after the case-insensitive check.
+
+Round-2 coverage stays at 713 tests (3 fixes were in-place: 1 SQL/code, 2 test-fixture hygiene + 1 docs); no new pin tests required because the round-2 issues were doc-staleness + test-cleanup-hygiene + invisible-byte ergonomics, not new bugs needing regression coverage.
+
+### Round-3 review fixes (post-round-2 fix-delta review)
+
+Third 4-way `/coderev` (GPT + Gemini + Grok + Copilot via `mcp__github__request_copilot_review`). Gemini and Copilot cleared the PR (0 findings, "ship"). 2 TP-MED findings (per `/6step` severity calibration) closed in-place + 1 PARTIAL FP dismissed:
+
+- **G3-1 (TP MED, GPT P2 → /6step elevated):** the round-2 fix replaced the literal ESC byte in the `malicious` *string* but left raw 0x1b ESC bytes in two adjacent COMMENTS at `test/unit/preflight-guard.test.ts:676,687`. Same class as G2-4 (round-2) — invisible bytes in source files break `rg`/`grep`/editor tooling and make `git diff` render unpredictably. **Fix:** replaced both with the literal ASCII string `ESC` (in comment context the human-readable name is clearer than `\x1b`). Empirical confirmation: `grep -n $'\033' test/unit/preflight-guard.test.ts` returns no hits.
+- **G3-2 (TP MED, GPT P2 → /6step elevated):** `src/utils/logger.ts:71-72` had three raw control bytes (NUL 0x00, US 0x1f, DEL 0x7f) embedded inline as comment "examples". `file(1)` reported the source as `data` (binary), `rg` skipped the file by default. **Fix:** replaced with double-escaped `\\x00`-style notation that renders as the literal escape sequence in the comment (`\x00-\x1f`, `\x7f`) rather than raw bytes. Empirical confirmation via Python control-byte scan: 3 → 0 control bytes remaining.
+- **G3-3 (FP, Grok P1 → /6step refuted):** Grok claimed `safeForLog` truncation was not rune-aware (could split surrogate pairs) and that an ANSI-flood DoS vector survived the length cap. Empirically verified via Node execution: codepoint-aware `for..of` truncation correctly excludes a 2-code-unit codepoint when including it would exceed the cap (output ends at the BMP char before the surrogate, not a lone high surrogate). Length cap is enforced post-escape (newline-flood 3000→6000-escaped→2013-final, NUL-flood 1000→4000-escaped→2013-final). Grok also misidentified the file location (`config.ts` vs `utils/logger.ts`).
+- **G3-4 (ACCEPTED LOW, Grok P2):** doc gap on the `safeForLog(raw)` vs `safeForLog(v)` choice in `readCachingModeEnv` (intentional — preserves diagnostic case + whitespace for typo-spotting). Tracked but not blocking.
+
+Round-3 coverage stays at 713 tests (G3-1 + G3-2 were doc/comment ergonomics fixes — invisible-byte sanitisation, no behaviour change). Lint, typecheck, double-test, build all green.
+
 ## [1.13.0] - 2026-04-27
 
 ### Added — implicit-cache opt-in (per-call `cachingMode` field on `ask` / `code`)

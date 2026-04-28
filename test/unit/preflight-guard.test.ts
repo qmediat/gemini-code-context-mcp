@@ -12,7 +12,7 @@
  * tool-call budget — the observed "agent exhausted budget retrying".
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -57,6 +57,10 @@ vi.mock('../../src/tools/ask-agentic.tool.js', () => ({
 function buildCtx(opts: {
   workspaceGuardRatio?: number;
   dailyBudgetUsd?: number;
+  /** v1.14.0+: override cachingMode default for tests that need to assert
+   *  per-config behaviour. Unset → defaults to `'implicit'` (the v1.14.0
+   *  production default) so existing tests don't regress. */
+  cachingMode?: 'explicit' | 'implicit';
 }): {
   ctx: ToolContext;
   generateContent: ReturnType<typeof vi.fn>;
@@ -85,6 +89,10 @@ function buildCtx(opts: {
       tpmThrottleLimit: 80_000,
       forceMaxOutputTokens: false,
       workspaceGuardRatio: opts.workspaceGuardRatio ?? 0.9,
+      // v1.14.0: default flip pinned at the test-fixture level so the
+      // tool's `requestedCachingMode` resolves through `ctx.config.cachingMode`
+      // when the per-call field is unset (matches loadConfig() production).
+      cachingMode: opts.cachingMode ?? 'implicit',
     } as ToolContext['config'],
     client: {
       models: {
@@ -503,6 +511,182 @@ describe('code preflight workspace guard (v1.5.0)', () => {
     if (parsed.success) {
       expect((parsed.data as Record<string, unknown>).onWorkspaceTooLarge).toBeUndefined();
     }
+  });
+});
+
+// v1.14.0 — `cachingMode` default flip threaded through the tool layer.
+// Pins the end-to-end behaviour: when `input.cachingMode` is unset, the tool
+// resolves through `ctx.config.cachingMode` and passes the result to
+// `prepareContext`. Catches regressions where someone re-introduces the
+// conditional spread that was the v1.13.0 bug shape.
+describe('cachingMode tool-level default flip (v1.14.0+)', () => {
+  it("ask uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
+    const { ctx } = buildCtx({ cachingMode: 'implicit' });
+    mockScanOfBytes(1_000); // small workspace, well under preflight cliff
+    mockModelWithLimit(1_000_000);
+
+    await askTool.execute({ prompt: 'hi' }, ctx);
+
+    expect(mocks.prepareContext).toHaveBeenCalledTimes(1);
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('implicit');
+  });
+
+  it("ask honours ctx.config.cachingMode='explicit' when input.cachingMode is unset", async () => {
+    const { ctx } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+
+    await askTool.execute({ prompt: 'hi' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('explicit');
+  });
+
+  it('per-call input.cachingMode overrides ctx.config.cachingMode', async () => {
+    const { ctx } = buildCtx({ cachingMode: 'implicit' }); // default
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+
+    // Caller explicitly opts into explicit mode; should override the default.
+    await askTool.execute({ prompt: 'hi', cachingMode: 'explicit' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('explicit');
+  });
+
+  it("code uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
+    const { ctx } = buildCtx({ cachingMode: 'implicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+
+    await codeTool.execute({ task: 'do something' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('implicit');
+  });
+});
+
+// v1.14.0 — `cachingMode` default flip + env-var override behaviour.
+// These tests pin the new default ('implicit') and the operator-level env
+// override so a future regression that flips the default back, mistypes
+// the env var, or forgets the strict-validation fallback is caught
+// immediately rather than silently shipping the wrong cache strategy.
+describe('cachingMode env resolution (v1.14.0+)', () => {
+  beforeEach(() => {
+    vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
+  });
+
+  // v1.14.0 round-2 fix (G2-2, Gemini P2): unconditional cleanup so a thrown
+  // assertion mid-test doesn't leak stubbed env vars / spy state into sibling
+  // tests. Pre-fix the inline `vi.unstubAllEnvs()` and `errSpy.mockRestore()`
+  // calls at the bottom of each test only ran on the happy path; an `expect`
+  // failure threw before they fired and contaminated downstream tests.
+  // `afterEach` runs in both pass-and-fail paths, closing the leak.
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('defaults to implicit when env var is unset', async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+  });
+
+  it('honours GEMINI_CODE_CONTEXT_CACHING_MODE=explicit', async () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'explicit');
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('explicit');
+  });
+
+  it('honours GEMINI_CODE_CONTEXT_CACHING_MODE=implicit', async () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'implicit');
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+  });
+
+  it('falls back to implicit + warns on invalid env value (no silent mistype)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'EXPLICITT'); // mistyped
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+    // Operator gets a clear stderr signal that their override didn't take.
+    expect(errSpy).toHaveBeenCalled();
+    const warnText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
+    expect(warnText).toMatch(/GEMINI_CODE_CONTEXT_CACHING_MODE/);
+    expect(warnText).toMatch(/EXPLICITT/);
+  });
+
+  it('case-insensitive: EXPLICIT and Implicit both parse', async () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'EXPLICIT');
+    vi.resetModules();
+    let { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('explicit');
+
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'Implicit');
+    vi.resetModules();
+    ({ loadConfig } = await import('../../src/config.js'));
+    expect(loadConfig().cachingMode).toBe('implicit');
+  });
+
+  // v1.14.0 round-1 fix (F9, Grok P1): whitespace-only env values are
+  // morally equivalent to "unset" — they should short-circuit to the
+  // default silently, NOT trigger the "not a recognised value" warning.
+  // Pre-fix the empty-check happened BEFORE `.trim()`, so '   ' fell
+  // through to the warn path with a confusing message.
+  it('whitespace-only env value silently defaults to implicit (no warn)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', '   '); // whitespace only
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+    // No warn should fire for whitespace-only — that's the F9 fix.
+    const warnText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
+    expect(warnText).not.toMatch(/not a recognised value/);
+  });
+
+  // v1.14.0 round-1 fix (F3+F4, Copilot + GPT P1): log injection via
+  // raw env interpolation. Pre-fix, a value containing newlines or ANSI
+  // escapes was echoed verbatim into a stderr line — downstream log
+  // analyzers parsing line-by-line could see forged separate records.
+  // Post-fix uses `safeForLog` which escapes C0 control chars to
+  // printable form and caps length at 2000 chars.
+  it('log-injection guard: control chars in env value escape to printable form (no record-splitting)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // Forge attempt: newline + fake CRITICAL log record with ANSI red.
+    const malicious = 'foo\n[CRITICAL] forged record\x1b[31mansi-red';
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', malicious);
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit'); // fallback fired
+
+    // safeForLog escapes \n → '\\n' and ESC → '\\x1b' (or similar
+    // printable form). Critical assertion: the warn payload contains NO
+    // raw newline character — record-splitting attempts collapse to one
+    // line.
+    expect(errSpy).toHaveBeenCalled();
+    const warnPayload = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('|');
+    // Empirical check: the malicious input had a literal '\n', the
+    // sanitised version should NOT.
+    expect(warnPayload).not.toMatch(/foo\n\[CRITICAL\]/);
+    // The printable prefix MUST still be visible to operators (so they
+    // see what they typed and can fix it). 'foo' should appear; the
+    // escaped form of newline (e.g. '\\n' or 'ESC'-escape) should
+    // also appear in the same single-line record.
+    expect(warnPayload).toMatch(/foo/);
+    // ANSI sequences MUST not survive — operator's terminal can't be
+    // hijacked via a forged colour code. Pattern uses string-form regex
+    // (NOT literal-regex syntax) to keep biome's noControlCharactersInRegex
+    // rule happy: `\x1b` is the JS string-escape for the ESC byte (0x1b);
+    // `RegExp(...)` then sees a literal ESC followed by `[31m` and the
+    // assertion fires only if that exact byte sequence survived sanitisation.
+    expect(warnPayload.includes(`${String.fromCharCode(0x1b)}[31m`)).toBe(false);
   });
 });
 

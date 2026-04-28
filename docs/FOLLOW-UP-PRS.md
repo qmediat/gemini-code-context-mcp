@@ -562,6 +562,29 @@ Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_F
 
 ---
 
+## T33. `ask_agentic` streaming migration — apply heartbeat-aware stall watchdog to agentic loops
+
+**Source:** Original v1.14.0 plan (split out for focused release pacing — v1.14.0 shipped the `cachingMode` default flip alone since the streaming migration is reliability-only and doesn't affect the user-perceived speed change that drove v1.14.0).
+
+**Why:** `ask` and `code` use `client.models.generateContentStream` since v1.7.0 (T20), giving them the v1.12.0 `stallMs` heartbeat-aware stall watchdog. `ask_agentic` still uses `generateContent` per iteration — a stuck agentic iteration can only be killed by `iterationTimeoutMs` (wall-clock), not by the stall watchdog that observes streaming chunks. Long thinking iterations look indistinguishable from dead sockets to the wall-clock cap. Migrating to `generateContentStream` per iteration brings agentic loops in line with the rest of the codebase.
+
+**Scope:**
+- `src/tools/ask-agentic.tool.ts:823-874` — replace per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
+- New schema field `stallMs` on `ask_agentic` (range `[1_000, 600_000]`, optional). Behaviour matches `ask`/`code`'s `stallMs`: per-iteration heartbeat reset on every chunk; fires only when the stream goes silent.
+- New env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` for operator-level default.
+- Existing `iterationTimeoutMs` stays orthogonal (wall-clock cap; both can be set, whichever fires first wins).
+- Update `createTimeoutController` call site to pass composite `{ totalMs, stallMs }` opts (already supported since v1.12.0; just call with the new field).
+
+**Tests:**
+- Extend `test/unit/ask-agentic.test.ts`: stall fires within `stallMs`; total fires at `iterationTimeoutMs`; `timeoutKind: 'stall'` vs `'total'` surfaces correctly on the agentic error path.
+- New regression: induce a network stall mid-iteration; confirm abort within `stallMs + 5 %`.
+
+**Sizing:** ~5 hours including tests + docs.
+
+**Blocked on:** nothing structural. Pure release pacing — held back from v1.14.0 to keep the speed-driver default-flip release small and review-able. Recommended for v1.14.1 or v1.15.0 alongside any other agentic-loop reliability work.
+
+---
+
 ## T31. `refreshFileFingerprints` — skip memo-hit rows to avoid WAL churn
 
 **Source:** PR #45 / 6step round-3 review, finding #4 (Grok P2 ACCEPTED).
