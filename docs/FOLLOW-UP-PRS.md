@@ -562,6 +562,42 @@ Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_F
 
 ---
 
+## T31. `refreshFileFingerprints` — skip memo-hit rows to avoid WAL churn
+
+**Source:** PR #45 / 6step round-3 review, finding #4 (Grok P2 ACCEPTED).
+
+**Why:** v1.13.0's `refreshFileFingerprints` (`src/manifest/db.ts:240-280`) runs one INSERT-with-ON-CONFLICT per scanned file every time `prepareContext` enters an inline / implicit / small-workspace branch. On a 10k-file workspace where every file is a memo hit (mtime+size unchanged since last scan), the method writes 10k WAL frames for rows whose values overwrite themselves. Correctness intact (the transaction wrapper at `db.ts:286-291` amortizes to a single fsync), but the work is wasted and shows up as unnecessary disk I/O on monorepos.
+
+**Scope:**
+- Pass the `ScannedFile.memoHit: boolean` (already populated by the scanner) through `seedScanMemo` in `src/cache/cache-manager.ts`.
+- Filter `scan.files.filter((f) => !f.memoHit)` before passing to `refreshFileFingerprints`.
+- Confirm with a test pin: same-content rescan produces zero `usage_metrics` writes from the memo-seeder code path (or measure `db.prepare('SELECT COUNT(*) FROM files...').get()` row-touch count via SQLite stats).
+- Document the invariant: `refreshFileFingerprints` is ONLY called for files whose mtime / size / hash actually changed since the last scan.
+
+**Sizing:** ~30 minutes — small refactor + 1 test + a one-line invariant comment.
+
+**Blocked on:** Operator complaint about WAL bloat on a large monorepo, OR profiling that shows the per-call I/O is meaningful in p99 latency. Likely never visible on workspaces under ~5k files.
+
+---
+
+## T32. Abort-discrimination: handle wrapped-error rejection paths via `isAbortLike(reason, signal)`
+
+**Source:** PR #45 / 6step round-3 bonus check (Grok P2 ACCEPTED).
+
+**Why:** The abort discrimination at `src/cache/files-uploader.ts:226-244` keys on `reason === signal?.reason` (object identity) OR `reason instanceof Error && reason.name === 'AbortError'`. Today's production flow at `:144-148` always throws `signal.reason` directly — the identity check catches every aborted task. But a future caller that wraps the abort reason in a different Error (e.g. `Promise.reject(new Error('upload failed', { cause: signal.reason }))`) would miss BOTH checks: object identity fails (different wrapper Error) AND `name !== 'AbortError'` (it's named whatever the wrapper named it). The wrapped abort would surface as a real failure warn — confusing and inconsistent.
+
+**Scope:**
+- Add `isAbortLike(reason: unknown, signal?: AbortSignal): boolean` helper, probably in `src/utils/run-pool.ts` since the pattern repeats across uploaders / agentic loops.
+- Walks `reason.cause` chain (capped at 3 levels for cycle safety) checking both identity match against `signal?.reason` and `name === 'AbortError' || name === 'TimeoutError'` at any level.
+- Replace the inline check at `files-uploader.ts:233-237` with the helper.
+- New test: `Promise.reject(new Error('wrapper', { cause: signal.reason }))` is recognized as abort-like.
+
+**Sizing:** ~1 hour — helper + cause-chain walk + 2-3 tests.
+
+**Blocked on:** Any future code path that wraps abort errors before they surface to the discrimination block. Today's single-throw flow doesn't need this; surface area is bounded.
+
+---
+
 ## T30. Bump SCHEMA_VERSION to "2" on the next destructive migration
 
 **Source:** PR #45 / 6step round-2 review, finding FN4 (Gemini P2 ACCEPTED). Reviewer noted: v1.13.0 added 4 columns via `addColumnIfMissing` (idempotent ALTER TABLE) but `SCHEMA_VERSION` (in `src/manifest/db.ts:15`) stayed at `'1'`. The pattern works fine for additive migrations — but the next destructive change (drop/rename column, add NOT NULL, etc.) needs a real version-pivot.

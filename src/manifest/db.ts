@@ -231,11 +231,31 @@ export class ManifestDb {
    * silently degrade to cold every call (every file re-hashes — defeating
    * the v1.13.0 perf headline).
    *
-   * Crucially this method **does not touch** `file_id` / `uploaded_at` /
-   * `expires_at` on conflict — those are populated only by genuine uploads
-   * via `uploadWorkspaceFiles`, and a later switch back to `cachingMode:
-   * 'explicit'` should be able to reuse a still-fresh upload from a prior
-   * explicit run. Touching them here would orphan that capability.
+   * Conditional preservation of `file_id` / `uploaded_at` / `expires_at`
+   * (round-3 fix for the v1.13.0 silent-corruption HIGH found by Gemini /
+   * GPT / Copilot in the round-2 review):
+   *
+   *   - **content_hash UNCHANGED** → preserve the upload metadata. A prior
+   *     explicit-cache run uploaded these bytes to Files API; a switch back
+   *     to `cachingMode: 'explicit'` should hit dedup and skip re-upload.
+   *   - **content_hash CHANGED** → null out `file_id` / `uploaded_at` /
+   *     `expires_at`. The previous fileId points to an upload of OLD bytes
+   *     on Google's servers; preserving it would let `findFileRowByHash`
+   *     return that stale fileId for the NEW content — silently feeding
+   *     OLD bytes into Gemini under the file's NEW relpath.
+   *
+   * The pre-fix version preserved unconditionally, locking in a stale-fileId
+   * row whenever an edit landed between an explicit run and an implicit run.
+   * Two corruption scenarios were reachable:
+   *   (A) same-relpath self-corruption: file edited mid-session, subsequent
+   *       explicit run reuses the stale fileId for the changed file.
+   *   (B) cross-file leak: a different file with the same NEW content_hash
+   *       hits the dedup query and gets routed through the stale fileId.
+   *
+   * The CASE-based clear closes both. Confirmed by /6step round-3 analysis:
+   * `findFileRowByHash` returns rows where `content_hash = ?` and `file_id IS
+   * NOT NULL` — the conditional null-out ensures any stale fileId is gone
+   * BEFORE the dedup query could return it.
    */
   refreshFileFingerprints(
     rows: ReadonlyArray<{
@@ -253,9 +273,12 @@ export class ManifestDb {
          mtime_ms, size
        ) VALUES (?, ?, ?, NULL, NULL, NULL, ?, ?)
        ON CONFLICT(workspace_root, relpath) DO UPDATE SET
+         file_id     = CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.file_id     END,
+         uploaded_at = CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.uploaded_at END,
+         expires_at  = CASE WHEN files.content_hash <> excluded.content_hash THEN NULL ELSE files.expires_at  END,
          content_hash = excluded.content_hash,
-         mtime_ms = excluded.mtime_ms,
-         size = excluded.size`,
+         mtime_ms     = excluded.mtime_ms,
+         size         = excluded.size`,
     );
     const tx = this.db.transaction((batch: ReadonlyArray<(typeof rows)[number]>): void => {
       for (const r of batch) {

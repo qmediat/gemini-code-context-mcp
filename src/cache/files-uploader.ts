@@ -242,6 +242,19 @@ export async function uploadWorkspaceFiles(args: {
     }
   });
 
+  // v1.13.0 round-3 fix (Copilot finding): `emitProgress` only force-emits
+  // when `completed === files.length`, but `completed` only increments on
+  // task SUCCESS — a tail of failed uploads (rejections) leaves `completed
+  // < files.length`, the throttle's `isFinal` predicate never trips, and
+  // the last successful indexed-file message can stay buffered behind the
+  // 250 ms / 25-file gates indefinitely. UI hangs at e.g. 490/500 even
+  // though the operation is fully finished. Trailing flush guarantees the
+  // emitter sees the final true `completed` value.
+  if (completed > lastEmitCompleted) {
+    emitter.emit(`indexed ${completed}/${files.length}`, completed, files.length);
+    lastEmitCompleted = completed;
+  }
+
   // Post-pool abort propagation (v1.12.1). `runPool` catches per-task
   // errors and returns a settled-results array, so the in-task abort
   // throw above just becomes "Upload failed for X" in `failures`. To
