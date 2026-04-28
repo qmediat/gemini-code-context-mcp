@@ -601,7 +601,6 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     vi.resetModules();
     const { loadConfig } = await import('../../src/config.js');
     expect(loadConfig().cachingMode).toBe('explicit');
-    vi.unstubAllEnvs();
   });
 
   it('honours GEMINI_CODE_CONTEXT_CACHING_MODE=implicit', async () => {
@@ -609,7 +608,6 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     vi.resetModules();
     const { loadConfig } = await import('../../src/config.js');
     expect(loadConfig().cachingMode).toBe('implicit');
-    vi.unstubAllEnvs();
   });
 
   it('falls back to implicit + warns on invalid env value (no silent mistype)', async () => {
@@ -623,8 +621,6 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     const warnText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
     expect(warnText).toMatch(/GEMINI_CODE_CONTEXT_CACHING_MODE/);
     expect(warnText).toMatch(/EXPLICITT/);
-    errSpy.mockRestore();
-    vi.unstubAllEnvs();
   });
 
   it('case-insensitive: EXPLICIT and Implicit both parse', async () => {
@@ -637,7 +633,6 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     vi.resetModules();
     ({ loadConfig } = await import('../../src/config.js'));
     expect(loadConfig().cachingMode).toBe('implicit');
-    vi.unstubAllEnvs();
   });
 
   // v1.14.0 round-1 fix (F9, Grok P1): whitespace-only env values are
@@ -654,8 +649,6 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     // No warn should fire for whitespace-only — that's the F9 fix.
     const warnText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
     expect(warnText).not.toMatch(/not a recognised value/);
-    errSpy.mockRestore();
-    vi.unstubAllEnvs();
   });
 
   // v1.14.0 round-1 fix (F3+F4, Copilot + GPT P1): log injection via
@@ -694,9 +687,6 @@ describe('cachingMode env resolution (v1.14.0+)', () => {
     // `RegExp(...)` then sees a literal ESC followed by `[31m` and the
     // assertion fires only if that exact byte sequence survived sanitisation.
     expect(warnPayload.includes(`${String.fromCharCode(0x1b)}[31m`)).toBe(false);
-
-    errSpy.mockRestore();
-    vi.unstubAllEnvs();
   });
 });
 
