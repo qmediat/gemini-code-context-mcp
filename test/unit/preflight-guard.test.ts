@@ -24,6 +24,11 @@ const mocks = vi.hoisted(() => ({
   prepareContext: vi.fn(),
   isStaleCacheError: vi.fn(),
   markCacheStale: vi.fn(),
+  // v1.11.0 — `ask` may delegate to `ask_agentic` when the caller opts
+  // in via `onWorkspaceTooLarge: 'fallback-to-agentic'`. Mock the
+  // module so we can assert on the translation + wrapping without
+  // booting the agentic loop.
+  askAgenticExecute: vi.fn(),
 }));
 
 vi.mock('../../src/indexer/workspace-validation.js', () => ({
@@ -40,6 +45,9 @@ vi.mock('../../src/cache/cache-manager.js', () => ({
   prepareContext: mocks.prepareContext,
   isStaleCacheError: mocks.isStaleCacheError,
   markCacheStale: mocks.markCacheStale,
+}));
+vi.mock('../../src/tools/ask-agentic.tool.js', () => ({
+  askAgenticTool: { execute: mocks.askAgenticExecute },
 }));
 
 function buildCtx(opts: {
@@ -278,6 +286,111 @@ describe('ask preflight workspace guard (v1.5.0)', () => {
     expect(result.isError).toBeUndefined();
     expect(generateContent).toHaveBeenCalledTimes(1);
   });
+
+  // ---------------------------------------------------------------------------
+  // v1.11.0 — opt-in `ask` → `ask_agentic` auto-fallback
+  // ---------------------------------------------------------------------------
+
+  it("default onWorkspaceTooLarge='error' preserves v1.5.0 behaviour (no fallback)", async () => {
+    mockScanOfBytes(4_000_000);
+    mockModelWithLimit(1_048_576);
+    const { ctx } = buildCtx({});
+
+    const result = await askTool.execute({ prompt: 'q' }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('WORKSPACE_TOO_LARGE');
+    // Critically: ask_agentic must NOT have been called when the user
+    // didn't opt in (today's default is 'error').
+    expect(mocks.askAgenticExecute).not.toHaveBeenCalled();
+  });
+
+  it("onWorkspaceTooLarge='fallback-to-agentic' invokes ask_agentic and wraps the result", async () => {
+    mockScanOfBytes(4_000_000);
+    mockModelWithLimit(1_048_576);
+    const { ctx, generateContent } = buildCtx({});
+
+    // Mock ask_agentic returning a known shape — the wrapper should
+    // pass through `content` verbatim and enrich `structuredContent`.
+    mocks.askAgenticExecute.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'agentic prose answer here' }],
+      structuredContent: {
+        iterations: 4,
+        totalInputTokens: 12_345,
+        resolvedModel: 'gemini-3-pro-preview',
+      },
+    });
+
+    const result = await askTool.execute(
+      {
+        prompt: 'analyse this',
+        onWorkspaceTooLarge: 'fallback-to-agentic',
+        // Pass a few translatable fields to verify the input mapping.
+        includeGlobs: ['*.ts'],
+        excludeGlobs: ['*.test.ts'],
+        timeoutMs: 60_000,
+        thinkingLevel: 'HIGH',
+      },
+      ctx,
+    );
+
+    // ask_agentic invoked exactly once with the translated input.
+    expect(mocks.askAgenticExecute).toHaveBeenCalledTimes(1);
+    const agenticInput = mocks.askAgenticExecute.mock.calls[0]?.[0];
+    expect(agenticInput.prompt).toBe('analyse this');
+    expect(agenticInput.includeGlobs).toEqual(['*.ts']);
+    expect(agenticInput.excludeGlobs).toEqual(['*.test.ts']);
+    expect(agenticInput.thinkingLevel).toBe('HIGH');
+    // `timeoutMs` translates to `iterationTimeoutMs` (semantic divergence
+    // — documented in the schema). No `timeoutMs` should leak through.
+    expect(agenticInput.iterationTimeoutMs).toBe(60_000);
+    expect(agenticInput.timeoutMs).toBeUndefined();
+
+    // The eager pipeline (scan → preflight → prepareContext → generateContent)
+    // is bypassed entirely on the fallback path.
+    expect(generateContent).not.toHaveBeenCalled();
+    expect(mocks.prepareContext).not.toHaveBeenCalled();
+
+    // The wrapped result keeps the agentic prose verbatim AND enriches
+    // structuredContent with fallback-trail metadata.
+    expect(result.content?.[0]).toEqual({
+      type: 'text',
+      text: 'agentic prose answer here',
+    });
+    expect(result.structuredContent?.fallbackApplied).toBe('ask_agentic');
+    expect(result.structuredContent?.fallbackReason).toBe('WORKSPACE_TOO_LARGE');
+    const preflightMeta = result.structuredContent?.preflightEstimate as Record<string, unknown>;
+    expect(preflightMeta).toBeDefined();
+    expect(preflightMeta.threshold).toBe(943_718);
+    expect(typeof preflightMeta.tokens).toBe('number');
+    // Original agenticResult preserved for orchestrators that need to
+    // audit the underlying agentic loop's metadata.
+    const agenticResult = result.structuredContent?.agenticResult as Record<string, unknown>;
+    expect(agenticResult.iterations).toBe(4);
+  });
+
+  it('fallback path passes through agentic isError flag faithfully', async () => {
+    // If ask_agentic itself fails (e.g. iteration budget exhausted),
+    // the wrapped result must propagate `isError` so callers can detect
+    // the failure — fallback is not a free pass to silent success.
+    mockScanOfBytes(4_000_000);
+    mockModelWithLimit(1_048_576);
+    const { ctx } = buildCtx({});
+
+    mocks.askAgenticExecute.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'ask_agentic: budget exhausted' }],
+      structuredContent: { errorCode: 'BUDGET_EXHAUSTED' },
+      isError: true,
+    });
+
+    const result = await askTool.execute(
+      { prompt: 'q', onWorkspaceTooLarge: 'fallback-to-agentic' },
+      ctx,
+    );
+
+    expect(result.structuredContent?.fallbackApplied).toBe('ask_agentic');
+    expect(result.structuredContent?.isError).toBe(true);
+  });
 });
 
 describe('code preflight workspace guard (v1.5.0)', () => {
@@ -305,6 +418,29 @@ describe('code preflight workspace guard (v1.5.0)', () => {
     expect(result.structuredContent?.resolvedModel).toBe('gemini-3-pro-preview');
     expect(result.structuredContent?.filesIndexed).toBe(1);
     expect(result.structuredContent?.guardRatio).toBe(0.9);
+  });
+
+  it('strips onWorkspaceTooLarge from code input (asymmetry: ask-only)', async () => {
+    // `code` deliberately does NOT support `onWorkspaceTooLarge` — its
+    // OLD/NEW edit format is load-bearing for Claude's Edit pipeline,
+    // and `ask_agentic` returns prose only. The Zod schema's default
+    // `.strip` mode silently drops unknown keys, so a caller passing
+    // `onWorkspaceTooLarge` to `code` sees the field disappear (no
+    // error; just a no-op). Pinning this empirically so a future
+    // refactor that intentionally adds the field fails this test
+    // and forces a deliberate decision to remove the asymmetry.
+    const { codeInputSchema } = await import('../../src/tools/code.tool.js');
+    const parsed = codeInputSchema.safeParse({
+      task: 'refactor foo',
+      onWorkspaceTooLarge: 'fallback-to-agentic',
+    });
+    // Parse succeeds (Zod strips unknown keys by default) — but the
+    // field MUST be absent on the typed output. No fallback path can
+    // ever fire on `code` because the field is never present.
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect((parsed.data as Record<string, unknown>).onWorkspaceTooLarge).toBeUndefined();
+    }
   });
 });
 

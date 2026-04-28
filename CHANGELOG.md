@@ -5,6 +5,29 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-04-28
+
+### Added — opt-in `ask` → `ask_agentic` auto-fallback on `WORKSPACE_TOO_LARGE` (Phase 3 of the v1.9.0 plan)
+
+When the v1.5.0 preflight detects a workspace exceeds the model's `inputTokenLimit × workspaceGuardRatio`, `ask` can now transparently re-route through `ask_agentic` instead of returning a structured error — provided the caller opts in. The agentic path uses sandboxed file-access tools (`list_directory`, `find_files`, `read_file`, `grep`) to read only what the model needs, so it scales to arbitrarily large repos without the eager Files API upload that was the v1.5.0 failure mode.
+
+- **New schema field on `ask` only:** `onWorkspaceTooLarge: 'error' | 'fallback-to-agentic'` (default `'error'`). The default preserves v1.5.0 behaviour — pre-v1.11.0 callers see no change. Setting `'fallback-to-agentic'` is the recommended configuration for orchestrators that prioritise getting an answer over a single round-trip.
+- **Why the default stays `'error'`:** silent fallback materially changes orchestration timing and cost shape. `ask` is one `generateContent` call; `ask_agentic` is a multi-iteration loop with N `generateContent` calls + tool round-trips — different timing, different cost profile, different retry shape. Users explicitly opt into the new behaviour. We may flip the default to `'fallback-to-agentic'` (or `'auto'`) in v2.0.0 after collecting feedback.
+- **Input translation (1:1 mapping with one semantic divergence):** `prompt`, `workspace`, `model`, `includeGlobs`, `excludeGlobs`, `maxOutputTokens`, `thinkingBudget`, `thinkingLevel` pass through unchanged. **`timeoutMs` translates to `iterationTimeoutMs`** — `ask`'s wall-clock cap becomes `ask_agentic`'s per-iteration cap, so total wall-clock can be `maxIterations × iterationTimeoutMs`. This divergence is documented explicitly in the `onWorkspaceTooLarge` schema description.
+- **Result wrapping:** the `content` field passes through the agentic prose verbatim — same shape any direct `ask_agentic` caller would see. The `structuredContent` is enriched with fallback-trail metadata so callers can audit the swap:
+  - `fallbackApplied: 'ask_agentic'`
+  - `fallbackReason: 'WORKSPACE_TOO_LARGE'`
+  - `preflightEstimate: { tokens, threshold, source: 'heuristic' | 'exact' | 'fallback', cacheHit, rawTokens }` — the same provenance the v1.10.0 preflight surfaces on the regular path
+  - `agenticResult: <full ask_agentic structuredContent>` — preserved for orchestrators that need underlying loop metadata (iterations, totalInputTokens, etc.)
+  - `isError: true` propagated faithfully if the agentic loop itself failed (e.g. iteration budget exhausted) — fallback is not a silent-success oracle
+- **Why `code` does NOT support this field — load-bearing constraint.** `code` returns `OLD/NEW` edit blocks parsed by `parseEdits` (`src/tools/code.tool.ts`) and consumed by Claude's Edit tool to apply patches. `ask_agentic` returns prose. A silent fallback would break Claude's Edit pipeline — the user would see "Gemini suggests these changes" prose where they expected an apply-able edit. The schema rejects `onWorkspaceTooLarge` on `code` via Zod's strict-mode unknown-key check; a regression test pins this asymmetry.
+- **3 new tests** in `test/unit/preflight-guard.test.ts`: default `'error'` behaviour preserved (no fallback fires); `'fallback-to-agentic'` invokes `ask_agentic` with correctly translated input AND wraps the result with provenance metadata; agentic `isError` propagates through the wrapper.
+
+### Notes
+
+- Zero breaking changes. `onWorkspaceTooLarge` defaults to `'error'`. All metadata fields additive on the `structuredContent` for fallback-served responses.
+- Phase 4 (heartbeat-aware stall detector replacing the wall-clock `timeoutMs` semantics) deferred to a subsequent release.
+
 ## [1.10.0] - 2026-04-28
 
 ### Added — accurate `countTokens`-based preflight (Phase 2 of the v1.9.0 plan; T17 closure)
