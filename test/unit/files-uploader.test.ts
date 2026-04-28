@@ -294,4 +294,151 @@ describe('uploadWorkspaceFiles', () => {
     expect(calls.some((c) => /indexed 1\/2/.test(c[0] as string))).toBe(true);
     expect(calls.some((c) => /indexed 2\/2/.test(c[0] as string))).toBe(true);
   });
+
+  // ---------------------------------------------------------------------------
+  // v1.12.1 + v1.12.2 — `signal?: AbortSignal` threading
+  //
+  // Three abort defenses guard the upload pool, each pinned by one test:
+  //
+  //   (a) Pre-flight: never enter the pool if the signal already fired.
+  //   (b) Mid-pool: per-task check before each `client.files.upload` call.
+  //   (c) Post-pool: after `runPool` returns, re-check and throw the
+  //       canonical reason — `runPool` collects per-task errors as
+  //       'rejected' settled results, so the per-task throw alone never
+  //       reached the caller pre-v1.12.1 round-2 (Copilot finding COP-2).
+  //
+  // The post-pool defense is the one that actually surfaces a `TIMEOUT`
+  // errorCode at the tool layer; the per-task defense is best-effort
+  // short-circuiting of new work.
+  // ---------------------------------------------------------------------------
+
+  it('throws immediately when signal is already aborted (pre-flight short-circuit, v1.12.1)', async () => {
+    // Defends against the caller racing the abort BEFORE invoking
+    // `uploadWorkspaceFiles` — without this guard, the pool would have
+    // entered runPool and processed at least one task before the
+    // per-task check fired.
+    const upload = vi.fn(async (_params: unknown) => ({
+      uri: 'https://example.invalid/files/x',
+    }));
+    const client = mkClient(upload);
+    const f1 = join(tmp, 'a.ts');
+    writeFileSync(f1, 'a');
+
+    const controller = new AbortController();
+    const reason = new DOMException('Timed out after 1000 ms (total wall-clock)', 'TimeoutError');
+    controller.abort(reason);
+
+    await expect(
+      uploadWorkspaceFiles({
+        client,
+        manifest: db,
+        workspaceRoot,
+        files: [mkScanned('a.ts', 'h1', f1)],
+        emitter: mkEmitter(),
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(reason);
+
+    // No SDK calls — short-circuit fired before runPool even started.
+    expect(upload).not.toHaveBeenCalled();
+  });
+
+  it('post-runPool abort propagates `signal.reason` (Copilot COP-2 closure, v1.12.1)', async () => {
+    // The headline regression test for the v1.12.1 round-2 fix:
+    // pre-fix `runPool` collected per-task abort throws as 'rejected'
+    // settled results, swallowing the canonical reason and surfacing as
+    // a generic "upload failed" entry in `failures`. Post-fix the
+    // explicit post-pool check re-throws the controller's reason so the
+    // outer tool layer can map it to `errorCode: 'TIMEOUT'`.
+    //
+    // Strategy: mock `client.files.upload` to fire abort mid-flight
+    // (via setImmediate so the abort lands AFTER runPool starts but
+    // BEFORE all tasks settle — exercising the post-pool path
+    // specifically rather than the pre-flight one).
+    let uploadCount = 0;
+    const controller = new AbortController();
+    const canonicalReason = new DOMException(
+      'Timed out after 50 ms (total wall-clock)',
+      'TimeoutError',
+    );
+    Object.assign(canonicalReason, { timeoutKind: 'total' as const });
+
+    const upload = vi.fn(async (_params: unknown) => {
+      uploadCount += 1;
+      if (uploadCount === 1) {
+        // First task: fire the abort synchronously inside the upload
+        // call. The await still resolves the promise normally (we
+        // don't throw here), but by the time runPool moves to the
+        // SECOND task, `signal.aborted === true`. The per-task check
+        // at the top of the second task throws, runPool catches it as
+        // `'rejected'`, and the post-pool guard then throws
+        // `signal.reason` to the outer caller.
+        controller.abort(canonicalReason);
+      }
+      return { uri: `https://example.invalid/files/${uploadCount}` };
+    });
+    const client = mkClient(upload);
+
+    const files = Array.from({ length: 5 }, (_, i) => {
+      const f = join(tmp, `f${i}.ts`);
+      writeFileSync(f, String(i));
+      return mkScanned(`f${i}.ts`, `h${i}`, f);
+    });
+
+    await expect(
+      uploadWorkspaceFiles({
+        client,
+        manifest: db,
+        workspaceRoot,
+        files,
+        emitter: mkEmitter(),
+        // Concurrency 1 keeps the abort timing deterministic — the
+        // first task fires the abort synchronously; runPool schedules
+        // the second, the per-task guard throws AbortError, runPool
+        // catches it as 'rejected'; post-pool guard sees aborted and
+        // throws canonicalReason.
+        concurrency: 1,
+        signal: controller.signal,
+      }),
+    ).rejects.toBe(canonicalReason);
+
+    // First upload completed; second was guarded out per-task.
+    expect(uploadCount).toBe(1);
+  });
+
+  it('post-pool synthesizes AbortError when signal.reason is not an Error (defensive, v1.12.1)', async () => {
+    // Edge case: `controller.abort('string-reason')` sets `signal.reason`
+    // to a non-Error value. The post-pool block falls back to a
+    // synthetic `DOMException('Operation aborted during file upload',
+    // 'AbortError')` so the abort still propagates as a recognizable
+    // error rather than `throw 'string-reason'`.
+    let uploadCount = 0;
+    const controller = new AbortController();
+    const upload = vi.fn(async (_params: unknown) => {
+      uploadCount += 1;
+      if (uploadCount === 1) {
+        controller.abort('this-is-a-string-not-an-error');
+      }
+      return { uri: `https://example.invalid/files/${uploadCount}` };
+    });
+    const client = mkClient(upload);
+
+    const files = Array.from({ length: 3 }, (_, i) => {
+      const f = join(tmp, `g${i}.ts`);
+      writeFileSync(f, String(i));
+      return mkScanned(`g${i}.ts`, `g${i}`, f);
+    });
+
+    await expect(
+      uploadWorkspaceFiles({
+        client,
+        manifest: db,
+        workspaceRoot,
+        files,
+        emitter: mkEmitter(),
+        concurrency: 1,
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/Operation aborted/);
+  });
 });
