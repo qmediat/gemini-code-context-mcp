@@ -190,12 +190,18 @@ describe('v1.5.2 → v1.7.0 manifest.db forward-compatibility', () => {
       'workspace_root:TEXT,files_hash:TEXT,model:TEXT,system_prompt_hash:TEXT,cache_id:TEXT,cache_expires_at:INTEGER,file_ids:TEXT,created_at:INTEGER,updated_at:INTEGER',
     );
 
-    // usage_metrics — D#7's new field is NOT a column; it's derived from duration_ms.
+    // usage_metrics — D#7's settled-vs-in-flight split is NOT a column;
+    // it's derived from duration_ms. v1.13.0 added two ADDITIVE columns
+    // (`caching_mode`, `cached_content_token_count`) for implicit-cache
+    // telemetry — both nullable, both backwards-compatible (rows written
+    // by v1.5.2 stay readable, INSERT statements lacking the new columns
+    // remain valid). The migration layer adds these via ALTER TABLE on
+    // v1.5.x → v1.13 upgrades.
     const umCols = colsFor('usage_metrics')
       .map((c) => c.name)
       .join(',');
     expect(umCols).toBe(
-      'id,workspace_root,tool_name,model,cached_tokens,uncached_tokens,cost_usd_micro,duration_ms,occurred_at',
+      'id,workspace_root,tool_name,model,cached_tokens,uncached_tokens,cost_usd_micro,duration_ms,occurred_at,caching_mode,cached_content_token_count',
     );
     reopened.close();
   });

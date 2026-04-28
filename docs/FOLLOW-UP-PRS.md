@@ -288,7 +288,11 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T25. Telemetry surface for `tokenCountMethod` distribution
+## T25. Telemetry surface for `tokenCountMethod` distribution — *partial in v1.13.0; preflight-distribution counters still pending*
+
+**2026-04-27 update:** v1.13.0 shipped the caching half of the telemetry surface (`caching_mode`, `cached_content_token_count` columns on `usage_metrics`; `cacheStatsLast24h` aggregation on `ManifestDb`; `caching` block on the `status` tool). The preflight-method distribution counters (`preflightHeuristicCount` / `preflightExactFreshCount` / `preflightExactCachedCount` / `preflightFallbackCount`) described below remain unimplemented. Prioritisation reasons: (a) preflight counts are already inspectable per-call via `tokenCountMethod` in `structuredContent`, while caching-mode hit rate is only observable with the new aggregation; (b) the v1.13.0 implicit-cache pivot needed empirical hit-rate data to gate the v1.14.0 default flip — preflight distribution didn't have a similar forcing function. Original scope below remains accurate for the preflight-counter half.
+
+## T25 (original scope — preflight half).
 
 **Source:** 2026-04-26 self-review of v1.10.0 (Phase 2 PR #40, finding F9).
 

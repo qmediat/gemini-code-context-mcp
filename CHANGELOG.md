@@ -5,6 +5,57 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-04-27
+
+### Added — implicit-cache opt-in (per-call `cachingMode` field on `ask` / `code`)
+
+Gemini 2.5+ and Gemini 3 Pro have automatic implicit caching enabled by default (per [ai.google.dev/gemini-api/docs/caching](https://ai.google.dev/gemini-api/docs/caching), 4 096-token minimum prefix). v1.13.0 lets callers opt into a cache strategy that skips the explicit `caches.create` build entirely and relies on Gemini's automatic implicit cache for the workspace prefix.
+
+- New optional schema field on `ask` / `code`: `cachingMode: 'explicit' | 'implicit'`. Default `'explicit'` — pre-1.13 behaviour preserved.
+  - **`'explicit'`** (default): builds a Gemini Context Cache via `caches.create` — guaranteed ~75 % discount on cached input tokens, but pays a 60–180 s rebuild cost whenever any file changes.
+  - **`'implicit'`**: skips the explicit cache; file content is sent inline every call. Gemini 2.5+/3 Pro applies its automatic implicit caching when prefix matches across calls. Best fit for review→edit→review workflows (no rebuild wait when files change between queries) at the cost of probabilistic rather than guaranteed savings — Gemini's docs note "no cost saving guarantee" for implicit caching.
+  - Hit rate is observable per workspace via `status.structuredContent.caching.implicitHitRate` (see telemetry below).
+  - The default may flip to `'implicit'` in v1.14.0 pending dogfood telemetry.
+
+### Added — caching telemetry on `usage_metrics` + `status` tool
+
+Two additive nullable columns land on `usage_metrics` so operators can see how the new caching mode is performing in production:
+
+- `caching_mode` (TEXT, nullable): `'explicit'` / `'implicit'` per call. NULL on rows written before v1.13.0 (treated as `'explicit'` for aggregations) or on `ask_agentic` calls (which don't fit the explicit/implicit model — they use agentic file-access, no workspace cache).
+- `cached_content_token_count` (INTEGER, nullable): mirrors `usage_metadata.cachedContentTokenCount` from the Gemini response. Used to compute the implicit cache hit rate.
+
+New aggregation method on `ManifestDb`: `cacheStatsLast24h(nowMs)` — returns `{mode, callCount, implicitCallsTotal, implicitCallsWithHit, implicitCachedTokens, implicitUncachedTokens, implicitHitRate, explicitRebuildCount}`. The `status` tool surfaces this under `structuredContent.caching` and renders a human-readable "caching (24h)" block when there's something to report. Implicit hit rate < 50 % gets a gentle inline warning (no error) so operators on implicit mode can revisit the trade-off.
+
+### Added — scan memo (warm rescans skip ~95 % of file hashing)
+
+Two additive nullable columns land on `files`: `mtime_ms` (INTEGER) and `size` (INTEGER). The scanner now consults these on subsequent rescans — when the file's stat-reported mtime AND size match the previously-stored values, the scanner reuses the stored content hash and skips the read+SHA256 step entirely. Both columns must match for the memo to fire (size guards the rare same-mtime-different-content case caused by sub-second writes within a 1-second resolution window).
+
+- New per-call schema field: `forceRescan: boolean` (default `false`) — bypasses the memo and re-hashes every file. Use when you suspect the manifest is stale (filesystem mutated outside the dev workflow, NTP clock-skew, etc.).
+- New env var: `GEMINI_CODE_CONTEXT_FORCE_RESCAN` — operator-level override that's ORed with the per-call flag.
+- The `reindex` tool always passes `forceRescan: true` (consistent with its "blow away the memo" semantics).
+- New helper: `buildScanMemo(rows)` builds the memo lookup map from the manifest's stored `FileRow[]`. Pre-1.13 rows lacking `mtimeMs`/`size` are dropped — they always re-hash on the next scan.
+- `ScannedFile` now exposes `mtimeMs: number` and `memoHit: boolean`. `ScanResult` exposes `memoHitCount: number` so operators can see how often the warm path is exercised.
+
+### Changed — parallel scan/hash + throttled progress notifications
+
+- **Parallel scan/hash.** The per-file `stat`+`hashFile` loop in `workspace-scanner.ts` now runs as a bounded-concurrency pool (default `hashConcurrency: 20`), measured ~6× faster than the prior serial loop on a 670k-token workspace. Memo hits drain the pool nearly instantly.
+- **Throttled progress emits.** `files-uploader.ts`'s per-file progress notifications now throttle to ≥ 250 ms apart OR ≥ 25 files of progress, whichever comes first. The final completion always emits so progress UIs don't hang at e.g. 475/500.
+- **Shared `runPool` utility.** Extracted from `cache/files-uploader.ts` to `utils/run-pool.ts` so the scanner and uploader share the same primitive.
+
+### Changed — `caches.delete` on stale-cache rebuild now async (saves 5–15 s per rebuild)
+
+When the explicit cache path detects a stale cache id and triggers `caches.create`, the previous `caches.delete` call ran SYNCHRONOUSLY before the rebuild — adding 5–15 s of round-trip time to every cache rebuild for users on `cachingMode: 'explicit'`. v1.13.0 swaps this for an async post-create delete: the manifest's `cacheId` pointer is updated to the new cache as soon as `caches.create` returns, then the stale-cache delete fires in the background with 3× retry (1 s, 3 s, 9 s back-off). On permanent failure the orphan auto-expires at Google's TTL — bounded storage cost only.
+
+### Migration
+
+Both schema additions are additive ALTER TABLE migrations on existing v1.12.x databases — `mtime_ms`, `size` (on `files`); `caching_mode`, `cached_content_token_count` (on `usage_metrics`). Migration is idempotent: opening the same DB twice swallows "duplicate column name" errors. No data conversion required; pre-1.13 rows lacking the new columns are read as NULL.
+
+### Notes
+
+- Minor-level release. New schema field (`cachingMode`); new structured-content metadata fields on `status`; new SQLite columns (additive, nullable). Default behaviour unchanged.
+- The implicit-caching pivot is the architectural answer to the v1.6-v1.7 streaming refactor's "review→edit→review" pain point: no more 60–180 s rebuild wait when files change between queries on Gemini 2.5+/3.
+- Coverage additions: 23 cache-manager tests (was 21), 32 manifest-db tests (was 23), 14 workspace-scanner tests (was 14 + 5 v1.13 scan-memo tests = 19), new 4-test `status-tool.test.ts`.
+
 ## [1.12.2] - 2026-04-28
 
 ### Added — observability for the `ask` → `ask_agentic` fallback timeout selection

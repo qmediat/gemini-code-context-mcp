@@ -21,6 +21,7 @@ import type { ManifestDb } from '../manifest/db.js';
 import type { FileRow } from '../types.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import type { ProgressEmitter } from '../utils/progress.js';
+import { runPool } from '../utils/run-pool.js';
 
 const FILES_API_TTL_MS = 47 * 3600 * 1000; // 1 h safety margin before 48 h auto-delete
 /**
@@ -62,39 +63,6 @@ export interface UploadResult {
   failures: UploadFailure[];
 }
 
-/**
- * Run `task` over `items` with up to `concurrency` in flight. Order of
- * results matches order of items. Never throws — every failure is captured
- * as a rejected `PromiseSettledResult` in the returned array.
- */
-async function runPool<T, R>(
-  items: T[],
-  concurrency: number,
-  task: (item: T, index: number) => Promise<R>,
-): Promise<PromiseSettledResult<R>[]> {
-  const results: PromiseSettledResult<R>[] = new Array(items.length);
-  let next = 0;
-  const workers = Array.from(
-    { length: Math.max(1, Math.min(concurrency, items.length || 1)) },
-    async () => {
-      while (next < items.length) {
-        const i = next;
-        next += 1;
-        const item = items[i];
-        if (item === undefined) continue;
-        try {
-          const value = await task(item, i);
-          results[i] = { status: 'fulfilled', value };
-        } catch (err) {
-          results[i] = { status: 'rejected', reason: err };
-        }
-      }
-    },
-  );
-  await Promise.all(workers);
-  return results;
-}
-
 export async function uploadWorkspaceFiles(args: {
   client: GoogleGenAI;
   manifest: ManifestDb;
@@ -123,6 +91,28 @@ export async function uploadWorkspaceFiles(args: {
   let reusedCount = 0;
   let completed = 0;
   const failures: UploadFailure[] = [];
+
+  // v1.13.0 progress-emit throttle. On a 500-file workspace, the previous
+  // per-file emit dispatched 500 MCP notifications inside ~3 s — most of
+  // them serialised over stdio for the same effective UI state ("X/500
+  // indexed"). Cap the emit cadence at ≥250 ms apart OR ≥25 files of
+  // progress, whichever comes first; ALWAYS emit the final completion so
+  // the progress UI doesn't hang at e.g. 475/500. Only the index
+  // notifications are throttled — abort/error events stay immediate.
+  const PROGRESS_EMIT_INTERVAL_MS = 250;
+  const PROGRESS_EMIT_FILE_STEP = 25;
+  let lastEmitTimeMs = 0;
+  let lastEmitCompleted = 0;
+  const emitProgress = (relpath: string): void => {
+    const isFinal = completed === files.length;
+    const tNow = Date.now();
+    const stepReached = completed - lastEmitCompleted >= PROGRESS_EMIT_FILE_STEP;
+    const intervalReached = tNow - lastEmitTimeMs >= PROGRESS_EMIT_INTERVAL_MS;
+    if (!(isFinal || stepReached || intervalReached)) return;
+    lastEmitTimeMs = tNow;
+    lastEmitCompleted = completed;
+    emitter.emit(`indexed ${completed}/${files.length}: ${relpath}`, completed, files.length);
+  };
 
   // Pre-flight: don't start the pool at all if abort already fired.
   if (signal?.aborted) {
@@ -167,15 +157,13 @@ export async function uploadWorkspaceFiles(args: {
         fileId: entry.existing.fileId,
         uploadedAt: entry.existing.uploadedAt,
         expiresAt: entry.existing.expiresAt,
+        mtimeMs: entry.file.mtimeMs,
+        size: entry.file.size,
       };
       manifest.upsertFile(row);
       out[i] = row;
       completed += 1;
-      emitter.emit(
-        `indexed ${completed}/${files.length}: ${entry.file.relpath}`,
-        completed,
-        files.length,
-      );
+      emitProgress(entry.file.relpath);
       return;
     }
 
@@ -216,16 +204,14 @@ export async function uploadWorkspaceFiles(args: {
       fileId,
       uploadedAt: now,
       expiresAt: now + FILES_API_TTL_MS,
+      mtimeMs: entry.file.mtimeMs,
+      size: entry.file.size,
     };
     manifest.upsertFile(row);
     out[i] = row;
     if (isDuplicate) reusedCount += 1;
     completed += 1;
-    emitter.emit(
-      `indexed ${completed}/${files.length}: ${entry.file.relpath}`,
-      completed,
-      files.length,
-    );
+    emitProgress(entry.file.relpath);
   }).then((settled) => {
     // Collect failures after the pool finishes — don't lose the mapping to files.
     for (let i = 0; i < settled.length; i += 1) {

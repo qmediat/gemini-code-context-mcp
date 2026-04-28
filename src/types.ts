@@ -55,6 +55,20 @@ export interface FileRow {
   fileId: string | null;
   uploadedAt: number | null;
   expiresAt: number | null;
+  /**
+   * File mtime in ms (v1.13.0+). Used by the scan memo to skip re-hashing
+   * when both `mtime_ms` and `size` match the previously-stored values.
+   * `null` for rows written before v1.13.0 — those rows always re-hash on
+   * the next scan.
+   */
+  mtimeMs?: number | null;
+  /**
+   * File size in bytes (v1.13.0+). Used alongside `mtimeMs` as a second
+   * gate for the scan memo — guards the (rare) case where two edits within
+   * a 1-second `mtime` resolution window leave the same `mtime` but different
+   * content.
+   */
+  size?: number | null;
 }
 
 /** Usage metric row for cost reporting. */
@@ -67,6 +81,22 @@ export interface UsageMetricRow {
   costUsdMicro: number | null;
   durationMs: number;
   occurredAt: number;
+  /**
+   * Caching mode used for this call (v1.13.0+).
+   * - `'explicit'`: Gemini Context Cache built/reused via `caches.create`.
+   * - `'implicit'`: skipped explicit cache; content sent inline; relies on
+   *   Gemini 2.5+/3 Pro's automatic implicit caching.
+   * - `null`: rows written before v1.13.0 (no caching-mode column) — treated
+   *   as `'explicit'` for backwards-compat aggregations.
+   */
+  cachingMode?: 'explicit' | 'implicit' | null;
+  /**
+   * Tokens served from Gemini's cache (explicit OR implicit) on this call,
+   * as reported by `usage_metadata.cachedContentTokenCount` (v1.13.0+).
+   * Used by the `status` tool to compute cache-hit rate. `null` for rows
+   * written before v1.13.0.
+   */
+  cachedContentTokenCount?: number | null;
 }
 
 /** Metadata attached to tool responses so Claude Code can show stats. */

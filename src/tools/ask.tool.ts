@@ -14,7 +14,7 @@ import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cach
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
-import { scanWorkspace } from '../indexer/workspace-scanner.js';
+import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
   WorkspaceValidationError,
   validateWorkspacePath,
@@ -135,6 +135,18 @@ export const askInputSchema = z
       .describe(
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
+    cachingMode: z
+      .enum(['explicit', 'implicit'])
+      .optional()
+      .describe(
+        "Cache strategy for the workspace context (v1.13.0+). `'explicit'` (default) builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays a 60–180 s rebuild cost whenever any file changes. `'implicit'` skips the explicit cache entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. **Best fit for review→edit→review workflows** (no rebuild wait when files change between queries) at the cost of probabilistic rather than guaranteed savings — Gemini's docs note 'no cost saving guarantee' for implicit caching. Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. The default may flip to `'implicit'` in v1.14.0 pending dogfood telemetry.",
+      ),
+    forceRescan: z
+      .boolean()
+      .optional()
+      .describe(
+        'Bypass the v1.13.0 scan memo and re-hash every file in the workspace (default `false`). The scan memo skips per-file SHA256 when `mtime_ms` and `size` match the previously-stored values — typically ~95% of files on a warm rescan, cutting scan wall-clock by ≥10× on large workspaces. Set this when you suspect the manifest is stale (e.g. files mutated outside the dev workflow, NTP clock-skew, or you ran `git checkout` on a directory tree). Equivalent to setting env `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` for a single call.',
+      ),
     onWorkspaceTooLarge: z
       .enum(['error', 'fallback-to-agentic'])
       .optional()
@@ -228,11 +240,18 @@ async function executeAskBody(
     resolvedModelKey = resolved.resolved;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
+    // v1.13.0 — build the scan memo from previously-stored file rows so the
+    // scanner can skip re-hashing files whose mtime+size haven't changed.
+    // First-run on a new workspace produces an empty map (= every file
+    // hashes), which matches pre-v1.13 behaviour.
+    const scanMemo = buildScanMemo(ctx.manifest.getFiles(workspaceRoot));
     const scan = await scanWorkspace(workspaceRoot, {
       ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
       ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
       maxFiles: ctx.config.maxFilesPerWorkspace,
       maxFileSizeBytes: ctx.config.maxFileSizeBytes,
+      manifestMemo: scanMemo,
+      forceRescan: input.forceRescan === true || ctx.config.forceRescan === true,
     });
 
     // Output-cap strategy (v1.4.0): three-layer precedence.
@@ -621,6 +640,12 @@ async function executeAskBody(
       .digest('hex')
       .slice(0, 16);
 
+    // v1.13.0 — record the resolved caching mode for telemetry. Defaults to
+    // `'explicit'` so pre-1.13 behaviour is unchanged. The status tool's
+    // `cacheStatsLast24h` aggregation reads this column to compute
+    // implicit-cache hit rate, dominant mode, and rebuild count.
+    const effectiveCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
+
     const ctxPrep = await prepareContext({
       client: ctx.client,
       manifest: ctx.manifest,
@@ -634,6 +659,8 @@ async function executeAskBody(
       allowCaching: !input.noCache && scan.files.length > 0,
       // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
       signal: abortSignal,
+      // v1.13.0 — opt-in implicit caching path (skip caches.create).
+      ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
     });
 
     // TPM throttle reservation — placed HERE (after `prepareContext`,
@@ -808,6 +835,8 @@ async function executeAskBody(
             allowCaching: !input.noCache && scan.files.length > 0,
             // v1.12.1 — propagate signal into stale-cache rebuild too.
             signal: abortSignal,
+            // v1.13.0 — keep cachingMode consistent across happy + retry paths.
+            ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
           });
           // Cancel the original throttle reservation — its `tsMs` was
           // stamped at first-dispatch time, which is now seconds in the
@@ -932,6 +961,8 @@ async function executeAskBody(
           uncachedTokens: uncached,
           costUsdMicro: costMicros,
           durationMs,
+          cachingMode: effectiveCachingMode,
+          cachedContentTokenCount: cached,
         });
       } catch (finalizeErr) {
         logger.error(
@@ -949,6 +980,8 @@ async function executeAskBody(
         costUsdMicro: costMicros,
         durationMs,
         occurredAt: Date.now(),
+        cachingMode: effectiveCachingMode,
+        cachedContentTokenCount: cached,
       });
     }
 

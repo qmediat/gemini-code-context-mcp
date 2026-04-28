@@ -356,4 +356,280 @@ describe('ManifestDb', () => {
       expect(stats.totalCostMicros).toBe(80_000);
     });
   });
+
+  describe('v1.13.0 — caching telemetry + scan memo columns', () => {
+    it('round-trips files with mtimeMs + size on upsert', () => {
+      db.upsertWorkspace({
+        workspaceRoot: '/ws',
+        filesHash: 'h',
+        model: 'm',
+        systemPromptHash: '',
+        cacheId: null,
+        cacheExpiresAt: null,
+        fileIds: [],
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      db.upsertFile({
+        workspaceRoot: '/ws',
+        relpath: 'a.ts',
+        contentHash: 'hh',
+        fileId: null,
+        uploadedAt: null,
+        expiresAt: null,
+        mtimeMs: 1_700_000_000_000,
+        size: 4096,
+      });
+      const rows = db.getFiles('/ws');
+      expect(rows[0]?.mtimeMs).toBe(1_700_000_000_000);
+      expect(rows[0]?.size).toBe(4096);
+    });
+
+    it('preserves null mtimeMs / size on rows the uploader hasn’t refreshed yet', () => {
+      db.upsertWorkspace({
+        workspaceRoot: '/ws',
+        filesHash: 'h',
+        model: 'm',
+        systemPromptHash: '',
+        cacheId: null,
+        cacheExpiresAt: null,
+        fileIds: [],
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      db.upsertFile({
+        workspaceRoot: '/ws',
+        relpath: 'b.ts',
+        contentHash: 'hh',
+        fileId: null,
+        uploadedAt: null,
+        expiresAt: null,
+      });
+      const rows = db.getFiles('/ws');
+      expect(rows[0]?.mtimeMs ?? null).toBeNull();
+      expect(rows[0]?.size ?? null).toBeNull();
+    });
+
+    it('records cachingMode + cachedContentTokenCount via insertUsageMetric', () => {
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'gemini-3-pro-preview',
+        cachedTokens: 50_000,
+        uncachedTokens: 10_000,
+        costUsdMicro: 100_000,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'implicit',
+        cachedContentTokenCount: 50_000,
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.mode).toBe('implicit');
+      expect(cs.implicitCallsTotal).toBe(1);
+      expect(cs.implicitCallsWithHit).toBe(1);
+      // Hit rate = 50_000 / (50_000 + 10_000) = ~0.833
+      expect(cs.implicitHitRate).toBeCloseTo(50_000 / 60_000, 3);
+    });
+
+    it('records cachingMode via finalizeBudgetReservation too', () => {
+      const t = Date.now();
+      const r = db.reserveBudget({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'gemini-3-pro-preview',
+        estimatedCostMicros: 100_000,
+        dailyBudgetMicros: 10_000_000,
+        nowMs: t,
+      });
+      if (!('id' in r)) throw new Error('reserve rejected unexpectedly');
+      db.finalizeBudgetReservation(r.id, {
+        cachedTokens: 50_000,
+        uncachedTokens: 10_000,
+        costUsdMicro: 80_000,
+        durationMs: 1_500,
+        cachingMode: 'implicit',
+        cachedContentTokenCount: 50_000,
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.mode).toBe('implicit');
+      expect(cs.implicitCallsWithHit).toBe(1);
+    });
+
+    it('treats pre-1.13 NULL caching_mode rows as explicit for dominant-mode tally', () => {
+      const t = Date.now();
+      // Simulate a pre-v1.13 row by passing undefined cachingMode.
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'gemini-2.5-pro',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.mode).toBe('explicit');
+      expect(cs.callCount).toBe(1);
+      expect(cs.implicitHitRate).toBe(0); // no implicit calls => denom=0 => 0
+    });
+
+    it('reports mode "mixed" when both explicit and implicit calls appear', () => {
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'explicit',
+      });
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        cachedTokens: 500,
+        uncachedTokens: 500,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'implicit',
+        cachedContentTokenCount: 500,
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.mode).toBe('mixed');
+      expect(cs.implicitCallsTotal).toBe(1);
+    });
+
+    it('counts implicit calls with cachedContentTokenCount=0 as misses', () => {
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+        cachingMode: 'implicit',
+        cachedContentTokenCount: 0,
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.implicitCallsTotal).toBe(1);
+      expect(cs.implicitCallsWithHit).toBe(0);
+      // 0 / 1000 = 0.
+      expect(cs.implicitHitRate).toBe(0);
+    });
+
+    it('returns mode=null when nothing in the 24 h window', () => {
+      const cs = db.cacheStatsLast24h(Date.now());
+      expect(cs.mode).toBeNull();
+      expect(cs.callCount).toBe(0);
+    });
+
+    it('counts cache.create rows toward explicitRebuildCount', () => {
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'cache.create',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 0,
+        costUsdMicro: 0,
+        durationMs: 60_000,
+        occurredAt: t,
+      });
+      // One regular ask call so callCount is non-zero.
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1,
+        costUsdMicro: 1,
+        durationMs: 1,
+        occurredAt: t,
+        cachingMode: 'explicit',
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.explicitRebuildCount).toBe(1);
+      expect(cs.callCount).toBe(1); // cache.create excluded from user-call count
+    });
+
+    it('excludes ask_agentic from the implicit/explicit aggregation', () => {
+      const t = Date.now();
+      db.insertUsageMetric({
+        workspaceRoot: '/ws',
+        toolName: 'ask_agentic',
+        model: 'm',
+        cachedTokens: 0,
+        uncachedTokens: 1_000,
+        costUsdMicro: 100,
+        durationMs: 1_000,
+        occurredAt: t,
+      });
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.callCount).toBe(0);
+      expect(cs.mode).toBeNull();
+    });
+
+    it('ignores in-flight reservations (duration_ms = 0)', () => {
+      const t = Date.now();
+      const r = db.reserveBudget({
+        workspaceRoot: '/ws',
+        toolName: 'ask',
+        model: 'm',
+        estimatedCostMicros: 1_000,
+        dailyBudgetMicros: 1_000_000,
+        nowMs: t,
+      });
+      expect('id' in r).toBe(true);
+      // No finalize — the row stays at duration_ms = 0.
+      const cs = db.cacheStatsLast24h(t + 1);
+      expect(cs.callCount).toBe(0);
+    });
+  });
+
+  describe('v1.13.0 — manifest forward-migration on existing v1.12.x DBs', () => {
+    it('ALTER TABLE: opening a fresh DB twice is idempotent (no duplicate-column error)', () => {
+      // The constructor ran once via beforeEach. Open a second instance on
+      // the SAME file — the v1.13 ALTER TABLE migrations must short-circuit
+      // on "duplicate column name" without throwing.
+      const path = join(tmp, 'manifest.db');
+      const db2 = new ManifestDb(path);
+      try {
+        // Sanity: scan-memo columns + telemetry columns are usable.
+        db2.upsertWorkspace({
+          workspaceRoot: '/x',
+          filesHash: 'h',
+          model: 'm',
+          systemPromptHash: '',
+          cacheId: null,
+          cacheExpiresAt: null,
+          fileIds: [],
+          createdAt: 1,
+          updatedAt: 1,
+        });
+        db2.upsertFile({
+          workspaceRoot: '/x',
+          relpath: 'a.ts',
+          contentHash: 'h',
+          fileId: null,
+          uploadedAt: null,
+          expiresAt: null,
+          mtimeMs: 1,
+          size: 1,
+        });
+        const rows = db2.getFiles('/x');
+        expect(rows[0]?.mtimeMs).toBe(1);
+      } finally {
+        db2.close();
+      }
+    });
+  });
 });

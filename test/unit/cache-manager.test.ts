@@ -188,6 +188,88 @@ describe('prepareContext', () => {
     expect(client.caches.create).not.toHaveBeenCalled();
   });
 
+  it('v1.13.0 cachingMode="implicit": skips caches.create, returns inline contents (rely on Gemini auto-cache)', async () => {
+    const client = mkClient({});
+
+    const result = await prepareContext({
+      client,
+      manifest: db,
+      // Big enough to trip the explicit-cache path under default behaviour.
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true, // would normally cache; mode override forces inline
+      cachingMode: 'implicit',
+    });
+
+    expect(result.inlineOnly).toBe(true);
+    expect(result.cacheId).toBeNull();
+    expect(result.inlineContents.length).toBeGreaterThan(0);
+    expect(client.caches.create).not.toHaveBeenCalled();
+    expect(client.files.upload).not.toHaveBeenCalled();
+
+    // Manifest still gets a workspace row so subsequent calls see the
+    // current filesHash (preserves invalidation semantics).
+    const ws = db.getWorkspace(workspaceRoot);
+    expect(ws).not.toBeNull();
+    expect(ws?.cacheId).toBeNull();
+  });
+
+  it('v1.13.0 async caches.delete: stale cache cleanup happens AFTER caches.create succeeds', async () => {
+    const now = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-OLD',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-1',
+      cacheId: 'cachedContents/stale',
+      cacheExpiresAt: now + 30 * 60 * 1000,
+      fileIds: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    const callOrder: string[] = [];
+    const client = mkClient({
+      cachesCreate: async () => {
+        callOrder.push('create');
+        return { name: 'cachedContents/fresh' };
+      },
+      cachesDelete: async (params: unknown) => {
+        callOrder.push(`delete:${(params as { name: string }).name}`);
+        return {};
+      },
+    });
+
+    await prepareContext({
+      client,
+      manifest: db,
+      scan: mkScan([{ relpath: 'big.ts', size: 10_000, content: 'X'.repeat(10_000) }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+    });
+
+    // Drain microtask queue so the void-fired delete runs.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Order check: create MUST happen before delete (manifest swap is the
+    // commit point; if delete ran first and create then failed, we'd lose
+    // both caches with no rollback).
+    const createIdx = callOrder.indexOf('create');
+    const deleteIdx = callOrder.indexOf('delete:cachedContents/stale');
+    expect(createIdx).toBeGreaterThanOrEqual(0);
+    expect(deleteIdx).toBeGreaterThan(createIdx);
+
+    // Manifest already points at the new cache when the delete fires.
+    const after = db.getWorkspace(workspaceRoot);
+    expect(after?.cacheId).toBe('cachedContents/fresh');
+  });
+
   it('cache REBUILD: filesHash mismatch → uploads + creates new cache + deletes old', async () => {
     const now = Date.now();
     db.upsertWorkspace({

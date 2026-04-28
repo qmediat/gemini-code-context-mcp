@@ -37,6 +37,10 @@ vi.mock('../../src/indexer/workspace-validation.js', () => ({
 }));
 vi.mock('../../src/indexer/workspace-scanner.js', () => ({
   scanWorkspace: mocks.scanWorkspace,
+  // v1.13.0 — tools call `buildScanMemo(manifest.getFiles(...))` before
+  // `scanWorkspace` to thread the scan memo. Stub returning an empty Map
+  // so the call is harmless when scanWorkspace itself is mocked out.
+  buildScanMemo: () => new Map<string, never>(),
 }));
 vi.mock('../../src/gemini/models.js', () => ({
   resolveModel: mocks.resolveModel,
@@ -125,6 +129,7 @@ function buildCtx(opts: {
       finalizeBudgetReservation: vi.fn(),
       cancelBudgetReservation: vi.fn(),
       insertUsageMetric: vi.fn(),
+      getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
     ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,

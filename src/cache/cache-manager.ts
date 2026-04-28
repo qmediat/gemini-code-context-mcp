@@ -84,6 +84,26 @@ export interface BuildOptions {
    * upload duration" instead of "total file count × max upload duration".
    */
   signal?: AbortSignal;
+  /**
+   * Caching mode (v1.13.0+). Controls whether `prepareContext` builds
+   * an explicit Gemini Context Cache (`caches.create`) or falls through
+   * to the inline path and relies on Gemini's automatic implicit
+   * caching for Gemini 2.5+/3 models.
+   *
+   * - `'explicit'` (today's behaviour): build + reuse a Context Cache
+   *   for the workspace. Hard ~75 % discount on cached input. Pays
+   *   60–180 s `caches.create` cost on file change.
+   * - `'implicit'` (v1.13.0+ opt-in): skip `caches.create` entirely;
+   *   send file content inline every call. Gemini's automatic implicit
+   *   caching applies a discount when the prefix matches across calls
+   *   (4 096-token minimum, no guarantee). No rebuild wait on file
+   *   change. **Best fit for review→edit→review workflows** where
+   *   files change between queries.
+   * - `undefined`: caller doesn't care; behave as `'explicit'` (the
+   *   v1.12.x default; flip planned for v1.14.0 pending dogfood
+   *   telemetry).
+   */
+  cachingMode?: 'explicit' | 'implicit';
 }
 
 function ttlString(seconds: number): string {
@@ -262,10 +282,19 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
     });
   }
 
-  // 2) If caching is disabled upfront, skip the Files API entirely and embed
-  //    file text inline. No upload round-trip, no 48 h housekeeping.
-  if (!allowCaching) {
-    logger.debug('caching disabled — embedding files inline from disk.');
+  // 2) Inline path — taken when caching is disabled OR the caller opted into
+  //    implicit caching (v1.13.0+). In both cases we skip `caches.create`,
+  //    embed file text inline from disk, and let Gemini handle whatever
+  //    caching it can: zero for `noCache` callers; automatic implicit
+  //    caching on Gemini 2.5+/3 Pro for `cachingMode: 'implicit'` callers.
+  //    No upload round-trip, no 48 h housekeeping.
+  const implicitMode = opts.cachingMode === 'implicit';
+  if (!allowCaching || implicitMode) {
+    logger.debug(
+      implicitMode
+        ? 'caching mode = implicit — embedding files inline from disk; Gemini 2.5+/3 will auto-cache prefix.'
+        : 'caching disabled — embedding files inline from disk.',
+    );
     const inlineContents = await buildInlineContentFromDisk(scan);
     manifest.upsertWorkspace({
       workspaceRoot: scan.workspaceRoot,
@@ -377,19 +406,16 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
     );
   }
 
-  // 6) Delete any stale cache BEFORE attempting to build the new one.
-  //    If the new build fails, the catch block can null-out cacheId in the
-  //    manifest without leaking a reference on Google's side.
-  if (existing?.cacheId) {
-    try {
-      await client.caches.delete({ name: existing.cacheId });
-      logger.debug(`deleted stale cache ${safeForLog(existing.cacheId)} before rebuild`);
-    } catch (err) {
-      logger.debug(
-        `pre-rebuild cache delete (${safeForLog(existing.cacheId)}) failed: ${safeForLog(err)}`,
-      );
-    }
-  }
+  // 6) Capture the stale cacheId for async post-create deletion.
+  //    v1.13.0 — pre-fix the delete ran synchronously before the build,
+  //    adding 5–15 s to the user's critical path on every cache rebuild.
+  //    Post-fix we build the new cache first, swap the manifest pointer,
+  //    return to the caller, and delete the old cache async (best-effort,
+  //    retried) — the user's wait drops by the delete's full duration.
+  //    Worst case on persistent delete failure: an orphaned cache lingers
+  //    on Google's side until its TTL expires (~hours-to-day). Storage
+  //    cost is bounded by `cacheTtlSeconds`. Documented in CHANGELOG.
+  const staleCacheIdForAsyncDelete = existing?.cacheId ?? null;
 
   // 7) Build a new cache.
   emitter.emit('building context cache…');
@@ -427,6 +453,14 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       updatedAt: afterCreateMs,
     });
 
+    // v1.13.0 — fire-and-forget delete of the stale cache. Manifest already
+    // points at the new cacheId, so a delete failure is purely a Google-side
+    // orphan (auto-expires at TTL). 3× retry handles transient errors;
+    // permanent failure is logged at warn but doesn't surface to the caller.
+    if (staleCacheIdForAsyncDelete !== null) {
+      void bestEffortDeleteCache(client, staleCacheIdForAsyncDelete);
+    }
+
     return {
       cacheId,
       cacheExpiresAt,
@@ -458,6 +492,39 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       reused: false,
       inlineOnly: false,
     };
+  }
+}
+
+/**
+ * Best-effort async delete of a stale cache after a successful rebuild
+ * (v1.13.0+). Retries 3× with exponential back-off (1 s, 3 s, 9 s) for
+ * transient errors. Logs at warn on permanent failure — orphaned caches
+ * auto-expire at Google's TTL so the worst case is bounded storage cost.
+ *
+ * Called as `void bestEffortDeleteCache(...)` so callers don't have to
+ * await; the manifest's `cacheId` pointer was already swapped to the new
+ * cache before this fires.
+ */
+async function bestEffortDeleteCache(client: GoogleGenAI, cacheId: string): Promise<void> {
+  const delays = [1000, 3000, 9000];
+  for (let attempt = 0; attempt < delays.length; attempt += 1) {
+    try {
+      await client.caches.delete({ name: cacheId });
+      logger.debug(`async-deleted stale cache ${safeForLog(cacheId)} (attempt ${attempt + 1})`);
+      return;
+    } catch (err) {
+      // Retry transient errors; give up quickly on 4xx (cache already gone, perms, etc.)
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = !msg.includes('NOT_FOUND') && !msg.includes('PERMISSION_DENIED');
+      if (!isTransient || attempt === delays.length - 1) {
+        logger.warn(
+          `async-delete of stale cache ${safeForLog(cacheId)} permanently failed (attempt ${attempt + 1}): ${safeForLog(msg)}. Orphan will auto-expire at TTL.`,
+        );
+        return;
+      }
+      const nextDelay = delays[attempt];
+      if (nextDelay !== undefined) await new Promise((r) => setTimeout(r, nextDelay));
+    }
   }
 }
 
