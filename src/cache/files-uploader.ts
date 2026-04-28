@@ -102,15 +102,34 @@ export async function uploadWorkspaceFiles(args: {
   files: ScannedFile[];
   emitter: ProgressEmitter;
   concurrency?: number;
+  /**
+   * Optional abort signal (v1.12.1+). Checked at the top of every per-file
+   * task in the pool. When fired, all not-yet-started tasks short-circuit
+   * with an AbortError and the upload phase rejects — letting the caller's
+   * `timeoutMs` budget propagate through the upload phase. In-flight
+   * `client.files.upload` calls are NOT individually cancellable (the SDK
+   * doesn't expose abort plumbing on `files.upload`), so already-flying
+   * uploads complete; the abort just stops queueing more work and surfaces
+   * the user's intent at the next pool yield point.
+   */
+  signal?: AbortSignal;
 }): Promise<UploadResult> {
   const { client, manifest, workspaceRoot, files, emitter } = args;
   const concurrency = args.concurrency ?? DEFAULT_UPLOAD_CONCURRENCY;
+  const signal = args.signal;
   const now = Date.now();
   const out: FileRow[] = new Array(files.length);
   let uploadedCount = 0;
   let reusedCount = 0;
   let completed = 0;
   const failures: UploadFailure[] = [];
+
+  // Pre-flight: don't start the pool at all if abort already fired.
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException('Operation aborted', 'AbortError');
+  }
 
   // First pass: decide reuse vs upload without hitting the network.
   const plan = files.map((file) => {
@@ -127,6 +146,16 @@ export async function uploadWorkspaceFiles(args: {
   const inBatchUploads = new Map<string, Promise<string>>();
 
   await runPool(plan, concurrency, async (entry, i) => {
+    // Mid-pool abort check. `runPool` schedules tasks lazily, so by the
+    // time this task starts, the user's `timeoutMs` may have already
+    // fired. Bail before doing any further I/O. Already-flying tasks
+    // (the ones currently inside `client.files.upload`) complete on
+    // their own — `files.upload` doesn't expose abort plumbing.
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : new DOMException('Operation aborted', 'AbortError');
+    }
     // Reuse path: preserve original uploadedAt / expiresAt so the Google-side
     // 48 h clock continues from the original upload, not from our reuse moment.
     if (entry.existing?.fileId) {
@@ -209,6 +238,24 @@ export async function uploadWorkspaceFiles(args: {
       }
     }
   });
+
+  // Post-pool abort propagation (v1.12.1). `runPool` catches per-task
+  // errors and returns a settled-results array, so the in-task abort
+  // throw above just becomes "Upload failed for X" in `failures`. To
+  // honour the user's `timeoutMs` semantics — and surface a proper
+  // TIMEOUT errorCode at the tool layer instead of a generic
+  // "upload failed" — we re-check the signal AFTER the pool completes
+  // and throw `signal.reason` (the canonical TimeoutError DOMException
+  // with `timeoutKind` property). The outer `isTimeoutAbort` walk
+  // then maps it to `errorCode: 'TIMEOUT'` cleanly.
+  //
+  // Caught regression from /coderev v1.12.1 audit (Copilot finding
+  // COP-2): pre-fix the abort was silently swallowed by runPool.
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new DOMException('Operation aborted during file upload', 'AbortError');
+  }
 
   // Pack only the successful rows into the final contiguous array for callers.
   const files_out: FileRow[] = [];

@@ -5,6 +5,23 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.1] - 2026-04-28
+
+### Fixed — cumulative-review hardening across Phase 2+3+4
+
+Post-merge `/coderev` audit on the cumulative `v1.9.0..main` diff (3-way: GPT + Gemini + Grok) surfaced 5 cross-cutting issues that only emerged when reviewing the three phases together. All applied per "no deferrals" directive.
+
+- **`stallMs` no longer silently dropped on `ask` → `ask_agentic` fallback** (Phase 3+4 interaction; GPT P1 + Grok P1 consensus). Pre-fix, the fallback translation map at `src/tools/ask.tool.ts` forwarded only `timeoutMs` → `iterationTimeoutMs` — a user who set `stallMs: 60000` (the v1.12.0 recommended liveness watchdog) saw it silently dropped on the fallback path. Fix: collapse both knobs onto the per-iteration cap using the TIGHTER of the two when both are set; emit a warn-log noting the translation when only `stallMs` was set.
+- **`timeoutKind` now lifted to top of `structuredContent` on fallback timeout** (Phase 3+4 interaction; Grok P1). Pre-fix, when a fallback-served `ask_agentic` call timed out, `timeoutKind: 'total'` lived nested at `agenticResult.timeoutKind`. Now the fallback wrapper lifts it to top-level alongside `errorCode` and `retryable`, restoring the uniform top-level error-metadata contract that Phase 4 introduced for direct-path TIMEOUT errors.
+- **`timeoutMs` now interrupts the eager Files API upload phase** (pre-existing v1.6.0 gap, surfaced on cumulative review; Gemini P1). Pre-fix, the user's `timeoutMs` AbortSignal was threaded into `generateContentStream` but NOT into `prepareContext` / `uploadWorkspaceFiles`. A 30 s `timeoutMs` against a workspace whose upload took 90 s burned 60 s of bandwidth before the abort took effect at `generateContent`-call time. Fix: thread `signal?: AbortSignal` through `BuildOptions` (cache-manager) and `uploadWorkspaceFiles` (files-uploader); abort short-circuits the upload pool at the next per-file poll point. Already-flying `client.files.upload` calls complete on their own (the SDK doesn't expose abort plumbing on `files.upload`).
+- **Preflight abort now re-throws `signal.reason`, not the SDK-wrapped `err`** (Gemini P1). Pre-fix, `countForPreflight`'s catch block re-threw the SDK's `err` on user-initiated abort. If the SDK strips the `cause` chain, the outer `isTimeoutAbort` walk fails and the error maps to `errorCode: 'UNKNOWN'` instead of `'TIMEOUT'`. Fix: throw `input.signal.reason` (the canonical TimeoutError DOMException with `timeoutKind` property) when the signal is aborted; falls back to `err` only if `signal.reason` isn't an Error instance. Belt-and-suspenders against SDK version drift.
+- **`SYSTEM_INSTRUCTION_RESERVE` now applied uniformly across all preflight paths** (Grok P2). Pre-fix, the 1 000-token reserve was added only on the `'exact'` path; `'heuristic'` and `'fallback'` paths returned `effectiveTokens === rawTokens`, leaving them slightly under-protected against system-instruction overhead. Fix: reserve added to all three return paths. The 1 000-token cost is < 0.1 % of a 1 M-token cap — well within the heuristic's slop and the fallback's 1.33× over-pad — so the change is harmless but uniform-by-construction.
+
+### Notes
+
+- Patch-level release (no breaking changes). All schema fields unchanged. The signal-threading change (`prepareContext` now respecting abort) is the only observable behaviour change for users who set `timeoutMs`; the new behaviour matches what the docstring already promised.
+- 3 false-positive findings dismissed: stale jsdoc claim (the comment correctly documents the v1.12.0 retirement); `dispose()` claim (the outer `finally` already covers the fallback path); cycle-safety claim on `getTimeoutKind` (the implementation already uses `Set<unknown>` + depth cap).
+
 ## [1.12.0] - 2026-04-28
 
 ### Added — heartbeat-aware stall detector for `ask` / `code` (Phase 4 of the v1.9.0 plan)

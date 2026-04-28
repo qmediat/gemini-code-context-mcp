@@ -410,6 +410,28 @@ async function executeAskBody(
           logger.warn(
             `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
           );
+          // Translate `timeoutMs` AND `stallMs` to the agentic per-iteration
+          // wall-clock cap (`iterationTimeoutMs`). Pre-v1.12.1 only `timeoutMs`
+          // was forwarded — a user who set `stallMs: 60000` (the v1.12.0
+          // recommended liveness watchdog) saw it silently dropped on the
+          // fallback path. The agentic loop uses non-streaming
+          // `generateContent`, so there's no chunk stream to reset on; we
+          // collapse both knobs onto the per-iteration cap and use the
+          // TIGHTER of the two as the bound. The CHANGELOG documents the
+          // semantic divergence on `timeoutMs` (total → per-iteration).
+          const tightestPerIterCap = ((): number | undefined => {
+            const a = input.timeoutMs;
+            const b = input.stallMs;
+            if (a !== undefined && b !== undefined) return Math.min(a, b);
+            if (a !== undefined) return a;
+            if (b !== undefined) return b;
+            return undefined;
+          })();
+          if (input.stallMs !== undefined && input.timeoutMs === undefined) {
+            logger.warn(
+              `ask: fallback to ask_agentic — \`stallMs\` (${input.stallMs}ms) translated to \`iterationTimeoutMs\` since the agentic loop uses non-streaming generateContent (no chunk stream to reset on). To preserve the original semantics, set \`timeoutMs\` instead on calls that may fall back.`,
+            );
+          }
           const agenticInput: AskAgenticInput = {
             prompt: input.prompt,
             ...(input.workspace !== undefined ? { workspace: input.workspace } : {}),
@@ -424,9 +446,10 @@ async function executeAskBody(
             // `timeoutMs` (ask wall-clock cap) → `iterationTimeoutMs`
             // (ask_agentic per-iteration cap). Total wall-clock for the
             // agentic call can be `maxIterations × iterationTimeoutMs`.
-            // This semantic divergence is documented in the
-            // `onWorkspaceTooLarge` schema description.
-            ...(input.timeoutMs !== undefined ? { iterationTimeoutMs: input.timeoutMs } : {}),
+            // v1.12.1 fix: also collapses `stallMs` onto this cap (using
+            // the TIGHTER of the two when both are set), so the fallback
+            // path doesn't silently drop the user's stall watchdog.
+            ...(tightestPerIterCap !== undefined ? { iterationTimeoutMs: tightestPerIterCap } : {}),
           };
           const agenticResult = await askAgenticTool.execute(agenticInput, ctx);
 
@@ -474,13 +497,21 @@ async function executeAskBody(
             },
             // Lift top-level error metadata from the agentic call's
             // structuredContent so orchestrator policies (e.g. retry on
-            // BUDGET_EXHAUSTED) keep working without descending into
-            // `.agenticResult.errorCode`.
+            // BUDGET_EXHAUSTED, retry on stall but not total) keep working
+            // without descending into `.agenticResult.errorCode`. v1.12.1
+            // adds `timeoutKind` to the lift set — Phase 4 introduced
+            // `timeoutKind` as a top-level field on direct-path TIMEOUT
+            // errors; the fallback wrapper now mirrors that on the
+            // fallback-served TIMEOUT path so the contract is uniform.
             ...(agenticResult.isError && typeof agenticStructured.errorCode === 'string'
               ? { errorCode: agenticStructured.errorCode }
               : {}),
             ...(agenticResult.isError && typeof agenticStructured.retryable === 'boolean'
               ? { retryable: agenticStructured.retryable }
+              : {}),
+            ...(agenticResult.isError &&
+            (agenticStructured.timeoutKind === 'total' || agenticStructured.timeoutKind === 'stall')
+              ? { timeoutKind: agenticStructured.timeoutKind }
               : {}),
             ...(Object.keys(agenticStructured).length > 0
               ? { agenticResult: agenticStructured }
@@ -577,6 +608,8 @@ async function executeAskBody(
       cacheMinTokens: ctx.config.cacheMinTokens,
       emitter,
       allowCaching: !input.noCache && scan.files.length > 0,
+      // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
+      signal: abortSignal,
     });
 
     // TPM throttle reservation — placed HERE (after `prepareContext`,
@@ -749,6 +782,8 @@ async function executeAskBody(
             cacheMinTokens: ctx.config.cacheMinTokens,
             emitter,
             allowCaching: !input.noCache && scan.files.length > 0,
+            // v1.12.1 — propagate signal into stale-cache rebuild too.
+            signal: abortSignal,
           });
           // Cancel the original throttle reservation — its `tsMs` was
           // stamped at first-dispatch time, which is now seconds in the

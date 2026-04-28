@@ -64,10 +64,13 @@ import { logger, safeForLog } from '../utils/logger.js';
  * `code` typically pass no system instruction so the reserve is pure
  * safety margin there.
  *
- * Applied ONLY on the `'exact'` path (fresh-API and cache-hit). Skipped on
- * `'heuristic'` (already coarse — adding the reserve to a coarse number
- * pretends we know more than we do) and on `'fallback'` (`bytes/3` already
- * carries 33 % over-pad which absorbs the reserve and then some). */
+ * Applied UNIFORMLY across all three paths (`'heuristic'`, `'exact'`,
+ * `'fallback'`) since v1.12.1 — pre-fix the reserve was only on the
+ * `'exact'` path, leaving heuristic and fallback paths slightly under-
+ * protected against system-instruction overhead. The 1 000-token cost
+ * is < 0.1 % of a 1 M-token cap, well within the heuristic's slop and
+ * the fallback's 1.33× over-pad — so adding it everywhere is harmless
+ * but uniform-by-construction. */
 export const SYSTEM_INSTRUCTION_RESERVE = 1_000;
 
 /** Heuristic-vs-exact tier boundary. Below this fraction of the model's
@@ -104,12 +107,10 @@ export interface PreflightTokenResult {
   effectiveTokens: number;
   /** Which path produced the count. Surfaces in tool metadata. */
   method: TokenCountMethod;
-  /** Raw count from the source — for diagnostics. Differs from
-   * `effectiveTokens` by `SYSTEM_INSTRUCTION_RESERVE` ONLY on the `'exact'`
-   * path (fresh-API and cache-hit). Equal to `effectiveTokens` on
-   * `'heuristic'` and `'fallback'` paths (the coarse heuristic and
-   * `bytes/3` over-pad respectively absorb the reserve as slop, so adding
-   * it twice would double-count). */
+  /** Raw count from the source — for diagnostics. Always differs from
+   * `effectiveTokens` by exactly `SYSTEM_INSTRUCTION_RESERVE` since
+   * v1.12.1 (uniform reserve across all three paths). Pre-v1.12.1 the
+   * reserve was only added on the `'exact'` path. */
   rawTokens: number;
   /** Whether the `'exact'` count came from the in-process LRU cache rather
    * than a fresh `countTokens` API call. `false` on every non-`'exact'`
@@ -230,12 +231,13 @@ export async function countForPreflight(
   const heuristicCount = computeHeuristic(input.files, input.prompt);
   const mode = input.preflightMode ?? 'auto';
 
-  // Pure-heuristic mode bypasses the API entirely. No reserve added —
-  // the heuristic is already a coarse estimate; users opting into this
-  // mode prioritize predictability over accuracy.
+  // Pure-heuristic mode bypasses the API entirely. Reserve added uniformly
+  // (v1.12.1 fix) — small absolute cost (1 000 tokens) well within the
+  // heuristic's coarse-estimate slop, but keeps the threshold-comparison
+  // contract uniform across all paths so callers don't have to special-case.
   if (mode === 'heuristic') {
     return {
-      effectiveTokens: heuristicCount,
+      effectiveTokens: heuristicCount + SYSTEM_INSTRUCTION_RESERVE,
       method: 'heuristic',
       rawTokens: heuristicCount,
       cacheHit: false,
@@ -247,7 +249,7 @@ export async function countForPreflight(
   // the heuristic near the threshold.
   if (mode === 'auto' && heuristicCount < input.inputTokenLimit * HEURISTIC_CUTOFF_FRACTION) {
     return {
-      effectiveTokens: heuristicCount,
+      effectiveTokens: heuristicCount + SYSTEM_INSTRUCTION_RESERVE,
       method: 'heuristic',
       rawTokens: heuristicCount,
       cacheHit: false,
@@ -303,7 +305,7 @@ export async function countForPreflight(
       );
       const fallback = computeFallback(input.files, input.prompt);
       return {
-        effectiveTokens: fallback,
+        effectiveTokens: fallback + SYSTEM_INSTRUCTION_RESERVE,
         method: 'fallback',
         rawTokens: fallback,
         cacheHit: false,
@@ -337,7 +339,7 @@ export async function countForPreflight(
     );
     const fallback = computeFallback(input.files, input.prompt);
     return {
-      effectiveTokens: fallback,
+      effectiveTokens: fallback + SYSTEM_INSTRUCTION_RESERVE,
       method: 'fallback',
       rawTokens: fallback,
       cacheHit: false,
@@ -377,7 +379,7 @@ export async function countForPreflight(
       );
       const fallback = computeFallback(input.files, input.prompt);
       return {
-        effectiveTokens: fallback,
+        effectiveTokens: fallback + SYSTEM_INSTRUCTION_RESERVE,
         method: 'fallback',
         rawTokens: fallback,
         cacheHit: false,
@@ -396,13 +398,23 @@ export async function countForPreflight(
     // budget is silently extended — `ask` would proceed to eager Files
     // API upload before the abort eventually lands on `generateContent`,
     // wasting bandwidth/compute the user explicitly asked us to abort.
-    if (input.signal?.aborted) throw err;
+    //
+    // Throw `signal.reason` (the canonical TimeoutError DOMException with
+    // `timeoutKind` property) rather than the SDK's wrapped `err` —
+    // re-throwing the SDK error depends on the SDK preserving the
+    // `cause` chain so `isTimeoutAbort` can find the TimeoutError, which
+    // is fragile across SDK versions. We control `signal.reason`; using
+    // it directly guarantees the outer `isTimeoutAbort` / `getTimeoutKind`
+    // walk finds the right error.
+    if (input.signal?.aborted) {
+      throw input.signal.reason instanceof Error ? input.signal.reason : err;
+    }
     logger.warn(
       `countTokens preflight failed for model=${safeForLog(input.model)}: ${safeForLog(err)} — falling back to heuristic × 1.33 (safety multiplier for the empirical 30-50% CJK undercount)`,
     );
     const fallback = computeFallback(input.files, input.prompt);
     return {
-      effectiveTokens: fallback,
+      effectiveTokens: fallback + SYSTEM_INSTRUCTION_RESERVE,
       method: 'fallback',
       rawTokens: fallback,
       cacheHit: false,

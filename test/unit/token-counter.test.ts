@@ -104,7 +104,7 @@ afterEach(async () => {
 });
 
 describe("countForPreflight — 'heuristic' mode", () => {
-  it('returns bytes/4 estimate without calling countTokens', async () => {
+  it('returns bytes/4 estimate (+ uniform reserve since v1.12.1) without calling countTokens', async () => {
     const { client, countTokens } = buildClient();
     const files = [fakeFile('a.ts', 4_000), fakeFile('b.ts', 8_000)];
     const result = await countForPreflight(
@@ -112,22 +112,27 @@ describe("countForPreflight — 'heuristic' mode", () => {
       baseInput(files, { preflightMode: 'heuristic' }),
     );
 
-    // 12_000 bytes / 4 + 17 chars / 4 = 3_000 + 5 = 3_005
+    // 12_000 bytes / 4 + 17 chars / 4 = 3_000 + 5 = 3_005 (rawTokens).
+    // v1.12.1 adds SYSTEM_INSTRUCTION_RESERVE (1000) uniformly across
+    // all paths → effectiveTokens = 4_005.
     expect(result.method).toBe('heuristic');
-    expect(result.effectiveTokens).toBe(3_005);
     expect(result.rawTokens).toBe(3_005);
+    expect(result.effectiveTokens).toBe(3_005 + SYSTEM_INSTRUCTION_RESERVE);
     expect(countTokens).not.toHaveBeenCalled();
   });
 
-  it('does NOT add SYSTEM_INSTRUCTION_RESERVE to heuristic count', async () => {
-    // Heuristic mode is opt-in — users prioritize predictability over
-    // accuracy. Adding a hidden reserve would be surprising.
+  it('adds SYSTEM_INSTRUCTION_RESERVE uniformly to heuristic count (v1.12.1)', async () => {
+    // Pre-v1.12.1 the heuristic path returned `effectiveTokens === rawTokens`
+    // (no reserve added) — leaving the threshold check slightly under-
+    // protected against system-instruction overhead. v1.12.1 makes the
+    // reserve uniform across all three paths so the threshold-comparison
+    // contract is consistent regardless of which path produced the count.
     const { client } = buildClient();
     const result = await countForPreflight(
       client,
       baseInput([fakeFile('a.ts', 1_000)], { preflightMode: 'heuristic' }),
     );
-    expect(result.effectiveTokens).toBe(result.rawTokens);
+    expect(result.effectiveTokens).toBe(result.rawTokens + SYSTEM_INSTRUCTION_RESERVE);
   });
 });
 
@@ -296,9 +301,10 @@ describe('countForPreflight — graceful degradation', () => {
 
     expect(countTokens).toHaveBeenCalledTimes(1);
     expect(result.method).toBe('fallback');
-    // 2_400_000 / 3 + 'analyse this code'.length / 3 = 800_000 + ceil(17/3) = 800_006
-    expect(result.effectiveTokens).toBe(800_006);
+    // 2_400_000 / 3 + 'analyse this code'.length / 3 = 800_000 + ceil(17/3) = 800_006 (rawTokens).
+    // v1.12.1 adds SYSTEM_INSTRUCTION_RESERVE uniformly → effectiveTokens = 801_006.
     expect(result.rawTokens).toBe(800_006);
+    expect(result.effectiveTokens).toBe(800_006 + SYSTEM_INSTRUCTION_RESERVE);
   });
 
   it('falls back to bytes/3 on network error', async () => {
@@ -452,14 +458,15 @@ describe('countForPreflight — AbortSignal threading (F1)', () => {
     expect(call.config).toBeUndefined();
   });
 
-  it('RE-THROWS the SDK abort when the user-provided signal is aborted', async () => {
-    // Round-2 (v1.10.0) correction: pre-v1.10.0 round-2 the catch
-    // unconditionally fell back even on user-initiated abort. That
-    // silently extended the user's `timeoutMs` budget — `ask` would
-    // proceed to eager Files API upload before the abort eventually
-    // landed on `generateContent`. The fix re-throws when
-    // `input.signal?.aborted`, so the outer tool catch maps it to
-    // `errorCode: 'TIMEOUT'` immediately.
+  it('RE-THROWS the canonical signal.reason when the user-provided signal is aborted (v1.12.1)', async () => {
+    // Round-2 (v1.10.0) introduced abort propagation; v1.12.1 hardened
+    // it to throw `input.signal.reason` (the canonical TimeoutError
+    // DOMException with `timeoutKind` property) instead of the SDK's
+    // wrapped err. Pre-v1.12.1 the SDK's err was thrown — depended on
+    // the SDK preserving the `cause` chain so `isTimeoutAbort` could
+    // find the TimeoutError, fragile across SDK versions. We control
+    // signal.reason; using it directly guarantees the outer
+    // `isTimeoutAbort` / `getTimeoutKind` walk finds the right error.
     const sdkErr = new Error('Request aborted');
     sdkErr.name = 'AbortError';
     const { client } = buildClient(async () => {
@@ -467,7 +474,36 @@ describe('countForPreflight — AbortSignal threading (F1)', () => {
     });
     const file = await realFile(tmpDir, 'big.ts', 'y'.repeat(2_400_000));
     const controller = new AbortController();
-    controller.abort();
+    const canonicalReason = new DOMException(
+      'Timed out after 1000 ms (total wall-clock)',
+      'TimeoutError',
+    );
+    Object.assign(canonicalReason, { timeoutKind: 'total' as const });
+    controller.abort(canonicalReason);
+
+    // Should throw `signal.reason` (the canonical TimeoutError),
+    // NOT the SDK-wrapped err.
+    await expect(
+      countForPreflight(
+        client,
+        baseInput([file], { preflightMode: 'exact', signal: controller.signal }),
+      ),
+    ).rejects.toBe(canonicalReason);
+  });
+
+  it('falls back to err if signal.reason is not an Error (defensive)', async () => {
+    // Edge case: caller passed `controller.abort('string-reason')` where
+    // the reason isn't an Error instance. Our fallback to the SDK's err
+    // covers this — keeps the abort propagation working even on
+    // non-conformant abort calls.
+    const sdkErr = new Error('Request aborted');
+    sdkErr.name = 'AbortError';
+    const { client } = buildClient(async () => {
+      throw sdkErr;
+    });
+    const file = await realFile(tmpDir, 'big.ts', 'y'.repeat(2_400_000));
+    const controller = new AbortController();
+    controller.abort('this-is-a-string-not-an-error');
 
     await expect(
       countForPreflight(
