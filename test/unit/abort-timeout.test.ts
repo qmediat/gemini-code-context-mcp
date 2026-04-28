@@ -10,6 +10,17 @@ import {
   isTimeoutAbort,
 } from '../../src/tools/shared/abort-timeout.js';
 
+/** Test-side helper that lets the v1.6.0–v1.11.0 test fixtures keep their
+ * concise call shape after the v1.12.0 API change (single-API
+ * structured-options form). Behaviour-equivalent to the retired 2-arg
+ * signature; production code now uses the structured-options form
+ * directly. */
+function totalOnlyController(perCallMs: number | undefined, envVar: string) {
+  return perCallMs !== undefined
+    ? createTimeoutController({ totalMs: perCallMs, totalEnvVar: envVar, stallEnvVar: '' })
+    : createTimeoutController({ totalEnvVar: envVar, stallEnvVar: '' });
+}
+
 // File-level hard floor: every test in this file starts with real timers and a
 // clean env-stub state regardless of the previous test's exit path. The first
 // describe (`createTimeoutController`) and the third (`abortableSleep`) both
@@ -32,7 +43,7 @@ describe('createTimeoutController', () => {
 
   describe('disabled (no env, no per-call)', () => {
     it('returns a controller whose signal never fires', () => {
-      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBeNull();
       expect(c.signal.aborted).toBe(false);
       // Calling dispose on a disabled controller is safe.
@@ -42,24 +53,24 @@ describe('createTimeoutController', () => {
 
     it('treats `0` as disabled', () => {
       vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', '0');
-      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBeNull();
     });
 
     it('treats negative values as disabled', () => {
-      const c = createTimeoutController(-100, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(-100, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBeNull();
     });
 
     it('treats non-numeric env as disabled', () => {
       vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', 'not-a-number');
-      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBeNull();
     });
 
     it('treats empty env as disabled', () => {
       vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', '');
-      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBeNull();
     });
   });
@@ -67,14 +78,14 @@ describe('createTimeoutController', () => {
   describe('env-var fallback', () => {
     it('reads timeout from env when per-call is undefined', () => {
       vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', '5000');
-      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBe(5000);
       c.dispose();
     });
 
     it('per-call wins over env var', () => {
       vi.stubEnv('GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS', '60000');
-      const c = createTimeoutController(10_000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(10_000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBe(10_000);
       c.dispose();
     });
@@ -82,19 +93,19 @@ describe('createTimeoutController', () => {
 
   describe('clamping', () => {
     it('clamps below the 1s minimum', () => {
-      const c = createTimeoutController(50, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(50, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBe(1_000);
       c.dispose();
     });
 
     it('clamps above the 30min maximum', () => {
-      const c = createTimeoutController(7_200_000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(7_200_000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBe(1_800_000);
       c.dispose();
     });
 
     it('floors fractional values', () => {
-      const c = createTimeoutController(1500.7, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(1500.7, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.timeoutMs).toBe(1500);
       c.dispose();
     });
@@ -103,7 +114,7 @@ describe('createTimeoutController', () => {
   describe('abort semantics', () => {
     it('signal fires after the timeout elapses', async () => {
       vi.useFakeTimers();
-      const c = createTimeoutController(2000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(2000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       expect(c.signal.aborted).toBe(false);
       vi.advanceTimersByTime(1999);
       expect(c.signal.aborted).toBe(false);
@@ -116,7 +127,7 @@ describe('createTimeoutController', () => {
 
     it('dispose() before timeout prevents signal from firing', async () => {
       vi.useFakeTimers();
-      const c = createTimeoutController(2000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
+      const c = totalOnlyController(2000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
       c.dispose();
       vi.advanceTimersByTime(5000);
       expect(c.signal.aborted).toBe(false);
@@ -292,29 +303,32 @@ describe('createTimeoutController — composite (Phase 4)', () => {
     });
   });
 
-  describe('legacy 2-arg signature (backward compat)', () => {
-    it('still works exactly as v1.6.0–v1.11.0', () => {
-      const c = createTimeoutController(5_000, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
-      expect(c.timeoutMs).toBe(5_000);
-      // Stall is implicitly disabled in legacy mode.
-      expect(c.stallMs).toBeNull();
+  describe('stall watchdog firing', () => {
+    it('does NOT fire BEFORE the first recordChunk() call (preflight latency safety)', async () => {
+      // v1.12.0 design fix: stall timer arms on the FIRST recordChunk(),
+      // not on controller creation. This prevents preflight latency
+      // (workspace scan + countTokens + Files API upload + TLS handshake)
+      // from being counted as "stall budget" — that latency is local
+      // I/O / SDK setup, not Gemini-side stall.
+      const c = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 1_000,
+        stallEnvVar: 'STALL',
+      });
+      // Wait > stallMs without ever calling recordChunk — must NOT fire.
+      await new Promise((r) => setTimeout(r, 1_500));
+      expect(c.signal.aborted).toBe(false);
       c.dispose();
     });
 
-    it('legacy disabled (undefined per-call, missing env) returns never-firing controller', () => {
-      const c = createTimeoutController(undefined, 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS');
-      expect(c.timeoutMs).toBeNull();
-      expect(c.stallMs).toBeNull();
-    });
-  });
-
-  describe('stall watchdog firing', () => {
-    it('fires after `stallMs` of silence with no chunks recorded', async () => {
+    it('fires after `stallMs` of silence FOLLOWING the first recordChunk()', async () => {
       const c = createTimeoutController({
         totalEnvVar: 'TOTAL',
         stallMs: 1_000, // 1s — minimum allowed; lowest test value
         stallEnvVar: 'STALL',
       });
+      // Arm the stall watchdog by recording the first chunk.
+      c.recordChunk();
       const start = Date.now();
       await new Promise<void>((resolve) => {
         const onAbort = (): void => {
@@ -330,6 +344,9 @@ describe('createTimeoutController — composite (Phase 4)', () => {
       expect(c.signal.reason).toBeInstanceOf(DOMException);
       expect(getTimeoutKind(c.signal.reason)).toBe('stall');
       expect(isTimeoutAbort(c.signal.reason)).toBe(true);
+      // Property-based dispatch (not message string-matching) — pin
+      // the v1.12.0 robustness improvement.
+      expect((c.signal.reason as { timeoutKind?: unknown }).timeoutKind).toBe('stall');
       c.dispose();
     });
 
@@ -401,14 +418,34 @@ describe('createTimeoutController — composite (Phase 4)', () => {
     });
   });
 
+  describe('dispose() hardens against post-cleanup re-arming (defense-in-depth)', () => {
+    it('recordChunk() after dispose() does NOT re-arm the stall timer', async () => {
+      const c = createTimeoutController({
+        totalEnvVar: 'TOTAL',
+        stallMs: 1_000,
+        stallEnvVar: 'STALL',
+      });
+      // Arm + then dispose.
+      c.recordChunk();
+      c.dispose();
+      // recordChunk after dispose must be a no-op — must not create a
+      // new setTimeout. Wait > stallMs to confirm no spurious abort.
+      c.recordChunk();
+      await new Promise((r) => setTimeout(r, 1_500));
+      expect(c.signal.aborted).toBe(false);
+    });
+  });
+
   describe('whichever fires first wins', () => {
-    it('stall fires first when totalMs is far in the future and chunks stop', async () => {
+    it('stall fires first when totalMs is far in the future and chunks stop after activity', async () => {
       const c = createTimeoutController({
         totalMs: 60_000, // 60s — way out
         totalEnvVar: 'TOTAL',
-        stallMs: 1_000, // 1s — fires first
+        stallMs: 1_000, // 1s — fires first (after first recordChunk)
         stallEnvVar: 'STALL',
       });
+      // Arm the stall watchdog by recording one chunk, then go silent.
+      c.recordChunk();
       await new Promise<void>((resolve) => {
         const onAbort = (): void => {
           c.signal.removeEventListener('abort', onAbort);

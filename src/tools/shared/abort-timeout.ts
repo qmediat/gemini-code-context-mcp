@@ -111,42 +111,11 @@ function readEnvMs(envVarName: string): number {
  *   - `stallMs`: `[1_000, 600_000]` ms (1 s to 10 min).
  *   Out-of-range positive values are clamped silently.
  *
- * Compatibility: the LEGACY signature `createTimeoutController(perCallMs,
- * envVarName)` is still accepted for backward compat — it builds a
- * controller with stall disabled. The new structured-options signature is
- * preferred. This dual-overload approach lets v1.6.0–v1.11.0 callers
- * continue working without source edits while new sites can opt into
- * stall detection.
+ * Single API: only the structured-options form is supported. The previous
+ * v1.6.0–v1.11.0 2-arg signature was retired in v1.12.0 — all internal
+ * callers (`ask`, `code`, `ask_agentic`) now pass options.
  */
-export function createTimeoutController(opts: CreateTimeoutControllerOpts): TimeoutController;
-export function createTimeoutController(
-  perCallMs: number | undefined,
-  envVarName: string,
-): TimeoutController;
-export function createTimeoutController(
-  optsOrPerCallMs: CreateTimeoutControllerOpts | number | undefined,
-  legacyEnvVar?: string,
-): TimeoutController {
-  // Normalise to the structured-options shape. The legacy path passes a
-  // bare number/undefined as the first arg + env var name as second.
-  // `exactOptionalPropertyTypes: true` requires we OMIT the field rather
-  // than assigning `undefined` when the legacy caller didn't provide it.
-  let opts: CreateTimeoutControllerOpts;
-  if (typeof optsOrPerCallMs === 'object' && optsOrPerCallMs !== null) {
-    opts = optsOrPerCallMs;
-  } else if (optsOrPerCallMs !== undefined) {
-    opts = {
-      totalMs: optsOrPerCallMs,
-      totalEnvVar: legacyEnvVar ?? '',
-      stallEnvVar: '', // legacy callers don't get stall detection
-    };
-  } else {
-    opts = {
-      totalEnvVar: legacyEnvVar ?? '',
-      stallEnvVar: '',
-    };
-  }
-
+export function createTimeoutController(opts: CreateTimeoutControllerOpts): TimeoutController {
   // Resolve total wall-clock cap.
   const totalRequested = opts.totalMs !== undefined ? opts.totalMs : readEnvMs(opts.totalEnvVar);
   const totalEffective =
@@ -168,49 +137,78 @@ export function createTimeoutController(
   const controller = new AbortController();
   let totalTimer: NodeJS.Timeout | null = null;
   let stallTimer: NodeJS.Timeout | null = null;
+  let disposed = false;
 
   if (totalEffective > 0) {
     totalTimer = setTimeout(() => {
-      controller.abort(
-        new DOMException(`Timed out after ${totalEffective} ms (total wall-clock)`, 'TimeoutError'),
+      const reason = new DOMException(
+        `Timed out after ${totalEffective} ms (total wall-clock)`,
+        'TimeoutError',
       );
+      // Embed the kind on the reason itself — message-string matching
+      // (the v1.12.0-pre approach) is brittle to any future copy changes.
+      Object.assign(reason, { timeoutKind: 'total' as const });
+      controller.abort(reason);
       // Stall timer is now moot — clear it.
       if (stallTimer !== null) clearTimeout(stallTimer);
     }, totalEffective);
     totalTimer.unref?.();
   }
 
-  // Arm the stall timer immediately when stall is enabled. The stream
-  // hasn't sent anything yet — counting that initial silence as part of
-  // the budget is intentional. If the model takes >stallMs to even open
-  // the stream, we WANT to abort.
+  // Stall watchdog (Phase 4, v1.12.0).
+  //
+  // The stall timer arms on the FIRST `recordChunk()` call (typically
+  // when `collectStream` begins iterating chunks). It does NOT arm on
+  // controller creation — counting the pre-stream phase (workspace scan,
+  // countTokens preflight, Files API eager upload, TLS handshake to
+  // generateContentStream) as "stall budget" is wrong: that latency is
+  // local I/O and SDK setup, not Gemini-side stall. If the user wants
+  // to bound that phase, they set `timeoutMs` (the wall-clock cost cap),
+  // which DOES include pre-stream time.
+  //
+  // After the first chunk, the timer resets on every subsequent chunk
+  // (text or thought — both prove the stream is alive). Gap > stallMs
+  // → abort with kind="stall".
+  //
+  // Edge case: if the stream opens but never yields any chunk
+  // (e.g. SDK fetch hangs after returning the response), `recordChunk`
+  // is never called, the stall watchdog never arms, and only `timeoutMs`
+  // can rescue. Documented limitation; users wanting that safety net
+  // should set both `stallMs` and `timeoutMs`.
+  const armStallTimer = (): NodeJS.Timeout => {
+    const t = setTimeout(() => {
+      const reason = new DOMException(
+        `Timed out after ${stallEffective} ms (stall — no chunk received)`,
+        'TimeoutError',
+      );
+      Object.assign(reason, { timeoutKind: 'stall' as const });
+      controller.abort(reason);
+      if (totalTimer !== null) clearTimeout(totalTimer);
+    }, stallEffective);
+    t.unref?.();
+    return t;
+  };
+
   if (stallEffective > 0) {
-    const armStallTimer = (): NodeJS.Timeout => {
-      const t = setTimeout(() => {
-        controller.abort(
-          new DOMException(
-            `Timed out after ${stallEffective} ms (stall — no chunk received)`,
-            'TimeoutError',
-          ),
-        );
-        if (totalTimer !== null) clearTimeout(totalTimer);
-      }, stallEffective);
-      t.unref?.();
-      return t;
-    };
-
-    stallTimer = armStallTimer();
-
     return {
       signal: controller.signal,
       timeoutMs: totalEffective > 0 ? totalEffective : null,
       stallMs: stallEffective,
       dispose: () => {
-        if (totalTimer !== null) clearTimeout(totalTimer);
-        if (stallTimer !== null) clearTimeout(stallTimer);
+        disposed = true;
+        if (totalTimer !== null) {
+          clearTimeout(totalTimer);
+          totalTimer = null;
+        }
+        if (stallTimer !== null) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
       },
       recordChunk: () => {
-        if (controller.signal.aborted) return; // Don't re-arm a fired controller.
+        // Defense-in-depth: refuse to re-arm after dispose() clears
+        // timers, and don't re-arm a fired controller.
+        if (disposed || controller.signal.aborted) return;
         if (stallTimer !== null) clearTimeout(stallTimer);
         stallTimer = armStallTimer();
       },
@@ -223,7 +221,11 @@ export function createTimeoutController(
     timeoutMs: totalEffective,
     stallMs: null,
     dispose: () => {
-      if (totalTimer !== null) clearTimeout(totalTimer);
+      disposed = true;
+      if (totalTimer !== null) {
+        clearTimeout(totalTimer);
+        totalTimer = null;
+      }
     },
     recordChunk: () => {
       /* stall disabled — no-op */
@@ -304,10 +306,18 @@ export function getTimeoutKind(err: unknown): TimeoutKind | null {
     if (seen.has(current)) return null;
     seen.add(current);
     if (current.name === 'TimeoutError') {
-      // Inspect the message to distinguish the two kinds. The message
-      // shape comes from `createTimeoutController` above.
-      if (current.message.includes('stall')) return 'stall';
-      if (current.message.includes('total wall-clock')) return 'total';
+      // Prefer the structured `timeoutKind` property on the abort reason
+      // (set by `createTimeoutController` since v1.12.0). Property-based
+      // dispatch is robust against future message-copy changes.
+      const kind = (current as { timeoutKind?: unknown }).timeoutKind;
+      if (kind === 'total' || kind === 'stall') return kind;
+      // Fall back to message inspection ONLY for messages produced by
+      // older v1.12.0-pre code paths (or third-party TimeoutErrors that
+      // happen to use this exact wording). Anchored on the parenthetical
+      // suffix `createTimeoutController` writes — narrow enough to avoid
+      // collisions with arbitrary error text.
+      if (current.message.endsWith('(stall — no chunk received)')) return 'stall';
+      if (current.message.endsWith('(total wall-clock)')) return 'total';
       // Backward compat: pre-v1.12.0 messages didn't include the suffix
       // — treat as `'total'` (the only kind that existed then).
       return 'total';

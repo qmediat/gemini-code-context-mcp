@@ -585,10 +585,16 @@ async function executeAskAgenticBody(
       // wait itself is bounded by the iteration timeout. (If iterTimeout
       // is created after the wait, a 60s throttle delay can blow past a
       // 10s iterationTimeoutMs without ever firing.) Disposed in finally.
-      const iterTimeout = createTimeoutController(
-        input.iterationTimeoutMs,
-        'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
-      );
+      // ask_agentic uses `generateContent` (not the streaming variant), so
+      // there's no chunk stream to feed `recordChunk()` — only `totalMs`
+      // matters. We pass an empty `stallEnvVar` (disables stall) and omit
+      // `stallMs`. The composite controller's signal still fires on the
+      // wall-clock cap exactly as before.
+      const iterTimeout = createTimeoutController({
+        ...(input.iterationTimeoutMs !== undefined ? { totalMs: input.iterationTimeoutMs } : {}),
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
+        stallEnvVar: '',
+      });
 
       // Per-iteration TPM throttle reservation + iteration call. Both must
       // run INSIDE the same try/catch so that a timeout firing during the
