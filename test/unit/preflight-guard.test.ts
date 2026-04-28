@@ -57,6 +57,10 @@ vi.mock('../../src/tools/ask-agentic.tool.js', () => ({
 function buildCtx(opts: {
   workspaceGuardRatio?: number;
   dailyBudgetUsd?: number;
+  /** v1.14.0+: override cachingMode default for tests that need to assert
+   *  per-config behaviour. Unset → defaults to `'implicit'` (the v1.14.0
+   *  production default) so existing tests don't regress. */
+  cachingMode?: 'explicit' | 'implicit';
 }): {
   ctx: ToolContext;
   generateContent: ReturnType<typeof vi.fn>;
@@ -85,6 +89,10 @@ function buildCtx(opts: {
       tpmThrottleLimit: 80_000,
       forceMaxOutputTokens: false,
       workspaceGuardRatio: opts.workspaceGuardRatio ?? 0.9,
+      // v1.14.0: default flip pinned at the test-fixture level so the
+      // tool's `requestedCachingMode` resolves through `ctx.config.cachingMode`
+      // when the per-call field is unset (matches loadConfig() production).
+      cachingMode: opts.cachingMode ?? 'implicit',
     } as ToolContext['config'],
     client: {
       models: {
@@ -503,6 +511,122 @@ describe('code preflight workspace guard (v1.5.0)', () => {
     if (parsed.success) {
       expect((parsed.data as Record<string, unknown>).onWorkspaceTooLarge).toBeUndefined();
     }
+  });
+});
+
+// v1.14.0 — `cachingMode` default flip threaded through the tool layer.
+// Pins the end-to-end behaviour: when `input.cachingMode` is unset, the tool
+// resolves through `ctx.config.cachingMode` and passes the result to
+// `prepareContext`. Catches regressions where someone re-introduces the
+// conditional spread that was the v1.13.0 bug shape.
+describe('cachingMode tool-level default flip (v1.14.0+)', () => {
+  it("ask uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
+    const { ctx } = buildCtx({ cachingMode: 'implicit' });
+    mockScanOfBytes(1_000); // small workspace, well under preflight cliff
+    mockModelWithLimit(1_000_000);
+
+    await askTool.execute({ prompt: 'hi' }, ctx);
+
+    expect(mocks.prepareContext).toHaveBeenCalledTimes(1);
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('implicit');
+  });
+
+  it("ask honours ctx.config.cachingMode='explicit' when input.cachingMode is unset", async () => {
+    const { ctx } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+
+    await askTool.execute({ prompt: 'hi' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('explicit');
+  });
+
+  it('per-call input.cachingMode overrides ctx.config.cachingMode', async () => {
+    const { ctx } = buildCtx({ cachingMode: 'implicit' }); // default
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+
+    // Caller explicitly opts into explicit mode; should override the default.
+    await askTool.execute({ prompt: 'hi', cachingMode: 'explicit' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('explicit');
+  });
+
+  it("code uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
+    const { ctx } = buildCtx({ cachingMode: 'implicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+
+    await codeTool.execute({ task: 'do something' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('implicit');
+  });
+});
+
+// v1.14.0 — `cachingMode` default flip + env-var override behaviour.
+// These tests pin the new default ('implicit') and the operator-level env
+// override so a future regression that flips the default back, mistypes
+// the env var, or forgets the strict-validation fallback is caught
+// immediately rather than silently shipping the wrong cache strategy.
+describe('cachingMode env resolution (v1.14.0+)', () => {
+  beforeEach(() => {
+    vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
+  });
+
+  it('defaults to implicit when env var is unset', async () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv('GEMINI_API_KEY', 'AIza-fake-for-unit-test-only');
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+  });
+
+  it('honours GEMINI_CODE_CONTEXT_CACHING_MODE=explicit', async () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'explicit');
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('explicit');
+    vi.unstubAllEnvs();
+  });
+
+  it('honours GEMINI_CODE_CONTEXT_CACHING_MODE=implicit', async () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'implicit');
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+    vi.unstubAllEnvs();
+  });
+
+  it('falls back to implicit + warns on invalid env value (no silent mistype)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'EXPLICITT'); // mistyped
+    vi.resetModules();
+    const { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('implicit');
+    // Operator gets a clear stderr signal that their override didn't take.
+    expect(errSpy).toHaveBeenCalled();
+    const warnText = errSpy.mock.calls.map((c) => String(c[0] ?? '')).join('\n');
+    expect(warnText).toMatch(/GEMINI_CODE_CONTEXT_CACHING_MODE/);
+    expect(warnText).toMatch(/EXPLICITT/);
+    errSpy.mockRestore();
+    vi.unstubAllEnvs();
+  });
+
+  it('case-insensitive: EXPLICIT and Implicit both parse', async () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'EXPLICIT');
+    vi.resetModules();
+    let { loadConfig } = await import('../../src/config.js');
+    expect(loadConfig().cachingMode).toBe('explicit');
+
+    vi.stubEnv('GEMINI_CODE_CONTEXT_CACHING_MODE', 'Implicit');
+    vi.resetModules();
+    ({ loadConfig } = await import('../../src/config.js'));
+    expect(loadConfig().cachingMode).toBe('implicit');
+    vi.unstubAllEnvs();
   });
 });
 

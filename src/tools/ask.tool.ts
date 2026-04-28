@@ -139,7 +139,7 @@ export const askInputSchema = z
       .enum(['explicit', 'implicit'])
       .optional()
       .describe(
-        "Cache strategy for the workspace context (v1.13.0+). `'explicit'` (default) builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays a 60–180 s rebuild cost whenever any file changes. `'implicit'` skips the explicit cache entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. **Best fit for review→edit→review workflows** (no rebuild wait when files change between queries) at the cost of probabilistic rather than guaranteed savings — Gemini's docs note 'no cost saving guarantee' for implicit caching. Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. The default may flip to `'implicit'` in v1.14.0 pending dogfood telemetry.",
+        "Cache strategy for the workspace context. **`'implicit'` (default since v1.14.0)** skips `caches.create` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the review→edit→review workflow — no 60–180 s rebuild wait when files change between queries. **`'explicit'`** builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays the rebuild cost on every file change. Use explicit when you need predictable per-call costs more than warm-path latency; the trade-off is documented in Gemini's docs as 'no cost saving guarantee' for implicit caching. Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. Operator-level override available via env `GEMINI_CODE_CONTEXT_CACHING_MODE`.",
       ),
     forceRescan: z
       .boolean()
@@ -640,13 +640,16 @@ async function executeAskBody(
       .digest('hex')
       .slice(0, 16);
 
-    // v1.13.0 — caching mode the user requested. The ACTUAL mode that lands
-    // in telemetry is computed AFTER `prepareContext` returns, derived from
-    // `activePrep.inlineOnly` so forced-inline flows (workspace below
-    // cacheMinTokens, allowCaching=false from `noCache`) are recorded as
-    // `'inline'` instead of being conflated with explicit-cache adoption.
-    // FN2 fix from /6step round-2 review.
-    const requestedCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
+    // v1.14.0 — `cachingMode` default flipped to `'implicit'`: Gemini 2.5+/3
+    // Pro applies its automatic implicit caching to repeated workspace prefixes,
+    // eliminating the 60–180 s `caches.create` rebuild wait on the
+    // review→edit→review path. Per-call `input.cachingMode` always wins;
+    // env-level override `GEMINI_CODE_CONTEXT_CACHING_MODE` lets operators force
+    // `'explicit'` when they need predictable per-call billing more than
+    // warm-path speed. Telemetry on the actual mode (vs requested) is computed
+    // AFTER `prepareContext` returns from `activePrep.inlineOnly` — see FN2 fix.
+    const requestedCachingMode: 'explicit' | 'implicit' =
+      input.cachingMode ?? ctx.config.cachingMode;
 
     const ctxPrep = await prepareContext({
       client: ctx.client,
@@ -662,7 +665,7 @@ async function executeAskBody(
       // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
       signal: abortSignal,
       // v1.13.0 — opt-in implicit caching path (skip caches.create).
-      ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
+      cachingMode: requestedCachingMode,
     });
 
     // TPM throttle reservation — placed HERE (after `prepareContext`,
@@ -838,7 +841,7 @@ async function executeAskBody(
             // v1.12.1 — propagate signal into stale-cache rebuild too.
             signal: abortSignal,
             // v1.13.0 — keep cachingMode consistent across happy + retry paths.
-            ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
+            cachingMode: requestedCachingMode,
           });
           // Cancel the original throttle reservation — its `tsMs` was
           // stamped at first-dispatch time, which is now seconds in the

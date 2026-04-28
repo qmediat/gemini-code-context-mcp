@@ -5,6 +5,49 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-04-28
+
+### Changed — `cachingMode` default flipped to `'implicit'`
+
+v1.13.0 shipped `cachingMode: 'explicit' | 'implicit'` as opt-in (default `'explicit'`) with a plan to flip the default in v1.14.0 pending dogfood telemetry. The dogfood gate is hereby resolved by direct user directive — implicit caching is the optimisation that closes the v1.6-v1.7 review→edit→review pain point, and the marginal cost of probabilistic vs guaranteed savings is acceptable for the latency win.
+
+- **Default for `ask` / `code`'s `cachingMode` field:** now `'implicit'` (was `'explicit'` in v1.13.0). Per-call `input.cachingMode` always wins; setting `'explicit'` explicitly reverts to v1.13.0 behaviour for that call.
+- **Operator-level override:** new env var `GEMINI_CODE_CONTEXT_CACHING_MODE` accepts `'explicit'` or `'implicit'` (case-insensitive). Unset → default `'implicit'`. Invalid value → falls back to `'implicit'` AND emits a stderr warning so operators see their mistype rather than silently shipping the wrong strategy.
+- **Strict env-var validation:** the warn path uses `console.error` (visible in MCP host log pipelines) and includes the offending raw value verbatim, so `GEMINI_CODE_CONTEXT_CACHING_MODE=EXPLICITT` produces a clear "not a recognised value" message instead of a silent fallback.
+
+### Behavioural impact
+
+- **First call cold:** ~80–110 s (single round-trip; Gemini caches during the call). Was 120–240 s in v1.13.0 explicit-default (60–180 s `caches.create` + 60 s query).
+- **Second call warm, same files:** ~14 s (implicit cache hits). Same as v1.13.0.
+- **Third call after editing 3 files:** ~14 s. Was 60–180 s rebuild + 14 s in v1.13.0 explicit-default — **the eliminated wait is the user-perceived speedup the v1.13.0 architectural pivot was designed to enable.**
+- **Cost trade-off:** Gemini's automatic implicit caching is documented as "no cost saving guarantee" (see ai.google.dev/gemini-api/docs/caching). When the implicit cache fires, savings are similar to explicit (~75 % discount); when it misses, the call pays full input rate. Operators who need predictable per-call billing can revert by setting `GEMINI_CODE_CONTEXT_CACHING_MODE=explicit` or per-call `cachingMode: 'explicit'`. Hit-rate observability remains available via `status.structuredContent.caching.implicitHitRate`.
+
+### Migration
+
+Operators upgrading from v1.13.0 see the default behaviour change on their first `ask`/`code` call after installing v1.14.0. To preserve v1.13.0 explicit-default semantics:
+
+```sh
+export GEMINI_CODE_CONTEXT_CACHING_MODE=explicit
+```
+
+Or per-call: `ask({ cachingMode: 'explicit' })` / `code({ cachingMode: 'explicit' })`.
+
+No schema migration required — the `caching_mode` column on `usage_metrics` already accepts both values (added in v1.13.0). Pre-1.14.0 rows that recorded `'explicit'` explicitly stay correct in aggregations.
+
+### Notes
+
+- Minor-level release. New env var (additive); behaviour change on the per-call default. No SQL schema changes.
+- `code({ codeExecution: true })` continues to force inline content regardless of `cachingMode` because Gemini rejects `cachedContent` + `tools` simultaneously. Telemetry tags those calls as `'inline'` (the v1.13.0 round-2 fix), distinguishing them from explicit-cache adoption.
+- The original v1.14.0 plan also included an `ask_agentic` streaming migration. That has been split into a follow-up (T33) so this release can ship the speed-driver default flip in a focused PR. The streaming migration is pure reliability — it doesn't affect speed and the release-pacing trade-off favours getting implicit-default to users sooner.
+
+### Coverage
+
+9 new tests in `test/unit/preflight-guard.test.ts`:
+- `cachingMode tool-level default flip (v1.14.0+)` — 4 tests covering `ask`/`code` with default + override + per-call override + ctx.config flow.
+- `cachingMode env resolution (v1.14.0+)` — 5 tests: default when unset, explicit honoured, implicit honoured, invalid-value fallback + stderr warning, case-insensitive parsing.
+
+Total suite: 709 passed | 9 skipped (was 700 | 9 in v1.13.0; +9 net new tests). Lint, typecheck, double-test, build all green.
+
 ## [1.13.0] - 2026-04-27
 
 ### Added — implicit-cache opt-in (per-call `cachingMode` field on `ask` / `code`)

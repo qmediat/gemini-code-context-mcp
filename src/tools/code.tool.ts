@@ -128,7 +128,7 @@ export const codeInputSchema = z
       .enum(['explicit', 'implicit'])
       .optional()
       .describe(
-        "Cache strategy for the workspace context (v1.13.0+). `'explicit'` (default) builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays a 60–180 s rebuild cost whenever any file changes. `'implicit'` skips the explicit cache entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. **Best fit for edit→review→edit cycles** at the cost of probabilistic rather than guaranteed savings (Gemini's docs note 'no cost saving guarantee' for implicit caching). Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. The default may flip to `'implicit'` in v1.14.0 pending dogfood telemetry.",
+        "Cache strategy for the workspace context. **`'implicit'` (default since v1.14.0)** skips `caches.create` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the edit→review→edit cycle — no rebuild wait when files change between queries. **`'explicit'`** builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays the 60–180 s rebuild cost on every file change. Note: `code({ codeExecution: true })` always forces inline content (Gemini rejects `cachedContent` + `tools` simultaneously), so `cachingMode` has no effect when codeExecution is enabled. Hit rate observable via `status.structuredContent.caching.implicitHitRate`. Operator-level override: env `GEMINI_CODE_CONTEXT_CACHING_MODE`.",
       ),
     forceRescan: z
       .boolean()
@@ -453,11 +453,13 @@ async function executeCodeBody(
       .digest('hex')
       .slice(0, 16);
 
-    // v1.13.0 — caching mode the user requested (used by `prepareContext`).
-    // The ACTUAL mode that ends up in telemetry is derived later from
-    // `activePrep.inlineOnly` + `activePrep.cacheId` so codeExecution-forced
-    // inline calls don't get tagged as `'explicit'` (FN2 review fix).
-    const requestedCachingMode: 'explicit' | 'implicit' = input.cachingMode ?? 'explicit';
+    // v1.14.0 — `cachingMode` default flipped to `'implicit'` (resolved via
+    // `ctx.config.cachingMode`, env-driven). codeExecution still forces inline
+    // regardless because Gemini rejects `cachedContent` + `tools` together;
+    // telemetry records the ACTUAL mode (FN2 fix) so the mode flip + the
+    // codeExecution-forced-inline path stay distinguishable.
+    const requestedCachingMode: 'explicit' | 'implicit' =
+      input.cachingMode ?? ctx.config.cachingMode;
 
     const ctxPrep = await prepareContext({
       client: ctx.client,
@@ -477,7 +479,7 @@ async function executeCodeBody(
       // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
       signal: abortSignal,
       // v1.13.0 — opt-in implicit caching path (skip caches.create).
-      ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
+      cachingMode: requestedCachingMode,
     });
 
     // TPM throttle — placed AFTER `prepareContext`, immediately before
@@ -631,7 +633,7 @@ async function executeCodeBody(
             // v1.12.1 — propagate signal into stale-cache rebuild too.
             signal: abortSignal,
             // v1.13.0 — keep cachingMode consistent across happy + retry paths.
-            ...(input.cachingMode !== undefined ? { cachingMode: input.cachingMode } : {}),
+            cachingMode: requestedCachingMode,
           });
           // Cancel stale reservation (tsMs was stamped before first
           // dispatch, now seconds old after rebuild) and re-reserve so

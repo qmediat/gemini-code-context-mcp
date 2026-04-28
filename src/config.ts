@@ -46,6 +46,26 @@ export interface Config {
    */
   forceRescan: boolean;
   /**
+   * v1.14.0+: default caching mode for `ask` / `code` when the per-call
+   * `cachingMode` field is unset.
+   *
+   * - `'implicit'` (v1.14.0 default): skip `caches.create`; rely on Gemini
+   *   2.5+/3 Pro's automatic implicit caching for repeated workspace
+   *   prefixes. Eliminates the 60–180 s rebuild wait on the
+   *   review→edit→review path. Probabilistic rather than guaranteed savings
+   *   (Gemini's docs note "no cost saving guarantee"); hit rate observable
+   *   via `status.structuredContent.caching.implicitHitRate`.
+   * - `'explicit'`: build a Gemini Context Cache via `caches.create`;
+   *   guaranteed ~75 % discount on cached input tokens but pays the rebuild
+   *   cost on every file change. Set this when you need predictable
+   *   per-call billing more than warm-path latency.
+   *
+   * Per-call `input.cachingMode` always wins. Controlled by env var
+   * `GEMINI_CODE_CONTEXT_CACHING_MODE`. Invalid values fall back to the
+   * `'implicit'` default with a startup warning.
+   */
+  cachingMode: 'explicit' | 'implicit';
+  /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
    * `0` disables the throttle entirely; positive integer caps how many input
    * tokens (cached + uncached) we'll let fly to Gemini inside any 60-second
@@ -109,6 +129,28 @@ function readBoolEnv(name: string): boolean {
   return v === 'true' || v === '1' || v === 'yes' || v === 'on';
 }
 
+/**
+ * v1.14.0 — read `GEMINI_CODE_CONTEXT_CACHING_MODE` env var with strict
+ * validation. Returns `'implicit'` (the v1.14.0 default) when unset; returns
+ * the parsed value when set to `'explicit'` or `'implicit'`. Anything else
+ * emits a startup warning and falls back to the default — operators get a
+ * clear signal that their override didn't take effect, instead of a silent
+ * mistype shipping the wrong cache strategy to production.
+ */
+function readCachingModeEnv(): 'explicit' | 'implicit' {
+  const raw = process.env.GEMINI_CODE_CONTEXT_CACHING_MODE;
+  if (raw === undefined || raw === '') return 'implicit';
+  const v = raw.trim().toLowerCase();
+  if (v === 'explicit' || v === 'implicit') return v;
+  // Stderr-only warning so MCP host log pipelines surface the mistype.
+  // Falling back to 'implicit' (the v1.14.0 default) keeps behaviour safe.
+  // eslint-disable-next-line no-console
+  console.error(
+    `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_CACHING_MODE="${raw}" is not a recognised value (expected 'explicit' or 'implicit'); falling back to 'implicit'.`,
+  );
+  return 'implicit';
+}
+
 export function loadConfig(): Config {
   const auth = resolveAuth();
 
@@ -154,5 +196,6 @@ export function loadConfig(): Config {
     workspaceGuardRatio,
     forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
     forceRescan: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_RESCAN'),
+    cachingMode: readCachingModeEnv(),
   };
 }
