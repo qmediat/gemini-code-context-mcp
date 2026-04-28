@@ -14,7 +14,7 @@
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
-import { codeTool } from '../../src/tools/code.tool.js';
+import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 
 const mocks = vi.hoisted(() => ({
@@ -310,14 +310,19 @@ describe('ask preflight workspace guard (v1.5.0)', () => {
     mockModelWithLimit(1_048_576);
     const { ctx, generateContent } = buildCtx({});
 
-    // Mock ask_agentic returning a known shape — the wrapper should
-    // pass through `content` verbatim and enrich `structuredContent`.
+    // Mock ask_agentic returning a known shape WITH the canonical
+    // `responseText` key — the wrapper must preserve this T23 wire-format
+    // invariant on the fallback path. (Pre-fix the wrapper built
+    // `wrappedStructured` from scratch and dropped `responseText`,
+    // breaking sub-agent orchestrators that extract from
+    // `structuredContent.responseText` only.)
     mocks.askAgenticExecute.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'agentic prose answer here' }],
       structuredContent: {
         iterations: 4,
         totalInputTokens: 12_345,
         resolvedModel: 'gemini-3-pro-preview',
+        responseText: 'agentic prose answer here',
       },
     });
 
@@ -359,6 +364,10 @@ describe('ask preflight workspace guard (v1.5.0)', () => {
     });
     expect(result.structuredContent?.fallbackApplied).toBe('ask_agentic');
     expect(result.structuredContent?.fallbackReason).toBe('WORKSPACE_TOO_LARGE');
+    // T23 wire-format invariant — `responseText` MUST be present at the
+    // top of `structuredContent`. Pre-fix this assertion failed because
+    // the wrapper dropped the key.
+    expect(result.structuredContent?.responseText).toBe('agentic prose answer here');
     const preflightMeta = result.structuredContent?.preflightEstimate as Record<string, unknown>;
     expect(preflightMeta).toBeDefined();
     expect(preflightMeta.threshold).toBe(943_718);
@@ -369,17 +378,44 @@ describe('ask preflight workspace guard (v1.5.0)', () => {
     expect(agenticResult.iterations).toBe(4);
   });
 
-  it('fallback path passes through agentic isError flag faithfully', async () => {
+  it('falls back to content[0].text for responseText when agenticResult.structuredContent omits it', async () => {
+    // Defensive: an older / non-conformant ask_agentic implementation
+    // might omit `responseText` from `structuredContent`. The wrapper
+    // must still produce a non-empty `responseText` by reading
+    // `content[0].text`.
+    mockScanOfBytes(4_000_000);
+    mockModelWithLimit(1_048_576);
+    const { ctx } = buildCtx({});
+
+    mocks.askAgenticExecute.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'prose only — no responseText' }],
+      structuredContent: { iterations: 1 },
+    });
+
+    const result = await askTool.execute(
+      { prompt: 'q', onWorkspaceTooLarge: 'fallback-to-agentic' },
+      ctx,
+    );
+    expect(result.structuredContent?.responseText).toBe('prose only — no responseText');
+  });
+
+  it('fallback path lifts agentic errorCode + retryable to top of structuredContent', async () => {
     // If ask_agentic itself fails (e.g. iteration budget exhausted),
-    // the wrapped result must propagate `isError` so callers can detect
-    // the failure — fallback is not a free pass to silent success.
+    // the wrapped result must propagate `isError` AND lift the
+    // top-level error metadata (`errorCode`, `retryable`) so
+    // orchestrator policies that switch on these keys keep working
+    // without descending into nested `agenticResult.errorCode`.
     mockScanOfBytes(4_000_000);
     mockModelWithLimit(1_048_576);
     const { ctx } = buildCtx({});
 
     mocks.askAgenticExecute.mockResolvedValueOnce({
       content: [{ type: 'text', text: 'ask_agentic: budget exhausted' }],
-      structuredContent: { errorCode: 'BUDGET_EXHAUSTED' },
+      structuredContent: {
+        errorCode: 'BUDGET_EXHAUSTED',
+        retryable: false,
+        responseText: 'ask_agentic: budget exhausted',
+      },
       isError: true,
     });
 
@@ -388,9 +424,31 @@ describe('ask preflight workspace guard (v1.5.0)', () => {
       ctx,
     );
 
+    // `isError` is at the ROOT of CallToolResult per MCP spec — NOT
+    // nested inside `structuredContent`. The pre-fix wrapper redundantly
+    // set both; this assertion pins the root-only convention.
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.isError).toBeUndefined();
+
+    // Wrapper-trail metadata still present.
     expect(result.structuredContent?.fallbackApplied).toBe('ask_agentic');
-    expect(result.structuredContent?.isError).toBe(true);
+
+    // Top-level error metadata lifted — orchestrator policies switching
+    // on `errorCode` / `retryable` keep working.
+    expect(result.structuredContent?.errorCode).toBe('BUDGET_EXHAUSTED');
+    expect(result.structuredContent?.retryable).toBe(false);
+
+    // T23 wire-format — even on errors, `responseText` is present.
+    expect(result.structuredContent?.responseText).toBe('ask_agentic: budget exhausted');
   });
+
+  // Removed: pre-fix `fallback path passes through agentic isError flag
+  // faithfully` superseded by the more comprehensive test above
+  // (`fallback path lifts agentic errorCode + retryable to top of
+  // structuredContent`). The pre-fix test asserted
+  // `result.structuredContent?.isError === true`, which contradicts the
+  // MCP spec convention (`isError` at the root, not nested) and pinned a
+  // bug rather than a behaviour.
 });
 
 describe('code preflight workspace guard (v1.5.0)', () => {
@@ -420,7 +478,7 @@ describe('code preflight workspace guard (v1.5.0)', () => {
     expect(result.structuredContent?.guardRatio).toBe(0.9);
   });
 
-  it('strips onWorkspaceTooLarge from code input (asymmetry: ask-only)', async () => {
+  it('strips onWorkspaceTooLarge from code input (asymmetry: ask-only)', () => {
     // `code` deliberately does NOT support `onWorkspaceTooLarge` — its
     // OLD/NEW edit format is load-bearing for Claude's Edit pipeline,
     // and `ask_agentic` returns prose only. The Zod schema's default
@@ -429,7 +487,6 @@ describe('code preflight workspace guard (v1.5.0)', () => {
     // error; just a no-op). Pinning this empirically so a future
     // refactor that intentionally adds the field fails this test
     // and forces a deliberate decision to remove the asymmetry.
-    const { codeInputSchema } = await import('../../src/tools/code.tool.js');
     const parsed = codeInputSchema.safeParse({
       task: 'refactor foo',
       onWorkspaceTooLarge: 'fallback-to-agentic',

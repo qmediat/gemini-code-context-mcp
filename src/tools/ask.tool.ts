@@ -423,6 +423,32 @@ async function executeAskBody(
           // see. The structuredContent is enriched with fallback-trail
           // metadata so orchestrators can distinguish a fallback-served
           // response from a direct one.
+          //
+          // Two load-bearing contracts the wrapper must preserve:
+          //   1. `structuredContent.responseText` — the T23 wire-format
+          //      invariant (`textResult` / `errorResult` always write it
+          //      LAST; sub-agent orchestrators extract from this key
+          //      ONLY). We pull it from the agentic result's
+          //      `structuredContent.responseText` (or the prose text from
+          //      `content[0].text` as a fallback) and write it LAST so
+          //      it can't be clobbered.
+          //   2. Top-level `errorCode` / `retryable` — orchestrator retry
+          //      policies switch on these. When the agentic call itself
+          //      fails (e.g. iteration budget exhausted), the failure
+          //      code lives in `agenticResult.structuredContent.errorCode`;
+          //      we lift it to the top level of `wrappedStructured` so
+          //      consumer policies see it without descending into nested
+          //      `agenticResult.errorCode` (which they wouldn't know
+          //      about pre-v1.11.0).
+          const agenticStructured =
+            (agenticResult.structuredContent as Record<string, unknown> | undefined) ?? {};
+          const promptResponseText =
+            typeof agenticStructured.responseText === 'string'
+              ? agenticStructured.responseText
+              : agenticResult.content?.[0]?.type === 'text'
+                ? agenticResult.content[0].text
+                : '';
+
           const wrappedStructured: Record<string, unknown> = {
             fallbackApplied: 'ask_agentic',
             fallbackReason: 'WORKSPACE_TOO_LARGE',
@@ -433,12 +459,31 @@ async function executeAskBody(
               cacheHit: preflight.cacheHit,
               rawTokens: preflight.rawTokens,
             },
-            ...(agenticResult.structuredContent !== undefined
-              ? { agenticResult: agenticResult.structuredContent }
+            // Lift top-level error metadata from the agentic call's
+            // structuredContent so orchestrator policies (e.g. retry on
+            // BUDGET_EXHAUSTED) keep working without descending into
+            // `.agenticResult.errorCode`.
+            ...(agenticResult.isError && typeof agenticStructured.errorCode === 'string'
+              ? { errorCode: agenticStructured.errorCode }
               : {}),
+            ...(agenticResult.isError && typeof agenticStructured.retryable === 'boolean'
+              ? { retryable: agenticStructured.retryable }
+              : {}),
+            ...(Object.keys(agenticStructured).length > 0
+              ? { agenticResult: agenticStructured }
+              : {}),
+            // T23 wire-format invariant — `responseText` is written LAST
+            // so any caller-supplied / nested key with the same name is
+            // intentionally clobbered by the canonical value. Sub-agent
+            // orchestrators read the prose from this exact key.
+            responseText: promptResponseText,
           };
-          if (agenticResult.isError) wrappedStructured.isError = true;
 
+          // `isError` lives at the ROOT of the MCP CallToolResult per spec
+          // (sibling to `structuredContent`, not nested inside it). The
+          // spread on the return statement carries the agentic root-level
+          // `isError` automatically — no need to mirror it inside
+          // `structuredContent`.
           return {
             ...agenticResult,
             structuredContent: wrappedStructured,
