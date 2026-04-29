@@ -420,6 +420,256 @@ describe('ask_agentic loop — guards', () => {
   });
 });
 
+// Forced-finalization pass: when the iteration budget is exhausted without
+// the model organically producing a final-text turn, run one extra
+// `generateContent` with `toolConfig.functionCallingConfig.mode = NONE` so
+// the model is prohibited from emitting more function calls and must answer
+// in text from the conversation already accumulated. Converts what was
+// previously an opaque AGENTIC_MAX_ITERATIONS error into a synthesized
+// answer derived from the gathered tool responses.
+describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', () => {
+  it('returns synthesized text via finalization pass when loop exhausts maxIterations', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    writeFileSync(join(root, 'b.ts'), 'y');
+    // 2 tool-call iters consume the maxIterations=2 budget; the loop exits
+    // without organic final text. The 3rd scripted response is the
+    // finalization pass — model returns text under forced-NONE mode.
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'read_file', args: { path: 'b.ts' } }] },
+        { text: 'Synthesized answer from gathered tool responses.' },
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'review', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(String(result.structuredContent?.responseText)).toContain('Synthesized answer');
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    expect(result.structuredContent?.iterations).toBe(2);
+    // Round-3 fix: `apiCalls` reports total `generateContent` calls including the
+    // finalization pass. With maxIterations=2 + finalization fired, apiCalls=3.
+    expect(result.structuredContent?.apiCalls).toBe(3);
+
+    // Finalization is the 3rd generateContent call. Its config MUST set
+    // `toolConfig.functionCallingConfig.mode = 'NONE'` — this is the
+    // mechanism that prohibits more function calls and forces text.
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    const finalizationCallArg = generateContent.mock.calls[2]?.[0] as {
+      contents?: Array<{ role?: string; parts?: unknown[] }>;
+      config?: { toolConfig?: { functionCallingConfig?: { mode?: string } } };
+    };
+    expect(finalizationCallArg?.config?.toolConfig?.functionCallingConfig?.mode).toBe('NONE');
+
+    // Conversation-shape pin: the post-loop finalization passes the
+    // accumulated `conversation` verbatim. After every non-final iteration,
+    // `runAgenticIteration` pushes a `[model fc, user functionResponse]`
+    // pair onto the conversation, so the array MUST end with a `user` turn
+    // when the loop exhausts maxIterations. A trailing `model` turn would
+    // violate Gemini's role-alternation contract and 400 the call. (Round-1
+    // Grok concern; empirically refuted in real-Gemini test but pinned
+    // here so a future regression to the conversation-mutation path is
+    // caught at unit-test time.)
+    const finalizationContents = finalizationCallArg?.contents ?? [];
+    expect(finalizationContents.length).toBeGreaterThan(0);
+    expect(finalizationContents[finalizationContents.length - 1]?.role).toBe('user');
+  });
+
+  it('falls through to AGENTIC_MAX_ITERATIONS error when finalization pass returns empty text', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // 2 tool-call iters (200 prompt tokens each) + finalization pass with
+    // 300 prompt tokens & empty text. Loop totals: 400 input. Pass adds 300,
+    // total 700 — telemetry on the errorResult MUST report the post-pass
+    // total so the operator sees the full billing footprint, not the
+    // pre-pass tokens (which previously under-reported usage by the pass's
+    // own input/output count).
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200,
+          candidatesTokenCount: 50,
+        },
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200,
+          candidatesTokenCount: 50,
+        },
+        { text: '', promptTokenCount: 300, candidatesTokenCount: 80 },
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    // No-progress signature dedupe fires at threshold=3, so 2 identical
+    // calls don't trigger it — the loop genuinely runs both iters then
+    // exhausts maxIterations, exercising the finalization-pass path.
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(generateContent).toHaveBeenCalledTimes(3); // finalization pass DID fire
+    // Telemetry MUST report POST-pass cumulative tokens — billed work
+    // doesn't disappear just because the pass returned empty text.
+    expect(result.structuredContent?.cumulativeInputTokens).toBe(700); // 200+200+300
+    expect(result.structuredContent?.cumulativeOutputTokens).toBe(180); // 50+50+80
+  });
+
+  it('skips finalization pass when running it would overshoot maxTotalInputTokens', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // Two iterations push cumulative input tokens to 100k. With
+    // PER_ITERATION_INPUT_TOKENS = 50k and maxTotalInputTokens = 120k, the
+    // finalization pass estimate (100k + 50k = 150k) overshoots the cap →
+    // skip the pass and emit the AGENTIC_MAX_ITERATIONS error directly. The
+    // pass MUST NOT fire and pre-pass cumulative tokens remain reported.
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 50_000,
+        },
+        {
+          functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
+          promptTokenCount: 50_000,
+        },
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2, maxTotalInputTokens: 120_000 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(String(result.structuredContent?.responseText)).toContain('maxTotalInputTokens');
+    // Only 2 generateContent calls — finalization was skipped.
+    expect(generateContent).toHaveBeenCalledTimes(2);
+    // Pre-pass cumulative tokens preserved; no phantom finalization usage.
+    expect(result.structuredContent?.cumulativeInputTokens).toBe(100_000);
+    // Round-3 fix: `apiCalls` reports the actual generateContent count. Token-
+    // budget skip means the pass never fired → apiCalls equals iterations.
+    expect(result.structuredContent?.apiCalls).toBe(2);
+  });
+
+  it('falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+    });
+    // Simulate finalization-call non-transient failure (HTTP error with
+    // numeric `.status`). `isTransientNetworkError` (src/gemini/retry.ts:82)
+    // returns false for any error carrying a numeric `status` field, so
+    // `withNetworkRetry` does NOT retry — the single rejection deterministically
+    // exits the pass. Using a transient shape like `Error('fetch failed')`
+    // would match `TRANSIENT_PATTERNS`, trigger the 3-attempt retry budget,
+    // and consume the next queued mock (or return `undefined`), making the
+    // test pass for the wrong reason. The pass MUST be best-effort
+    // regardless of failure shape — caller deserves a structured error, not
+    // a re-thrown SDK exception. (Round-3 review fix: GPT P1 + Copilot.)
+    generateContent.mockRejectedValueOnce(
+      Object.assign(new Error('http 500 internal server error'), { status: 500 }),
+    );
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    // G1 fix: pre-response failures (timeout, network) MUST still count
+    // toward `apiCalls`. The HTTP 500 mock fails before usageMetadata
+    // arrives, so `finalizationUsage.promptTokenCount` stays 0. Pre-fix the
+    // inference `apiCalls = iterations + (promptTokenCount > 0 ? 1 : 0)`
+    // undercounted (reported 2). Post-fix uses explicit
+    // `finalizationAttempted` flag set BEFORE dispatch — so apiCalls = 3
+    // (2 loop iters + 1 attempted finalization, even though it failed).
+    expect(result.structuredContent?.apiCalls).toBe(3);
+  });
+
+  it('skips finalization pass when daily budget is exhausted', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent, manifest } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+      dailyBudgetUsd: 50,
+    });
+    // First 2 reservations succeed (loop body); 3rd reservation (finalization
+    // pass) is rejected — budget cap reached.
+    manifest.reserveBudget
+      .mockImplementationOnce(() => ({ id: 1 }))
+      .mockImplementationOnce(() => ({ id: 2 }))
+      .mockImplementationOnce(() => ({ rejected: true, spentMicros: 50_000_000 }));
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    // Only 2 generateContent calls — finalization was skipped because
+    // reserveBudget rejected.
+    expect(generateContent).toHaveBeenCalledTimes(2);
+  });
+
+  it('finalization call: NONE mode + thinkingConfig preserved + tools omitted (G2 fix)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { text: 'final synthesis' },
+      ],
+    });
+    await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 1, thinkingLevel: 'HIGH' },
+      ctx,
+    );
+
+    // Finalization is the 2nd call. Verify:
+    //   1. NONE override is set
+    //   2. thinkingConfig is preserved from baseConfig (still useful — model
+    //      can think while synthesizing)
+    //   3. systemInstruction is replaced with finalization-focused version
+    //   4. tools[] is OMITTED (G2 fix). Per Gemini API spec, NONE mode is
+    //      "equivalent to sending a request without any function declarations"
+    //      — sending tools[] alongside NONE wastes tokens (~150-300 input
+    //      tokens for the 4 declared functions) and contradicts the spec.
+    //      `tools: undefined` in the finalization config explicitly overrides
+    //      the inherited `tools` from `...baseConfig` spread.
+    const finalConfig = generateContent.mock.calls[1]?.[0] as {
+      config?: {
+        toolConfig?: { functionCallingConfig?: { mode?: string } };
+        tools?: unknown[];
+        thinkingConfig?: { thinkingLevel?: string };
+        systemInstruction?: string;
+      };
+    };
+    expect(finalConfig?.config?.toolConfig?.functionCallingConfig?.mode).toBe('NONE');
+    expect(finalConfig?.config?.thinkingConfig?.thinkingLevel).toBe('HIGH');
+    expect(String(finalConfig?.config?.systemInstruction)).toContain(
+      'iteration budget is now exhausted',
+    );
+    // G2 fix: tools[] MUST be undefined on finalization call. Pre-fix it was
+    // preserved via `...baseConfig` spread (tested as `Array.isArray(...) === true`)
+    // — that behavior wasted prompt tokens and contradicted the NONE-mode spec.
+    expect(finalConfig?.config?.tools).toBeUndefined();
+  });
+});
+
 describe('ask_agentic loop — sandbox integration', () => {
   it('path traversal attempts come back as recoverable functionResponse.error', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));

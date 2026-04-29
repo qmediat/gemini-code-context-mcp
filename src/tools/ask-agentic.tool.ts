@@ -38,7 +38,7 @@ import type {
   ThinkingConfig,
   ThinkingLevel,
 } from '@google/genai';
-import { Type as GeminiType } from '@google/genai';
+import { FunctionCallingConfigMode, Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -100,7 +100,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        'Hard cap on agentic iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20.',
+        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `maxTotalInputTokens` (skipped when overshooting), `dailyBudgetUsd` (skipped when reservation rejected), and `iterationTimeoutMs`.',
       ),
     maxTotalInputTokens: z
       .number()
@@ -175,8 +175,29 @@ const SYSTEM_INSTRUCTION_AGENTIC = [
   '3. Open only the handful of files that actually bear on the question via `read_file`',
   'When you have enough context, respond with a plain-text answer and make NO further tool calls.',
   '',
+  '# DECISIVENESS',
+  "Be decisive. Once you have read the relevant files and gathered evidence, produce your final answer. Continuing to call tools when you already have an answer is a failure mode — it wastes the user's budget and delays the response.",
+  'When the user provides a complete diff inline, your primary task is reasoning ABOUT the diff. Read each touched file at most once unless a specific concern requires re-reading; do not recursively explore the project tree to verify what the diff already shows.',
+  'A focused investigation typically converges in 3–8 iterations. If you find yourself on iteration 10+ still calling tools, stop and synthesize what you know — state findings as Known / Unknown / Next checks rather than chasing completeness.',
+  '',
   '# OUTPUT',
   "Your final response (the one with no function calls) should directly answer the user's prompt. Cite specific `file:line` when referring to code. Be concrete; do not speculate beyond what you read.",
+].join('\n');
+
+/**
+ * Forced-finalization system instruction. Sent on the post-loop synthesis
+ * pass when the iteration budget is exhausted. Combined with
+ * `toolConfig.functionCallingConfig.mode = NONE`, the model is prohibited
+ * from emitting further function calls (per Gemini API spec, NONE mode is
+ * "equivalent to sending a request without any function declarations") and
+ * must answer with text using the conversation it has already accumulated.
+ */
+const SYSTEM_INSTRUCTION_FINALIZATION = [
+  'You are wrapping up an investigation. The conversation history above already contains the tool responses you have gathered.',
+  'Your iteration budget is now exhausted. You CANNOT call any more tools — function calling is disabled for this turn.',
+  'Synthesize the evidence you already have into a final answer in the format the user originally requested.',
+  'If some details remain unverified, state them honestly under "Unknown" rather than refusing to answer. Cite specific `file:line` for the claims you can support.',
+  'Do not apologise for the budget exhaustion; just produce the best answer the gathered evidence supports.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -574,6 +595,13 @@ async function executeAskAgenticBody(
               errorCode: 'BUDGET_REJECT',
               retryable: false,
               iterations,
+              // BUDGET_REJECT is pre-dispatch — `iterations` was incremented
+              // at the top of the loop body, but this iteration's
+              // `generateContent` never fired. Subtract 1 to match the
+              // schema contract that `apiCalls` is the AUTHORITATIVE total
+              // generateContent count. `Math.max(0, ...)` guards the
+              // first-iteration-rejection edge (iter 1 + reject → 0 calls).
+              apiCalls: Math.max(0, iterations - 1),
               cumulativeInputTokens,
             },
           );
@@ -608,6 +636,13 @@ async function executeAskAgenticBody(
       let throttleReservationId = -1;
       let iterResult: Awaited<ReturnType<typeof runAgenticIteration>>;
       const iterStarted = Date.now();
+      // H2 fix: track whether this iteration's `generateContent` was
+      // actually dispatched. The iter timeout can fire DURING `abortableSleep`
+      // (TPM throttle wait, BEFORE runAgenticIteration is called) — in that
+      // case no API call happened for this iter and `apiCalls` must subtract
+      // it. Set true immediately before runAgenticIteration so any throw
+      // after that point counts the dispatched call.
+      let iterDispatched = false;
       try {
         if (tpmEnforced) {
           const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
@@ -620,6 +655,10 @@ async function executeAskAgenticBody(
             await abortableSleep(reservation.delayMs, iterTimeout.signal);
           }
         }
+        // H2: about to dispatch generateContent. Any throw past this point
+        // counts the iter as having made an API call (Gemini may bill
+        // server-side even on aborted-mid-flight calls).
+        iterDispatched = true;
         iterResult = await runAgenticIteration({
           ctx,
           resolvedModel: resolved.resolved,
@@ -659,6 +698,14 @@ async function executeAskAgenticBody(
               errorCode: 'TIMEOUT',
               timeoutMs: ms,
               iteration: iterations,
+              iterations,
+              // H2 fix: distinguish timeout-during-throttle-wait (no
+              // dispatch) from timeout-during-generateContent (dispatch
+              // happened). `iterDispatched` is set true just before the
+              // runAgenticIteration await — if it's still false, the timeout
+              // fired during abortableSleep and this iter never reached the
+              // API. Subtract 1 in that case to keep apiCalls authoritative.
+              apiCalls: iterDispatched ? iterations : Math.max(0, iterations - 1),
               retryable: true,
             },
           );
@@ -723,6 +770,9 @@ async function executeAskAgenticBody(
           modelCategory: resolved.category,
           contextWindow: resolved.inputTokenLimit,
           iterations,
+          // Organic final-text path: no forced-finalization pass ran, so
+          // total `generateContent` calls equals loop iterations.
+          apiCalls: iterations,
           cumulativeInputTokens,
           cumulativeOutputTokens,
           cumulativeThinkingTokens,
@@ -745,6 +795,9 @@ async function executeAskAgenticBody(
             retryable: false,
             subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED',
             iterations,
+            // Budget guard fires AFTER the iteration's generateContent
+            // completed — the call IS counted in apiCalls.
+            apiCalls: iterations,
             cumulativeInputTokens,
           },
         );
@@ -765,6 +818,9 @@ async function executeAskAgenticBody(
               retryable: false,
               subReason: 'AGENTIC_NO_PROGRESS',
               iterations,
+              // Dedupe fires AFTER the iteration's generateContent completed —
+              // the call IS counted in apiCalls.
+              apiCalls: iterations,
               repeatedSignature: sig.slice(0, 500),
               cumulativeInputTokens,
               filesRead: filesReadSet.size,
@@ -774,6 +830,265 @@ async function executeAskAgenticBody(
       }
     }
 
+    // Loop exhausted maxIterations without an organic final-text turn.
+    // Run a single forced-finalization pass — `generateContent` with
+    // `toolConfig.functionCallingConfig.mode = NONE` so the model is
+    // prohibited from emitting more function calls (Gemini API spec: NONE
+    // = "equivalent to sending a request without any function declarations")
+    // and must answer in text using the conversation it has already
+    // accumulated. Converts what was previously an opaque error into a
+    // synthesized text answer derived from the tool responses gathered so
+    // far. If the forced call itself fails (timeout, network, budget
+    // exhausted, empty text), fall through to the original error so the
+    // caller still gets a structured failure signal.
+    emitter.emit(`maxIterations (${maxIterations}) reached — evaluating forced-finalization pass`);
+
+    // Token-budget guard: the finalization pass is one extra `generateContent`
+    // roundtrip whose conservative input estimate is `PER_ITERATION_INPUT_TOKENS`.
+    // If that estimate would push `cumulativeInputTokens` past
+    // `maxTotalInputTokens`, skip the pass and fall through to the
+    // AGENTIC_MAX_ITERATIONS error — running it anyway would silently
+    // overshoot the operator's documented per-call token cap.
+    if (cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS > maxTotalInputTokens) {
+      emitter.emit(
+        `skipping forced-finalization pass — would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
+      );
+      logger.warn(
+        `ask_agentic: skipping forced-finalization pass — running it would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
+      );
+      return errorResult(
+        `ask_agentic: reached maxIterations (${maxIterations}) without a final answer; forced-finalization pass skipped to honour maxTotalInputTokens (${maxTotalInputTokens.toLocaleString()}). Increase maxTotalInputTokens or narrow your prompt.`,
+        {
+          errorCode: 'UNKNOWN',
+          retryable: false,
+          subReason: 'AGENTIC_MAX_ITERATIONS',
+          iterations,
+          // Pass was skipped (token budget guard) — total generateContent
+          // count equals loop iterations.
+          apiCalls: iterations,
+          cumulativeInputTokens,
+          cumulativeOutputTokens,
+          filesRead: filesReadSet.size,
+        },
+      );
+    }
+
+    let finalizationText = '';
+    let finalizationUsage = {
+      promptTokenCount: 0,
+      candidatesTokenCount: 0,
+      thoughtsTokenCount: 0,
+    };
+    let finalizationThinkingSummary: string | null = null;
+    let finalizationReservationId: number | null = null;
+    // Tracks whether the finalization `generateContent` call was actually
+    // dispatched (regardless of outcome). Used by `apiCalls` accounting so
+    // mid-flight timeouts / pre-response network failures still count the
+    // attempt — `finalizationUsage.promptTokenCount` would stay at 0 in those
+    // cases (response never arrived to populate usageMetadata) and
+    // inferring "fired" from usage would undercount the API call.
+    let finalizationAttempted = false;
+
+    if (dailyBudgetEnforced) {
+      const reserve = ctx.manifest.reserveBudget({
+        workspaceRoot,
+        toolName: 'ask_agentic',
+        model: resolved.resolved,
+        estimatedCostMicros: toMicrosUsd(perIterationCostUsd),
+        dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+        nowMs: Date.now(),
+      });
+      if ('rejected' in reserve) {
+        emitter.emit(
+          `skipping forced-finalization pass — daily budget cap reached (spent $${(
+            reserve.spentMicros / 1_000_000
+          ).toFixed(4)})`,
+        );
+        logger.warn(
+          `ask_agentic: skipping forced-finalization pass — daily budget cap reached (spent $${(
+            reserve.spentMicros / 1_000_000
+          ).toFixed(4)})`,
+        );
+      } else {
+        finalizationReservationId = reserve.id;
+      }
+    }
+
+    if (finalizationReservationId !== null || !dailyBudgetEnforced) {
+      emitter.emit('running forced-finalization pass (tools disabled)');
+      const finalizationTimeout = createTimeoutController({
+        ...(input.iterationTimeoutMs !== undefined ? { totalMs: input.iterationTimeoutMs } : {}),
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
+        stallEnvVar: '',
+      });
+      let finalizationThrottleId = -1;
+      const finalizationStarted = Date.now();
+      try {
+        if (tpmEnforced) {
+          const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
+          finalizationThrottleId = reservation.releaseId;
+          if (reservation.delayMs > 0) {
+            emitter.emit(
+              `finalization throttle: waiting ${Math.ceil(
+                reservation.delayMs / 1000,
+              )}s for TPM window…`,
+            );
+            await abortableSleep(reservation.delayMs, finalizationTimeout.signal);
+          }
+        }
+
+        // G2 fix: omit `tools` (function declarations) from the finalization
+        // call. Per Gemini API spec, `mode: NONE` is "equivalent to sending
+        // a request without any function declarations" — sending the
+        // declarations alongside NONE wastes ~150-300 input tokens and
+        // contradicts the spec we depend on. The destructure below is the
+        // TS-safe way to OMIT a property from the spread (assignment to
+        // `undefined` trips `exactOptionalPropertyTypes`).
+        const { tools: _unusedTools, ...baseConfigNoTools } = baseConfig;
+        // Mark the API attempt BEFORE dispatch so timeouts / pre-response
+        // network failures still count toward `apiCalls`. Set inside the try
+        // (after throttle wait) so a throttle-wait abort doesn't mis-count.
+        finalizationAttempted = true;
+        const response = await withNetworkRetry(
+          () =>
+            ctx.client.models.generateContent({
+              model: resolved.resolved,
+              contents: conversation,
+              config: {
+                ...baseConfigNoTools,
+                systemInstruction: SYSTEM_INSTRUCTION_FINALIZATION,
+                toolConfig: {
+                  functionCallingConfig: { mode: FunctionCallingConfigMode.NONE },
+                },
+                abortSignal: finalizationTimeout.signal,
+              },
+            }),
+          {
+            signal: finalizationTimeout.signal,
+            onRetry: (attempt, retryErr) => {
+              logger.warn(
+                `ask_agentic finalization: retry attempt ${attempt}: ${
+                  retryErr instanceof Error ? retryErr.message : String(retryErr)
+                }`,
+              );
+            },
+          },
+        );
+
+        const usage = response.usageMetadata;
+        finalizationUsage = {
+          promptTokenCount:
+            typeof usage?.promptTokenCount === 'number' ? usage.promptTokenCount : 0,
+          candidatesTokenCount:
+            typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0,
+          thoughtsTokenCount:
+            typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0,
+        };
+        const parts = response.candidates?.[0]?.content?.parts ?? [];
+        finalizationText = (response.text ?? parts.map((p) => p.text ?? '').join('')).trim();
+        const thoughtTexts = parts
+          .filter((p) => p.thought === true && typeof p.text === 'string')
+          .map((p) => p.text as string);
+        finalizationThinkingSummary =
+          thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
+
+        if (finalizationReservationId !== null) {
+          const actualCost = estimateCostUsd({
+            model: resolved.resolved,
+            uncachedInputTokens: finalizationUsage.promptTokenCount,
+            cachedInputTokens: 0,
+            outputTokens: finalizationUsage.candidatesTokenCount,
+            thinkingTokens: finalizationUsage.thoughtsTokenCount,
+          });
+          try {
+            ctx.manifest.finalizeBudgetReservation(finalizationReservationId, {
+              cachedTokens: 0,
+              uncachedTokens: finalizationUsage.promptTokenCount,
+              costUsdMicro: toMicrosUsd(actualCost),
+              durationMs: Date.now() - finalizationStarted,
+            });
+          } catch (finalizeErr) {
+            logger.error(
+              `ask_agentic finalization: finalize reservation failed: ${safeForLog(finalizeErr)}`,
+            );
+          }
+        }
+        if (finalizationThrottleId !== -1) {
+          ctx.throttle.release(finalizationThrottleId, finalizationUsage.promptTokenCount);
+        }
+      } catch (finalErr) {
+        if (finalizationReservationId !== null) {
+          try {
+            ctx.manifest.cancelBudgetReservation(finalizationReservationId);
+          } catch (cancelErr) {
+            logger.error(
+              `ask_agentic finalization: cancelBudgetReservation failed: ${safeForLog(cancelErr)}`,
+            );
+          }
+        }
+        if (finalizationThrottleId !== -1) {
+          ctx.throttle.cancel(finalizationThrottleId);
+        }
+        // Best-effort: log and fall through to errorResult. The caller
+        // already burned the iteration budget and deserves a structured
+        // failure rather than a re-thrown SDK error.
+        if (isTimeoutAbort(finalErr)) {
+          logger.warn('ask_agentic finalization: timed out after maxIterations exhaustion');
+        } else {
+          logger.warn(
+            `ask_agentic finalization: pass failed: ${
+              finalErr instanceof Error ? finalErr.message : String(finalErr)
+            }`,
+          );
+        }
+      } finally {
+        finalizationTimeout.dispose();
+      }
+    }
+
+    // Token totals after the finalization pass. When the pass succeeded at
+    // the API level its tokens ARE billed even if `finalizationText` came
+    // back empty, so both branches below report the post-pass totals — this
+    // closes the structured-telemetry drift where the empty-text fallback
+    // previously under-reported real usage.
+    const totalCumulativeInputTokens = cumulativeInputTokens + finalizationUsage.promptTokenCount;
+    const totalCumulativeOutputTokens =
+      cumulativeOutputTokens + finalizationUsage.candidatesTokenCount;
+    // `apiCalls` = total generateContent calls. Track from the explicit
+    // `finalizationAttempted` flag (set IMMEDIATELY BEFORE the
+    // `await withNetworkRetry(...)` dispatch) rather than inferring from
+    // `finalizationUsage.promptTokenCount > 0` — timeouts and pre-response
+    // network failures leave usageMetadata empty even though the API attempt
+    // happened (and may have been billed server-side). Skipped paths
+    // (daily-budget reject, token-cap overshoot) leave `finalizationAttempted`
+    // false so they correctly report `apiCalls = iterations`. Operators can
+    // branch on `apiCalls > iterations` to detect the forced pass without
+    // parsing `convergenceForced`. (Round-4 Copilot fix.)
+    const apiCalls = iterations + (finalizationAttempted ? 1 : 0);
+
+    if (finalizationText.length > 0) {
+      return textResult(finalizationText, {
+        resolvedModel: resolved.resolved,
+        requestedModel: resolved.requested,
+        fallbackApplied: resolved.fallbackApplied,
+        modelCategory: resolved.category,
+        contextWindow: resolved.inputTokenLimit,
+        iterations,
+        apiCalls,
+        cumulativeInputTokens: totalCumulativeInputTokens,
+        cumulativeOutputTokens: totalCumulativeOutputTokens,
+        cumulativeThinkingTokens: cumulativeThinkingTokens + finalizationUsage.thoughtsTokenCount,
+        filesRead: filesReadSet.size,
+        filesReadList: [...filesReadSet].slice(0, 40),
+        durationMs: Date.now() - started,
+        thinkingSummary: finalizationThinkingSummary,
+        convergenceForced: true,
+        // Mirror the organic-final-text path (line ~754) so callers can
+        // detect when the pass pushed cumulative tokens past the cap.
+        overBudget: totalCumulativeInputTokens > maxTotalInputTokens,
+      });
+    }
+
     return errorResult(
       `ask_agentic: reached maxIterations (${maxIterations}) without a final answer. Increase maxIterations or narrow your prompt.`,
       {
@@ -781,8 +1096,9 @@ async function executeAskAgenticBody(
         retryable: false,
         subReason: 'AGENTIC_MAX_ITERATIONS',
         iterations,
-        cumulativeInputTokens,
-        cumulativeOutputTokens,
+        apiCalls,
+        cumulativeInputTokens: totalCumulativeInputTokens,
+        cumulativeOutputTokens: totalCumulativeOutputTokens,
         filesRead: filesReadSet.size,
       },
     );
