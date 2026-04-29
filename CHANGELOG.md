@@ -5,6 +5,36 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.3] - 2026-04-29
+
+### Fixed — Two v1.14.2 deferral followups
+
+- **Outer-catch 429 hint extraction** (Phase 4-F1 from v1.14.2). Hoists the `resolved` model declaration from inner-`const` to function-scope `let` so the outer `catch (err)` block can read `resolved?.resolved` and seed `throttle.recordRetryHint` for 429s thrown POST-resolution that bypass the inner iter / finalization catches. Pre-v1.14.3 those 429s discarded Gemini's `retryInfo.retryDelay` hint, leaving the next call to retry without the hint and likely 429 again. **Pre-resolution 429s** (rare — Google rate-limiting `models.list()` during the very first call after API-key rotation or quota reset) still discard the hint by design: recording against the unresolved alias would key the hint to a string that future calls (which resolve to literal model ids) wouldn't match. Tracked as v1.14.4 followup if alias↔literal hint reconciliation becomes valuable.
+- **Schema describe simplification** (Phase 7-F1 from v1.14.2). Trimmed both `maxIterations` and `maxTotalInputTokens` `.describe()` strings (~50% reduction). Removed v1.14.2 migration history ("raised from 500_000", "matches Gemini 3 Pro inputTokenLimit minus framing headroom", empirical-benchmark prose). Kept the user-visible rescue contract (apiCalls semantics, convergenceForced, overBudget signal, dailyBudgetUsd/iterationTimeoutMs bounds, cross-reference between the two describes). The CHANGELOG retains the migration history; the schema docs surface the contract. Closes the run-on-paragraph readability concern from Phase-7 /coderev.
+
+### Behavioural impact
+
+- **Outer-catch hint extraction**: post-resolution 429s that escape inner catches now seed the throttle hint (small UX improvement on rare paths). Pre-resolution 429s unchanged. No schema changes.
+- **Describe simplification**: schema responses are smaller (~600 bytes saved per `tools/list` response). User-facing tooltips are easier to read. Migration history moved to CHANGELOG. **No semantic change.**
+
+### TypeScript narrowing detail
+
+The hoist from `const resolved` to `let resolved: ... | undefined` widens the type for ~25 inner uses. Flow narrowing past the `if (!resolved) throw` line propagates through most code paths automatically. ONE closure-capture site (rescue's `withNetworkRetry` lambda at line ~1003) re-widens to `string | undefined` on the closure boundary — addressed via `const resolvedModelName = resolved.resolved` extraction immediately before the lambda. Other closures (e.g., the iter-loop's `runAgenticIteration` site at line ~754) didn't trigger the same narrowing failure empirically (typecheck passes); a defensive audit is tracked as v1.14.4 followup.
+
+### Coverage
+
+2 net new tests in `test/unit/ask-agentic.test.ts`:
+
+- `outer-catch 429 from PRE-resolution path (resolveModel itself 429s) does NOT seed hint — alias key mismatch (v1.14.3)` — pins the negative case with a real `@google/genai` `ApiError(status: 429, body containing retryDelay: '15s')` thrown from the `resolveModel` mock; asserts `recordRetryHint` was NOT called (resolved is undefined; alias-vs-literal mismatch).
+- `outer-catch 429 from POST-resolution path seeds hint via hoisted resolved (v1.14.3)` — pins the happy path: resolved succeeds, then a 429 is thrown later; either the iter catch (Fix 4 from v1.14.2) OR the outer catch (this Fix) records the hint with the resolved model id + parsed delay.
+
+Total suite: 727 passed | 9 skipped (was 725 in v1.14.2; +2 net new tests).
+
+### Notes
+
+- Patch-level release. No API surface changes; additive comment + test coverage only. Migration: nothing — the new behaviour is strictly more lenient (records more hints) than v1.14.2.
+- v1.14.4 backlog: alias↔literal hint key reconciliation, defensive closure-narrowing audit (other lambda sites that capture `resolved`).
+
 ## [1.14.2] - 2026-04-29
 
 ### Fixed — `ask_agentic` rescue path unblocked + benchmark-surfaced UX/correctness fixes
