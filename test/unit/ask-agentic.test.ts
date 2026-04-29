@@ -54,6 +54,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ApiError } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { askAgenticTool } from '../../src/tools/ask-agentic.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -520,14 +521,25 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(result.structuredContent?.cumulativeOutputTokens).toBe(180); // 50+50+80
   });
 
-  it('skips finalization pass when running it would overshoot maxTotalInputTokens', async () => {
+  it('allows finalization pass to run even when it would push past maxTotalInputTokens (v1.14.2 rescue unblock)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
-    // Two iterations push cumulative input tokens to 100k. With
-    // PER_ITERATION_INPUT_TOKENS = 50k and maxTotalInputTokens = 120k, the
-    // finalization pass estimate (100k + 50k = 150k) overshoots the cap →
-    // skip the pass and emit the AGENTIC_MAX_ITERATIONS error directly. The
-    // pass MUST NOT fire and pre-pass cumulative tokens remain reported.
+    // Pre-v1.14.2 contract: when `cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS
+    // > maxTotalInputTokens`, the finalization pass was SKIPPED to honour the
+    // operator's per-call token cap, returning AGENTIC_MAX_ITERATIONS with no
+    // synthesised answer. v1.14.2 inverts that: the rescue is the documented
+    // exit path for "loop ran out of iterations without final text", so blocking
+    // it on rescue's own potential overshoot defeated the v1.14.1 feature for
+    // any operator running near the cap. Empirical repro: today's 6-way
+    // benchmark on the v1.14.1 PR self-review failed with
+    // `cumulativeInputTokens=500_919 > 500_000` (the line-790 mid-loop hard-stop;
+    // this rescue self-block was the same pathology at the maxIters boundary).
+    //
+    // Post-v1.14.2 contract: the rescue runs even when its own input would push
+    // past the cap. Cost is bounded by `dailyBudgetUsd` (skipped if reservation
+    // rejects), wall-clock by `iterationTimeoutMs`. Cap-overshoot is signalled
+    // via `overBudget: true` on the result, mirroring the organic-final-text
+    // path's contract.
     const { ctx, generateContent } = buildCtx({
       script: [
         {
@@ -538,6 +550,13 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
           functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
           promptTokenCount: 50_000,
         },
+        // Rescue (3rd call) runs and synthesises an answer. With
+        // promptTokenCount=80_000, cumulative becomes 180_000 — well past the
+        // 120_000 cap, exercising the overBudget signal.
+        {
+          text: 'Synthesised answer from gathered tool responses (rescue past cap).',
+          promptTokenCount: 80_000,
+        },
       ],
     });
     const result = await askAgenticTool.execute(
@@ -545,16 +564,111 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
       ctx,
     );
 
+    // Rescue path was NOT skipped — the 3rd generateContent call fired and
+    // returned synthesised text.
+    expect(result.isError).toBeUndefined();
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    expect(String(result.structuredContent?.responseText)).toContain('Synthesised answer');
+    // convergenceForced flags the rescue as the source of the answer.
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    // overBudget is the structured signal that operators key on to detect
+    // cap-overshoot. Loop pushed 100k; rescue added 80k = 180k > 120k cap.
+    expect(result.structuredContent?.overBudget).toBe(true);
+    expect(result.structuredContent?.cumulativeInputTokens).toBe(180_000);
+    // apiCalls tracks total generateContent dispatches: 2 loop + 1 rescue.
+    expect(result.structuredContent?.apiCalls).toBe(3);
+    expect(result.structuredContent?.iterations).toBe(2);
+  });
+
+  it('finalization pass returns structured error when iterationTimeoutMs fires mid-flight (cleanup + AGENTIC_MAX_ITERATIONS) (Fix 2)', async () => {
+    // 4-reviewer agreement on today's 6-way benchmark (A1): the v1.14.1 test
+    // suite covered empty-text / network-failure / budget-skip / tools-omission
+    // paths but NOT the finalization-pass timeout/AbortSignal mid-flight path.
+    // A future refactor of the catch block at lines ~1050-1085 could silently
+    // break the cleanup contract — no test would catch it.
+    //
+    // This test pins:
+    //   - timeout fires DURING the rescue's generateContent (not before
+    //     dispatch and not after response)
+    //   - falls through to AGENTIC_MAX_ITERATIONS errorResult (NOT errorCode:
+    //     'TIMEOUT' — the rescue is best-effort; timeout is logged but
+    //     conversion to TIMEOUT is reserved for the iter-loop timeout path)
+    //   - apiCalls = iterations + 1 (finalizationAttempted=true is set BEFORE
+    //     withNetworkRetry, so a mid-flight abort still counts the dispatched
+    //     attempt — Gemini may bill server-side even on aborted-mid-flight
+    //     calls)
+    //   - convergenceForced is undefined (rescue did NOT produce a synthesised
+    //     answer)
+    //   - cancelBudgetReservation fires for the rescue's reservation
+    //   - throttle.cancel fires for the rescue's TPM reservation
+    //
+    // Real timers per the file-level fake-timer hazard guidance (top of file).
+    // iterationTimeoutMs=1000 + setup overhead → ~1.0–1.5s wall-clock per run;
+    // bounded by suite testTimeout=30s.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent, manifest, throttle } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+      tpmThrottleLimit: 80_000, // exercises throttle.cancel cleanup path
+      dailyBudgetUsd: 100, // exercises manifest.cancelBudgetReservation cleanup path
+    });
+    // 3rd generateContent (rescue) hangs until aborted via the test's
+    // iterationTimeoutMs signal. The SDK threads `abortSignal` into the config
+    // so we can drive abortion deterministically.
+    generateContent.mockImplementationOnce(
+      (req: { config?: { abortSignal?: AbortSignal } }) =>
+        new Promise((_resolve, reject) => {
+          const sig = req.config?.abortSignal;
+          if (!sig) {
+            reject(new Error('test invariant: abortSignal not threaded into rescue config'));
+            return;
+          }
+          if (sig.aborted) {
+            reject(sig.reason);
+            return;
+          }
+          sig.addEventListener('abort', () => reject(sig.reason));
+        }),
+    );
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2, iterationTimeoutMs: 1_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    // Rescue timed out → fall through to AGENTIC_MAX_ITERATIONS shape (NOT
+    // errorCode: 'TIMEOUT' — the iter-loop timeout path converts to TIMEOUT,
+    // but the rescue's best-effort catch logs and falls through).
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
-    expect(String(result.structuredContent?.responseText)).toContain('maxTotalInputTokens');
-    // Only 2 generateContent calls — finalization was skipped.
-    expect(generateContent).toHaveBeenCalledTimes(2);
-    // Pre-pass cumulative tokens preserved; no phantom finalization usage.
-    expect(result.structuredContent?.cumulativeInputTokens).toBe(100_000);
-    // Round-3 fix: `apiCalls` reports the actual generateContent count. Token-
-    // budget skip means the pass never fired → apiCalls equals iterations.
-    expect(result.structuredContent?.apiCalls).toBe(2);
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    // Rescue did NOT produce text — convergenceForced is reserved for
+    // successful rescue synthesis only.
+    expect(result.structuredContent?.convergenceForced).toBeUndefined();
+    // 2 loop iters + 1 attempted rescue = 3 generateContent calls counted.
+    // finalizationAttempted=true is set BEFORE withNetworkRetry, so a
+    // mid-flight abort still counts toward apiCalls.
+    expect(result.structuredContent?.apiCalls).toBe(3);
+    expect(generateContent).toHaveBeenCalledTimes(3);
+
+    // Cleanup contract: rescue's budget reservation cancelled (NOT finalised);
+    // rescue's TPM reservation cancelled (NOT released). The 2 successful
+    // loop iters' reservations went through finalize/release pre-rescue.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(2);
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(throttle.release).toHaveBeenCalledTimes(2); // 2 loop iters
+    expect(throttle.cancel).toHaveBeenCalledTimes(1); // 1 rescue cleanup
+
+    // Timing sanity: actually waited for the timer. Lower bound 950ms
+    // accommodates timer-precision jitter on slow CI workers; upper bound
+    // 5_000ms catches a runaway hang past the documented timeout budget.
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
+    expect(elapsedMs).toBeLessThan(5_000);
   });
 
   it('falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)', async () => {
@@ -623,6 +737,46 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // Only 2 generateContent calls — finalization was skipped because
     // reserveBudget rejected.
     expect(generateContent).toHaveBeenCalledTimes(2);
+    // v1.14.2 Fix 5: structured field signals WHY the rescue was skipped, so
+    // automated triage doesn't have to parse the prose error message.
+    expect(result.structuredContent?.finalizationSkipReason).toBe('daily-budget');
+    // v1.14.2 Fix 5: error message is cause-specific. Pre-fix said "Increase
+    // maxIterations or narrow your prompt" (a lie when the cause is daily
+    // budget). Post-fix points operators at the actual remediation.
+    expect(String(result.structuredContent?.responseText)).toContain('daily budget cap reached');
+    expect(String(result.structuredContent?.responseText)).toContain('GEMINI_DAILY_BUDGET_USD');
+    expect(String(result.structuredContent?.responseText)).not.toContain('Increase maxIterations');
+  });
+
+  it('rescue ran-and-failed (empty text) keeps original "Increase maxIterations" message — no false skip-reason flag (Fix 5)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // The rescue dispatched and returned empty text — distinct from the
+    // daily-budget skip path. Operator should see the original "Increase
+    // maxIterations" message and NO `finalizationSkipReason` field (the
+    // structured field is reserved for actual skips, not run-and-failed).
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+        { text: '' }, // rescue ran but returned empty
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    // Original message — rescue ran, just produced no text.
+    expect(String(result.structuredContent?.responseText)).toContain('Increase maxIterations');
+    expect(String(result.structuredContent?.responseText)).not.toContain(
+      'daily budget cap reached',
+    );
+    // Skip-reason field is ABSENT on the run-and-failed path (additive
+    // optional field — only emitted when set).
+    expect(result.structuredContent?.finalizationSkipReason).toBeUndefined();
   });
 
   it('finalization call: NONE mode + thinkingConfig preserved + tools omitted (G2 fix)', async () => {
@@ -667,6 +821,168 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // preserved via `...baseConfig` spread (tested as `Array.isArray(...) === true`)
     // — that behavior wasted prompt tokens and contradicted the NONE-mode spec.
     expect(finalConfig?.config?.tools).toBeUndefined();
+  });
+
+  it('finalization pass uses last-iteration prompt tokens for TPM reservation, not static estimate (v1.14.2)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // The finalization pass replays the entire accumulated conversation, so
+    // its actual prompt size ≈ the LAST iter's `promptTokenCount`, not the
+    // static `PER_ITERATION_INPUT_TOKENS = 50_000` constant. Pre-v1.14.2 the
+    // TPM reservation under-reserved by 4-6× on a 20-iter loop with file reads
+    // (real workloads observed at 200-300k for the rescue prompt). Post-v1.14.2
+    // the reservation uses `lastIterationPromptTokens + 5_000` margin (covers
+    // SYSTEM_INSTRUCTION_FINALIZATION + thinking overhead). Bias to over-reserve
+    // is intentional — TPM over-reserve is harmless wait; under-reserve risks
+    // 429 from Gemini.
+    const { ctx, throttle } = buildCtx({
+      script: [
+        // Loop iter 1: prompt 200k tokens.
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200_000,
+        },
+        // Loop iter 2: prompt grew to 250k (history accumulation).
+        {
+          functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
+          promptTokenCount: 250_000,
+        },
+        // Rescue: synthesises text. Uses last-iter prompt size (250k) + 5k
+        // margin = 255_000 for the TPM reservation.
+        { text: 'Synthesised answer.' },
+      ],
+      tpmThrottleLimit: 80_000, // exercises tpmEnforced=true gate
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    // Three throttle.reserve calls: 2 loop iters + 1 rescue.
+    expect(throttle.reserve).toHaveBeenCalledTimes(3);
+    // Per-iter calls use static 50_000 (no usage record yet).
+    expect(throttle.reserve).toHaveBeenNthCalledWith(1, expect.any(String), 50_000);
+    expect(throttle.reserve).toHaveBeenNthCalledWith(2, expect.any(String), 50_000);
+    // Rescue pass uses lastIterationPromptTokens (250k) + 5k margin = 255_000.
+    // This is the load-bearing assertion — pre-v1.14.2 was hardcoded 50_000.
+    expect(throttle.reserve).toHaveBeenNthCalledWith(3, expect.any(String), 255_000);
+  });
+
+  it('finalization pass daily-budget reserve uses dynamic cost estimate (Fix 6.1 — symmetric with TPM reserve)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // Pre-Fix-6.1: rescue's `reserveBudget` used `perIterationCostUsd` (computed
+    // from the static `PER_ITERATION_INPUT_TOKENS = 50_000` baseline), while the
+    // TPM reserve was already updated to use the dynamic
+    // `lastIterationPromptTokens + 5_000` estimate. Asymmetric — rescue would
+    // under-estimate cost against the daily-budget cap, breaking the documented
+    // "daily budget is a true upper bound" guarantee. Operators who set
+    // `dailyBudgetUsd` near their actual spend could see the rescue silently
+    // exceed the cap.
+    //
+    // Post-Fix-6.1: BOTH reservations use the dynamic estimate. This test pins
+    // that the daily-budget reserve passes a cost computed from the dynamic
+    // estimate (255k input tokens), not the static 50k.
+    const { ctx, manifest } = buildCtx({
+      script: [
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200_000,
+        },
+        {
+          functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
+          promptTokenCount: 250_000,
+        },
+        { text: 'Synthesised answer.' },
+      ],
+      dailyBudgetUsd: 100, // exercises dailyBudgetEnforced=true gate
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+
+    // 3 reserveBudget calls total: 2 loop iters + 1 rescue. The third is the
+    // load-bearing assertion — its estimatedCostMicros must reflect the
+    // dynamic 255k token estimate, NOT the static 50k baseline.
+    expect(manifest.reserveBudget).toHaveBeenCalledTimes(3);
+    const rescueReserveCall = manifest.reserveBudget.mock.calls[2]?.[0] as
+      | { estimatedCostMicros?: number }
+      | undefined;
+    const loopReserveCall = manifest.reserveBudget.mock.calls[0]?.[0] as
+      | { estimatedCostMicros?: number }
+      | undefined;
+    expect(rescueReserveCall?.estimatedCostMicros).toBeDefined();
+    expect(loopReserveCall?.estimatedCostMicros).toBeDefined();
+    // Rescue cost must be substantially higher than the loop's per-iter cost
+    // (255k vs 50k input tokens — 5.1× the input, but total cost ratio is
+    // smaller because output + thinking-token components stay the same in both
+    // calls). Asserting >2× is a soft-but-load-bearing check: catches a
+    // regression to the static `perIterationCostUsd` baseline (which would make
+    // the two costs IDENTICAL → ratio = 1×) without pinning the exact pricing
+    // math (cost.ts is a separate module that may re-tune token rates).
+    const loopCost = loopReserveCall?.estimatedCostMicros ?? 0;
+    const rescueCost = rescueReserveCall?.estimatedCostMicros ?? 0;
+    expect(rescueCost).toBeGreaterThan(loopCost * 2);
+  });
+});
+
+describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () => {
+  it('per-iteration 429: extracts retryDelay from ApiError + seeds throttle hint', async () => {
+    // Pre-Fix-4 ask_agentic discarded 429 retry hints — TPM throttle relied on
+    // pure-window math which over-estimates by 30s+ on real 429s. Post-Fix-4
+    // mirrors `ask.tool.ts:~1063`: gate on `isGemini429` (requires
+    // `err instanceof ApiError` + status===429), parse `retryInfo.retryDelay`
+    // from the body, and `throttle.recordRetryHint(model, delayMs)` to seed
+    // the cache. Future ask_agentic / ask / code calls honour the hint via
+    // `throttle.reserve`'s `activeHint` lookup.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}',
+    });
+    const { ctx, throttle } = buildCtx({ script: [] });
+    // Override generateContent to throw the 429 on iter 1.
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    // Iter catch re-throws non-timeout errors, so the call ultimately errors
+    // out via the outer catch with errorCode='UNKNOWN'. The load-bearing
+    // assertion is that the retry hint WAS recorded BEFORE the re-throw.
+    expect(result.isError).toBe(true);
+    // recordRetryHint may be called once (inner catch) or once more if the
+    // outer catch's safety-net hint extraction also fires (depends on whether
+    // the inner catch's `throw iterErr` path reaches the outer for the same
+    // 429). Either way the recorded model + delay must match. Pin BOTH the
+    // model (literal — `resolveModel` mock returns 'gemini-3-pro-preview') and
+    // the parsed delay (7s → 7000ms).
+    expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 7_000);
+  });
+
+  it('non-429 ApiError (e.g. 500) does NOT seed retry hint (status-strict gate)', async () => {
+    // The `isGemini429` gate requires BOTH instanceof ApiError AND status===429.
+    // A real ApiError with a different status (500, 503) must NOT seed a hint
+    // even if its message contains a `retryDelay` decoy (which Google's
+    // server-side error bodies sometimes include for non-429 errors too).
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 500,
+      message: '{"error":{"code":500,"details":[{"retryDelay":"30s"}]}}',
+    });
+    const { ctx, throttle } = buildCtx({ script: [] });
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    expect(throttle.recordRetryHint).not.toHaveBeenCalled();
   });
 });
 

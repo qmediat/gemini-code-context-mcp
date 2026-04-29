@@ -60,6 +60,7 @@ import {
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { THINKING_LEVELS } from './shared/thinking.js';
+import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -100,7 +101,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `maxTotalInputTokens` (skipped when overshooting), `dailyBudgetUsd` (skipped when reservation rejected), and `iterationTimeoutMs`.',
+        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `dailyBudgetUsd` (skipped when reservation rejected) and `iterationTimeoutMs` (per-call wall-clock). The pass is NOT gated on `maxTotalInputTokens` — running it may push cumulative tokens past that cap by one call's worth, signalled via `overBudget: true` on the result (v1.14.2; pre-v1.14.2 the pass was skipped on cap overshoot, defeating the rescue feature for any operator running near the cap).",
       ),
     maxTotalInputTokens: z
       .number()
@@ -108,7 +109,7 @@ export const askAgenticInputSchema = z
       .min(10_000)
       .optional()
       .describe(
-        'Cumulative input-token budget across all iterations. Default 500_000. Rejects the call early if exceeded.',
+        "Cumulative input-token budget across all iterations. Default 1_000_000 (raised from 500_000 in v1.14.2; matches Gemini 3 Pro's `inputTokenLimit: 1_048_576` minus framing headroom — empirical benchmark showed 500_000 was overly conservative for diff-bounded review workloads). Loop iterations are HARD-STOPPED past this cap (subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'); the post-loop forced-finalization rescue pass is NOT gated on this cap (the rescue is the documented exit path, bounded by `dailyBudgetUsd` for cost and `iterationTimeoutMs` for wall-clock) and may push cumulative tokens past the cap by one call's worth — detect via `overBudget: true` on the result.",
       ),
     maxFilesRead: z
       .number()
@@ -126,7 +127,7 @@ export const askAgenticInputSchema = z
       .max(1_800_000)
       .optional()
       .describe(
-        'Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls + per-iteration TPM throttle wait) is bounded by this. **A single iteration that times out FAILS THE WHOLE agentic call** with `errorCode: "TIMEOUT"` (the failed iteration\'s function-call results never came back, leaving the conversation structurally incomplete — continuing with partial state would 400 on the next turn). Whole-loop budget is also bounded by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled.',
+        "Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls + per-iteration TPM throttle wait) is bounded by this. **A single iteration that times out FAILS THE WHOLE agentic call** with `errorCode: 'TIMEOUT'` (the failed iteration's function-call results never came back, leaving the conversation structurally incomplete — continuing with partial state would 400 on the next turn). The post-loop forced-finalization rescue pass is ALSO bounded by this timeout, but its timeout behaviour DIFFERS: rescue timeouts are caught best-effort and fall through to the original `subReason: 'AGENTIC_MAX_ITERATIONS'` shape with `errorCode: 'UNKNOWN'` (NOT `'TIMEOUT'`) — the rescue is the documented exit path, and surfacing TIMEOUT for it would obscure the underlying maxIterations exhaustion. Operators detect rescue-attempted-but-failed via `apiCalls > iterations` and `convergenceForced` absent. Whole-loop budget is also bounded by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -142,7 +143,7 @@ export type AskAgenticInput = z.infer<typeof askAgenticInputSchema>;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_ITERATIONS = 20;
-const DEFAULT_MAX_TOTAL_INPUT_TOKENS = 500_000;
+const DEFAULT_MAX_TOTAL_INPUT_TOKENS = 1_000_000;
 const DEFAULT_MAX_FILES_READ = 40;
 const TOOL_EXECUTION_CONCURRENCY = 3;
 /** If the SAME call signature (name + args) appears this many times, we
@@ -548,6 +549,15 @@ async function executeAskAgenticBody(
     let cumulativeOutputTokens = 0;
     let cumulativeThinkingTokens = 0;
     let iterations = 0;
+    // Tracks the most recent iteration's actual `promptTokenCount` (size of the
+    // conversation as sent in the LAST loop iter). Used by the v1.14.2
+    // forced-finalization rescue's TPM-reservation estimate (line ~910) — the
+    // rescue replays the same accumulated history, so its real prompt size
+    // ≈ this value, not the static `PER_ITERATION_INPUT_TOKENS = 50_000` that
+    // under-reserves by 4–6× on a 20-iter loop with file reads. Stays 0 if the
+    // loop never produced a usage record (defensive — falls back to the static
+    // estimate at the use site).
+    let lastIterationPromptTokens = 0;
 
     emitter.emit('starting agentic loop…');
 
@@ -682,6 +692,18 @@ async function executeAskAgenticBody(
         if (throttleReservationId !== -1) {
           ctx.throttle.cancel(throttleReservationId);
         }
+        // v1.14.2 Fix 4: extract Gemini's `retryInfo.retryDelay` from 429s and
+        // seed the throttle hint cache, mirroring `ask.tool.ts:~1063`. Pre-fix
+        // ask_agentic catch paths discarded the hint — TPM throttle relied on
+        // pure-window math which empirically over-estimates by 30s+ on real
+        // 429s. Gating on `isGemini429` (requires `err instanceof ApiError` +
+        // `err.status === 429`) is non-user-influenceable; only real Gemini
+        // 429s match. Future iterations / future `ask_agentic` callers honour
+        // the recorded hint via `throttle.reserve`'s `activeHint` lookup.
+        const iterRetryDelayMs = isGemini429(iterErr) ? parseRetryDelayMs(iterErr.message) : null;
+        if (iterRetryDelayMs !== null) {
+          ctx.throttle.recordRetryHint(resolved.resolved, iterRetryDelayMs);
+        }
         // If the iteration aborted on timeout, surface a structured TIMEOUT
         // error so the caller can distinguish "this iteration was too slow"
         // from "Gemini rejected the request". Annotate which iteration so
@@ -750,6 +772,7 @@ async function executeAskAgenticBody(
       cumulativeInputTokens += iterResult.usage.promptTokenCount;
       cumulativeOutputTokens += iterResult.usage.candidatesTokenCount;
       cumulativeThinkingTokens += iterResult.usage.thoughtsTokenCount;
+      lastIterationPromptTokens = iterResult.usage.promptTokenCount;
 
       emitter.emit(
         `iter ${iterations}/${maxIterations}: ${iterResult.functionCallCount} tool calls, ${cumulativeInputTokens} in-tokens so far`,
@@ -841,38 +864,20 @@ async function executeAskAgenticBody(
     // far. If the forced call itself fails (timeout, network, budget
     // exhausted, empty text), fall through to the original error so the
     // caller still gets a structured failure signal.
-    emitter.emit(`maxIterations (${maxIterations}) reached — evaluating forced-finalization pass`);
+    emitter.emit(`maxIterations (${maxIterations}) reached — running forced-finalization pass`);
 
-    // Token-budget guard: the finalization pass is one extra `generateContent`
-    // roundtrip whose conservative input estimate is `PER_ITERATION_INPUT_TOKENS`.
-    // If that estimate would push `cumulativeInputTokens` past
-    // `maxTotalInputTokens`, skip the pass and fall through to the
-    // AGENTIC_MAX_ITERATIONS error — running it anyway would silently
-    // overshoot the operator's documented per-call token cap.
-    if (cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS > maxTotalInputTokens) {
-      emitter.emit(
-        `skipping forced-finalization pass — would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
-      );
-      logger.warn(
-        `ask_agentic: skipping forced-finalization pass — running it would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
-      );
-      return errorResult(
-        `ask_agentic: reached maxIterations (${maxIterations}) without a final answer; forced-finalization pass skipped to honour maxTotalInputTokens (${maxTotalInputTokens.toLocaleString()}). Increase maxTotalInputTokens or narrow your prompt.`,
-        {
-          errorCode: 'UNKNOWN',
-          retryable: false,
-          subReason: 'AGENTIC_MAX_ITERATIONS',
-          iterations,
-          // Pass was skipped (token budget guard) — total generateContent
-          // count equals loop iterations.
-          apiCalls: iterations,
-          cumulativeInputTokens,
-          cumulativeOutputTokens,
-          filesRead: filesReadSet.size,
-        },
-      );
-    }
-
+    // v1.14.2: the rescue pass is NOT gated on `maxTotalInputTokens`. It is
+    // the documented exit path for "loop ran out of iterations without final
+    // text" and blocking it on rescue's own potential overshoot defeats the
+    // v1.14.1 feature — an operator running near the cap would never get the
+    // synthesised answer the rescue is designed to produce. Empirical repro:
+    // the v1.14.1 PR self-review benchmark hit `cumulativeInputTokens=500_919
+    // > 500_000` cap mid-loop (the line-790 hard-stop guard, which stays);
+    // operators hitting maxIters near the cap saw the same self-block via the
+    // pre-v1.14.2 token-budget guard previously here. Rescue cost remains
+    // bounded by `dailyBudgetUsd` reservation (line ~892), wall-clock by
+    // `iterationTimeoutMs` (line ~919). Cap-overshoot is signalled via
+    // `overBudget: true` on the result so callers can detect the trade.
     let finalizationText = '';
     let finalizationUsage = {
       promptTokenCount: 0,
@@ -888,13 +893,45 @@ async function executeAskAgenticBody(
     // cases (response never arrived to populate usageMetadata) and
     // inferring "fired" from usage would undercount the API call.
     let finalizationAttempted = false;
+    // v1.14.2 Fix 5: tracks WHY the rescue pass was skipped, so the trailing
+    // errorResult can emit a cause-specific message + structured field instead
+    // of the misleading generic "Increase maxIterations or narrow your prompt"
+    // (active lie when the cause is daily budget exhaustion). Set to
+    // 'daily-budget' when `reserveBudget` rejects below; remains null on
+    // success or when no rescue was attempted at all (e.g. dailyBudgetEnforced
+    // = false). Surfaces as `finalizationSkipReason` on `structuredContent` —
+    // additive optional field, no schema break for existing callers.
+    let finalizationSkipReason: 'daily-budget' | null = null;
+
+    // v1.14.2: dynamic estimate for the rescue pass — replaces the static
+    // `PER_ITERATION_INPUT_TOKENS = 50_000` baseline with the actual size of
+    // the last observed iteration (+5k margin for SYSTEM_INSTRUCTION_FINALIZATION
+    // + thinking-config overhead). Used by BOTH the daily-budget reservation
+    // (immediately below) AND the TPM-throttle reservation (line ~919) so cost
+    // and rate-limit gates stay symmetric — pre-Fix-6.1 only the TPM reserve was
+    // dynamic, leaving the daily-budget gate to under-estimate rescue cost
+    // (broke the documented "daily budget is a true upper bound" guarantee).
+    // Fallback to the static estimate when the loop produced no usage record
+    // (defensive — in practice rescue is gated on `iterations >= maxIterations`
+    // so iter 1+ ran and lastIterationPromptTokens was populated).
+    const finalizationEstimate =
+      lastIterationPromptTokens > 0
+        ? lastIterationPromptTokens + 5_000
+        : PER_ITERATION_INPUT_TOKENS;
+    const finalizationCostUsd = estimateCostUsd({
+      model: resolved.resolved,
+      uncachedInputTokens: finalizationEstimate,
+      cachedInputTokens: 0,
+      outputTokens: PER_ITERATION_OUTPUT_TOKENS,
+      thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
+    });
 
     if (dailyBudgetEnforced) {
       const reserve = ctx.manifest.reserveBudget({
         workspaceRoot,
         toolName: 'ask_agentic',
         model: resolved.resolved,
-        estimatedCostMicros: toMicrosUsd(perIterationCostUsd),
+        estimatedCostMicros: toMicrosUsd(finalizationCostUsd),
         dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
         nowMs: Date.now(),
       });
@@ -909,6 +946,7 @@ async function executeAskAgenticBody(
             reserve.spentMicros / 1_000_000
           ).toFixed(4)})`,
         );
+        finalizationSkipReason = 'daily-budget';
       } else {
         finalizationReservationId = reserve.id;
       }
@@ -925,7 +963,13 @@ async function executeAskAgenticBody(
       const finalizationStarted = Date.now();
       try {
         if (tpmEnforced) {
-          const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
+          // v1.14.2: use the dynamic `finalizationEstimate` (computed above the
+          // daily-budget reserve block — same value, same +5k margin rationale)
+          // for the TPM-throttle reservation. Symmetric with the daily-budget
+          // reserve so rate-limit and cost gates use the SAME size estimate for
+          // the rescue pass. TPM over-reserve = transient throttle wait
+          // (harmless); under-reserve = 429 risk; bias is intentional.
+          const reservation = ctx.throttle.reserve(resolved.resolved, finalizationEstimate);
           finalizationThrottleId = reservation.releaseId;
           if (reservation.delayMs > 0) {
             emitter.emit(
@@ -1029,6 +1073,15 @@ async function executeAskAgenticBody(
         if (finalizationThrottleId !== -1) {
           ctx.throttle.cancel(finalizationThrottleId);
         }
+        // v1.14.2 Fix 4: same retry-hint extraction as the per-iteration catch
+        // — the rescue's generateContent can also 429, and the hint should
+        // seed the throttle cache for future ask_agentic / ask / code calls.
+        const finalRetryDelayMs = isGemini429(finalErr)
+          ? parseRetryDelayMs(finalErr.message)
+          : null;
+        if (finalRetryDelayMs !== null) {
+          ctx.throttle.recordRetryHint(resolved.resolved, finalRetryDelayMs);
+        }
         // Best-effort: log and fall through to errorResult. The caller
         // already burned the iteration budget and deserves a structured
         // failure rather than a re-thrown SDK error.
@@ -1089,22 +1142,42 @@ async function executeAskAgenticBody(
       });
     }
 
-    return errorResult(
-      `ask_agentic: reached maxIterations (${maxIterations}) without a final answer. Increase maxIterations or narrow your prompt.`,
-      {
-        errorCode: 'UNKNOWN',
-        retryable: false,
-        subReason: 'AGENTIC_MAX_ITERATIONS',
-        iterations,
-        apiCalls,
-        cumulativeInputTokens: totalCumulativeInputTokens,
-        cumulativeOutputTokens: totalCumulativeOutputTokens,
-        filesRead: filesReadSet.size,
-      },
-    );
+    // v1.14.2 Fix 5: branch the error message on whether the rescue was
+    // skipped due to daily-budget exhaustion vs ran-and-failed (empty text /
+    // network error / timeout). Pre-fix the generic "Increase maxIterations"
+    // message lied to operators on the daily-budget skip path — the actual
+    // remediation is to wait for daily reset or raise GEMINI_DAILY_BUDGET_USD.
+    // The structured field `finalizationSkipReason` is additive (only present
+    // when set) so existing callers ignore it; new callers can branch on it
+    // for automated triage.
+    const errorMessage =
+      finalizationSkipReason === 'daily-budget'
+        ? `ask_agentic: reached maxIterations (${maxIterations}) without a final answer; forced-finalization pass skipped because daily budget cap reached. Wait for daily reset (UTC midnight) or raise GEMINI_DAILY_BUDGET_USD.`
+        : `ask_agentic: reached maxIterations (${maxIterations}) without a final answer. Increase maxIterations or narrow your prompt.`;
+
+    return errorResult(errorMessage, {
+      errorCode: 'UNKNOWN',
+      retryable: false,
+      subReason: 'AGENTIC_MAX_ITERATIONS',
+      ...(finalizationSkipReason !== null ? { finalizationSkipReason } : {}),
+      iterations,
+      apiCalls,
+      cumulativeInputTokens: totalCumulativeInputTokens,
+      cumulativeOutputTokens: totalCumulativeOutputTokens,
+      filesRead: filesReadSet.size,
+    });
   } catch (err) {
     logger.error(`ask_agentic failed: ${safeForLog(err)}`);
     const httpStatus = (err as { status?: number }).status;
+    // v1.14.2 Fix 4 (round-2 verdict from Phase 4 /coderev — Grok P1):
+    // outer-catch hint extraction is structurally infeasible — `resolved` is
+    // scoped to the inner try block, not visible here. Hoisting `resolved`
+    // out of the try would widen the change beyond Fix 4's scope. Net real-
+    // world impact is bounded: the iter catch already extracts hints for all
+    // generateContent 429s (the load-bearing 429 surface); the only escape
+    // path is a `resolveModel.list()` 429 during model resolution (rare —
+    // happens only on the very first call after API-key rotation or quota
+    // reset). Tracked as v1.14.3 followup in `.claude/local-v1.14.2-6step.md`.
     return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       retryable: false,

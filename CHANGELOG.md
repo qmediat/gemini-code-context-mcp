@@ -5,6 +5,57 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.2] - 2026-04-29
+
+### Fixed — `ask_agentic` rescue path unblocked + benchmark-surfaced UX/correctness fixes
+
+A 6-way code-review benchmark of v1.14.1 today (`@qmediat.io/gemini-code-context-mcp` reviewed alongside `gpt-cli`, `grok`, `gemini-chat`, `gemini-cli`) surfaced 9 distinct findings AND demonstrated that `ask_agentic` itself **failed its own benchmark** — `cumulativeInputTokens=500_919` exceeded the `DEFAULT_MAX_TOTAL_INPUT_TOKENS=500_000` mid-loop guard at iter 18, returning `subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'` with no synthesised answer. v1.14.2 ships 6 small fixes:
+
+- **`maxTotalInputTokens` default raised from `500_000` → `1_000_000`** (`src/tools/ask-agentic.tool.ts:145`). Matches Gemini 3 Pro's `inputTokenLimit: 1_048_576` minus framing headroom; the 500K default consumed only 48% of available headroom and was overly conservative for diff-bounded review workloads. Operators who want tighter caps still set `maxTotalInputTokens` per call. **This alone fixes the benchmark failure.**
+- **Forced-finalization rescue pass no longer skipped on token-cap overshoot** (`:846-874` post-loop guard removed). The rescue IS the documented exit path for `maxIterations` exhaustion; blocking it on rescue's own potential overshoot defeated the v1.14.1 feature whenever the loop ran near the cap. Rescue cost remains bounded by `dailyBudgetUsd` reservation and `iterationTimeoutMs`; the new behaviour may push `cumulativeInputTokens` past `maxTotalInputTokens` by one call's worth, signalled via `overBudget: true` on the result. The mid-loop hard-stop guard at `:790` (`AGENTIC_INPUT_BUDGET_EXCEEDED`) is intentionally preserved — operator-explicit cap = honoured hard-stop, distinct exit mode.
+- **Rescue's TPM-throttle reservation uses observed prompt size, not static estimate** (`:910`). Pre-fix used `PER_ITERATION_INPUT_TOKENS = 50_000` baseline; the rescue replays the entire accumulated conversation (200-300K tokens on a 20-iter loop with file reads), so the static estimate under-reserved by 4-6× and risked TPM 429s. Post-fix tracks `lastIterationPromptTokens` and uses `lastIterationPromptTokens + 5_000` margin (covers `SYSTEM_INSTRUCTION_FINALIZATION` + thinking-config overhead). TPM over-reserve = harmless wait; under-reserve = 429 risk; bias is intentional.
+- **Rescue's daily-budget reserve uses the same dynamic estimate** (`:907-915`, Fix 6.1 — Phase-2 /coderev follow-up). Pre-fix only the TPM reserve was dynamic, leaving the daily-budget gate to under-estimate rescue cost by 5×+ on real workloads — broke the documented "daily budget is a true upper bound" guarantee. Post-fix hoists `finalizationEstimate` above both reservations so cost and rate-limit gates use the same size estimate.
+- **Branched error message + structured `finalizationSkipReason: 'daily-budget'` field on rescue skip** (`:1131-1143`). Pre-fix the trailing `errorResult` always said *"Increase maxIterations or narrow your prompt"* even when the actual cause was daily-budget exhaustion (an active lie pointing operators at the wrong remediation). Post-fix branches: when `finalizationSkipReason === 'daily-budget'`, emits a budget-specific message *("Wait for daily reset (UTC midnight) or raise GEMINI_DAILY_BUDGET_USD")*. The `finalizationSkipReason` field on `structuredContent` is additive (only present when set) — no schema break.
+- **Gemini 429 retry-hint integration** (`:60` import + `:683` iter catch + `:1050` rescue catch). Pre-fix `ask_agentic` discarded `retryInfo.retryDelay` from 429s — TPM throttle relied on pure-window math which over-estimates retry-after by 30s+. Post-fix mirrors `ask.tool.ts:~1063`: gates on `isGemini429` (requires `err instanceof ApiError` + `status===429`) and seeds `throttle.recordRetryHint(model, delayMs)`. Future ask_agentic / ask / code calls honour the recorded hint via `throttle.reserve`'s `activeHint` lookup. Outer-most catch hint extraction deferred to v1.14.3 (structurally needs hoisting `resolved` out of the inner try block — wider than this PR).
+
+### Behavioural impact
+
+- **Benchmark recovery (the headline):** the v1.14.1 self-review prompt that previously failed at iter 18 with `AGENTIC_INPUT_BUDGET_EXCEEDED` now succeeds with a synthesised rescue answer. The cap raise alone clears the immediate failure; the guard removal closes the parallel pathology at the `maxIterations` boundary.
+- **Calls that previously failed with `AGENTIC_INPUT_BUDGET_EXCEEDED` (mid-loop) at the new 1M cap continue to hard-stop** — the line-790 guard is preserved; operators who explicitly set tight `maxTotalInputTokens` get hard enforcement. Only the parallel post-loop rescue-skip path (`:846-874` pre-fix) was removed.
+- **Operators with `dailyBudgetUsd` set near their actual spend** see the rescue's daily-budget reserve now use a realistic cost estimate (~5× the pre-fix value on real workloads). Previously could silently exceed the cap; now the reservation rejects earlier with the correct sub-cap accounting. UX correction.
+- **Daily-budget skip path** now emits a budget-specific error message + `finalizationSkipReason: 'daily-budget'` structured field. Existing telemetry consumers parsing the prose error string for the daily-budget cause should switch to the structured field; existing "Increase maxIterations" parsers continue to work for the run-and-failed paths.
+- **`finalizationSkipReason` is a new optional field** on the `errorResult`'s `structuredContent`. Additive — existing callers ignore it; new callers can branch on `'daily-budget' | undefined` (more variants reserved for future skip causes).
+
+### Coverage
+
+7 net new tests across `test/unit/ask-agentic.test.ts`:
+
+- `allows finalization pass to run even when it would push past maxTotalInputTokens (v1.14.2 rescue unblock)` — REWRITES the v1.14.1 "skips finalization pass when running it would overshoot maxTotalInputTokens" test. Asserts the rescue runs (3 generateContent calls), returns synthesised text with `convergenceForced: true` and `overBudget: true`, and `cumulativeInputTokens=180_000` (loop 100k + rescue 80k > 120k cap).
+- `finalization pass uses last-iteration prompt tokens for TPM reservation, not static estimate (v1.14.2)` — pins Fix 6: 2 loop iters at 200k/250k + rescue, asserts `throttle.reserve` was called 3× with sizes [50_000, 50_000, 255_000].
+- `finalization pass daily-budget reserve uses dynamic cost estimate (Fix 6.1 — symmetric with TPM reserve)` — pins Fix 6.1: 2 loop iters + rescue with `dailyBudgetUsd=100`, asserts `manifest.reserveBudget` was called 3× and the rescue's `estimatedCostMicros` is >2× the loop's per-iter cost (catches a regression to the static baseline).
+- Existing `skips finalization pass when daily budget is exhausted` test now ALSO asserts `finalizationSkipReason: 'daily-budget'` + the budget-specific error message wording (Fix 5 contract).
+- `rescue ran-and-failed (empty text) keeps original "Increase maxIterations" message — no false skip-reason flag (Fix 5)` — pins the negative case: rescue ran but produced no text → original message + `finalizationSkipReason` ABSENT.
+- `per-iteration 429: extracts retryDelay from ApiError + seeds throttle hint` — pins Fix 4 happy path with a real `@google/genai` `ApiError`(status=429, body containing `retryDelay: "7s"`); asserts `throttle.recordRetryHint('gemini-3-pro-preview', 7_000)`.
+- `non-429 ApiError (e.g. 500) does NOT seed retry hint (status-strict gate)` — pins Fix 4 negative case: status===500 ApiError with `retryDelay` decoy in body; asserts `recordRetryHint` was NOT called.
+- `finalization pass returns structured error when iterationTimeoutMs fires mid-flight (cleanup + AGENTIC_MAX_ITERATIONS) (Fix 2)` — closes the A1 finding (4-reviewer benchmark agreement on missing finalization-timeout coverage). Mocks the rescue's `generateContent` to hang on `abortSignal`, asserts `subReason: 'AGENTIC_MAX_ITERATIONS'` + `errorCode: 'UNKNOWN'` (NOT `TIMEOUT` — the rescue is best-effort), `apiCalls: 3` (mid-flight abort still counts), `cancelBudgetReservation` called once for the rescue, `throttle.cancel` called once. Real-timer test bounded by `iterationTimeoutMs=1000`.
+
+Total suite: 725 passed | 9 skipped (was 719 in v1.14.1; +6 net new tests; +1 net from existing test rewrites that don't change count).
+
+### Notes — reviewed but NOT changed
+
+- **`apiCalls` overcount on attempted-but-failed finalization (benchmark A2 — 3-reviewer agreement).** Verified intentional. Pattern matches the main loop's `iterDispatched` design (lines 645/661/708) which has the explicit comment *"Any throw past this point counts the iter as having made an API call (Gemini may bill server-side even on aborted-mid-flight calls)."* The forced pass at `:951` follows the same intent. The schema description for `apiCalls` (line 103) already documents the contract: it is the *"AUTHORITATIVE total `generateContent` count"*, including dispatched-but-failed calls. No change.
+- **`tools` + `toolConfig.NONE` 400 risk (benchmark A3 — 2 reviewers, competing theories).** Empirically refuted. SDK type definitions in `node_modules/@google/genai/dist/genai.d.ts` permit the combination freely — `functionCallingConfig` is an optional field of `ToolConfig`. v1.14.0 CHANGELOG empirical reproduction (`~7m 50s wall-clock real-API run`) confirms Gemini accepts our config. The codebase comment at `:189-195` cites the spec rationale verbatim. No change.
+- **Outer `AbortSignal` not composed with `finalizationTimeout.signal` (benchmark A6 — single-reviewer).** Cross-codebase concern: `ask.tool.ts:208-214`, `code.tool.ts`, and `ask-agentic.tool.ts:621-625, 919-923` all create isolated timeout controllers without composing `input.abortSignal`. Tracked as a separate v1.15 followup; touching one without the others would create inconsistency.
+- **Budget-ledger double-cancel risk (benchmark A9 — single-reviewer).** Inspected: the inner `try/catch` at `:1003-1014` swallows `finalizeBudgetReservation` errors via `logger.error` without re-throwing, so control does NOT escape to the outer `catch (finalErr)`. No double-cancel possible. The inner-swallow pattern is bounded but worth its own follow-up if operators see budget-ledger drift in production. No change.
+
+### Empirical reproduction
+
+- The original benchmark prompt that failed v1.14.1 with `AGENTIC_INPUT_BUDGET_EXCEEDED` after 18 iters now completes successfully under v1.14.2 with `convergenceForced: true` flagged in `structuredContent`. Wall-clock ~10-15 minutes for the full agentic loop on the 119-file workspace; the rescue pass adds ~30-90 s on top of the loop iterations. Captured in `/tmp/bench-2026-04-29/v1.14.2-rerun.md` (gitignored — operator-local). Detailed /6step write-up of every benchmark finding + verdict is at `.claude/local-v1.14.2-6step.md` (gitignored).
+
+### Migration
+
+No schema migration required. All structured-content fields added by v1.14.2 are additive optional fields. Existing operators see the default `maxTotalInputTokens` raised from 500K to 1M on first call after upgrade — explicit per-call values still honoured.
+
 ## [1.14.1] - 2026-04-29
 
 ### Fixed — `ask_agentic` convergence on bounded code-review tasks
@@ -23,15 +74,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Coverage
 
-5 new tests in `test/unit/ask-agentic.test.ts`:
+6 new tests in `test/unit/ask-agentic.test.ts`:
 
 - `returns synthesized text via finalization pass when loop exhausts maxIterations` — pins the happy path: tool-call iters consume budget, finalization pass returns text with `convergenceForced: true`, and the 3rd `generateContent` call has `toolConfig.functionCallingConfig.mode = 'NONE'`.
 - `falls through to AGENTIC_MAX_ITERATIONS error when finalization pass returns empty text` — empty-text fallback preserves the original structured failure shape (`errorCode: 'UNKNOWN'` + `subReason: 'AGENTIC_MAX_ITERATIONS'`).
+- `skips finalization pass when running it would overshoot maxTotalInputTokens` — token-budget guard at the time skipped the pass when the static 50k estimate would push cumulative tokens past the operator's per-call cap; preserves `apiCalls = iterations` and pre-pass cumulative tokens. (NB: this test was rewritten in v1.14.2 to assert the rescue-allows-overshoot contract — see v1.14.2 changelog.)
 - `falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)` — pre-response network failures don't escape; caller still gets `errorCode: 'UNKNOWN'` + `subReason: 'AGENTIC_MAX_ITERATIONS'`.
 - `skips finalization pass when daily budget is exhausted` — third `reserveBudget` rejection is honoured; the pass does not execute and only 2 `generateContent` calls are observed.
 - `finalization call: NONE mode + thinkingConfig preserved + tools omitted` — verifies that `tools` is omitted (`undefined`) on the finalization call, while `thinkingConfig` and the focused `systemInstruction` remain set. Per Gemini API spec, `mode: NONE` is "equivalent to sending a request without any function declarations" — sending tool declarations alongside NONE wastes ~150-300 input tokens, so the finalization config explicitly omits them.
 
-Total suite: 718 passed | 9 skipped (was 713 | 9 in v1.14.0; +5 net new tests). Lint, typecheck, build all green.
+Total suite: 719 passed | 9 skipped (was 713 | 9 in v1.14.0; +6 net new tests). Lint, typecheck, build all green.
 
 ### Notes
 
