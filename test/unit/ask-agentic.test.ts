@@ -451,6 +451,9 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(String(result.structuredContent?.responseText)).toContain('Synthesized answer');
     expect(result.structuredContent?.convergenceForced).toBe(true);
     expect(result.structuredContent?.iterations).toBe(2);
+    // Round-3 fix: `apiCalls` reports total `generateContent` calls including the
+    // finalization pass. With maxIterations=2 + finalization fired, apiCalls=3.
+    expect(result.structuredContent?.apiCalls).toBe(3);
 
     // Finalization is the 3rd generateContent call. Its config MUST set
     // `toolConfig.functionCallingConfig.mode = 'NONE'` — this is the
@@ -549,6 +552,9 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(generateContent).toHaveBeenCalledTimes(2);
     // Pre-pass cumulative tokens preserved; no phantom finalization usage.
     expect(result.structuredContent?.cumulativeInputTokens).toBe(100_000);
+    // Round-3 fix: `apiCalls` reports the actual generateContent count. Token-
+    // budget skip means the pass never fired → apiCalls equals iterations.
+    expect(result.structuredContent?.apiCalls).toBe(2);
   });
 
   it('falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)', async () => {
@@ -560,10 +566,19 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
         { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
       ],
     });
-    // Simulate finalization-call network failure: 3rd call rejects. The
-    // pass MUST be best-effort — caller deserves a structured error, not a
-    // re-thrown SDK exception.
-    generateContent.mockRejectedValueOnce(new Error('fetch failed'));
+    // Simulate finalization-call non-transient failure (HTTP error with
+    // numeric `.status`). `isTransientNetworkError` (src/gemini/retry.ts:82)
+    // returns false for any error carrying a numeric `status` field, so
+    // `withNetworkRetry` does NOT retry — the single rejection deterministically
+    // exits the pass. Using a transient shape like `Error('fetch failed')`
+    // would match `TRANSIENT_PATTERNS`, trigger the 3-attempt retry budget,
+    // and consume the next queued mock (or return `undefined`), making the
+    // test pass for the wrong reason. The pass MUST be best-effort
+    // regardless of failure shape — caller deserves a structured error, not
+    // a re-thrown SDK exception. (Round-3 review fix: GPT P1 + Copilot.)
+    generateContent.mockRejectedValueOnce(
+      Object.assign(new Error('http 500 internal server error'), { status: 500 }),
+    );
 
     const result = await askAgenticTool.execute(
       { prompt: 'q', workspace: root, maxIterations: 2 },

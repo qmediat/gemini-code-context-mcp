@@ -100,7 +100,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        'Hard cap on agentic iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20.',
+        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. The total `generateContent` count for the call is therefore `iterations + (convergenceForced ? 1 : 0)`, exposed as `structuredContent.apiCalls`. The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `maxTotalInputTokens` (skipped when overshooting), `dailyBudgetUsd` (skipped when reservation rejected), and `iterationTimeoutMs`.',
       ),
     maxTotalInputTokens: z
       .number()
@@ -744,6 +744,9 @@ async function executeAskAgenticBody(
           modelCategory: resolved.category,
           contextWindow: resolved.inputTokenLimit,
           iterations,
+          // Organic final-text path: no forced-finalization pass ran, so
+          // total `generateContent` calls equals loop iterations.
+          apiCalls: iterations,
           cumulativeInputTokens,
           cumulativeOutputTokens,
           cumulativeThinkingTokens,
@@ -806,7 +809,7 @@ async function executeAskAgenticBody(
     // far. If the forced call itself fails (timeout, network, budget
     // exhausted, empty text), fall through to the original error so the
     // caller still gets a structured failure signal.
-    emitter.emit(`maxIterations (${maxIterations}) reached — running forced-finalization pass`);
+    emitter.emit(`maxIterations (${maxIterations}) reached — evaluating forced-finalization pass`);
 
     // Token-budget guard: the finalization pass is one extra `generateContent`
     // roundtrip whose conservative input estimate is `PER_ITERATION_INPUT_TOKENS`.
@@ -815,6 +818,9 @@ async function executeAskAgenticBody(
     // AGENTIC_MAX_ITERATIONS error — running it anyway would silently
     // overshoot the operator's documented per-call token cap.
     if (cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS > maxTotalInputTokens) {
+      emitter.emit(
+        `skipping forced-finalization pass — would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
+      );
       logger.warn(
         `ask_agentic: skipping forced-finalization pass — running it would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
       );
@@ -825,6 +831,9 @@ async function executeAskAgenticBody(
           retryable: false,
           subReason: 'AGENTIC_MAX_ITERATIONS',
           iterations,
+          // Pass was skipped (token budget guard) — total generateContent
+          // count equals loop iterations.
+          apiCalls: iterations,
           cumulativeInputTokens,
           cumulativeOutputTokens,
           filesRead: filesReadSet.size,
@@ -851,6 +860,11 @@ async function executeAskAgenticBody(
         nowMs: Date.now(),
       });
       if ('rejected' in reserve) {
+        emitter.emit(
+          `skipping forced-finalization pass — daily budget cap reached (spent $${(
+            reserve.spentMicros / 1_000_000
+          ).toFixed(4)})`,
+        );
         logger.warn(
           `ask_agentic: skipping forced-finalization pass — daily budget cap reached (spent $${(
             reserve.spentMicros / 1_000_000
@@ -862,6 +876,7 @@ async function executeAskAgenticBody(
     }
 
     if (finalizationReservationId !== null || !dailyBudgetEnforced) {
+      emitter.emit('running forced-finalization pass (tools disabled)');
       const finalizationTimeout = createTimeoutController({
         ...(input.iterationTimeoutMs !== undefined ? { totalMs: input.iterationTimeoutMs } : {}),
         totalEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
@@ -988,6 +1003,15 @@ async function executeAskAgenticBody(
     const totalCumulativeInputTokens = cumulativeInputTokens + finalizationUsage.promptTokenCount;
     const totalCumulativeOutputTokens =
       cumulativeOutputTokens + finalizationUsage.candidatesTokenCount;
+    // `apiCalls` = total generateContent calls. The finalization pass only
+    // actually fires `generateContent` when `finalizationUsage.promptTokenCount`
+    // is non-zero (set by extracting usageMetadata from a real API response).
+    // Skipped paths (daily-budget reject, token-cap overshoot) leave the usage
+    // counters at zero, so the field correctly reports `iterations` only for
+    // those. Operators can branch on `apiCalls > iterations` to detect the
+    // forced pass without parsing `convergenceForced`.
+    const finalizationFired = finalizationUsage.promptTokenCount > 0;
+    const apiCalls = iterations + (finalizationFired ? 1 : 0);
 
     if (finalizationText.length > 0) {
       return textResult(finalizationText, {
@@ -997,6 +1021,7 @@ async function executeAskAgenticBody(
         modelCategory: resolved.category,
         contextWindow: resolved.inputTokenLimit,
         iterations,
+        apiCalls,
         cumulativeInputTokens: totalCumulativeInputTokens,
         cumulativeOutputTokens: totalCumulativeOutputTokens,
         cumulativeThinkingTokens: cumulativeThinkingTokens + finalizationUsage.thoughtsTokenCount,
@@ -1018,6 +1043,7 @@ async function executeAskAgenticBody(
         retryable: false,
         subReason: 'AGENTIC_MAX_ITERATIONS',
         iterations,
+        apiCalls,
         cumulativeInputTokens: totalCumulativeInputTokens,
         cumulativeOutputTokens: totalCumulativeOutputTokens,
         filesRead: filesReadSet.size,
