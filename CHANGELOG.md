@@ -23,15 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Coverage
 
-5 new tests in `test/unit/ask-agentic.test.ts`:
+6 new tests in `test/unit/ask-agentic.test.ts`:
 
 - `returns synthesized text via finalization pass when loop exhausts maxIterations` — pins the happy path: tool-call iters consume budget, finalization pass returns text with `convergenceForced: true`, and the 3rd `generateContent` call has `toolConfig.functionCallingConfig.mode = 'NONE'`.
 - `falls through to AGENTIC_MAX_ITERATIONS error when finalization pass returns empty text` — empty-text fallback preserves the original structured failure shape (`errorCode: 'UNKNOWN'` + `subReason: 'AGENTIC_MAX_ITERATIONS'`).
+- `skips finalization pass when running it would overshoot maxTotalInputTokens` — token-budget guard at the time skipped the pass when the static 50k estimate would push cumulative tokens past the operator's per-call cap; preserves `apiCalls = iterations` and pre-pass cumulative tokens. (NB: this test was rewritten in v1.14.2 to assert the rescue-allows-overshoot contract — see v1.14.2 changelog.)
 - `falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)` — pre-response network failures don't escape; caller still gets `errorCode: 'UNKNOWN'` + `subReason: 'AGENTIC_MAX_ITERATIONS'`.
 - `skips finalization pass when daily budget is exhausted` — third `reserveBudget` rejection is honoured; the pass does not execute and only 2 `generateContent` calls are observed.
 - `finalization call: NONE mode + thinkingConfig preserved + tools omitted` — verifies that `tools` is omitted (`undefined`) on the finalization call, while `thinkingConfig` and the focused `systemInstruction` remain set. Per Gemini API spec, `mode: NONE` is "equivalent to sending a request without any function declarations" — sending tool declarations alongside NONE wastes ~150-300 input tokens, so the finalization config explicitly omits them.
 
-Total suite: 718 passed | 9 skipped (was 713 | 9 in v1.14.0; +5 net new tests). Lint, typecheck, build all green.
+Total suite: 719 passed | 9 skipped (was 713 | 9 in v1.14.0; +6 net new tests). Lint, typecheck, build all green.
 
 ### Notes
 
