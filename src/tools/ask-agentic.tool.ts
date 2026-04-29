@@ -548,6 +548,15 @@ async function executeAskAgenticBody(
     let cumulativeOutputTokens = 0;
     let cumulativeThinkingTokens = 0;
     let iterations = 0;
+    // Tracks the most recent iteration's actual `promptTokenCount` (size of the
+    // conversation as sent in the LAST loop iter). Used by the v1.14.2
+    // forced-finalization rescue's TPM-reservation estimate (line ~910) — the
+    // rescue replays the same accumulated history, so its real prompt size
+    // ≈ this value, not the static `PER_ITERATION_INPUT_TOKENS = 50_000` that
+    // under-reserves by 4–6× on a 20-iter loop with file reads. Stays 0 if the
+    // loop never produced a usage record (defensive — falls back to the static
+    // estimate at the use site).
+    let lastIterationPromptTokens = 0;
 
     emitter.emit('starting agentic loop…');
 
@@ -750,6 +759,7 @@ async function executeAskAgenticBody(
       cumulativeInputTokens += iterResult.usage.promptTokenCount;
       cumulativeOutputTokens += iterResult.usage.candidatesTokenCount;
       cumulativeThinkingTokens += iterResult.usage.thoughtsTokenCount;
+      lastIterationPromptTokens = iterResult.usage.promptTokenCount;
 
       emitter.emit(
         `iter ${iterations}/${maxIterations}: ${iterResult.functionCallCount} tool calls, ${cumulativeInputTokens} in-tokens so far`,
@@ -907,7 +917,23 @@ async function executeAskAgenticBody(
       const finalizationStarted = Date.now();
       try {
         if (tpmEnforced) {
-          const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
+          // v1.14.2: use the actual size of the LAST observed iteration as the
+          // TPM-reservation estimate for the rescue pass. The rescue replays
+          // the entire accumulated conversation, which on a 20-iter loop with
+          // file reads can reach 200-300k tokens — the static
+          // `PER_ITERATION_INPUT_TOKENS = 50_000` constant under-reserved by
+          // 4-6× and risked TPM 429s on real workloads. The +5k margin covers
+          // `SYSTEM_INSTRUCTION_FINALIZATION` (~200 tok) + thinking overhead.
+          // Falls back to the static estimate if the loop never produced a
+          // usage record (defensive — in practice the rescue is gated on
+          // iterations >= maxIterations so iter 1+ ran). TPM over-reserve =
+          // transient throttle wait (harmless); under-reserve = 429 risk; bias
+          // is intentional.
+          const finalizationEstimate =
+            lastIterationPromptTokens > 0
+              ? lastIterationPromptTokens + 5_000
+              : PER_ITERATION_INPUT_TOKENS;
+          const reservation = ctx.throttle.reserve(resolved.resolved, finalizationEstimate);
           finalizationThrottleId = reservation.releaseId;
           if (reservation.delayMs > 0) {
             emitter.emit(

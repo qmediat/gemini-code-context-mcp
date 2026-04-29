@@ -690,6 +690,53 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // — that behavior wasted prompt tokens and contradicted the NONE-mode spec.
     expect(finalConfig?.config?.tools).toBeUndefined();
   });
+
+  it('finalization pass uses last-iteration prompt tokens for TPM reservation, not static estimate (v1.14.2)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // The finalization pass replays the entire accumulated conversation, so
+    // its actual prompt size ≈ the LAST iter's `promptTokenCount`, not the
+    // static `PER_ITERATION_INPUT_TOKENS = 50_000` constant. Pre-v1.14.2 the
+    // TPM reservation under-reserved by 4-6× on a 20-iter loop with file reads
+    // (real workloads observed at 200-300k for the rescue prompt). Post-v1.14.2
+    // the reservation uses `lastIterationPromptTokens + 5_000` margin (covers
+    // SYSTEM_INSTRUCTION_FINALIZATION + thinking overhead). Bias to over-reserve
+    // is intentional — TPM over-reserve is harmless wait; under-reserve risks
+    // 429 from Gemini.
+    const { ctx, throttle } = buildCtx({
+      script: [
+        // Loop iter 1: prompt 200k tokens.
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200_000,
+        },
+        // Loop iter 2: prompt grew to 250k (history accumulation).
+        {
+          functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
+          promptTokenCount: 250_000,
+        },
+        // Rescue: synthesises text. Uses last-iter prompt size (250k) + 5k
+        // margin = 255_000 for the TPM reservation.
+        { text: 'Synthesised answer.' },
+      ],
+      tpmThrottleLimit: 80_000, // exercises tpmEnforced=true gate
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    // Three throttle.reserve calls: 2 loop iters + 1 rescue.
+    expect(throttle.reserve).toHaveBeenCalledTimes(3);
+    // Per-iter calls use static 50_000 (no usage record yet).
+    expect(throttle.reserve).toHaveBeenNthCalledWith(1, expect.any(String), 50_000);
+    expect(throttle.reserve).toHaveBeenNthCalledWith(2, expect.any(String), 50_000);
+    // Rescue pass uses lastIterationPromptTokens (250k) + 5k margin = 255_000.
+    // This is the load-bearing assertion — pre-v1.14.2 was hardcoded 50_000.
+    expect(throttle.reserve).toHaveBeenNthCalledWith(3, expect.any(String), 255_000);
+  });
 });
 
 describe('ask_agentic loop — sandbox integration', () => {
