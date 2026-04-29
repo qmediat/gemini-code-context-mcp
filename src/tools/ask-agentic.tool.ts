@@ -808,6 +808,30 @@ async function executeAskAgenticBody(
     // caller still gets a structured failure signal.
     emitter.emit(`maxIterations (${maxIterations}) reached — running forced-finalization pass`);
 
+    // Token-budget guard: the finalization pass is one extra `generateContent`
+    // roundtrip whose conservative input estimate is `PER_ITERATION_INPUT_TOKENS`.
+    // If that estimate would push `cumulativeInputTokens` past
+    // `maxTotalInputTokens`, skip the pass and fall through to the
+    // AGENTIC_MAX_ITERATIONS error — running it anyway would silently
+    // overshoot the operator's documented per-call token cap.
+    if (cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS > maxTotalInputTokens) {
+      logger.warn(
+        `ask_agentic: skipping forced-finalization pass — running it would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
+      );
+      return errorResult(
+        `ask_agentic: reached maxIterations (${maxIterations}) without a final answer; forced-finalization pass skipped to honour maxTotalInputTokens (${maxTotalInputTokens.toLocaleString()}). Increase maxTotalInputTokens or narrow your prompt.`,
+        {
+          errorCode: 'UNKNOWN',
+          retryable: false,
+          subReason: 'AGENTIC_MAX_ITERATIONS',
+          iterations,
+          cumulativeInputTokens,
+          cumulativeOutputTokens,
+          filesRead: filesReadSet.size,
+        },
+      );
+    }
+
     let finalizationText = '';
     let finalizationUsage = {
       promptTokenCount: 0,
@@ -956,6 +980,15 @@ async function executeAskAgenticBody(
       }
     }
 
+    // Token totals after the finalization pass. When the pass succeeded at
+    // the API level its tokens ARE billed even if `finalizationText` came
+    // back empty, so both branches below report the post-pass totals — this
+    // closes the structured-telemetry drift where the empty-text fallback
+    // previously under-reported real usage.
+    const totalCumulativeInputTokens = cumulativeInputTokens + finalizationUsage.promptTokenCount;
+    const totalCumulativeOutputTokens =
+      cumulativeOutputTokens + finalizationUsage.candidatesTokenCount;
+
     if (finalizationText.length > 0) {
       return textResult(finalizationText, {
         resolvedModel: resolved.resolved,
@@ -964,14 +997,17 @@ async function executeAskAgenticBody(
         modelCategory: resolved.category,
         contextWindow: resolved.inputTokenLimit,
         iterations,
-        cumulativeInputTokens: cumulativeInputTokens + finalizationUsage.promptTokenCount,
-        cumulativeOutputTokens: cumulativeOutputTokens + finalizationUsage.candidatesTokenCount,
+        cumulativeInputTokens: totalCumulativeInputTokens,
+        cumulativeOutputTokens: totalCumulativeOutputTokens,
         cumulativeThinkingTokens: cumulativeThinkingTokens + finalizationUsage.thoughtsTokenCount,
         filesRead: filesReadSet.size,
         filesReadList: [...filesReadSet].slice(0, 40),
         durationMs: Date.now() - started,
         thinkingSummary: finalizationThinkingSummary,
         convergenceForced: true,
+        // Mirror the organic-final-text path (line ~754) so callers can
+        // detect when the pass pushed cumulative tokens past the cap.
+        overBudget: totalCumulativeInputTokens > maxTotalInputTokens,
       });
     }
 
@@ -982,8 +1018,8 @@ async function executeAskAgenticBody(
         retryable: false,
         subReason: 'AGENTIC_MAX_ITERATIONS',
         iterations,
-        cumulativeInputTokens,
-        cumulativeOutputTokens,
+        cumulativeInputTokens: totalCumulativeInputTokens,
+        cumulativeOutputTokens: totalCumulativeOutputTokens,
         filesRead: filesReadSet.size,
       },
     );

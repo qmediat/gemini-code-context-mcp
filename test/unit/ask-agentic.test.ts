@@ -457,20 +457,47 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // mechanism that prohibits more function calls and forces text.
     expect(generateContent).toHaveBeenCalledTimes(3);
     const finalizationCallArg = generateContent.mock.calls[2]?.[0] as {
+      contents?: Array<{ role?: string; parts?: unknown[] }>;
       config?: { toolConfig?: { functionCallingConfig?: { mode?: string } } };
     };
     expect(finalizationCallArg?.config?.toolConfig?.functionCallingConfig?.mode).toBe('NONE');
+
+    // Conversation-shape pin: the post-loop finalization passes the
+    // accumulated `conversation` verbatim. After every non-final iteration,
+    // `runAgenticIteration` pushes a `[model fc, user functionResponse]`
+    // pair onto the conversation, so the array MUST end with a `user` turn
+    // when the loop exhausts maxIterations. A trailing `model` turn would
+    // violate Gemini's role-alternation contract and 400 the call. (Round-1
+    // Grok concern; empirically refuted in real-Gemini test but pinned
+    // here so a future regression to the conversation-mutation path is
+    // caught at unit-test time.)
+    const finalizationContents = finalizationCallArg?.contents ?? [];
+    expect(finalizationContents.length).toBeGreaterThan(0);
+    expect(finalizationContents[finalizationContents.length - 1]?.role).toBe('user');
   });
 
   it('falls through to AGENTIC_MAX_ITERATIONS error when finalization pass returns empty text', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
-    // 2 tool-call iters + finalization pass returning empty text.
+    // 2 tool-call iters (200 prompt tokens each) + finalization pass with
+    // 300 prompt tokens & empty text. Loop totals: 400 input. Pass adds 300,
+    // total 700 — telemetry on the errorResult MUST report the post-pass
+    // total so the operator sees the full billing footprint, not the
+    // pre-pass tokens (which previously under-reported usage by the pass's
+    // own input/output count).
     const { ctx, generateContent } = buildCtx({
       script: [
-        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
-        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
-        { text: '' },
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200,
+          candidatesTokenCount: 50,
+        },
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200,
+          candidatesTokenCount: 50,
+        },
+        { text: '', promptTokenCount: 300, candidatesTokenCount: 80 },
       ],
     });
     const result = await askAgenticTool.execute(
@@ -484,6 +511,44 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
     expect(generateContent).toHaveBeenCalledTimes(3); // finalization pass DID fire
+    // Telemetry MUST report POST-pass cumulative tokens — billed work
+    // doesn't disappear just because the pass returned empty text.
+    expect(result.structuredContent?.cumulativeInputTokens).toBe(700); // 200+200+300
+    expect(result.structuredContent?.cumulativeOutputTokens).toBe(180); // 50+50+80
+  });
+
+  it('skips finalization pass when running it would overshoot maxTotalInputTokens', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // Two iterations push cumulative input tokens to 100k. With
+    // PER_ITERATION_INPUT_TOKENS = 50k and maxTotalInputTokens = 120k, the
+    // finalization pass estimate (100k + 50k = 150k) overshoots the cap →
+    // skip the pass and emit the AGENTIC_MAX_ITERATIONS error directly. The
+    // pass MUST NOT fire and pre-pass cumulative tokens remain reported.
+    const { ctx, generateContent } = buildCtx({
+      script: [
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 50_000,
+        },
+        {
+          functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
+          promptTokenCount: 50_000,
+        },
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2, maxTotalInputTokens: 120_000 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(String(result.structuredContent?.responseText)).toContain('maxTotalInputTokens');
+    // Only 2 generateContent calls — finalization was skipped.
+    expect(generateContent).toHaveBeenCalledTimes(2);
+    // Pre-pass cumulative tokens preserved; no phantom finalization usage.
+    expect(result.structuredContent?.cumulativeInputTokens).toBe(100_000);
   });
 
   it('falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)', async () => {
