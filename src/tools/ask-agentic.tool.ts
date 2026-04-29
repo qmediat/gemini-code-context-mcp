@@ -38,7 +38,7 @@ import type {
   ThinkingConfig,
   ThinkingLevel,
 } from '@google/genai';
-import { Type as GeminiType } from '@google/genai';
+import { FunctionCallingConfigMode, Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -175,8 +175,29 @@ const SYSTEM_INSTRUCTION_AGENTIC = [
   '3. Open only the handful of files that actually bear on the question via `read_file`',
   'When you have enough context, respond with a plain-text answer and make NO further tool calls.',
   '',
+  '# DECISIVENESS',
+  "Be decisive. Once you have read the relevant files and gathered evidence, produce your final answer. Continuing to call tools when you already have an answer is a failure mode — it wastes the user's budget and delays the response.",
+  'When the user provides a complete diff inline, your primary task is reasoning ABOUT the diff. Read each touched file at most once unless a specific concern requires re-reading; do not recursively explore the project tree to verify what the diff already shows.',
+  'A focused investigation typically converges in 3–8 iterations. If you find yourself on iteration 10+ still calling tools, stop and synthesize what you know — state findings as Known / Unknown / Next checks rather than chasing completeness.',
+  '',
   '# OUTPUT',
   "Your final response (the one with no function calls) should directly answer the user's prompt. Cite specific `file:line` when referring to code. Be concrete; do not speculate beyond what you read.",
+].join('\n');
+
+/**
+ * Forced-finalization system instruction. Sent on the post-loop synthesis
+ * pass when the iteration budget is exhausted. Combined with
+ * `toolConfig.functionCallingConfig.mode = NONE`, the model is prohibited
+ * from emitting further function calls (per Gemini API spec, NONE mode is
+ * "equivalent to sending a request without any function declarations") and
+ * must answer with text using the conversation it has already accumulated.
+ */
+const SYSTEM_INSTRUCTION_FINALIZATION = [
+  'You are wrapping up an investigation. The conversation history above already contains the tool responses you have gathered.',
+  'Your iteration budget is now exhausted. You CANNOT call any more tools — function calling is disabled for this turn.',
+  'Synthesize the evidence you already have into a final answer in the format the user originally requested.',
+  'If some details remain unverified, state them honestly under "Unknown" rather than refusing to answer. Cite specific `file:line` for the claims you can support.',
+  'Do not apologise for the budget exhaustion; just produce the best answer the gathered evidence supports.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -772,6 +793,186 @@ async function executeAskAgenticBody(
           );
         }
       }
+    }
+
+    // Loop exhausted maxIterations without an organic final-text turn.
+    // Run a single forced-finalization pass — `generateContent` with
+    // `toolConfig.functionCallingConfig.mode = NONE` so the model is
+    // prohibited from emitting more function calls (Gemini API spec: NONE
+    // = "equivalent to sending a request without any function declarations")
+    // and must answer in text using the conversation it has already
+    // accumulated. Converts what was previously an opaque error into a
+    // synthesized text answer derived from the tool responses gathered so
+    // far. If the forced call itself fails (timeout, network, budget
+    // exhausted, empty text), fall through to the original error so the
+    // caller still gets a structured failure signal.
+    emitter.emit(`maxIterations (${maxIterations}) reached — running forced-finalization pass`);
+
+    let finalizationText = '';
+    let finalizationUsage = {
+      promptTokenCount: 0,
+      candidatesTokenCount: 0,
+      thoughtsTokenCount: 0,
+    };
+    let finalizationThinkingSummary: string | null = null;
+    let finalizationReservationId: number | null = null;
+
+    if (dailyBudgetEnforced) {
+      const reserve = ctx.manifest.reserveBudget({
+        workspaceRoot,
+        toolName: 'ask_agentic',
+        model: resolved.resolved,
+        estimatedCostMicros: toMicrosUsd(perIterationCostUsd),
+        dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
+        nowMs: Date.now(),
+      });
+      if ('rejected' in reserve) {
+        logger.warn(
+          `ask_agentic: skipping forced-finalization pass — daily budget cap reached (spent $${(
+            reserve.spentMicros / 1_000_000
+          ).toFixed(4)})`,
+        );
+      } else {
+        finalizationReservationId = reserve.id;
+      }
+    }
+
+    if (finalizationReservationId !== null || !dailyBudgetEnforced) {
+      const finalizationTimeout = createTimeoutController({
+        ...(input.iterationTimeoutMs !== undefined ? { totalMs: input.iterationTimeoutMs } : {}),
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
+        stallEnvVar: '',
+      });
+      let finalizationThrottleId = -1;
+      const finalizationStarted = Date.now();
+      try {
+        if (tpmEnforced) {
+          const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
+          finalizationThrottleId = reservation.releaseId;
+          if (reservation.delayMs > 0) {
+            emitter.emit(
+              `finalization throttle: waiting ${Math.ceil(
+                reservation.delayMs / 1000,
+              )}s for TPM window…`,
+            );
+            await abortableSleep(reservation.delayMs, finalizationTimeout.signal);
+          }
+        }
+
+        const response = await withNetworkRetry(
+          () =>
+            ctx.client.models.generateContent({
+              model: resolved.resolved,
+              contents: conversation,
+              config: {
+                ...baseConfig,
+                systemInstruction: SYSTEM_INSTRUCTION_FINALIZATION,
+                toolConfig: {
+                  functionCallingConfig: { mode: FunctionCallingConfigMode.NONE },
+                },
+                abortSignal: finalizationTimeout.signal,
+              },
+            }),
+          {
+            signal: finalizationTimeout.signal,
+            onRetry: (attempt, retryErr) => {
+              logger.warn(
+                `ask_agentic finalization: retry attempt ${attempt}: ${
+                  retryErr instanceof Error ? retryErr.message : String(retryErr)
+                }`,
+              );
+            },
+          },
+        );
+
+        const usage = response.usageMetadata;
+        finalizationUsage = {
+          promptTokenCount:
+            typeof usage?.promptTokenCount === 'number' ? usage.promptTokenCount : 0,
+          candidatesTokenCount:
+            typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0,
+          thoughtsTokenCount:
+            typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0,
+        };
+        const parts = response.candidates?.[0]?.content?.parts ?? [];
+        finalizationText = (response.text ?? parts.map((p) => p.text ?? '').join('')).trim();
+        const thoughtTexts = parts
+          .filter((p) => p.thought === true && typeof p.text === 'string')
+          .map((p) => p.text as string);
+        finalizationThinkingSummary =
+          thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
+
+        if (finalizationReservationId !== null) {
+          const actualCost = estimateCostUsd({
+            model: resolved.resolved,
+            uncachedInputTokens: finalizationUsage.promptTokenCount,
+            cachedInputTokens: 0,
+            outputTokens: finalizationUsage.candidatesTokenCount,
+            thinkingTokens: finalizationUsage.thoughtsTokenCount,
+          });
+          try {
+            ctx.manifest.finalizeBudgetReservation(finalizationReservationId, {
+              cachedTokens: 0,
+              uncachedTokens: finalizationUsage.promptTokenCount,
+              costUsdMicro: toMicrosUsd(actualCost),
+              durationMs: Date.now() - finalizationStarted,
+            });
+          } catch (finalizeErr) {
+            logger.error(
+              `ask_agentic finalization: finalize reservation failed: ${safeForLog(finalizeErr)}`,
+            );
+          }
+        }
+        if (finalizationThrottleId !== -1) {
+          ctx.throttle.release(finalizationThrottleId, finalizationUsage.promptTokenCount);
+        }
+      } catch (finalErr) {
+        if (finalizationReservationId !== null) {
+          try {
+            ctx.manifest.cancelBudgetReservation(finalizationReservationId);
+          } catch (cancelErr) {
+            logger.error(
+              `ask_agentic finalization: cancelBudgetReservation failed: ${safeForLog(cancelErr)}`,
+            );
+          }
+        }
+        if (finalizationThrottleId !== -1) {
+          ctx.throttle.cancel(finalizationThrottleId);
+        }
+        // Best-effort: log and fall through to errorResult. The caller
+        // already burned the iteration budget and deserves a structured
+        // failure rather than a re-thrown SDK error.
+        if (isTimeoutAbort(finalErr)) {
+          logger.warn('ask_agentic finalization: timed out after maxIterations exhaustion');
+        } else {
+          logger.warn(
+            `ask_agentic finalization: pass failed: ${
+              finalErr instanceof Error ? finalErr.message : String(finalErr)
+            }`,
+          );
+        }
+      } finally {
+        finalizationTimeout.dispose();
+      }
+    }
+
+    if (finalizationText.length > 0) {
+      return textResult(finalizationText, {
+        resolvedModel: resolved.resolved,
+        requestedModel: resolved.requested,
+        fallbackApplied: resolved.fallbackApplied,
+        modelCategory: resolved.category,
+        contextWindow: resolved.inputTokenLimit,
+        iterations,
+        cumulativeInputTokens: cumulativeInputTokens + finalizationUsage.promptTokenCount,
+        cumulativeOutputTokens: cumulativeOutputTokens + finalizationUsage.candidatesTokenCount,
+        cumulativeThinkingTokens: cumulativeThinkingTokens + finalizationUsage.thoughtsTokenCount,
+        filesRead: filesReadSet.size,
+        filesReadList: [...filesReadSet].slice(0, 40),
+        durationMs: Date.now() - started,
+        thinkingSummary: finalizationThinkingSummary,
+        convergenceForced: true,
+      });
     }
 
     return errorResult(

@@ -5,6 +5,40 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.1] - 2026-04-29
+
+### Fixed — `ask_agentic` convergence on bounded code-review tasks
+
+`ask_agentic` could exhaust `maxIterations` (default 20) without producing a final-text response when the model kept making unique tool calls — most reproducibly on diff-bounded code-review tasks where the model would re-verify rather than synthesize. The loop's existing safeguards (`NO_PROGRESS_CALL_THRESHOLD = 3` signature dedupe, cumulative input-token budget) only catch repetition or runaway cost — they don't fire when the model genuinely explores without converging. Result: a 5–10 minute wall-clock failure with `errorCode: 'AGENTIC_MAX_ITERATIONS'` and no answer, even though the model had read enough to answer.
+
+- **Forced-finalization pass on `maxIterations` exhaustion.** When the loop exits without an organic final-text turn, the server now runs one extra `generateContent` with `toolConfig.functionCallingConfig.mode = NONE`. Per [Gemini API spec](https://ai.google.dev/gemini-api/docs/function-calling), `NONE` mode is "equivalent to sending a request without any function declarations" — the model is prohibited from emitting more function calls and must answer in text using the conversation it has already accumulated. The synthesized answer is returned as a successful `textResult` with `structuredContent.convergenceForced = true`, so callers can distinguish a force-synthesised answer from an organically-produced one.
+- **Belt-and-braces fallbacks** on the finalization pass: empty text, network failure, per-iteration timeout, and budget-cap rejection all fall through to the original `errorResult` so the caller still gets a structured failure signal rather than a re-thrown SDK exception. The pass uses the same per-iteration budget reservation, TPM throttle reservation, and `iterationTimeoutMs` as a normal loop iteration — no silent budget bypass.
+- **System-instruction tightening.** `SYSTEM_INSTRUCTION_AGENTIC` gains a `# DECISIVENESS` section: when the user supplies a complete diff inline, prioritise reasoning over re-verification (read each touched file at most once); a focused investigation typically converges in 3–8 iterations; on iteration 10+ still calling tools, state findings as Known / Unknown / Next checks rather than chasing completeness. The new `SYSTEM_INSTRUCTION_FINALIZATION` is sent only on the post-loop synthesis pass and instructs the model to consolidate gathered evidence into the user's requested format without apologising for the budget exhaustion.
+
+### Behavioural impact
+
+- **Diff-bounded code review with default `maxIterations=20`:** previously failed at 5–10 min wall-clock with `AGENTIC_MAX_ITERATIONS`. Now returns a synthesized text answer at the same wall-clock budget (the finalization pass adds ~30–60 s on top of the already-spent loop iterations), with `convergenceForced: true` flagged in `structuredContent`.
+- **Existing happy paths unchanged.** Focused agentic calls that converge in 2–8 iterations skip the finalization pass entirely — they exit the loop on organic final text exactly as before. The forced pass only fires when the iteration budget is exhausted without convergence.
+- **Cost.** The forced pass is one extra `generateContent` call (typically ~$0.4–0.8 at Gemini Pro pricing for a workspace-prefixed conversation). Operators with `dailyBudgetUsd` set who hit the cap mid-loop will see the pass skipped (logged), and the original error returned.
+
+### Coverage
+
+5 new tests in `test/unit/ask-agentic.test.ts`:
+
+- `returns synthesized text via finalization pass when loop exhausts maxIterations` — pins the happy path: tool-call iters consume budget, finalization pass returns text with `convergenceForced: true`, and the 3rd `generateContent` call has `toolConfig.functionCallingConfig.mode = 'NONE'`.
+- `falls through to AGENTIC_MAX_ITERATIONS error when finalization pass returns empty text` — empty-text fallback preserves the original structured failure shape.
+- `falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)` — pre-response network failures don't escape; caller still gets `errorCode: 'UNKNOWN'`.
+- `skips finalization pass when daily budget is exhausted` — third `reserveBudget` rejection is honoured; the pass does not execute and only 2 `generateContent` calls are observed.
+- `preserves baseConfig (tools, thinking) on finalization call alongside NONE override` — verifies that `tools[]`, `thinkingConfig`, and the focused `systemInstruction` are all set on the finalization call.
+
+Total suite: 718 passed | 9 skipped (was 713 | 9 in v1.14.0; +5 net new tests). Lint, typecheck, build all green.
+
+### Notes
+
+- Patch-level release. Behaviour change is observable only on calls that previously failed with `AGENTIC_MAX_ITERATIONS` — those now succeed with a force-synthesised answer instead of a structured error. No schema changes.
+- The synthesis is best-effort: the model answers from whatever evidence it gathered before exhaustion. Operators who need guaranteed full investigation can raise `maxIterations` (max 50) or narrow the prompt; operators who want to detect force-synthesised answers can branch on `structuredContent.convergenceForced`.
+- Empirical reproduction: the v1.14.0 self-review prompt that previously triggered the failure on three independent server builds now returns successfully in ~7m 50s wall-clock with `convergenceForced: true` and a populated `responseText`.
+
 ## [1.14.0] - 2026-04-28
 
 ### Changed — `cachingMode` default flipped to `'implicit'`
