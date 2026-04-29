@@ -100,7 +100,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. The total `generateContent` count for the call is therefore `iterations + (convergenceForced ? 1 : 0)`, exposed as `structuredContent.apiCalls`. The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `maxTotalInputTokens` (skipped when overshooting), `dailyBudgetUsd` (skipped when reservation rejected), and `iterationTimeoutMs`.',
+        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `maxTotalInputTokens` (skipped when overshooting), `dailyBudgetUsd` (skipped when reservation rejected), and `iterationTimeoutMs`.',
       ),
     maxTotalInputTokens: z
       .number()
@@ -865,6 +865,13 @@ async function executeAskAgenticBody(
     };
     let finalizationThinkingSummary: string | null = null;
     let finalizationReservationId: number | null = null;
+    // Tracks whether the finalization `generateContent` call was actually
+    // dispatched (regardless of outcome). Used by `apiCalls` accounting so
+    // mid-flight timeouts / pre-response network failures still count the
+    // attempt — `finalizationUsage.promptTokenCount` would stay at 0 in those
+    // cases (response never arrived to populate usageMetadata) and
+    // inferring "fired" from usage would undercount the API call.
+    let finalizationAttempted = false;
 
     if (dailyBudgetEnforced) {
       const reserve = ctx.manifest.reserveBudget({
@@ -914,13 +921,25 @@ async function executeAskAgenticBody(
           }
         }
 
+        // G2 fix: omit `tools` (function declarations) from the finalization
+        // call. Per Gemini API spec, `mode: NONE` is "equivalent to sending
+        // a request without any function declarations" — sending the
+        // declarations alongside NONE wastes ~150-300 input tokens and
+        // contradicts the spec we depend on. The destructure below is the
+        // TS-safe way to OMIT a property from the spread (assignment to
+        // `undefined` trips `exactOptionalPropertyTypes`).
+        const { tools: _unusedTools, ...baseConfigNoTools } = baseConfig;
+        // Mark the API attempt BEFORE dispatch so timeouts / pre-response
+        // network failures still count toward `apiCalls`. Set inside the try
+        // (after throttle wait) so a throttle-wait abort doesn't mis-count.
+        finalizationAttempted = true;
         const response = await withNetworkRetry(
           () =>
             ctx.client.models.generateContent({
               model: resolved.resolved,
               contents: conversation,
               config: {
-                ...baseConfig,
+                ...baseConfigNoTools,
                 systemInstruction: SYSTEM_INSTRUCTION_FINALIZATION,
                 toolConfig: {
                   functionCallingConfig: { mode: FunctionCallingConfigMode.NONE },
@@ -1019,15 +1038,17 @@ async function executeAskAgenticBody(
     const totalCumulativeInputTokens = cumulativeInputTokens + finalizationUsage.promptTokenCount;
     const totalCumulativeOutputTokens =
       cumulativeOutputTokens + finalizationUsage.candidatesTokenCount;
-    // `apiCalls` = total generateContent calls. The finalization pass only
-    // actually fires `generateContent` when `finalizationUsage.promptTokenCount`
-    // is non-zero (set by extracting usageMetadata from a real API response).
-    // Skipped paths (daily-budget reject, token-cap overshoot) leave the usage
-    // counters at zero, so the field correctly reports `iterations` only for
-    // those. Operators can branch on `apiCalls > iterations` to detect the
-    // forced pass without parsing `convergenceForced`.
-    const finalizationFired = finalizationUsage.promptTokenCount > 0;
-    const apiCalls = iterations + (finalizationFired ? 1 : 0);
+    // `apiCalls` = total generateContent calls. Track from the explicit
+    // `finalizationAttempted` flag (set IMMEDIATELY BEFORE the
+    // `await withNetworkRetry(...)` dispatch) rather than inferring from
+    // `finalizationUsage.promptTokenCount > 0` — timeouts and pre-response
+    // network failures leave usageMetadata empty even though the API attempt
+    // happened (and may have been billed server-side). Skipped paths
+    // (daily-budget reject, token-cap overshoot) leave `finalizationAttempted`
+    // false so they correctly report `apiCalls = iterations`. Operators can
+    // branch on `apiCalls > iterations` to detect the forced pass without
+    // parsing `convergenceForced`. (Round-4 Copilot fix.)
+    const apiCalls = iterations + (finalizationAttempted ? 1 : 0);
 
     if (finalizationText.length > 0) {
       return textResult(finalizationText, {

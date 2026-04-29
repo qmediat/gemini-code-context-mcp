@@ -587,6 +587,14 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
     expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    // G1 fix: pre-response failures (timeout, network) MUST still count
+    // toward `apiCalls`. The HTTP 500 mock fails before usageMetadata
+    // arrives, so `finalizationUsage.promptTokenCount` stays 0. Pre-fix the
+    // inference `apiCalls = iterations + (promptTokenCount > 0 ? 1 : 0)`
+    // undercounted (reported 2). Post-fix uses explicit
+    // `finalizationAttempted` flag set BEFORE dispatch — so apiCalls = 3
+    // (2 loop iters + 1 attempted finalization, even though it failed).
+    expect(result.structuredContent?.apiCalls).toBe(3);
   });
 
   it('skips finalization pass when daily budget is exhausted', async () => {
@@ -617,7 +625,7 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(generateContent).toHaveBeenCalledTimes(2);
   });
 
-  it('preserves baseConfig (tools, thinking) on finalization call alongside NONE override', async () => {
+  it('finalization call: NONE mode + thinkingConfig preserved + tools omitted (G2 fix)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
     const { ctx, generateContent } = buildCtx({
@@ -631,8 +639,17 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
       ctx,
     );
 
-    // Finalization is the 2nd call; verify both NONE override AND that
-    // tools[] / thinkingConfig from baseConfig are preserved.
+    // Finalization is the 2nd call. Verify:
+    //   1. NONE override is set
+    //   2. thinkingConfig is preserved from baseConfig (still useful — model
+    //      can think while synthesizing)
+    //   3. systemInstruction is replaced with finalization-focused version
+    //   4. tools[] is OMITTED (G2 fix). Per Gemini API spec, NONE mode is
+    //      "equivalent to sending a request without any function declarations"
+    //      — sending tools[] alongside NONE wastes tokens (~150-300 input
+    //      tokens for the 4 declared functions) and contradicts the spec.
+    //      `tools: undefined` in the finalization config explicitly overrides
+    //      the inherited `tools` from `...baseConfig` spread.
     const finalConfig = generateContent.mock.calls[1]?.[0] as {
       config?: {
         toolConfig?: { functionCallingConfig?: { mode?: string } };
@@ -642,13 +659,14 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
       };
     };
     expect(finalConfig?.config?.toolConfig?.functionCallingConfig?.mode).toBe('NONE');
-    expect(Array.isArray(finalConfig?.config?.tools)).toBe(true);
     expect(finalConfig?.config?.thinkingConfig?.thinkingLevel).toBe('HIGH');
-    // systemInstruction MUST be replaced with the finalization-focused
-    // version, not the regular agentic one.
     expect(String(finalConfig?.config?.systemInstruction)).toContain(
       'iteration budget is now exhausted',
     );
+    // G2 fix: tools[] MUST be undefined on finalization call. Pre-fix it was
+    // preserved via `...baseConfig` spread (tested as `Array.isArray(...) === true`)
+    // — that behavior wasted prompt tokens and contradicted the NONE-mode spec.
+    expect(finalConfig?.config?.tools).toBeUndefined();
   });
 });
 
