@@ -580,6 +580,97 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(result.structuredContent?.iterations).toBe(2);
   });
 
+  it('finalization pass returns structured error when iterationTimeoutMs fires mid-flight (cleanup + AGENTIC_MAX_ITERATIONS) (Fix 2)', async () => {
+    // 4-reviewer agreement on today's 6-way benchmark (A1): the v1.14.1 test
+    // suite covered empty-text / network-failure / budget-skip / tools-omission
+    // paths but NOT the finalization-pass timeout/AbortSignal mid-flight path.
+    // A future refactor of the catch block at lines ~1050-1085 could silently
+    // break the cleanup contract — no test would catch it.
+    //
+    // This test pins:
+    //   - timeout fires DURING the rescue's generateContent (not before
+    //     dispatch and not after response)
+    //   - falls through to AGENTIC_MAX_ITERATIONS errorResult (NOT errorCode:
+    //     'TIMEOUT' — the rescue is best-effort; timeout is logged but
+    //     conversion to TIMEOUT is reserved for the iter-loop timeout path)
+    //   - apiCalls = iterations + 1 (finalizationAttempted=true is set BEFORE
+    //     withNetworkRetry, so a mid-flight abort still counts the dispatched
+    //     attempt — Gemini may bill server-side even on aborted-mid-flight
+    //     calls)
+    //   - convergenceForced is undefined (rescue did NOT produce a synthesised
+    //     answer)
+    //   - cancelBudgetReservation fires for the rescue's reservation
+    //   - throttle.cancel fires for the rescue's TPM reservation
+    //
+    // Real timers per the file-level fake-timer hazard guidance (top of file).
+    // iterationTimeoutMs=1000 + setup overhead → ~1.0–1.5s wall-clock per run;
+    // bounded by suite testTimeout=30s.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent, manifest, throttle } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+      tpmThrottleLimit: 80_000, // exercises throttle.cancel cleanup path
+      dailyBudgetUsd: 100, // exercises manifest.cancelBudgetReservation cleanup path
+    });
+    // 3rd generateContent (rescue) hangs until aborted via the test's
+    // iterationTimeoutMs signal. The SDK threads `abortSignal` into the config
+    // so we can drive abortion deterministically.
+    generateContent.mockImplementationOnce(
+      (req: { config?: { abortSignal?: AbortSignal } }) =>
+        new Promise((_resolve, reject) => {
+          const sig = req.config?.abortSignal;
+          if (!sig) {
+            reject(new Error('test invariant: abortSignal not threaded into rescue config'));
+            return;
+          }
+          if (sig.aborted) {
+            reject(sig.reason);
+            return;
+          }
+          sig.addEventListener('abort', () => reject(sig.reason));
+        }),
+    );
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2, iterationTimeoutMs: 1_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    // Rescue timed out → fall through to AGENTIC_MAX_ITERATIONS shape (NOT
+    // errorCode: 'TIMEOUT' — the iter-loop timeout path converts to TIMEOUT,
+    // but the rescue's best-effort catch logs and falls through).
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    // Rescue did NOT produce text — convergenceForced is reserved for
+    // successful rescue synthesis only.
+    expect(result.structuredContent?.convergenceForced).toBeUndefined();
+    // 2 loop iters + 1 attempted rescue = 3 generateContent calls counted.
+    // finalizationAttempted=true is set BEFORE withNetworkRetry, so a
+    // mid-flight abort still counts toward apiCalls.
+    expect(result.structuredContent?.apiCalls).toBe(3);
+    expect(generateContent).toHaveBeenCalledTimes(3);
+
+    // Cleanup contract: rescue's budget reservation cancelled (NOT finalised);
+    // rescue's TPM reservation cancelled (NOT released). The 2 successful
+    // loop iters' reservations went through finalize/release pre-rescue.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(2);
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(throttle.release).toHaveBeenCalledTimes(2); // 2 loop iters
+    expect(throttle.cancel).toHaveBeenCalledTimes(1); // 1 rescue cleanup
+
+    // Timing sanity: actually waited for the timer. Lower bound 950ms
+    // accommodates timer-precision jitter on slow CI workers; upper bound
+    // 5_000ms catches a runaway hang past the documented timeout budget.
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
+    expect(elapsedMs).toBeLessThan(5_000);
+  });
+
   it('falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
