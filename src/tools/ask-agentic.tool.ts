@@ -60,6 +60,7 @@ import {
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
 import { THINKING_LEVELS } from './shared/thinking.js';
+import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -691,6 +692,18 @@ async function executeAskAgenticBody(
         if (throttleReservationId !== -1) {
           ctx.throttle.cancel(throttleReservationId);
         }
+        // v1.14.2 Fix 4: extract Gemini's `retryInfo.retryDelay` from 429s and
+        // seed the throttle hint cache, mirroring `ask.tool.ts:~1063`. Pre-fix
+        // ask_agentic catch paths discarded the hint — TPM throttle relied on
+        // pure-window math which empirically over-estimates by 30s+ on real
+        // 429s. Gating on `isGemini429` (requires `err instanceof ApiError` +
+        // `err.status === 429`) is non-user-influenceable; only real Gemini
+        // 429s match. Future iterations / future `ask_agentic` callers honour
+        // the recorded hint via `throttle.reserve`'s `activeHint` lookup.
+        const iterRetryDelayMs = isGemini429(iterErr) ? parseRetryDelayMs(iterErr.message) : null;
+        if (iterRetryDelayMs !== null) {
+          ctx.throttle.recordRetryHint(resolved.resolved, iterRetryDelayMs);
+        }
         // If the iteration aborted on timeout, surface a structured TIMEOUT
         // error so the caller can distinguish "this iteration was too slow"
         // from "Gemini rejected the request". Annotate which iteration so
@@ -1059,6 +1072,15 @@ async function executeAskAgenticBody(
         }
         if (finalizationThrottleId !== -1) {
           ctx.throttle.cancel(finalizationThrottleId);
+        }
+        // v1.14.2 Fix 4: same retry-hint extraction as the per-iteration catch
+        // — the rescue's generateContent can also 429, and the hint should
+        // seed the throttle cache for future ask_agentic / ask / code calls.
+        const finalRetryDelayMs = isGemini429(finalErr)
+          ? parseRetryDelayMs(finalErr.message)
+          : null;
+        if (finalRetryDelayMs !== null) {
+          ctx.throttle.recordRetryHint(resolved.resolved, finalRetryDelayMs);
         }
         // Best-effort: log and fall through to errorResult. The caller
         // already burned the iteration budget and deserves a structured

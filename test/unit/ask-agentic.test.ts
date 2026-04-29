@@ -54,6 +54,7 @@
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ApiError } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { askAgenticTool } from '../../src/tools/ask-agentic.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -835,6 +836,60 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     const loopCost = loopReserveCall?.estimatedCostMicros ?? 0;
     const rescueCost = rescueReserveCall?.estimatedCostMicros ?? 0;
     expect(rescueCost).toBeGreaterThan(loopCost * 2);
+  });
+});
+
+describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () => {
+  it('per-iteration 429: extracts retryDelay from ApiError + seeds throttle hint', async () => {
+    // Pre-Fix-4 ask_agentic discarded 429 retry hints — TPM throttle relied on
+    // pure-window math which over-estimates by 30s+ on real 429s. Post-Fix-4
+    // mirrors `ask.tool.ts:~1063`: gate on `isGemini429` (requires
+    // `err instanceof ApiError` + status===429), parse `retryInfo.retryDelay`
+    // from the body, and `throttle.recordRetryHint(model, delayMs)` to seed
+    // the cache. Future ask_agentic / ask / code calls honour the hint via
+    // `throttle.reserve`'s `activeHint` lookup.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}',
+    });
+    const { ctx, throttle } = buildCtx({ script: [] });
+    // Override generateContent to throw the 429 on iter 1.
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    // Iter catch re-throws non-timeout errors, so the call ultimately errors
+    // out via the outer catch with errorCode='UNKNOWN'. The load-bearing
+    // assertion is that the retry hint WAS recorded BEFORE the re-throw.
+    expect(result.isError).toBe(true);
+    expect(throttle.recordRetryHint).toHaveBeenCalledTimes(1);
+    expect(throttle.recordRetryHint).toHaveBeenCalledWith(
+      expect.any(String), // resolved model id
+      7_000, // 7s converted to ms
+    );
+  });
+
+  it('non-429 ApiError (e.g. 500) does NOT seed retry hint (status-strict gate)', async () => {
+    // The `isGemini429` gate requires BOTH instanceof ApiError AND status===429.
+    // A real ApiError with a different status (500, 503) must NOT seed a hint
+    // even if its message contains a `retryDelay` decoy (which Google's
+    // server-side error bodies sometimes include for non-429 errors too).
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 500,
+      message: '{"error":{"code":500,"details":[{"retryDelay":"30s"}]}}',
+    });
+    const { ctx, throttle } = buildCtx({ script: [] });
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    expect(throttle.recordRetryHint).not.toHaveBeenCalled();
   });
 });
 
