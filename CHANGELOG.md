@@ -80,7 +80,7 @@ Total suite: 725 passed | 9 skipped (was 719 in v1.14.1; +6 net new tests; +1 ne
 
 ### Empirical reproduction
 
-- The original benchmark prompt that failed v1.14.1 with `AGENTIC_INPUT_BUDGET_EXCEEDED` after 18 iters now completes successfully under v1.14.2 with `convergenceForced: true` flagged in `structuredContent`. Wall-clock ~10-15 minutes for the full agentic loop on the 119-file workspace; the rescue pass adds ~30-90 s on top of the loop iterations. Captured in `/tmp/bench-2026-04-29/v1.14.2-rerun.md` (gitignored — operator-local). Detailed /6step write-up of every benchmark finding + verdict is at `.claude/local-v1.14.2-6step.md` (gitignored).
+- The original benchmark prompt that failed v1.14.1 with `AGENTIC_INPUT_BUDGET_EXCEEDED` after 18 iters now completes successfully under v1.14.2 with `convergenceForced: true` flagged in `structuredContent`. Wall-clock ~10-15 minutes for the full agentic loop on the 119-file workspace; the rescue pass adds ~30-90 s on top of the loop iterations. The rewritten test `allows finalization pass to run even when it would push past maxTotalInputTokens (v1.14.2 rescue unblock)` in `test/unit/ask-agentic.test.ts` pins the equivalent contract at unit-test scale.
 
 ### Migration
 
@@ -277,7 +277,7 @@ A second `/coderev` pass on the round-2 fix delta (HEAD~2..HEAD), plus Copilot's
 
 ### Round-3 verification polish (post-adversarial /6step)
 
-After landing the round-3 HIGH fix, an adversarial /6step verification pass (workspace `/tmp/coderev/20260428-140123-51773/round3-verify-sixstep.md`) explicitly counter-cased BOTH leak directions on 13 plausible gaps in the round-3 fix. All 12 correctness gaps verified clean by an empirical `better-sqlite3` probe — confirming SQLite CASE-clause OLD/NEW semantics, end-to-end Scenario B closure (cross-file leak via shared content_hash), WAL snapshot isolation across concurrent connections, and `findFileRowByHash`'s correctness under the post-fix manifest state. The fix is empirically complete.
+After landing the round-3 HIGH fix, an adversarial /6step verification pass explicitly counter-cased BOTH leak directions on 13 plausible gaps in the round-3 fix. All 12 correctness gaps verified clean by an empirical `better-sqlite3` probe — confirming SQLite CASE-clause OLD/NEW semantics, end-to-end Scenario B closure (cross-file leak via shared content_hash), WAL snapshot isolation across concurrent connections, and `findFileRowByHash`'s correctness under the post-fix manifest state. The fix is empirically complete.
 
 Three defense-in-depth polish items applied:
 
