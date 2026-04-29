@@ -881,12 +881,35 @@ async function executeAskAgenticBody(
     // inferring "fired" from usage would undercount the API call.
     let finalizationAttempted = false;
 
+    // v1.14.2: dynamic estimate for the rescue pass — replaces the static
+    // `PER_ITERATION_INPUT_TOKENS = 50_000` baseline with the actual size of
+    // the last observed iteration (+5k margin for SYSTEM_INSTRUCTION_FINALIZATION
+    // + thinking-config overhead). Used by BOTH the daily-budget reservation
+    // (immediately below) AND the TPM-throttle reservation (line ~919) so cost
+    // and rate-limit gates stay symmetric — pre-Fix-6.1 only the TPM reserve was
+    // dynamic, leaving the daily-budget gate to under-estimate rescue cost
+    // (broke the documented "daily budget is a true upper bound" guarantee).
+    // Fallback to the static estimate when the loop produced no usage record
+    // (defensive — in practice rescue is gated on `iterations >= maxIterations`
+    // so iter 1+ ran and lastIterationPromptTokens was populated).
+    const finalizationEstimate =
+      lastIterationPromptTokens > 0
+        ? lastIterationPromptTokens + 5_000
+        : PER_ITERATION_INPUT_TOKENS;
+    const finalizationCostUsd = estimateCostUsd({
+      model: resolved.resolved,
+      uncachedInputTokens: finalizationEstimate,
+      cachedInputTokens: 0,
+      outputTokens: PER_ITERATION_OUTPUT_TOKENS,
+      thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
+    });
+
     if (dailyBudgetEnforced) {
       const reserve = ctx.manifest.reserveBudget({
         workspaceRoot,
         toolName: 'ask_agentic',
         model: resolved.resolved,
-        estimatedCostMicros: toMicrosUsd(perIterationCostUsd),
+        estimatedCostMicros: toMicrosUsd(finalizationCostUsd),
         dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
         nowMs: Date.now(),
       });
@@ -917,22 +940,12 @@ async function executeAskAgenticBody(
       const finalizationStarted = Date.now();
       try {
         if (tpmEnforced) {
-          // v1.14.2: use the actual size of the LAST observed iteration as the
-          // TPM-reservation estimate for the rescue pass. The rescue replays
-          // the entire accumulated conversation, which on a 20-iter loop with
-          // file reads can reach 200-300k tokens — the static
-          // `PER_ITERATION_INPUT_TOKENS = 50_000` constant under-reserved by
-          // 4-6× and risked TPM 429s on real workloads. The +5k margin covers
-          // `SYSTEM_INSTRUCTION_FINALIZATION` (~200 tok) + thinking overhead.
-          // Falls back to the static estimate if the loop never produced a
-          // usage record (defensive — in practice the rescue is gated on
-          // iterations >= maxIterations so iter 1+ ran). TPM over-reserve =
-          // transient throttle wait (harmless); under-reserve = 429 risk; bias
-          // is intentional.
-          const finalizationEstimate =
-            lastIterationPromptTokens > 0
-              ? lastIterationPromptTokens + 5_000
-              : PER_ITERATION_INPUT_TOKENS;
+          // v1.14.2: use the dynamic `finalizationEstimate` (computed above the
+          // daily-budget reserve block — same value, same +5k margin rationale)
+          // for the TPM-throttle reservation. Symmetric with the daily-budget
+          // reserve so rate-limit and cost gates use the SAME size estimate for
+          // the rescue pass. TPM over-reserve = transient throttle wait
+          // (harmless); under-reserve = 429 risk; bias is intentional.
           const reservation = ctx.throttle.reserve(resolved.resolved, finalizationEstimate);
           finalizationThrottleId = reservation.releaseId;
           if (reservation.delayMs > 0) {

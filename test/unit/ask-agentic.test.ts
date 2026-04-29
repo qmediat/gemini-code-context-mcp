@@ -737,6 +737,62 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // This is the load-bearing assertion — pre-v1.14.2 was hardcoded 50_000.
     expect(throttle.reserve).toHaveBeenNthCalledWith(3, expect.any(String), 255_000);
   });
+
+  it('finalization pass daily-budget reserve uses dynamic cost estimate (Fix 6.1 — symmetric with TPM reserve)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // Pre-Fix-6.1: rescue's `reserveBudget` used `perIterationCostUsd` (computed
+    // from the static `PER_ITERATION_INPUT_TOKENS = 50_000` baseline), while the
+    // TPM reserve was already updated to use the dynamic
+    // `lastIterationPromptTokens + 5_000` estimate. Asymmetric — rescue would
+    // under-estimate cost against the daily-budget cap, breaking the documented
+    // "daily budget is a true upper bound" guarantee. Operators who set
+    // `dailyBudgetUsd` near their actual spend could see the rescue silently
+    // exceed the cap.
+    //
+    // Post-Fix-6.1: BOTH reservations use the dynamic estimate. This test pins
+    // that the daily-budget reserve passes a cost computed from the dynamic
+    // estimate (255k input tokens), not the static 50k.
+    const { ctx, manifest } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }], promptTokenCount: 200_000 },
+        {
+          functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
+          promptTokenCount: 250_000,
+        },
+        { text: 'Synthesised answer.' },
+      ],
+      dailyBudgetUsd: 100, // exercises dailyBudgetEnforced=true gate
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+
+    // 3 reserveBudget calls total: 2 loop iters + 1 rescue. The third is the
+    // load-bearing assertion — its estimatedCostMicros must reflect the
+    // dynamic 255k token estimate, NOT the static 50k baseline.
+    expect(manifest.reserveBudget).toHaveBeenCalledTimes(3);
+    const rescueReserveCall = manifest.reserveBudget.mock.calls[2]?.[0] as
+      | { estimatedCostMicros?: number }
+      | undefined;
+    const loopReserveCall = manifest.reserveBudget.mock.calls[0]?.[0] as
+      | { estimatedCostMicros?: number }
+      | undefined;
+    expect(rescueReserveCall?.estimatedCostMicros).toBeDefined();
+    expect(loopReserveCall?.estimatedCostMicros).toBeDefined();
+    // Rescue cost must be substantially higher than the loop's per-iter cost
+    // (255k vs 50k input tokens — 5.1× the input, but total cost ratio is
+    // smaller because output + thinking-token components stay the same in both
+    // calls). Asserting >2× is a soft-but-load-bearing check: catches a
+    // regression to the static `perIterationCostUsd` baseline (which would make
+    // the two costs IDENTICAL → ratio = 1×) without pinning the exact pricing
+    // math (cost.ts is a separate module that may re-tune token rates).
+    const loopCost = loopReserveCall?.estimatedCostMicros ?? 0;
+    const rescueCost = rescueReserveCall?.estimatedCostMicros ?? 0;
+    expect(rescueCost).toBeGreaterThan(loopCost * 2);
+  });
 });
 
 describe('ask_agentic loop — sandbox integration', () => {
