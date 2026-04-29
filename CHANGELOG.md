@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `falls through to AGENTIC_MAX_ITERATIONS error when finalization pass returns empty text` — empty-text fallback preserves the original structured failure shape (`errorCode: 'UNKNOWN'` + `subReason: 'AGENTIC_MAX_ITERATIONS'`).
 - `falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)` — pre-response network failures don't escape; caller still gets `errorCode: 'UNKNOWN'` + `subReason: 'AGENTIC_MAX_ITERATIONS'`.
 - `skips finalization pass when daily budget is exhausted` — third `reserveBudget` rejection is honoured; the pass does not execute and only 2 `generateContent` calls are observed.
-- `preserves baseConfig (tools, thinking) on finalization call alongside NONE override` — verifies that `tools[]`, `thinkingConfig`, and the focused `systemInstruction` are all set on the finalization call.
+- `finalization call: NONE mode + thinkingConfig preserved + tools omitted` — verifies that `tools` is omitted (`undefined`) on the finalization call, while `thinkingConfig` and the focused `systemInstruction` remain set. Per Gemini API spec, `mode: NONE` is "equivalent to sending a request without any function declarations" — sending tool declarations alongside NONE wastes ~150-300 input tokens, so the finalization config explicitly omits them.
 
 Total suite: 718 passed | 9 skipped (was 713 | 9 in v1.14.0; +5 net new tests). Lint, typecheck, build all green.
 

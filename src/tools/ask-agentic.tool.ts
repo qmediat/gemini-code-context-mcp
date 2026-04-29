@@ -595,11 +595,13 @@ async function executeAskAgenticBody(
               errorCode: 'BUDGET_REJECT',
               retryable: false,
               iterations,
-              // Pre-dispatch reject: this iteration's `generateContent` never
-              // fired. The reported total is approximate (off by 1 vs strict
-              // billable count) but matches the contract used elsewhere —
-              // `apiCalls` tracks loop iterations as a cost-bound proxy.
-              apiCalls: iterations,
+              // BUDGET_REJECT is pre-dispatch — `iterations` was incremented
+              // at the top of the loop body, but this iteration's
+              // `generateContent` never fired. Subtract 1 to match the
+              // schema contract that `apiCalls` is the AUTHORITATIVE total
+              // generateContent count. `Math.max(0, ...)` guards the
+              // first-iteration-rejection edge (iter 1 + reject → 0 calls).
+              apiCalls: Math.max(0, iterations - 1),
               cumulativeInputTokens,
             },
           );
@@ -634,6 +636,13 @@ async function executeAskAgenticBody(
       let throttleReservationId = -1;
       let iterResult: Awaited<ReturnType<typeof runAgenticIteration>>;
       const iterStarted = Date.now();
+      // H2 fix: track whether this iteration's `generateContent` was
+      // actually dispatched. The iter timeout can fire DURING `abortableSleep`
+      // (TPM throttle wait, BEFORE runAgenticIteration is called) — in that
+      // case no API call happened for this iter and `apiCalls` must subtract
+      // it. Set true immediately before runAgenticIteration so any throw
+      // after that point counts the dispatched call.
+      let iterDispatched = false;
       try {
         if (tpmEnforced) {
           const reservation = ctx.throttle.reserve(resolved.resolved, PER_ITERATION_INPUT_TOKENS);
@@ -646,6 +655,10 @@ async function executeAskAgenticBody(
             await abortableSleep(reservation.delayMs, iterTimeout.signal);
           }
         }
+        // H2: about to dispatch generateContent. Any throw past this point
+        // counts the iter as having made an API call (Gemini may bill
+        // server-side even on aborted-mid-flight calls).
+        iterDispatched = true;
         iterResult = await runAgenticIteration({
           ctx,
           resolvedModel: resolved.resolved,
@@ -686,10 +699,13 @@ async function executeAskAgenticBody(
               timeoutMs: ms,
               iteration: iterations,
               iterations,
-              // Iteration was aborted mid-flight after generateContent dispatch
-              // — Gemini may still finish server-side and bill the call. Count
-              // it in apiCalls.
-              apiCalls: iterations,
+              // H2 fix: distinguish timeout-during-throttle-wait (no
+              // dispatch) from timeout-during-generateContent (dispatch
+              // happened). `iterDispatched` is set true just before the
+              // runAgenticIteration await — if it's still false, the timeout
+              // fired during abortableSleep and this iter never reached the
+              // API. Subtract 1 in that case to keep apiCalls authoritative.
+              apiCalls: iterDispatched ? iterations : Math.max(0, iterations - 1),
               retryable: true,
             },
           );
