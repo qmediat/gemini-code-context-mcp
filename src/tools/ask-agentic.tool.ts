@@ -100,7 +100,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `maxTotalInputTokens` (skipped when overshooting), `dailyBudgetUsd` (skipped when reservation rejected), and `iterationTimeoutMs`.',
+        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `dailyBudgetUsd` (skipped when reservation rejected) and `iterationTimeoutMs` (per-call wall-clock). The pass is NOT gated on `maxTotalInputTokens` — running it may push cumulative tokens past that cap by one call's worth, signalled via `overBudget: true` on the result (v1.14.2; pre-v1.14.2 the pass was skipped on cap overshoot, defeating the rescue feature for any operator running near the cap).",
       ),
     maxTotalInputTokens: z
       .number()
@@ -108,7 +108,7 @@ export const askAgenticInputSchema = z
       .min(10_000)
       .optional()
       .describe(
-        'Cumulative input-token budget across all iterations. Default 500_000. Rejects the call early if exceeded.',
+        "Cumulative input-token budget across all iterations. Default 1_000_000 (raised from 500_000 in v1.14.2; matches Gemini 3 Pro's `inputTokenLimit: 1_048_576` minus framing headroom — empirical benchmark showed 500_000 was overly conservative for diff-bounded review workloads). Loop iterations are HARD-STOPPED past this cap (subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'); the post-loop forced-finalization rescue pass is NOT gated on this cap (the rescue is the documented exit path, bounded by `dailyBudgetUsd` for cost and `iterationTimeoutMs` for wall-clock) and may push cumulative tokens past the cap by one call's worth — detect via `overBudget: true` on the result.",
       ),
     maxFilesRead: z
       .number()
@@ -142,7 +142,7 @@ export type AskAgenticInput = z.infer<typeof askAgenticInputSchema>;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_ITERATIONS = 20;
-const DEFAULT_MAX_TOTAL_INPUT_TOKENS = 500_000;
+const DEFAULT_MAX_TOTAL_INPUT_TOKENS = 1_000_000;
 const DEFAULT_MAX_FILES_READ = 40;
 const TOOL_EXECUTION_CONCURRENCY = 3;
 /** If the SAME call signature (name + args) appears this many times, we
@@ -841,38 +841,20 @@ async function executeAskAgenticBody(
     // far. If the forced call itself fails (timeout, network, budget
     // exhausted, empty text), fall through to the original error so the
     // caller still gets a structured failure signal.
-    emitter.emit(`maxIterations (${maxIterations}) reached — evaluating forced-finalization pass`);
+    emitter.emit(`maxIterations (${maxIterations}) reached — running forced-finalization pass`);
 
-    // Token-budget guard: the finalization pass is one extra `generateContent`
-    // roundtrip whose conservative input estimate is `PER_ITERATION_INPUT_TOKENS`.
-    // If that estimate would push `cumulativeInputTokens` past
-    // `maxTotalInputTokens`, skip the pass and fall through to the
-    // AGENTIC_MAX_ITERATIONS error — running it anyway would silently
-    // overshoot the operator's documented per-call token cap.
-    if (cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS > maxTotalInputTokens) {
-      emitter.emit(
-        `skipping forced-finalization pass — would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
-      );
-      logger.warn(
-        `ask_agentic: skipping forced-finalization pass — running it would overshoot maxTotalInputTokens (cumulative ${cumulativeInputTokens.toLocaleString()} + estimated ${PER_ITERATION_INPUT_TOKENS.toLocaleString()} > cap ${maxTotalInputTokens.toLocaleString()})`,
-      );
-      return errorResult(
-        `ask_agentic: reached maxIterations (${maxIterations}) without a final answer; forced-finalization pass skipped to honour maxTotalInputTokens (${maxTotalInputTokens.toLocaleString()}). Increase maxTotalInputTokens or narrow your prompt.`,
-        {
-          errorCode: 'UNKNOWN',
-          retryable: false,
-          subReason: 'AGENTIC_MAX_ITERATIONS',
-          iterations,
-          // Pass was skipped (token budget guard) — total generateContent
-          // count equals loop iterations.
-          apiCalls: iterations,
-          cumulativeInputTokens,
-          cumulativeOutputTokens,
-          filesRead: filesReadSet.size,
-        },
-      );
-    }
-
+    // v1.14.2: the rescue pass is NOT gated on `maxTotalInputTokens`. It is
+    // the documented exit path for "loop ran out of iterations without final
+    // text" and blocking it on rescue's own potential overshoot defeats the
+    // v1.14.1 feature — an operator running near the cap would never get the
+    // synthesised answer the rescue is designed to produce. Empirical repro:
+    // the v1.14.1 PR self-review benchmark hit `cumulativeInputTokens=500_919
+    // > 500_000` cap mid-loop (the line-790 hard-stop guard, which stays);
+    // operators hitting maxIters near the cap saw the same self-block via the
+    // pre-v1.14.2 token-budget guard previously here. Rescue cost remains
+    // bounded by `dailyBudgetUsd` reservation (line ~892), wall-clock by
+    // `iterationTimeoutMs` (line ~919). Cap-overshoot is signalled via
+    // `overBudget: true` on the result so callers can detect the trade.
     let finalizationText = '';
     let finalizationUsage = {
       promptTokenCount: 0,

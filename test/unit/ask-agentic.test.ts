@@ -520,14 +520,25 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(result.structuredContent?.cumulativeOutputTokens).toBe(180); // 50+50+80
   });
 
-  it('skips finalization pass when running it would overshoot maxTotalInputTokens', async () => {
+  it('allows finalization pass to run even when it would push past maxTotalInputTokens (v1.14.2 rescue unblock)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
-    // Two iterations push cumulative input tokens to 100k. With
-    // PER_ITERATION_INPUT_TOKENS = 50k and maxTotalInputTokens = 120k, the
-    // finalization pass estimate (100k + 50k = 150k) overshoots the cap →
-    // skip the pass and emit the AGENTIC_MAX_ITERATIONS error directly. The
-    // pass MUST NOT fire and pre-pass cumulative tokens remain reported.
+    // Pre-v1.14.2 contract: when `cumulativeInputTokens + PER_ITERATION_INPUT_TOKENS
+    // > maxTotalInputTokens`, the finalization pass was SKIPPED to honour the
+    // operator's per-call token cap, returning AGENTIC_MAX_ITERATIONS with no
+    // synthesised answer. v1.14.2 inverts that: the rescue is the documented
+    // exit path for "loop ran out of iterations without final text", so blocking
+    // it on rescue's own potential overshoot defeated the v1.14.1 feature for
+    // any operator running near the cap. Empirical repro: today's 6-way
+    // benchmark on the v1.14.1 PR self-review failed with
+    // `cumulativeInputTokens=500_919 > 500_000` (the line-790 mid-loop hard-stop;
+    // this rescue self-block was the same pathology at the maxIters boundary).
+    //
+    // Post-v1.14.2 contract: the rescue runs even when its own input would push
+    // past the cap. Cost is bounded by `dailyBudgetUsd` (skipped if reservation
+    // rejects), wall-clock by `iterationTimeoutMs`. Cap-overshoot is signalled
+    // via `overBudget: true` on the result, mirroring the organic-final-text
+    // path's contract.
     const { ctx, generateContent } = buildCtx({
       script: [
         {
@@ -538,6 +549,13 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
           functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
           promptTokenCount: 50_000,
         },
+        // Rescue (3rd call) runs and synthesises an answer. With
+        // promptTokenCount=80_000, cumulative becomes 180_000 — well past the
+        // 120_000 cap, exercising the overBudget signal.
+        {
+          text: 'Synthesised answer from gathered tool responses (rescue past cap).',
+          promptTokenCount: 80_000,
+        },
       ],
     });
     const result = await askAgenticTool.execute(
@@ -545,16 +563,20 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
       ctx,
     );
 
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
-    expect(String(result.structuredContent?.responseText)).toContain('maxTotalInputTokens');
-    // Only 2 generateContent calls — finalization was skipped.
-    expect(generateContent).toHaveBeenCalledTimes(2);
-    // Pre-pass cumulative tokens preserved; no phantom finalization usage.
-    expect(result.structuredContent?.cumulativeInputTokens).toBe(100_000);
-    // Round-3 fix: `apiCalls` reports the actual generateContent count. Token-
-    // budget skip means the pass never fired → apiCalls equals iterations.
-    expect(result.structuredContent?.apiCalls).toBe(2);
+    // Rescue path was NOT skipped — the 3rd generateContent call fired and
+    // returned synthesised text.
+    expect(result.isError).toBeUndefined();
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    expect(String(result.structuredContent?.responseText)).toContain('Synthesised answer');
+    // convergenceForced flags the rescue as the source of the answer.
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    // overBudget is the structured signal that operators key on to detect
+    // cap-overshoot. Loop pushed 100k; rescue added 80k = 180k > 120k cap.
+    expect(result.structuredContent?.overBudget).toBe(true);
+    expect(result.structuredContent?.cumulativeInputTokens).toBe(180_000);
+    // apiCalls tracks total generateContent dispatches: 2 loop + 1 rescue.
+    expect(result.structuredContent?.apiCalls).toBe(3);
+    expect(result.structuredContent?.iterations).toBe(2);
   });
 
   it('falls through to AGENTIC_MAX_ITERATIONS when finalization pass throws (network failure)', async () => {
