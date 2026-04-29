@@ -1169,6 +1169,15 @@ async function executeAskAgenticBody(
   } catch (err) {
     logger.error(`ask_agentic failed: ${safeForLog(err)}`);
     const httpStatus = (err as { status?: number }).status;
+    // v1.14.2 Fix 4 (round-2 verdict from Phase 4 /coderev — Grok P1):
+    // outer-catch hint extraction is structurally infeasible — `resolved` is
+    // scoped to the inner try block, not visible here. Hoisting `resolved`
+    // out of the try would widen the change beyond Fix 4's scope. Net real-
+    // world impact is bounded: the iter catch already extracts hints for all
+    // generateContent 429s (the load-bearing 429 surface); the only escape
+    // path is a `resolveModel.list()` 429 during model resolution (rare —
+    // happens only on the very first call after API-key rotation or quota
+    // reset). Tracked as v1.14.3 followup in `.claude/local-v1.14.2-6step.md`.
     return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       retryable: false,

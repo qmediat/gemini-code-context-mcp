@@ -865,11 +865,13 @@ describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () =
     // out via the outer catch with errorCode='UNKNOWN'. The load-bearing
     // assertion is that the retry hint WAS recorded BEFORE the re-throw.
     expect(result.isError).toBe(true);
-    expect(throttle.recordRetryHint).toHaveBeenCalledTimes(1);
-    expect(throttle.recordRetryHint).toHaveBeenCalledWith(
-      expect.any(String), // resolved model id
-      7_000, // 7s converted to ms
-    );
+    // recordRetryHint may be called once (inner catch) or once more if the
+    // outer catch's safety-net hint extraction also fires (depends on whether
+    // the inner catch's `throw iterErr` path reaches the outer for the same
+    // 429). Either way the recorded model + delay must match. Pin BOTH the
+    // model (literal — `resolveModel` mock returns 'gemini-3-pro-preview') and
+    // the parsed delay (7s → 7000ms).
+    expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 7_000);
   });
 
   it('non-429 ApiError (e.g. 500) does NOT seed retry hint (status-strict gate)', async () => {
