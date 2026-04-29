@@ -595,6 +595,11 @@ async function executeAskAgenticBody(
               errorCode: 'BUDGET_REJECT',
               retryable: false,
               iterations,
+              // Pre-dispatch reject: this iteration's `generateContent` never
+              // fired. The reported total is approximate (off by 1 vs strict
+              // billable count) but matches the contract used elsewhere —
+              // `apiCalls` tracks loop iterations as a cost-bound proxy.
+              apiCalls: iterations,
               cumulativeInputTokens,
             },
           );
@@ -680,6 +685,11 @@ async function executeAskAgenticBody(
               errorCode: 'TIMEOUT',
               timeoutMs: ms,
               iteration: iterations,
+              iterations,
+              // Iteration was aborted mid-flight after generateContent dispatch
+              // — Gemini may still finish server-side and bill the call. Count
+              // it in apiCalls.
+              apiCalls: iterations,
               retryable: true,
             },
           );
@@ -769,6 +779,9 @@ async function executeAskAgenticBody(
             retryable: false,
             subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED',
             iterations,
+            // Budget guard fires AFTER the iteration's generateContent
+            // completed — the call IS counted in apiCalls.
+            apiCalls: iterations,
             cumulativeInputTokens,
           },
         );
@@ -789,6 +802,9 @@ async function executeAskAgenticBody(
               retryable: false,
               subReason: 'AGENTIC_NO_PROGRESS',
               iterations,
+              // Dedupe fires AFTER the iteration's generateContent completed —
+              // the call IS counted in apiCalls.
+              apiCalls: iterations,
               repeatedSignature: sig.slice(0, 500),
               cumulativeInputTokens,
               filesRead: filesReadSet.size,
