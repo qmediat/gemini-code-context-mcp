@@ -101,7 +101,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. NOTE: when the loop exhausts this cap without producing a final-text turn, ONE additional non-tool `generateContent` (forced-finalization pass) may run to synthesize an answer from the gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count for the call** (loop iterations + 1 if the finalization pass was actually dispatched, regardless of whether it succeeded, returned empty text, or failed mid-flight). `convergenceForced: true` indicates ONLY that the forced-finalization pass produced the returned synthesized answer successfully — it MUST NOT be used to infer whether an extra API call was attempted (an attempted-but-failed pass increments `apiCalls` without setting `convergenceForced`). The schema-level `maxIterations` cap bounds loop iterations; the finalization pass is bounded separately by `dailyBudgetUsd` (skipped when reservation rejected) and `iterationTimeoutMs` (per-call wall-clock). The pass is NOT gated on `maxTotalInputTokens` — running it may push cumulative tokens past that cap by one call's worth, signalled via `overBudget: true` on the result (v1.14.2; pre-v1.14.2 the pass was skipped on cap overshoot, defeating the rescue feature for any operator running near the cap).",
+        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract.',
       ),
     maxTotalInputTokens: z
       .number()
@@ -109,7 +109,7 @@ export const askAgenticInputSchema = z
       .min(10_000)
       .optional()
       .describe(
-        "Cumulative input-token budget across all iterations. Default 1_000_000 (raised from 500_000 in v1.14.2; matches Gemini 3 Pro's `inputTokenLimit: 1_048_576` minus framing headroom — empirical benchmark showed 500_000 was overly conservative for diff-bounded review workloads). Loop iterations are HARD-STOPPED past this cap (subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'); the post-loop forced-finalization rescue pass is NOT gated on this cap (the rescue is the documented exit path, bounded by `dailyBudgetUsd` for cost and `iterationTimeoutMs` for wall-clock) and may push cumulative tokens past the cap by one call's worth — detect via `overBudget: true` on the result.",
+        "Cumulative input-token budget across all iterations. Default 1_000_000. Loop iterations HARD-STOP past this cap (subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'). The post-loop forced-finalization rescue is NOT gated on this cap — it may push cumulative tokens past by one call's worth, signalled via `overBudget: true` on the result. Rescue cost remains bounded by `dailyBudgetUsd`; wall-clock by `iterationTimeoutMs`.",
       ),
     maxFilesRead: z
       .number()
@@ -459,6 +459,12 @@ async function executeAskAgenticBody(
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
+  // v1.14.3: hoisted out of the inner try so the outer catch can access the
+  // resolved model name when seeding throttle hints from 429s thrown during
+  // model resolution (`resolveModel.list()` can 429 too — pre-fix that path
+  // had no hint extraction at all). Declared with `Awaited<ReturnType<...>>`
+  // inline to avoid importing `ResolvedModel` just for this site.
+  let resolved: Awaited<ReturnType<typeof resolveModel>> | undefined;
   try {
     try {
       validateWorkspacePath(rawWorkspaceRoot);
@@ -483,9 +489,15 @@ async function executeAskAgenticBody(
     }
 
     emitter.emit(`resolving model '${model}'…`);
-    const resolved = await resolveModel(model, ctx.client, {
+    resolved = await resolveModel(model, ctx.client, {
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
+    // Narrow `resolved` to non-undefined for the rest of the body — closure
+    // captures (e.g., the rescue's `withNetworkRetry` lambda at line ~1003)
+    // would otherwise see the hoisted `let resolved: ... | undefined` type.
+    // `resolveModel` either returns ResolvedModel or throws (per its
+    // signature), so this assertion never fires; it's a TS-narrowing helper.
+    if (!resolved) throw new Error('ask_agentic: resolveModel returned undefined (unreachable)');
 
     const maxIterations = input.maxIterations ?? DEFAULT_MAX_ITERATIONS;
     const maxTotalInputTokens = input.maxTotalInputTokens ?? DEFAULT_MAX_TOTAL_INPUT_TOKENS;
@@ -993,10 +1005,16 @@ async function executeAskAgenticBody(
         // network failures still count toward `apiCalls`. Set inside the try
         // (after throttle wait) so a throttle-wait abort doesn't mis-count.
         finalizationAttempted = true;
+        // Capture `resolved.resolved` outside the closure so TS doesn't
+        // re-widen the type to `string | undefined` on the closure boundary
+        // (`resolved` is hoisted to function scope in v1.14.3 for outer-catch
+        // 429 hint extraction; flow-narrowing past the line-486 assignment
+        // doesn't propagate into closures defined further down).
+        const resolvedModelName = resolved.resolved;
         const response = await withNetworkRetry(
           () =>
             ctx.client.models.generateContent({
-              model: resolved.resolved,
+              model: resolvedModelName,
               contents: conversation,
               config: {
                 ...baseConfigNoTools,
@@ -1169,15 +1187,29 @@ async function executeAskAgenticBody(
   } catch (err) {
     logger.error(`ask_agentic failed: ${safeForLog(err)}`);
     const httpStatus = (err as { status?: number }).status;
-    // v1.14.2 Fix 4 (round-2 verdict from Phase 4 /coderev — Grok P1):
-    // outer-catch hint extraction is structurally infeasible — `resolved` is
-    // scoped to the inner try block, not visible here. Hoisting `resolved`
-    // out of the try would widen the change beyond Fix 4's scope. Net real-
-    // world impact is bounded: the iter catch already extracts hints for all
-    // generateContent 429s (the load-bearing 429 surface); the only escape
-    // path is a `resolveModel.list()` 429 during model resolution (rare —
-    // happens only on the very first call after API-key rotation or quota
-    // reset). Tracked as v1.14.3 followup in `.claude/local-v1.14.2-6step.md`.
+    // v1.14.3 (Phase4-F1 follow-up): outer-catch 429 hint extraction for 429s
+    // thrown POST-resolution that bypass the inner iter / finalization catches
+    // (e.g., a re-thrown 429 from `runAgenticIteration` setup or any code path
+    // between resolution and the inner try blocks). `resolved` is hoisted to
+    // function scope (above) so the outer catch can now read `resolved.resolved`
+    // when the model has already been resolved.
+    //
+    // PRE-RESOLUTION 429s (the rarer case — Google rate-limiting `models.list()`
+    // during the very first call after API-key rotation or quota reset) still
+    // DISCARD the hint here: `resolved` is undefined, optional chaining skips
+    // the extraction. Recording the hint against the unresolved alias (e.g.,
+    // 'latest-pro-thinking') would key the throttle hint to a string that
+    // future calls won't match — they'd resolve to a literal model id like
+    // `gemini-3-pro-preview`, miss the alias-keyed hint, retry too soon.
+    // Tracked as v1.14.4 followup if alias↔literal hint reconciliation
+    // becomes worth the throttle-state widening. (Pinned by the
+    // `outer-catch 429 from PRE-resolution path... does NOT seed hint` test.)
+    if (typeof resolved?.resolved === 'string') {
+      const outerRetryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
+      if (outerRetryDelayMs !== null) {
+        ctx.throttle.recordRetryHint(resolved.resolved, outerRetryDelayMs);
+      }
+    }
     return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       retryable: false,

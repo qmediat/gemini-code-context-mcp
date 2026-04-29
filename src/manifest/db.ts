@@ -268,7 +268,7 @@ export class ManifestDb {
   ): void {
     if (rows.length === 0) return;
     // SQL semantics anchored by an empirical better-sqlite3 probe (round-3
-    // verification, /tmp/coderev/.../round3-verify-sixstep.md finding #2):
+    // verification — see commit history for the round-3 audit trail):
     //
     //   - `files.X` in the SET clause references the OLD (pre-conflict) row
     //     value, so `files.content_hash <> excluded.content_hash` correctly

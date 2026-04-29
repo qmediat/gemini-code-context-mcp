@@ -5,6 +5,36 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.3] - 2026-04-29
+
+### Fixed — Two v1.14.2 deferral followups
+
+- **Outer-catch 429 hint extraction** (Phase 4-F1 from v1.14.2). Hoists the `resolved` model declaration from inner-`const` to function-scope `let` so the outer `catch (err)` block can read `resolved?.resolved` and seed `throttle.recordRetryHint` for 429s thrown POST-resolution that bypass the inner iter / finalization catches. Pre-v1.14.3 those 429s discarded Gemini's `retryInfo.retryDelay` hint, leaving the next call to retry without the hint and likely 429 again. **Pre-resolution 429s** (rare — Google rate-limiting `models.list()` during the very first call after API-key rotation or quota reset) still discard the hint by design: recording against the unresolved alias would key the hint to a string that future calls (which resolve to literal model ids) wouldn't match. Tracked as v1.14.4 followup if alias↔literal hint reconciliation becomes valuable.
+- **Schema describe simplification** (Phase 7-F1 from v1.14.2). Trimmed both `maxIterations` and `maxTotalInputTokens` `.describe()` strings (~50% reduction). Removed v1.14.2 migration history ("raised from 500_000", "matches Gemini 3 Pro inputTokenLimit minus framing headroom", empirical-benchmark prose). Kept the user-visible rescue contract (apiCalls semantics, convergenceForced, overBudget signal, dailyBudgetUsd/iterationTimeoutMs bounds, cross-reference between the two describes). The CHANGELOG retains the migration history; the schema docs surface the contract. Closes the run-on-paragraph readability concern from Phase-7 /coderev.
+
+### Behavioural impact
+
+- **Outer-catch hint extraction**: post-resolution 429s that escape inner catches now seed the throttle hint (small UX improvement on rare paths). Pre-resolution 429s unchanged. No schema changes.
+- **Describe simplification**: schema responses are smaller (~600 bytes saved per `tools/list` response). User-facing tooltips are easier to read. Migration history moved to CHANGELOG. **No semantic change.**
+
+### TypeScript narrowing detail
+
+The hoist from `const resolved` to `let resolved: ... | undefined` widens the type for ~25 inner uses. Flow narrowing past the `if (!resolved) throw` line propagates through most code paths automatically. ONE closure-capture site (rescue's `withNetworkRetry` lambda at line ~1003) re-widens to `string | undefined` on the closure boundary — addressed via `const resolvedModelName = resolved.resolved` extraction immediately before the lambda. Other closures (e.g., the iter-loop's `runAgenticIteration` site at line ~754) didn't trigger the same narrowing failure empirically (typecheck passes); a defensive audit is tracked as v1.14.4 followup.
+
+### Coverage
+
+2 net new tests in `test/unit/ask-agentic.test.ts`:
+
+- `outer-catch 429 from PRE-resolution path (resolveModel itself 429s) does NOT seed hint — alias key mismatch (v1.14.3)` — pins the negative case with a real `@google/genai` `ApiError(status: 429, body containing retryDelay: '15s')` thrown from the `resolveModel` mock; asserts `recordRetryHint` was NOT called (resolved is undefined; alias-vs-literal mismatch).
+- `outer-catch 429 from POST-resolution path seeds hint via hoisted resolved (v1.14.3)` — pins the happy path: resolved succeeds, then a 429 is thrown later; either the iter catch (Fix 4 from v1.14.2) OR the outer catch (this Fix) records the hint with the resolved model id + parsed delay.
+
+Total suite: 727 passed | 9 skipped (was 725 in v1.14.2; +2 net new tests).
+
+### Notes
+
+- Patch-level release. No API surface changes; additive comment + test coverage only. Migration: nothing — the new behaviour is strictly more lenient (records more hints) than v1.14.2.
+- v1.14.4 backlog: alias↔literal hint key reconciliation, defensive closure-narrowing audit (other lambda sites that capture `resolved`).
+
 ## [1.14.2] - 2026-04-29
 
 ### Fixed — `ask_agentic` rescue path unblocked + benchmark-surfaced UX/correctness fixes
@@ -50,7 +80,7 @@ Total suite: 725 passed | 9 skipped (was 719 in v1.14.1; +6 net new tests; +1 ne
 
 ### Empirical reproduction
 
-- The original benchmark prompt that failed v1.14.1 with `AGENTIC_INPUT_BUDGET_EXCEEDED` after 18 iters now completes successfully under v1.14.2 with `convergenceForced: true` flagged in `structuredContent`. Wall-clock ~10-15 minutes for the full agentic loop on the 119-file workspace; the rescue pass adds ~30-90 s on top of the loop iterations. Captured in `/tmp/bench-2026-04-29/v1.14.2-rerun.md` (gitignored — operator-local). Detailed /6step write-up of every benchmark finding + verdict is at `.claude/local-v1.14.2-6step.md` (gitignored).
+- The original benchmark prompt that failed v1.14.1 with `AGENTIC_INPUT_BUDGET_EXCEEDED` after 18 iters now completes successfully under v1.14.2 with `convergenceForced: true` flagged in `structuredContent`. Wall-clock ~10-15 minutes for the full agentic loop on the 119-file workspace; the rescue pass adds ~30-90 s on top of the loop iterations. The rewritten test `allows finalization pass to run even when it would push past maxTotalInputTokens (v1.14.2 rescue unblock)` in `test/unit/ask-agentic.test.ts` pins the equivalent contract at unit-test scale.
 
 ### Migration
 
@@ -247,7 +277,7 @@ A second `/coderev` pass on the round-2 fix delta (HEAD~2..HEAD), plus Copilot's
 
 ### Round-3 verification polish (post-adversarial /6step)
 
-After landing the round-3 HIGH fix, an adversarial /6step verification pass (workspace `/tmp/coderev/20260428-140123-51773/round3-verify-sixstep.md`) explicitly counter-cased BOTH leak directions on 13 plausible gaps in the round-3 fix. All 12 correctness gaps verified clean by an empirical `better-sqlite3` probe — confirming SQLite CASE-clause OLD/NEW semantics, end-to-end Scenario B closure (cross-file leak via shared content_hash), WAL snapshot isolation across concurrent connections, and `findFileRowByHash`'s correctness under the post-fix manifest state. The fix is empirically complete.
+After landing the round-3 HIGH fix, an adversarial /6step verification pass explicitly counter-cased BOTH leak directions on 13 plausible gaps in the round-3 fix. All 12 correctness gaps verified clean by an empirical `better-sqlite3` probe — confirming SQLite CASE-clause OLD/NEW semantics, end-to-end Scenario B closure (cross-file leak via shared content_hash), WAL snapshot isolation across concurrent connections, and `findFileRowByHash`'s correctness under the post-fix manifest state. The fix is empirically complete.
 
 Three defense-in-depth polish items applied:
 

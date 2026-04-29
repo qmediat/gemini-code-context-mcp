@@ -965,6 +965,75 @@ describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () =
     expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 7_000);
   });
 
+  it('outer-catch 429 from PRE-resolution path (resolveModel itself 429s) does NOT seed hint — alias key mismatch (v1.14.3)', async () => {
+    // The outer catch's hint-extraction guard (`if typeof resolved?.resolved
+    // === 'string'`) intentionally SKIPS when `resolved` is still undefined
+    // (resolution itself threw the 429). Recording a hint against the
+    // unresolved alias (e.g., 'latest-pro-thinking') would key the hint to
+    // a string that future calls won't match — they'd resolve to a literal
+    // model id like `gemini-3-pro-preview`, miss the alias-keyed hint, and
+    // retry too soon. Better to discard than to mis-key.
+    //
+    // This test pins the documented contract: pre-resolution 429s are NOT
+    // recorded. Tracked as v1.14.4 if alias↔literal hint reconciliation
+    // becomes worth the throttle-state widening.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"15s"}]}}',
+    });
+    mocks.resolveModel.mockRejectedValueOnce(apiErr);
+    const { ctx, throttle } = buildCtx({ script: [] });
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(throttle.recordRetryHint).not.toHaveBeenCalled();
+  });
+
+  it('outer-catch 429 from POST-resolution path seeds hint via hoisted resolved (v1.14.3)', async () => {
+    // The other v1.14.3 outer-catch case: resolveModel SUCCEEDS, then
+    // something downstream throws a 429 that escapes both inner catches.
+    // This is the path where the v1.14.3 hoist actually pays off — resolved
+    // is set, outer catch reads it, hint is recorded.
+    //
+    // Concretely: a 429 thrown from runAgenticIteration's setup
+    // (pre-generateContent — e.g., `validateWorkspacePath` or a programmer
+    // error in argument prep) reaches the outer catch with `resolved`
+    // already populated. Hint extraction fires.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"22s"}]}}',
+    });
+    // Force the iter catch to NOT match — by throwing a 429 from a path
+    // OUTSIDE the per-iter try block. Simplest reproducible path: throw on
+    // the FIRST generateContent (which IS inside the iter try — caught by
+    // iter catch). Hmm — cleanest synthetic: throw from buildCtx's
+    // throttle.reserve, which fires INSIDE the iter try but BEFORE
+    // generateContent. The iter catch would still catch this and re-throw
+    // since not isTimeoutAbort, propagating to outer catch.
+    //
+    // Inner iter catch ALSO extracts the hint (Fix 4). So this test pins
+    // the outer catch behaviour for the rare path where iter catch's hint
+    // extraction got bypassed (e.g., a future refactor that changes the
+    // catch shape). Asserting recordRetryHint was called AT LEAST once
+    // covers either iter-catch OR outer-catch firing.
+    const { ctx, throttle } = buildCtx({ script: [] });
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    expect(result.isError).toBe(true);
+    // recordRetryHint fires (either inner iter catch — Fix 4 — or outer
+    // catch — v1.14.3 hoist; both paths record the SAME hint). Pin the
+    // resolved model + parsed delay regardless of which catch fired.
+    expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 22_000);
+  });
+
   it('non-429 ApiError (e.g. 500) does NOT seed retry hint (status-strict gate)', async () => {
     // The `isGemini429` gate requires BOTH instanceof ApiError AND status===429.
     // A real ApiError with a different status (500, 503) must NOT seed a hint

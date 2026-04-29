@@ -21,9 +21,9 @@
  *     Otherwise call `client.models.countTokens({ model, contents })` with
  *     the same payload shape we'll send to `generateContent`. Use the
  *     returned `totalTokens` for the threshold check. countTokens is
- *     billed at zero (per Google docs and the v1.9.0 probe — see
- *     `.claude/local-PLAN-v1.10.0.md`) and shares NO RPM quota with
- *     `generateContent` (probe Q1 — 30 calls in 2.9 s, zero 429s).
+ *     billed at zero (per Google docs and an empirical v1.9.0 probe) and
+ *     shares NO RPM quota with `generateContent` (probe Q1 — 30 calls in
+ *     2.9 s, zero 429s).
  *
  *   Cache.
  *     `LRUCache<string, number>` (in-process, simple). Key:
