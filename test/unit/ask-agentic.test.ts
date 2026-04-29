@@ -645,6 +645,46 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // Only 2 generateContent calls — finalization was skipped because
     // reserveBudget rejected.
     expect(generateContent).toHaveBeenCalledTimes(2);
+    // v1.14.2 Fix 5: structured field signals WHY the rescue was skipped, so
+    // automated triage doesn't have to parse the prose error message.
+    expect(result.structuredContent?.finalizationSkipReason).toBe('daily-budget');
+    // v1.14.2 Fix 5: error message is cause-specific. Pre-fix said "Increase
+    // maxIterations or narrow your prompt" (a lie when the cause is daily
+    // budget). Post-fix points operators at the actual remediation.
+    expect(String(result.structuredContent?.responseText)).toContain('daily budget cap reached');
+    expect(String(result.structuredContent?.responseText)).toContain('GEMINI_DAILY_BUDGET_USD');
+    expect(String(result.structuredContent?.responseText)).not.toContain('Increase maxIterations');
+  });
+
+  it('rescue ran-and-failed (empty text) keeps original "Increase maxIterations" message — no false skip-reason flag (Fix 5)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // The rescue dispatched and returned empty text — distinct from the
+    // daily-budget skip path. Operator should see the original "Increase
+    // maxIterations" message and NO `finalizationSkipReason` field (the
+    // structured field is reserved for actual skips, not run-and-failed).
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+        { text: '' }, // rescue ran but returned empty
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    // Original message — rescue ran, just produced no text.
+    expect(String(result.structuredContent?.responseText)).toContain('Increase maxIterations');
+    expect(String(result.structuredContent?.responseText)).not.toContain(
+      'daily budget cap reached',
+    );
+    // Skip-reason field is ABSENT on the run-and-failed path (additive
+    // optional field — only emitted when set).
+    expect(result.structuredContent?.finalizationSkipReason).toBeUndefined();
   });
 
   it('finalization call: NONE mode + thinkingConfig preserved + tools omitted (G2 fix)', async () => {
@@ -755,7 +795,10 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // estimate (255k input tokens), not the static 50k.
     const { ctx, manifest } = buildCtx({
       script: [
-        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }], promptTokenCount: 200_000 },
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 200_000,
+        },
         {
           functionCalls: [{ name: 'list_directory', args: { path: '.' } }],
           promptTokenCount: 250_000,

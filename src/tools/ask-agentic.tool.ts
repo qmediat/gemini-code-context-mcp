@@ -880,6 +880,15 @@ async function executeAskAgenticBody(
     // cases (response never arrived to populate usageMetadata) and
     // inferring "fired" from usage would undercount the API call.
     let finalizationAttempted = false;
+    // v1.14.2 Fix 5: tracks WHY the rescue pass was skipped, so the trailing
+    // errorResult can emit a cause-specific message + structured field instead
+    // of the misleading generic "Increase maxIterations or narrow your prompt"
+    // (active lie when the cause is daily budget exhaustion). Set to
+    // 'daily-budget' when `reserveBudget` rejects below; remains null on
+    // success or when no rescue was attempted at all (e.g. dailyBudgetEnforced
+    // = false). Surfaces as `finalizationSkipReason` on `structuredContent` —
+    // additive optional field, no schema break for existing callers.
+    let finalizationSkipReason: 'daily-budget' | null = null;
 
     // v1.14.2: dynamic estimate for the rescue pass — replaces the static
     // `PER_ITERATION_INPUT_TOKENS = 50_000` baseline with the actual size of
@@ -924,6 +933,7 @@ async function executeAskAgenticBody(
             reserve.spentMicros / 1_000_000
           ).toFixed(4)})`,
         );
+        finalizationSkipReason = 'daily-budget';
       } else {
         finalizationReservationId = reserve.id;
       }
@@ -1110,19 +1120,30 @@ async function executeAskAgenticBody(
       });
     }
 
-    return errorResult(
-      `ask_agentic: reached maxIterations (${maxIterations}) without a final answer. Increase maxIterations or narrow your prompt.`,
-      {
-        errorCode: 'UNKNOWN',
-        retryable: false,
-        subReason: 'AGENTIC_MAX_ITERATIONS',
-        iterations,
-        apiCalls,
-        cumulativeInputTokens: totalCumulativeInputTokens,
-        cumulativeOutputTokens: totalCumulativeOutputTokens,
-        filesRead: filesReadSet.size,
-      },
-    );
+    // v1.14.2 Fix 5: branch the error message on whether the rescue was
+    // skipped due to daily-budget exhaustion vs ran-and-failed (empty text /
+    // network error / timeout). Pre-fix the generic "Increase maxIterations"
+    // message lied to operators on the daily-budget skip path — the actual
+    // remediation is to wait for daily reset or raise GEMINI_DAILY_BUDGET_USD.
+    // The structured field `finalizationSkipReason` is additive (only present
+    // when set) so existing callers ignore it; new callers can branch on it
+    // for automated triage.
+    const errorMessage =
+      finalizationSkipReason === 'daily-budget'
+        ? `ask_agentic: reached maxIterations (${maxIterations}) without a final answer; forced-finalization pass skipped because daily budget cap reached. Wait for daily reset (UTC midnight) or raise GEMINI_DAILY_BUDGET_USD.`
+        : `ask_agentic: reached maxIterations (${maxIterations}) without a final answer. Increase maxIterations or narrow your prompt.`;
+
+    return errorResult(errorMessage, {
+      errorCode: 'UNKNOWN',
+      retryable: false,
+      subReason: 'AGENTIC_MAX_ITERATIONS',
+      ...(finalizationSkipReason !== null ? { finalizationSkipReason } : {}),
+      iterations,
+      apiCalls,
+      cumulativeInputTokens: totalCumulativeInputTokens,
+      cumulativeOutputTokens: totalCumulativeOutputTokens,
+      filesRead: filesReadSet.size,
+    });
   } catch (err) {
     logger.error(`ask_agentic failed: ${safeForLog(err)}`);
     const httpStatus = (err as { status?: number }).status;
