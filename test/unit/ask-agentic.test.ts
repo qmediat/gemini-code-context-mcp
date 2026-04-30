@@ -56,7 +56,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ApiError } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { askAgenticTool } from '../../src/tools/ask-agentic.tool.js';
+import {
+  askAgenticTool,
+  resolveToolExecutionConcurrency,
+} from '../../src/tools/ask-agentic.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 
 const mocks = vi.hoisted(() => ({
@@ -2144,5 +2147,97 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // observed in CI on Node 22 / Linux: 999ms elapsed (PR #35 round 1).
     expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(elapsedMs).toBeLessThan(5_000);
+  });
+});
+
+// v1.15.1 P9_a — TOOL_EXECUTION_CONCURRENCY env override + clamp.
+// Tests the `resolveToolExecutionConcurrency()` helper directly. Uses
+// vi.stubEnv with explicit beforeEach + afterEach `vi.unstubAllEnvs()` to
+// guarantee the env stubs don't leak to tests appended after this describe
+// block. (Round-1 Copilot CCC1 fix — vitest doesn't auto-restore stubs
+// without explicit lifecycle hooks unless `unstubEnvs: true` is set in
+// vitest.config.ts, which this repo doesn't enable.)
+describe('resolveToolExecutionConcurrency (v1.15.1 P9_a)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('returns default 10 when env var unset OR empty string', () => {
+    // Resolver short-circuits BOTH `undefined` (truly unset) AND `''` (empty
+    // string) to the default — same OR-branch in the source. Cover both
+    // semantically distinct cases here so the test name matches the body.
+    // (Round-1 Copilot CCC2 fix.)
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', undefined);
+    expect(resolveToolExecutionConcurrency()).toBe(10);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '');
+    expect(resolveToolExecutionConcurrency()).toBe(10);
+  });
+
+  it('honours valid integer override (1 ≤ n ≤ 50)', () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '5');
+    expect(resolveToolExecutionConcurrency()).toBe(5);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '1');
+    expect(resolveToolExecutionConcurrency()).toBe(1);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '50');
+    expect(resolveToolExecutionConcurrency()).toBe(50);
+  });
+
+  it('clamps overshoot to 50 (pathological-config guard)', () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '99999');
+    expect(resolveToolExecutionConcurrency()).toBe(50);
+  });
+
+  it('falls back to default ONLY on NaN; numeric inputs clamp into [1, 50] (Round-1 Y1 fix)', () => {
+    // Round-1 review (gemini-cli F2 LOW + grok F1 MEDIUM, /6step TP) caught
+    // that the original guard `if (Number.isNaN(parsed) || parsed < 1)`
+    // silently mapped operator-supplied `0` and negatives back to default
+    // 10 — the OPPOSITE of intent. An operator setting
+    // GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY=0 on a low-spec / Windows
+    // CI / file-handle-constrained host means "minimise parallelism", not
+    // "use the default". Post-fix: only NaN falls back; numeric inputs
+    // always clamp into [1, 50].
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', 'banana');
+    expect(resolveToolExecutionConcurrency()).toBe(10); // NaN → default
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '0');
+    expect(resolveToolExecutionConcurrency()).toBe(1); // clamp UP to 1 (serial)
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '-3');
+    expect(resolveToolExecutionConcurrency()).toBe(1); // clamp UP to 1
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '-99999');
+    expect(resolveToolExecutionConcurrency()).toBe(1); // clamp UP to 1
+  });
+});
+
+// v1.15.1 P9_b — batch-reads instruction + hallucination guardrail.
+describe('SYSTEM_INSTRUCTION_AGENTIC batch-reads guidance (v1.15.1 P9_b + Y2)', () => {
+  it('SYSTEM_INSTRUCTION_AGENTIC contains batch-reads instruction AND hallucination guard', async () => {
+    // P9_b adds latency-cost framing to incentivize batching. Round-1 review
+    // (gemini-cli F1 LOW + grok F2 MEDIUM, /6step TP) caught that the framing
+    // could incentivize the model to fabricate read_file calls just to fill
+    // a batch and avoid the 30-60s per-iteration thinking-token cost.
+    // Y2 fix: append "no hallucinated paths" guardrail. Pin both the
+    // batching instruction AND the guardrail so a future PR can't quietly
+    // weaken either.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent } = buildCtx({
+      script: [{ functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] }, { text: 'ok' }],
+    });
+    await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+    const callArg = generateContent.mock.calls[0]?.[0] as {
+      config?: { systemInstruction?: string };
+    };
+    const instr = String(callArg?.config?.systemInstruction);
+    // P9_b batching instruction:
+    expect(instr).toContain('Batch your tool calls within a single iteration');
+    expect(instr).toContain('30-60s of thinking-token latency');
+    // Y2 hallucination guardrail (Round-1 fix):
+    expect(instr).toContain('Never synthesize or guess additional paths');
+    expect(instr).toContain(
+      'Only batch calls for paths you have already seen in prior tool results',
+    );
   });
 });

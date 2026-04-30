@@ -145,7 +145,56 @@ export type AskAgenticInput = z.infer<typeof askAgenticInputSchema>;
 const DEFAULT_MAX_ITERATIONS = 20;
 const DEFAULT_MAX_TOTAL_INPUT_TOKENS = 1_000_000;
 const DEFAULT_MAX_FILES_READ = 40;
-const TOOL_EXECUTION_CONCURRENCY = 3;
+/**
+ * Default cap on parallel tool-call dispatch within a single iteration.
+ *
+ * Bumped 3 → 10 in v1.15.1 (P9_a). Pre-bump rationale was "be conservative,
+ * avoid hammering local filesystem I/O." Empirical: today's `read_file` /
+ * `grep` / `find_files` run against the SQLite-backed manifest + workspace
+ * mmap, all of which are CPU-bound and parallelism-friendly. The 3-wide cap
+ * forced the model to serialise even small batches like 5 `read_file` calls
+ * into 2 round-trips of the iteration loop, eating ~30-60s of HIGH-thinking
+ * latency per artificial split. 10-wide handles the typical batch a Gemini
+ * 3 Pro response emits without queuing.
+ *
+ * Operators can override via `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`
+ * env var (clamped to [1, 50]) — kill switch for environments where
+ * filesystem contention or local I/O bandwidth makes wider concurrency
+ * counter-productive. v1.15.1+ telemetry gap: no per-call dispatch metric
+ * yet exists; if a future release adds one, the env-override knob lets
+ * operators dial back without code changes. (Tracked in `wiggly-twirling-karp.md`.)
+ */
+const DEFAULT_TOOL_EXECUTION_CONCURRENCY = 10;
+
+/** Read + clamp the tool-execution concurrency at dispatch time.
+ *
+ * Why a function not a top-level const: env vars can change between calls
+ * within a long-lived MCP-server process (operator ctrl-Cs and re-launches
+ * with a different value mid-session). Resolving per-call keeps behaviour
+ * predictable. Cost: one env-read per iter; negligible vs the
+ * `generateContent` round-trip dominating wall-clock.
+ *
+ * Clamps numeric inputs to `[1, 50]`. Only NaN / unset / empty falls back
+ * to default. 50 cap prevents pathological "concurrency: 99999" misconfig
+ * from spawning ~unbounded `read_file` Promise chains. 0 / negative inputs
+ * clamp UP to 1 (= serial dispatch) — operators setting `0` or `-3` mean
+ * "minimise parallelism", not "use the default" (the v1.15.1 PR-Round-1
+ * 2-of-2 cross-reviewer correction: gemini-cli F2 + grok F1 flagged that
+ * silently mapping operator-supplied `0` back to 10× was the opposite of
+ * intent and a confusing UX on resource-constrained CI / Windows hosts).
+ *
+ * Exported for unit testing — not part of the public MCP surface. */
+export function resolveToolExecutionConcurrency(): number {
+  const raw = process.env.GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY;
+  if (raw === undefined || raw === '') return DEFAULT_TOOL_EXECUTION_CONCURRENCY;
+  const parsed = Number.parseInt(raw, 10);
+  // Only NaN (genuinely malformed input like `'banana'`) falls back to
+  // default. Numeric inputs always clamp into [1, 50] so the operator's
+  // stated intent (lower bound = serial; upper bound = throughput cap)
+  // is honoured for any value parseInt can extract a number from.
+  if (Number.isNaN(parsed)) return DEFAULT_TOOL_EXECUTION_CONCURRENCY;
+  return Math.max(1, Math.min(parsed, 50));
+}
 /** If the SAME call signature (name + args) appears this many times, we
  * conclude the model is stuck in a loop and surface a partial answer.
  *
@@ -213,6 +262,7 @@ const SYSTEM_INSTRUCTION_AGENTIC = [
   '2. Locate relevant symbols with `grep`',
   '3. Open only the handful of files that actually bear on the question via `read_file`',
   'When you have enough context, respond with a plain-text answer and make NO further tool calls.',
+  'Batch your tool calls within a single iteration. If you need to read 5 files, issue all 5 `read_file` calls in ONE turn rather than one-per-iteration across 5 turns — each iteration costs 30-60s of thinking-token latency that you only pay once when calls are batched. The dispatcher runs the batch in parallel (up to 10 concurrent by default). Only batch calls for paths you have already seen in prior tool results (e.g., from `list_directory`, `find_files`, or `grep` output) or that the user provided. Never synthesize or guess additional paths solely to fill a batch — a hallucinated path costs the same iteration latency as the split you were trying to avoid, and the executors will reject it.',
   '',
   '# DECISIVENESS',
   "Be decisive. Once you have read the relevant files and gathered evidence, produce your final answer. Continuing to call tools when you already have an answer is a failure mode — it wastes the user's budget and delays the response.",
@@ -513,7 +563,7 @@ export const askAgenticTool: ToolDefinition<AskAgenticInput> = {
   name: 'ask_agentic',
   title: 'Ask Gemini (agentic)',
   description:
-    'Answer a workspace question WITHOUT uploading the full repo. Gemini uses sandboxed file-access tools (list_directory, find_files, read_file, grep) to read only what it needs. Use this when the workspace would exceed the model input-token limit (~900k tokens for Gemini Pro). Cost profile: more API round trips, but total tokens are usually much smaller than eager `ask` on big repos.',
+    "Surgical fallback for repos that exceed `ask`'s model input-token limit (~1M tokens for Gemini Pro), OR when you only need a handful of files (cheaper than eager-uploading a large repo). Gemini uses sandboxed file-access tools (`list_directory`, `find_files`, `read_file`, `grep`) to read only what it needs across multiple iterations (default 20). Cost profile: more API round trips than `ask`, but total tokens usually much smaller on big repos. **Wall-clock is structurally slower than `ask`** — each iteration pays ~30-60s of HIGH-thinking latency, so a 20-iter call can take 10-20 minutes. For the fast path, use `ask`. For oversize repos or focused investigation, use `ask_agentic`.",
   schema: askAgenticInputSchema,
 
   async execute(input, ctx) {
@@ -638,8 +688,9 @@ async function executeAskAgenticBody(
     // `generateContent` returned. Folded into the rescue's
     // `finalizationEstimate` so its TPM/budget reservation covers the data
     // the rescue actually replays. Pre-P5 the estimate omitted this delta;
-    // with `TOOL_EXECUTION_CONCURRENCY = 3` reading large files, the rescue
-    // could under-reserve by 100k+ tokens and 429 mid-flight.
+    // with the parallel tool-dispatch (default 10 in v1.15.1+, was 3
+    // pre-bump) reading large files, the rescue could under-reserve by
+    // 100k+ tokens and 429 mid-flight.
     let lastToolResponseTokens = 0;
     let iterations = 0;
     // Tracks the most recent iteration's actual `promptTokenCount` (size of the
@@ -1064,11 +1115,12 @@ async function executeAskAgenticBody(
     // tool-response Parts appended to `conversation` AFTER the last iteration's
     // `generateContent` returned. The rescue's prompt replays the entire
     // accumulated conversation, so its actual size ≈ last-iter prompt + the
-    // tool responses appended after. Pre-P5 a final iteration that issued 3
-    // concurrent `read_file` calls (with `TOOL_EXECUTION_CONCURRENCY = 3`)
-    // could append 100k+ tokens of file content the estimate missed, causing
-    // the rescue to under-reserve TPM and 429 mid-flight. (3-of-3 cross-reviewer
-    // /6step verdict: TRUE POSITIVE Medium — gcc-ask own F1.)
+    // tool responses appended after. Pre-P5 a final iteration that issued
+    // several concurrent `read_file` calls (default parallel-dispatch is 10
+    // in v1.15.1+, was 3 pre-bump) could append 100k+ tokens of file content
+    // the estimate missed, causing the rescue to under-reserve TPM and 429
+    // mid-flight. (3-of-3 cross-reviewer /6step verdict: TRUE POSITIVE
+    // Medium — gcc-ask own F1.)
     const finalizationEstimate =
       lastIterationPromptTokens > 0
         ? lastIterationPromptTokens + lastToolResponseTokens + 5_000
@@ -1499,8 +1551,9 @@ interface IterationResult {
    * size ≈ `lastIterationPromptTokens` + size of the tool-response Parts
    * appended AFTER that iteration's `generateContent` returned. Pre-P5
    * the estimate omitted the tool-response delta, undershooting by 100k+
-   * tokens when the final iter read 3 large files concurrently
-   * (`TOOL_EXECUTION_CONCURRENCY = 3`). */
+   * tokens when the final iter read several large files concurrently
+   * (post-v1.15.1 default `TOOL_EXECUTION_CONCURRENCY = 10`; operator
+   * override via `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`). */
   toolResponseTokens: number;
 }
 
@@ -1666,10 +1719,12 @@ async function runAgenticIteration(args: {
   }
 
   // Dispatch the non-capped calls in parallel.
+  // v1.15.1 (P9_a): concurrency now resolves per-call from env override
+  // (`GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`), default 10. Bumped from 3.
   const dispatched = await dispatchToolCallsParallel(
     workspaceRoot,
     toDispatch,
-    TOOL_EXECUTION_CONCURRENCY,
+    resolveToolExecutionConcurrency(),
     matchConfig,
   );
   // Check abort AFTER tool execution — local file I/O / large grep regex /
