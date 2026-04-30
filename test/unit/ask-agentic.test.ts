@@ -518,7 +518,7 @@ describe('ask_agentic loop — guards', () => {
     expect(result.structuredContent?.iterations).toBe(2);
   });
 
-  it('content-aware: 5× same signature with NO file growth between WINS trips dedupe (v1.16.0 P2 Phase B)', async () => {
+  it('content-aware: 5× same signature with NO file growth between repeats still trips dedupe (v1.16.0 P2 Phase B)', async () => {
     // Negative pin for content-aware logic: when the model truly is stuck
     // (issuing same signature with NO progress between repeats), dedupe
     // MUST still trip. Identical to the v1.14.4 threshold-5 test but

@@ -663,11 +663,12 @@ async function executeAskAgenticBody(
      *
      * v1.16.0 (P2 Phase B): replaces the v1.14.4 simple counter with a
      * content-aware version. Pre-Phase-B `signatureCounts: Map<string,
-     * number>` tripped on N consecutive identical signatures regardless
-     * of whether the model was making progress between repeats. That
-     * was empirically wrong on 2026-04-30 — Gemini 3 Pro under HIGH
-     * thinking re-runs the same `grep` while ALSO reading new files,
-     * which IS progress, but the simple counter still tripped.
+     * number>` tracked repeat occurrences of the same signature and
+     * tripped after N repeats even if the model had made progress
+     * elsewhere since an earlier occurrence. That was empirically wrong
+     * on 2026-04-30 — Gemini 3 Pro under HIGH thinking re-runs the same
+     * `grep` while ALSO reading new files, which IS progress, but the
+     * simple counter still tripped.
      *
      * Phase B tracks `lastFilesReadSize` per signature: same signature
      * counts toward the threshold ONLY if no `read_file` against an
@@ -980,9 +981,10 @@ async function executeAskAgenticBody(
 
       // No-progress detection (v1.16.0 P2 Phase B — content-aware):
       // bails when any single call signature has been issued
-      // `NO_PROGRESS_CALL_THRESHOLD` times CONSECUTIVELY without the
-      // `filesReadSet` growing between repeats. If `filesReadSet` grew,
-      // the model is exploring (productive) — reset count to 1.
+      // `NO_PROGRESS_CALL_THRESHOLD` times without any new
+      // `filesReadSet` growth between repeats. If `filesReadSet` grew,
+      // the model is exploring (productive) — reset that signature's
+      // count to 1.
       //
       // Implementation note: capture `filesReadSet.size` ONCE per iter
       // (after tool execution) so all signatures within the same iter

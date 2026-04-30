@@ -22,7 +22,7 @@ The v1.14.4 threshold bump (3 → 5) was a stop-gap. v1.16.0 ships the planned *
 ### Behavioural impact
 
 - **Wins**: Gemini 3 Pro multi-file investigations that re-issue the same `grep`/`list_directory` between `read_file` calls now run to completion (or to maxIterations + rescue) instead of bailing prematurely. Today's empirical regression on the v1.14.1 self-review prompt (50% NO_PROGRESS rate at threshold-3, partially mitigated by threshold-5 in v1.14.4) is now structurally addressed.
-- **Negative pin preserved**: when the model truly is stuck (5× identical signature with NO new `read_file` between), dedupe still trips. The new test `content-aware: 5× same signature with NO file growth between WINS trips dedupe` pins this.
+- **Negative pin preserved**: when the model truly is stuck (5× identical signature with NO new `read_file` between), dedupe still trips. The new test `content-aware: 5× same signature with NO file growth between repeats still trips dedupe` pins this.
 - **No API/schema change.** structuredContent fields unchanged. `repeatedSignature` and `filesRead` continue to surface as before.
 
 ### Coverage
@@ -30,7 +30,7 @@ The v1.14.4 threshold bump (3 → 5) was a stop-gap. v1.16.0 ships the planned *
 2 net new test cases in `test/unit/ask-agentic.test.ts`:
 
 - `content-aware: same signature does NOT trip dedupe when read_file growth happens between repeats` — scripts 5× same `grep` with `read_file` interspersed; loop reaches the scripted final-text on iter 6 (would have tripped at iter 5 pre-Phase-B).
-- `content-aware: 5× same signature with NO file growth between WINS trips dedupe` — negative pin: pure-grep loop with no file reads still bails at threshold-5. Also pins the new error message wording.
+- `content-aware: 5× same signature with NO file growth between repeats still trips dedupe` — negative pin: pure-grep loop with no file reads still bails at threshold-5. Also pins the new error message wording.
 
 Total suite: 758 passed | 9 skipped (was 756 in v1.15.3). Lint, typecheck, build all green on Node 22 and Node 24.
 
