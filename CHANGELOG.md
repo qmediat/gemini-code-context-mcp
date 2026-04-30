@@ -5,6 +5,31 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.3] - 2026-04-30
+
+### Added — P10 defensive integration test for `ask_agentic` rescue payload contract
+
+Closes the last queued v1.14.4 review followup — gemini-chat F4 (Round-1) flagged that the unit test for the rescue config (G2 fix at `test/unit/ask-agentic.test.ts:782+`) verifies request SHAPE only and would not catch a future Google API contract regression on the rescue payload. v1.15.3 adds an env-gated integration smoke test that exercises the EXACT load-bearing payload shape against the live API.
+
+- **New test case** in `test/integration/real-gemini.smoke.test.ts`: *"forced-finalization rescue payload (toolConfig: NONE without tools) is accepted (P10/v1.15.3)"*. Skips silently in CI (no `GEMINI_API_KEY`) so the standard `npm test` run is unaffected; runs locally / during release validation when the key is present.
+- **What it pins**: the v1.14.4 G2 contract — `generateContent` with `toolConfig: { functionCallingConfig: { mode: NONE } }` AND no `tools` field MUST be accepted by the live API. Per Google docs (`ai.google.dev/gemini-api/docs/function-calling`): *"NONE: equivalent to sending a request without any function declarations."* If Google ever flips this contract, CI on a release-validation run catches the regression before customer impact.
+- **Single-turn conversation shape** (not multi-turn synthetic tool-call history): Google's API recently started rejecting synthetic `functionCall` parts without a `thought_signature` (per `ai.google.dev/gemini-api/docs/thought-signatures`, replay-safety contract). Production rescue paths replay GENUINE accumulated conversations built by prior loop iterations, so their tool-call parts are correctly signed. The smoke test uses a plain user-text turn instead — sufficient to exercise the load-bearing toolConfig + no-tools claim without the synthetic-history signing complication.
+
+### Behavioural impact
+
+- **No production code change.** Pure test addition. `dist/` artefact is byte-identical to v1.15.2 except for the version string.
+- **CI runs unchanged** (smoke test is `describe.skip` without the env key — same as the rest of `real-gemini.smoke.test.ts`).
+- **Release validation** can now run `GEMINI_API_KEY=AIza... npm run test:integration` and get an additional 60s API-contract check.
+
+### Coverage
+
+756 passed | 9 skipped (was 755 in v1.15.2). +1 net new integration test (skipped without `GEMINI_API_KEY`, runs locally with).
+
+### Notes
+
+- Patch-level release. Pure additive defensive test. No API/schema/code change.
+- Closes the last v1.14.4-cycle followup. Remaining v1.15.x followups in queue: P2 Phase B (content-aware NO_PROGRESS dedupe — bigger refactor), R2 (`/6step` on structuredContent-on-MCP-error-channel first), T33 (ask_agentic streaming refactor — separate v1.16/v1.7 cycle).
+
 ## [1.15.2] - 2026-04-30
 
 ### Security — `SYSTEM_INSTRUCTION_SAFETY` firewall extended to `ask` + `code`

@@ -196,4 +196,67 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
     expect(response.text?.length).toBeGreaterThan(0);
     expect(response.usageMetadata).toBeDefined();
   }, 60_000);
+
+  // P10 (v1.15.3): defensive smoke test for ask_agentic's forced-finalization
+  // rescue payload contract. v1.14.4 review surfaced 2-of-3 reviewers
+  // claiming `toolConfig: { mode: NONE }` without `tools` would 400 — refuted
+  // empirically by 5+ successful rescue runs. The unit test for the rescue
+  // config (G2 fix in ask-agentic.test.ts:782+) verifies request SHAPE only;
+  // it can't catch a future Google API contract regression.
+  //
+  // This integration test exercises the EXACT payload shape the rescue uses
+  // against the live API. CI without the GEMINI_API_KEY env skips silently;
+  // local / release-validation runs catch a contract flip before customer
+  // impact. Per Google docs (ai.google.dev/gemini-api/docs/function-calling):
+  // "NONE: equivalent to sending a request without any function declarations."
+  it('forced-finalization rescue payload (toolConfig: NONE without tools) is accepted (P10/v1.15.3)', async () => {
+    const resolved = await resolveModel('latest-flash', client);
+    // The load-bearing claim under test: Gemini API accepts a `generateContent`
+    // request with `toolConfig: { mode: NONE }` AND no `tools` field. v1.14.4
+    // review surfaced 2-of-3 reviewers (gemini-cli + gemini-chat) claiming this
+    // would 400 — empirically refuted, but the unit test for the rescue config
+    // (G2 fix in ask-agentic.test.ts) verifies request SHAPE only, so a future
+    // Google API contract regression on this specific shape would slip through.
+    //
+    // We use a single-turn plain-text conversation rather than a synthetic
+    // multi-turn `[user, model fc, user functionResponse]` history. Reason:
+    // Google's API recently started rejecting synthetic `functionCall` parts
+    // that lack a `thought_signature` (per ai.google.dev/gemini-api/docs/thought-signatures
+    // — replay-safety contract for tool-calling). Building a valid signed
+    // conversation would require a real prior tool-calling turn, which is
+    // overkill for the contract under test. The single-turn shape exercises
+    // the same load-bearing assertion (toolConfig + NONE + no tools) without
+    // the synthetic-history complication. Production rescue paths replay a
+    // GENUINE accumulated conversation built by prior loop iterations, so
+    // their tool-call parts are correctly signed.
+    const response = await client.models.generateContent({
+      model: resolved.resolved,
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: 'Acknowledge that you have no tools available on this turn. One sentence, under 15 words.',
+            },
+          ],
+        },
+      ],
+      config: {
+        systemInstruction:
+          'You are wrapping up an investigation. Function calling is disabled — synthesize the answer in plain text.',
+        // The load-bearing assertion: toolConfig with NONE mode AND tools
+        // field omitted. If Google flips the contract to require tools when
+        // toolConfig is set, this call throws and the test fails loudly.
+        toolConfig: { functionCallingConfig: { mode: 'NONE' as const } },
+        // tools field intentionally omitted — production rescue uses
+        // `const { tools: _, ...baseConfigNoTools } = baseConfig` to strip.
+      },
+    });
+    expect(typeof response.text).toBe('string');
+    expect(response.text?.length).toBeGreaterThan(0);
+    // Sanity: response shape includes the fields the rescue's post-await
+    // parsing reads (candidates[0].content.parts + usageMetadata).
+    expect(response.candidates?.[0]?.content?.parts).toBeDefined();
+    expect(response.usageMetadata).toBeDefined();
+  }, 60_000);
 });
