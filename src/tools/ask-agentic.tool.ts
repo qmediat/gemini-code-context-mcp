@@ -983,16 +983,41 @@ async function executeAskAgenticBody(
       // `NO_PROGRESS_CALL_THRESHOLD` times CONSECUTIVELY without the
       // `filesReadSet` growing between repeats. If `filesReadSet` grew,
       // the model is exploring (productive) — reset count to 1.
-      // Implementation note: capture `filesReadSet.size` BEFORE iterating
-      // signatures so all signatures within the same iteration see the
-      // same "size at end of this iter" snapshot. Without the snapshot,
-      // a single iter that issues `read_file` AND `grep` AND `read_file`
-      // would have a different `filesReadSet.size` per signature
-      // depending on tool-execution order — non-deterministic + wrong
-      // (the snapshot represents iter-level progress, not within-iter).
+      //
+      // Implementation note: capture `filesReadSet.size` ONCE per iter
+      // (after tool execution) so all signatures within the same iter
+      // see the same "size at end of this iter" snapshot. Without the
+      // snapshot, a single iter that issues `read_file` AND `grep` AND
+      // `read_file` would have a different `filesReadSet.size` per
+      // signature depending on tool-execution order — non-deterministic
+      // + wrong (the snapshot represents iter-level progress, not
+      // within-iter).
+      //
+      // AA1 fix (v1.16.0 PR-Round-1, 3-of-3 cross-corroborated TP HIGH):
+      // ALSO dedupe signatures WITHIN an iter before counting. The
+      // counter conceptually measures iters-spent-stuck, not raw
+      // emission count. If the model glitches and emits the same
+      // `grep` 5× in one parallel batch, that's pathological output
+      // for ONE iter — should count as +1 toward the threshold, not
+      // +5. Pre-AA1 the counter compounded 1→2→3→4→5 in a single
+      // iter, instantly tripping AGENTIC_NO_PROGRESS even though
+      // zero stuck-iters had elapsed.
+      //
+      // Tool-surface assumption (AA2 ACCEPTED-DEFERRED): `read_file`
+      // is the sole progress oracle because ask_agentic's tool
+      // surface is exclusively read-only (`read_file`, `grep`,
+      // `list_directory`, `find_files` — no write_file, no terminal
+      // exec). When a future PR adds workspace-mutating tools, this
+      // oracle MUST be expanded to track any state-changing tool
+      // call (e.g., a combined "workspace state version" counter)
+      // — otherwise a model iterating on edits + command execution
+      // would false-positive AGENTIC_NO_PROGRESS.
       const filesReadSizeAtIterEnd = filesReadSet.size;
+      const uniqueSigsThisIter = new Set<string>();
       for (const { name, args } of iterResult.signatures) {
-        const sig = `${name}(${stableJson(args)})`;
+        uniqueSigsThisIter.add(`${name}(${stableJson(args)})`);
+      }
+      for (const sig of uniqueSigsThisIter) {
         const prev = signatureCounts.get(sig);
         // Reset count when files grew between identical signatures —
         // model is making progress, not stuck. Otherwise increment.

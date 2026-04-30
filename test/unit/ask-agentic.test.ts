@@ -475,6 +475,49 @@ describe('ask_agentic loop — guards', () => {
     expect(result.structuredContent?.filesRead).toBe(4); // a, b, c, d
   });
 
+  it('AA1 fix (v1.16.0 PR-Round-1): within-iter parallel duplicates count as +1, not +N', async () => {
+    // Pathological model output: same signature emitted 5× in ONE parallel
+    // batch (single iteration). Pre-AA1 the dedupe loop iterated raw
+    // signatures and compounded 1→2→3→4→5 in that single iter, instantly
+    // tripping AGENTIC_NO_PROGRESS even though zero stuck-iters had
+    // elapsed. Post-AA1 the dedupe loop hashes signatures into a Set
+    // first; same signature in same iter counts as +1 toward the threshold.
+    //
+    // 3-of-3 cross-corroborated TP HIGH (gemini-cli + gemini-chat NIT,
+    // grok HIGH — escalated severity per merge gate). Negative pin so a
+    // future refactor that drops the within-iter dedup is caught.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const sameGrep = { name: 'grep' as const, args: { pattern: 'foo' } };
+    const { ctx } = buildCtx({
+      script: [
+        // Iter 1: 5× identical grep in one parallel batch. Pre-AA1: trips
+        // immediately. Post-AA1: counts as +1, loop continues.
+        {
+          functionCalls: [
+            { id: 'p1', ...sameGrep },
+            { id: 'p2', ...sameGrep },
+            { id: 'p3', ...sameGrep },
+            { id: 'p4', ...sameGrep },
+            { id: 'p5', ...sameGrep },
+          ],
+        },
+        // Iter 2: scripted final-text answer. Loop should reach this
+        // because Iter 1's 5 dupes counted as 1 toward threshold.
+        { text: 'Final answer despite glitchy parallel batch.' },
+      ],
+    });
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 3 },
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(String(result.structuredContent?.responseText)).toContain('Final answer');
+    expect(result.structuredContent?.iterations).toBe(2);
+  });
+
   it('content-aware: 5× same signature with NO file growth between WINS trips dedupe (v1.16.0 P2 Phase B)', async () => {
     // Negative pin for content-aware logic: when the model truly is stuck
     // (issuing same signature with NO progress between repeats), dedupe
