@@ -38,12 +38,23 @@ The v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to stream
 ### Backward compatibility
 
 - **No breaking change.** `stallMs` is an optional new schema field; existing callers that don't set it see identical behavior to v1.16.1.
-- **`structuredContent.timeoutMs` semantics**: now reflects the LIMIT THAT FIRED (mirrors `ask`/`code`). Pre-v1.16.2 only `iterationTimeoutMs` could fire, so that field always held the `iterationTimeoutMs` value. Post-v1.16.2 a `timeoutKind: 'stall'` failure surfaces the `stallMs` value here. Wrappers that branch on `timeoutKind` get unambiguous routing; wrappers that read only `timeoutMs` see the active cap.
+- **`structuredContent` shape**: `timeoutMs` continues to report the configured TOTAL wall-clock cap (or `null` when disabled) — verbatim mirror of `ask.tool.ts:1132`. New sibling field `stallMs` reports the configured stall watchdog (or `null` when disabled). The discriminator for which one fired is the new `timeoutKind: 'stall' | 'total'` field. Wrappers that branched on `timeoutMs > X` pre-v1.16.2 see a stable contract — only `null` (disabled) is a new case, and existing branches handle it correctly because `null > X` is always `false`.
 - **Rescue path completely unchanged.** Operators who hit the rescue see byte-identical behavior to v1.16.1 (`convergenceForced`, `rescueErrorCode`, etc.).
+
+### PR-Round-1 review folds (gemini Finding #1 + #2)
+
+Round-1 cross-review (gemini-code-context + grok + codex) flagged two empirically verifiable issues. Both folded same PR per workflow:
+
+- **Finding #1 (HIGH) — `collectStream` candidate-preservation defensive gap (`src/tools/shared/stream-collector.ts:174-176`).** Pre-fix gate was `chunk.candidates.length > 0` (outer-array length only). If Gemini's stream protocol ever emits a final terminator shape like `{ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }`, the previous chunk's `functionCall` Part would be silently overwritten — the agentic loop would treat the iteration as final-text and never dispatch the tool. Fixed by adding a `parts.length > 0` gate on the inner array. Empirical current-protocol behaviour (functionCall + finishReason packed into one chunk) is preserved either way; this hardens against fragmentation patterns that future Gemini SDK / thinking-mode variants could legitimately introduce. Side-effect on `ask` / `code`: `lastCandidates.finishReason` may now come from a non-final chunk if the final chunk has no parts — observably equivalent for both, since they read accumulated `response.text`, not `candidates[0].finishReason`.
+- **Finding #2 (MEDIUM) — `timeoutMs` payload contract divergence from ask/code (`src/tools/ask-agentic.tool.ts`).** Initial commit collapsed `timeoutMs` to "the limit that fired" (stall value when stall fired). `ask.tool.ts:1132` always reports the configured total wall-clock cap regardless of which watchdog fired — the discriminator is `timeoutKind`. Reverted to ask/code parity: `timeoutMs` = configured total (or null), `stallMs` = configured stall (or null), `timeoutKind` = which one fired.
+
+Two new regression tests pin the fixes:
+- `test/unit/stream-collector.test.ts` — `does not overwrite with terminator-only candidates that have empty parts (v1.16.2 fragmentation guard)` — exercises the multi-chunk fragmentation pattern at the collector level.
+- `test/unit/ask-agentic.test.ts` — `dispatches functionCall correctly when stream fragments fc into one chunk and terminator into the next (v1.16.2 PR-Round-1)` — exercises the same pattern at the agentic-loop level, asserting that `read_file` actually dispatches and the loop reaches organic final-text.
 
 ### Coverage
 
-762 passed | 9 skipped (up from 759 — added 3 new tests: stall-fires-on-silent-stream, total-fires-when-heartbeat-keeps-stall-reset, timeoutKind-knob-hint-discrimination). All v1.15.0 rescue tests + v1.16.0 content-aware NO_PROGRESS tests still green — proves the TRIM scope-exclusion held.
+764 passed | 9 skipped (759 → 762 in initial commit; 762 → 764 after Round-1 folds: added 2 regression tests for the fragmentation guard + adjusted 2 stallMs tests for the corrected `timeoutMs` semantics). All v1.15.0 rescue tests + v1.16.0 content-aware NO_PROGRESS tests still green — proves the TRIM scope-exclusion held.
 
 ### Notes
 

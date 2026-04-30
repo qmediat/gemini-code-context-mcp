@@ -894,10 +894,16 @@ async function executeAskAgenticBody(
           // v1.16.2 (T33 TRIM): with the loop now streaming, stall vs total
           // is meaningful. Surface `timeoutKind` so wrappers can route retry
           // policy: 'stall' → safe to retry (dead socket); 'total' → raise
-          // iterationTimeoutMs or narrow prompt. Mirrors ask.tool.ts:1119
-          // — `timeoutMs` is the legacy flat field documented as the
-          // BACKWARD-COMPAT alias for the active limit, so we collapse to
-          // the value that actually fired (mirrors ask).
+          // iterationTimeoutMs or narrow prompt. `limitMs` is the value that
+          // actually fired — used in the message string + emitter line for
+          // operator-readable context. The structuredContent payload mirrors
+          // `ask.tool.ts:1129-1135` exactly: `timeoutMs` always reports the
+          // configured TOTAL wall-clock cap (or null if disabled), `stallMs`
+          // reports the configured stall watchdog. The `timeoutKind` field
+          // is the discriminator. Wrappers that branched on `timeoutMs > X`
+          // pre-v1.16.2 see a stable contract — only configured-but-not-fired
+          // adds a new `null` case (which existing branches handle correctly
+          // since `null > X` is false).
           const kind = getTimeoutKind(iterErr) ?? 'total';
           const limitMs = kind === 'stall' ? stallMs : totalMs;
           const knobHint =
@@ -911,12 +917,14 @@ async function executeAskAgenticBody(
             `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} Note: AbortSignal is client-only — Gemini may still finish server-side and bill tokens for completed work.`,
             {
               errorCode: 'TIMEOUT',
-              // `timeoutMs` is the active limit that fired (legacy field —
-              // pre-v1.16.2 callers see the same shape). `stallMs` is the
-              // configured stall watchdog (or null if disabled) — surfaces
-              // both so operators can correlate which knob they configured
-              // vs which one actually fired.
-              timeoutMs: limitMs,
+              // Mirrors ask.tool.ts:1132 verbatim: `timeoutMs` = configured
+              // total wall-clock cap (or null when disabled); `stallMs` =
+              // configured stall watchdog (or null when disabled). The
+              // discriminator for which one fired is `timeoutKind`. Pre-fix
+              // (v1.16.2 PR-Round-1) this collapsed to "the limit that fired"
+              // — diverged from ask/code; flagged by gemini Round-1 as a
+              // contract regression. Reverted to ask/code parity.
+              timeoutMs: totalMs,
               stallMs,
               timeoutKind: kind,
               iteration: iterations,

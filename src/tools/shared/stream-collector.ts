@@ -169,9 +169,39 @@ export async function collectStream(
       const chunkText = chunk.text ?? '';
       if (chunkText.length > 0) textChunks.push(chunkText);
 
-      // Last non-empty candidates wins. Gemini sends finish reasons +
-      // safety ratings authoritatively only on the final chunk.
-      if (chunk.candidates && chunk.candidates.length > 0) {
+      // Last candidates with non-empty parts wins.
+      //
+      // Pre-v1.16.2 the gate was `chunk.candidates.length > 0` (outer-array
+      // check only). That correctly preserved finishReason / safety ratings
+      // from final chunks for the v1.7.0 ask/code text-extraction path
+      // (which reads accumulated `response.text`, not `candidates[0].parts`).
+      // The v1.16.2 ask_agentic streaming migration is the first consumer
+      // that reads `candidates[0].content.parts` directly — to extract
+      // `functionCall` Parts on each loop iteration. If Gemini's stream
+      // protocol ever emits a final terminator chunk shape like
+      // `{ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }`
+      // — non-empty outer array but empty inner parts — the prior gate
+      // would silently overwrite a previous chunk that carried the actual
+      // `functionCall`, dropping the tool dispatch.
+      //
+      // Defensive fix: gate also on `parts.length > 0`. The empirical
+      // current-protocol behaviour (functionCall + finishReason emitted
+      // together in one chunk) is preserved either way; this hardens
+      // against a fragmentation pattern that future Gemini SDK versions
+      // OR thinking-mode variants could legitimately introduce. Flagged
+      // by gemini Round-1 review on PR #58 as a HIGH-severity defensive
+      // gap.
+      //
+      // Side-effect on ask/code: `lastCandidates.finishReason` may now come
+      // from a non-final chunk if the final chunk has no parts. Neither
+      // `ask` nor `code` reads finishReason off the CollectedResponse —
+      // both extract via `response.text` (concatenated) — so this is
+      // observably equivalent for them.
+      if (
+        chunk.candidates &&
+        chunk.candidates.length > 0 &&
+        (chunk.candidates[0]?.content?.parts?.length ?? 0) > 0
+      ) {
         lastCandidates = chunk.candidates;
       }
 

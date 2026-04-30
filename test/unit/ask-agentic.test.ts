@@ -2377,7 +2377,12 @@ describe('ask_agentic loop — stallMs heartbeat watchdog (T33, v1.16.2)', () =>
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
     expect(result.structuredContent?.timeoutKind).toBe('stall');
-    expect(result.structuredContent?.timeoutMs).toBe(1_000);
+    // v1.16.2 PR-Round-1 (gemini Finding #2): structuredContent.timeoutMs
+    // mirrors ask/code — it ALWAYS reports the configured total wall-clock
+    // cap (or null when disabled), regardless of which watchdog fired.
+    // The active limit is signalled via `timeoutKind` + `stallMs` sibling.
+    expect(result.structuredContent?.timeoutMs).toBeNull();
+    expect(result.structuredContent?.stallMs).toBe(1_000);
     expect(result.structuredContent?.iteration).toBe(1);
     // Sanity: actually waited for the stall timer to fire (~1s) and didn't
     // run away. 950ms lower bound matches the T19 setTimeout-precision
@@ -2436,9 +2441,94 @@ describe('ask_agentic loop — stallMs heartbeat watchdog (T33, v1.16.2)', () =>
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
     expect(result.structuredContent?.timeoutKind).toBe('total');
+    // v1.16.2 PR-Round-1 (gemini Finding #2): both `timeoutMs` (total) and
+    // `stallMs` (stall) reflect the CONFIGURED knobs — the discriminator is
+    // `timeoutKind`. Both populated here because both were set on the call.
     expect(result.structuredContent?.timeoutMs).toBe(1_000);
+    expect(result.structuredContent?.stallMs).toBe(5_000);
     expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(elapsedMs).toBeLessThan(5_000);
+  });
+
+  it('dispatches functionCall correctly when stream fragments fc into one chunk and terminator into the next (v1.16.2 PR-Round-1)', async () => {
+    // Regression pin for gemini Finding #1 (HIGH). Even if Gemini's current
+    // protocol typically packs functionCall + finishReason into one chunk,
+    // the loop must remain robust when fragmentation does occur — for
+    // example, when thinkingLevel: HIGH inserts a terminator-only chunk
+    // after the function-call chunk, OR a future SDK release changes
+    // chunking behaviour.
+    //
+    // Pre-fix collectStream's last-write-wins on candidates would overwrite
+    // chunk 1's functionCall with chunk 2's empty parts, the loop would
+    // treat the iteration as final-text, and the read_file would never
+    // dispatch. Post-fix collectStream's gate also requires non-empty
+    // parts — chunk 1's functionCall survives.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-fragmented-fc-'));
+    writeFileSync(join(root, 'a.ts'), 'export const answer = 42;');
+
+    const { ctx, generateContent, generateContentStream } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    // Iter 1: stream emits the read_file functionCall in chunk 1, then a
+    // terminator chunk with empty parts + finishReason in chunk 2. The
+    // load-bearing assertion: the functionCall is preserved across the
+    // fragmentation and gets dispatched.
+    generateContentStream.mockReset();
+    generateContentStream.mockImplementationOnce(() => {
+      async function* fragmentedFc() {
+        yield {
+          candidates: [
+            {
+              content: {
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }],
+              },
+            },
+          ],
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+        yield {
+          candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            thoughtsTokenCount: 0,
+          },
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+      }
+      return Promise.resolve(fragmentedFc());
+    });
+    // Iter 2: organic final text (no fragmentation needed; one-shot stream).
+    // Note: collectStream reads `chunk.text` (a getter on real
+    // GenerateContentResponse) — for plain-object chunks we expose it as a
+    // property so the text-concat path picks it up. Mirrors the buildResponse
+    // helper at line 134.
+    generateContentStream.mockImplementationOnce(() => {
+      async function* finalText() {
+        yield {
+          text: 'The answer is 42.',
+          candidates: [
+            {
+              content: { parts: [{ text: 'The answer is 42.' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 150,
+            candidatesTokenCount: 5,
+            thoughtsTokenCount: 0,
+          },
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+      }
+      return Promise.resolve(finalText());
+    });
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    // Load-bearing: the functionCall WAS dispatched (read_file ran against
+    // a.ts), the loop completed organically, and the final answer is text.
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.iterations).toBe(2);
+    expect(result.structuredContent?.filesRead).toBe(1);
+    const message = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+    expect(message).toBe('The answer is 42.');
   });
 
   it('timeoutKind="stall" surfaces a knob hint pointing at stallMs (not iterationTimeoutMs)', async () => {
