@@ -58,7 +58,8 @@ import {
   readFileExecutor,
 } from './agentic/workspace-tools.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, isTimeoutAbort } from './shared/abort-timeout.js';
+import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import { collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_AGENTIC } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
@@ -129,6 +130,15 @@ export const askAgenticInputSchema = z
       .optional()
       .describe(
         "Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls + per-iteration TPM throttle wait) is bounded by this. **A single iteration that times out FAILS THE WHOLE agentic call** with `errorCode: 'TIMEOUT'` (the failed iteration's function-call results never came back, leaving the conversation structurally incomplete — continuing with partial state would 400 on the next turn). The post-loop forced-finalization rescue pass is ALSO bounded by this timeout, but its timeout behaviour DIFFERS: rescue timeouts are caught best-effort and fall through to the original `subReason: 'AGENTIC_MAX_ITERATIONS'` shape with `errorCode: 'UNKNOWN'` (NOT `'TIMEOUT'`) — the rescue is the documented exit path, and surfacing TIMEOUT for it would obscure the underlying maxIterations exhaustion. Operators detect rescue-attempted-but-failed via `apiCalls > iterations` and `convergenceForced` absent. Whole-loop budget is also bounded by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled.",
+      ),
+    stallMs: z
+      .number()
+      .int()
+      .min(1_000)
+      .max(600_000)
+      .optional()
+      .describe(
+        'Per-iteration HEARTBEAT-AWARE stall watchdog in ms (1s–10min). Resets on every chunk yielded by `generateContentStream` (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Right knob for "kill dead sockets quickly without penalising deep reasoning." Recommended: `60_000` (60s). Falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`, then disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `iterationTimeoutMs` — both can be set; whichever fires first wins. **Loop iterations only — the post-loop forced-finalization rescue pass keeps the v1.15.0 `apiCallSucceeded` non-streaming contract.**',
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -775,15 +785,19 @@ async function executeAskAgenticBody(
       // wait itself is bounded by the iteration timeout. (If iterTimeout
       // is created after the wait, a 60s throttle delay can blow past a
       // 10s iterationTimeoutMs without ever firing.) Disposed in finally.
-      // ask_agentic uses `generateContent` (not the streaming variant), so
-      // there's no chunk stream to feed `recordChunk()` — only `totalMs`
-      // matters. We pass an empty `stallEnvVar` (disables stall) and omit
-      // `stallMs`. The composite controller's signal still fires on the
-      // wall-clock cap exactly as before.
+      // v1.16.2 (T33 TRIM): the loop now streams via `generateContentStream`
+      // + `collectStream`, so `recordChunk()` is wired in to reset the stall
+      // watchdog on every text/thought chunk. The TPM throttle wait that
+      // precedes the dispatch has no chunks to record — `stallMs` only
+      // governs the stream itself; the wall-clock `totalMs` still bounds
+      // the throttle wait. Composite signal still fires on whichever cap
+      // hits first. Rescue path uses non-streaming `generateContent` and
+      // keeps an empty `stallEnvVar` — see the rescue site below.
       const iterTimeout = createTimeoutController({
         ...(input.iterationTimeoutMs !== undefined ? { totalMs: input.iterationTimeoutMs } : {}),
         totalEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
-        stallEnvVar: '',
+        ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
+        stallEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS',
       });
 
       // Per-iteration TPM throttle reservation + iteration call. Both must
@@ -831,6 +845,17 @@ async function executeAskAgenticBody(
           maxFilesRead,
           abortSignal: iterTimeout.signal,
           matchConfig,
+          // v1.16.2 (T33 TRIM): wire stall watchdog reset + live thought
+          // surfacing. `recordChunk` is the bridge that makes `stallMs`
+          // heartbeat-aware — it fires on every text/thought chunk arrival.
+          // `onThoughtChunk` mirrors the ask/code streaming UX so operators
+          // see model reasoning progress live instead of waiting for the
+          // 30-120s iteration to complete.
+          recordChunk: () => iterTimeout.recordChunk(),
+          onThoughtChunk: (text) => {
+            const trimmed = text.trim().slice(0, 80);
+            if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
+          },
         });
       } catch (iterErr) {
         // Release both reservations on failure before re-throwing.
@@ -864,13 +889,36 @@ async function executeAskAgenticBody(
         // function-call results never came back, so the conversation is
         // structurally incomplete.
         if (isTimeoutAbort(iterErr)) {
-          const ms = iterTimeout.timeoutMs;
-          emitter.emit(`ask_agentic: iteration ${iterations} aborted after ${ms ?? '?'}ms`);
+          const totalMs = iterTimeout.timeoutMs;
+          const stallMs = iterTimeout.stallMs;
+          // v1.16.2 (T33 TRIM): with the loop now streaming, stall vs total
+          // is meaningful. Surface `timeoutKind` so wrappers can route retry
+          // policy: 'stall' → safe to retry (dead socket); 'total' → raise
+          // iterationTimeoutMs or narrow prompt. Mirrors ask.tool.ts:1119
+          // — `timeoutMs` is the legacy flat field documented as the
+          // BACKWARD-COMPAT alias for the active limit, so we collapse to
+          // the value that actually fired (mirrors ask).
+          const kind = getTimeoutKind(iterErr) ?? 'total';
+          const limitMs = kind === 'stall' ? stallMs : totalMs;
+          const knobHint =
+            kind === 'stall'
+              ? 'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.'
+              : 'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.';
+          emitter.emit(
+            `ask_agentic: iteration ${iterations} aborted after ${limitMs ?? '?'}ms (${kind})`,
+          );
           return errorResult(
-            `ask_agentic: iteration ${iterations} timed out after ${ms ?? '?'}ms. Increase \`iterationTimeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS\` higher; default disabled. Note: AbortSignal is client-only — Gemini may still finish server-side and bill tokens for completed work.`,
+            `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} Note: AbortSignal is client-only — Gemini may still finish server-side and bill tokens for completed work.`,
             {
               errorCode: 'TIMEOUT',
-              timeoutMs: ms,
+              // `timeoutMs` is the active limit that fired (legacy field —
+              // pre-v1.16.2 callers see the same shape). `stallMs` is the
+              // configured stall watchdog (or null if disabled) — surfaces
+              // both so operators can correlate which knob they configured
+              // vs which one actually fired.
+              timeoutMs: limitMs,
+              stallMs,
+              timeoutKind: kind,
               iteration: iterations,
               iterations,
               // H2 fix: distinguish timeout-during-throttle-wait (no
@@ -1627,6 +1675,13 @@ async function runAgenticIteration(args: {
    * a fallback from `ask` (which already applies the same globs to its
    * eager scanner) preserves filter semantics — no privacy regression. */
   matchConfig: MatchConfig;
+  /** Reset the per-iteration stall watchdog on every stream chunk (T33,
+   * v1.16.2). Wired from the loop's `iterTimeout.recordChunk`. No-op when
+   * stall is disabled. */
+  recordChunk: () => void;
+  /** Surface live thought-chunk previews via the MCP progress channel
+   * (T33, v1.16.2). Mirrors the ask/code streaming UX. */
+  onThoughtChunk: (text: string) => void;
 }): Promise<IterationResult> {
   const {
     ctx,
@@ -1638,6 +1693,8 @@ async function runAgenticIteration(args: {
     maxFilesRead,
     abortSignal,
     matchConfig,
+    recordChunk,
+    onThoughtChunk,
   } = args;
 
   // Each agentic iteration is its own `generateContent` call; a transient
@@ -1647,9 +1704,24 @@ async function runAgenticIteration(args: {
   // rationale — SDK-side retry is intentionally disabled because enabling it
   // strips Gemini's informative error bodies; 429 rate-limits continue to be
   // handled at the tool layer via `isGemini429` + `parseRetryDelayMs`).
-  const response = await withNetworkRetry(
+  //
+  // v1.16.2 (T33 TRIM): switched to `generateContentStream` + `collectStream`
+  // for two operator wins: (1) live `thinking: …` progress events during the
+  // 30-120s thinking phase (previously only iter-counter notifications),
+  // (2) heartbeat-aware `stallMs` watchdog that resets on every chunk —
+  // catches dead sockets ~30× faster than wall-clock alone without
+  // penalising legitimate deep reasoning. Mid-stream failures cannot be
+  // retried (Gemini's generateContentStream has no resume), so the retry
+  // wraps ONLY the stream OPENING — same contract as `ask`/`code`. The
+  // assembled `CollectedResponse` is shape-identical to the previous
+  // `GenerateContentResponse`, so all downstream extraction
+  // (`response.candidates[0].content.parts`, `response.usageMetadata`) is
+  // unchanged. The post-loop forced-finalization rescue keeps the v1.15.0
+  // P3 non-streaming `apiCallSucceeded` contract unchanged — see the
+  // rescue site for rationale.
+  const stream = await withNetworkRetry(
     () =>
-      ctx.client.models.generateContent({
+      ctx.client.models.generateContentStream({
         model: resolvedModel,
         contents: conversation,
         config: { ...baseConfig, abortSignal },
@@ -1665,6 +1737,11 @@ async function runAgenticIteration(args: {
       },
     },
   );
+  const response = await collectStream(stream, {
+    signal: abortSignal,
+    onThoughtChunk,
+    onChunkReceived: recordChunk,
+  });
 
   const usage = response.usageMetadata;
   const usageOut = {

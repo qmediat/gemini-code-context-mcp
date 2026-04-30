@@ -562,26 +562,36 @@ Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_F
 
 ---
 
-## T33. `ask_agentic` streaming migration — apply heartbeat-aware stall watchdog to agentic loops
+## T33. `ask_agentic` streaming migration — apply heartbeat-aware stall watchdog to agentic loops — ✅ SHIPPED in v1.16.2 (TRIM scope)
+
+**Status:** ✅ **SHIPPED in v1.16.2 (TRIM scope — loop only)** on 2026-04-30. Loop iterations now stream via `generateContentStream` + `collectStream` with `stallMs` watchdog. The post-loop forced-finalization rescue intentionally stays on non-streaming `generateContent` — see scope-exclusion rationale below.
 
 **Source:** Original v1.14.0 plan (split out for focused release pacing — v1.14.0 shipped the `cachingMode` default flip alone since the streaming migration is reliability-only and doesn't affect the user-perceived speed change that drove v1.14.0).
 
-**Why:** `ask` and `code` use `client.models.generateContentStream` since v1.7.0 (T20), giving them the v1.12.0 `stallMs` heartbeat-aware stall watchdog. `ask_agentic` still uses `generateContent` per iteration — a stuck agentic iteration can only be killed by `iterationTimeoutMs` (wall-clock), not by the stall watchdog that observes streaming chunks. Long thinking iterations look indistinguishable from dead sockets to the wall-clock cap. Migrating to `generateContentStream` per iteration brings agentic loops in line with the rest of the codebase.
-
-**Scope:**
-- `src/tools/ask-agentic.tool.ts:823-874` — replace per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
+**What shipped (v1.16.2)**:
+- `src/tools/ask-agentic.tool.ts` `runAgenticIteration()` — replaced per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
 - New schema field `stallMs` on `ask_agentic` (range `[1_000, 600_000]`, optional). Behaviour matches `ask`/`code`'s `stallMs`: per-iteration heartbeat reset on every chunk; fires only when the stream goes silent.
 - New env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` for operator-level default.
 - Existing `iterationTimeoutMs` stays orthogonal (wall-clock cap; both can be set, whichever fires first wins).
-- Update `createTimeoutController` call site to pass composite `{ totalMs, stallMs }` opts (already supported since v1.12.0; just call with the new field).
+- `createTimeoutController` loop call site now passes composite `{ totalMs, stallMs }` opts.
+- TIMEOUT errorResult now surfaces `timeoutKind: 'stall' | 'total'` + both `timeoutMs` (active limit that fired) and `stallMs` (configured stall watchdog) — mirrors ask/code conventions.
+- Live `thinking: …` progress events (throttled to ~1.5s by `collectStream`) — UX parity with ask/code.
 
-**Tests:**
-- Extend `test/unit/ask-agentic.test.ts`: stall fires within `stallMs`; total fires at `iterationTimeoutMs`; `timeoutKind: 'stall'` vs `'total'` surfaces correctly on the agentic error path.
-- New regression: induce a network stall mid-iteration; confirm abort within `stallMs + 5 %`.
+**ACCEPTED-DEFERRED**: streaming the post-loop forced-finalization rescue pass.
 
-**Sizing:** ~5 hours including tests + docs.
+The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to streaming. After 2-of-2 cross-reviewer consultation (gcc-ask: GO full scope; grok: TRIM), TRIM was adopted because:
+- The rescue's `apiCallSucceeded` contract was stabilized in v1.15.0 (P3+P4+P5) through 4 review rounds + `/6step` cross-corroboration. Streaming it would re-open that recently-stabilized surface for marginal liveness gain on a once-per-call path.
+- Mid-stream failures cannot be retried (Gemini's `generateContentStream` has no resume) — v1.6/v1.7 plan §11 explicitly calls this out. The rescue's transient-failure budget routing depends on knowing whether the API was billed; partial-stream-then-fail blurs that signal.
+- Empirical wall-clock dominance is in the LOOP, not the rescue. Streaming where the wall-clock lives gets 80-90% of the value at half the effort and zero risk to recently-stabilized code.
+- Rescue cost is ONE call. Stalls there are bounded by `iterationTimeoutMs`. Adequate.
 
-**Blocked on:** nothing structural. Pure release pacing — held back from v1.14.0 to keep the speed-driver default-flip release small and review-able. Recommended for v1.14.1 or v1.15.0 alongside any other agentic-loop reliability work.
+**When to revisit:** if rescue-path stalls become an empirically observed problem (e.g., operator reports of rescue calls that hang for 30+ minutes before `iterationTimeoutMs` fires). Currently zero such reports across the v1.14.x → v1.16.x release cycle.
+
+**Tests pinned in v1.16.2:**
+- `fires stall TIMEOUT when stream yields one chunk then goes silent` (stall arms on first chunk per documented edge case in `abort-timeout.ts:173-177`).
+- `total fires (timeoutKind=total) when iterationTimeoutMs hits even if stallMs is also set`.
+- `timeoutKind="stall" surfaces a knob hint pointing at stallMs (not iterationTimeoutMs)`.
+- All existing v1.14.4 + v1.15.0 + v1.16.0 + v1.16.1 tests still green (regression check on rescue scope-exclusion).
 
 ---
 
