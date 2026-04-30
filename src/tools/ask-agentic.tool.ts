@@ -659,8 +659,33 @@ async function executeAskAgenticBody(
     };
 
     const conversation: Content[] = [{ role: 'user', parts: [{ text: input.prompt }] }];
-    /** Call-signature → count, for no-progress detection. */
-    const signatureCounts = new Map<string, number>();
+    /** Call-signature → state, for content-aware no-progress detection.
+     *
+     * v1.16.0 (P2 Phase B): replaces the v1.14.4 simple counter with a
+     * content-aware version. Pre-Phase-B `signatureCounts: Map<string,
+     * number>` tripped on N consecutive identical signatures regardless
+     * of whether the model was making progress between repeats. That
+     * was empirically wrong on 2026-04-30 — Gemini 3 Pro under HIGH
+     * thinking re-runs the same `grep` while ALSO reading new files,
+     * which IS progress, but the simple counter still tripped.
+     *
+     * Phase B tracks `lastFilesReadSize` per signature: same signature
+     * counts toward the threshold ONLY if no `read_file` against an
+     * unseen path happened between repeats. If `filesReadSet` grew
+     * since the previous identical signature, count resets to 1
+     * (current call) — the model is exploring, not stuck.
+     *
+     * Why `read_file` specifically and not all tool calls? `list_directory`
+     * / `find_files` / `grep` are exploration without commitment. They
+     * tell us where to look but don't capture content into the
+     * conversation. `read_file` is the progress signal — it means
+     * "I found something worth examining" and grows the conversation
+     * the rescue path will replay.
+     *
+     * Threshold (NO_PROGRESS_CALL_THRESHOLD = 5) unchanged from v1.14.4
+     * — Phase B refines the SIGNAL, not the cap. Hard upper bound
+     * remains `maxIterations` × `maxTotalInputTokens`. */
+    const signatureCounts = new Map<string, { count: number; lastFilesReadSize: number }>();
     const filesReadSet = new Set<string>();
     let cumulativeInputTokens = 0;
     let cumulativeOutputTokens = 0;
@@ -953,16 +978,30 @@ async function executeAskAgenticBody(
         );
       }
 
-      // No-progress detection: if any single call signature has now been
-      // issued NO_PROGRESS_CALL_THRESHOLD times across the loop, bail with
-      // the best text we can extract.
+      // No-progress detection (v1.16.0 P2 Phase B — content-aware):
+      // bails when any single call signature has been issued
+      // `NO_PROGRESS_CALL_THRESHOLD` times CONSECUTIVELY without the
+      // `filesReadSet` growing between repeats. If `filesReadSet` grew,
+      // the model is exploring (productive) — reset count to 1.
+      // Implementation note: capture `filesReadSet.size` BEFORE iterating
+      // signatures so all signatures within the same iteration see the
+      // same "size at end of this iter" snapshot. Without the snapshot,
+      // a single iter that issues `read_file` AND `grep` AND `read_file`
+      // would have a different `filesReadSet.size` per signature
+      // depending on tool-execution order — non-deterministic + wrong
+      // (the snapshot represents iter-level progress, not within-iter).
+      const filesReadSizeAtIterEnd = filesReadSet.size;
       for (const { name, args } of iterResult.signatures) {
         const sig = `${name}(${stableJson(args)})`;
-        const count = (signatureCounts.get(sig) ?? 0) + 1;
-        signatureCounts.set(sig, count);
+        const prev = signatureCounts.get(sig);
+        // Reset count when files grew between identical signatures —
+        // model is making progress, not stuck. Otherwise increment.
+        const count =
+          prev && filesReadSizeAtIterEnd > prev.lastFilesReadSize ? 1 : (prev?.count ?? 0) + 1;
+        signatureCounts.set(sig, { count, lastFilesReadSize: filesReadSizeAtIterEnd });
         if (count >= NO_PROGRESS_CALL_THRESHOLD) {
           return errorResult(
-            `ask_agentic: no-progress loop detected — call '${sig.slice(0, 200)}' was repeated ${count} times. Returning partial state.`,
+            `ask_agentic: no-progress loop detected — call '${sig.slice(0, 200)}' was repeated ${count} times without new file reads between repeats. Returning partial state.`,
             {
               errorCode: 'UNKNOWN',
               retryable: false,

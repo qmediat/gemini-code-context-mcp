@@ -5,6 +5,38 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] - 2026-04-30
+
+### Changed — `ask_agentic` NO_PROGRESS dedupe is now content-aware (P2 Phase B)
+
+The v1.14.4 threshold bump (3 → 5) was a stop-gap. v1.16.0 ships the planned **Phase B** content-aware refactor: same call signature counts toward the no-progress threshold ONLY if no `read_file` against an unseen path happened between repeats. If `filesReadSet` grew between identical signatures, the count resets to 1 — the model is exploring, not stuck. **No schema change.**
+
+- **Why**: today's empirical Gemini 3 Pro under HIGH thinking re-runs the same `grep "FunctionCallingConfigMode"` while ALSO reading new files between iterations. That IS progress. The simple counter (v1.14.4) tripped before `maxIterations`, killing the rescue path on workflows where the model alternated `grep` + `read_file` calls. Phase B distinguishes "exploring with repeated lookups" from "genuinely stuck".
+- **Why `read_file` specifically?** `list_directory` / `find_files` / `grep` are exploration without commitment — they tell the model where to look but don't capture content into the conversation. `read_file` is the progress signal — it grows the conversation the rescue path will replay if the loop exhausts iterations. The rescue benefits from a richer accumulated history, so commitment-via-read is the right progress oracle.
+- **Implementation**: `signatureCounts` Map type changed from `<string, number>` to `<string, { count: number; lastFilesReadSize: number }>`. Capture `filesReadSet.size` once per iter (after tool execution completes) so all signatures within the same iter see the same snapshot — within-iter ordering doesn't matter. On each signature: if `prev.lastFilesReadSize < current size` → count = 1 (reset, progress). Otherwise → count = prev.count + 1 (no progress, may trip).
+- **Threshold (`NO_PROGRESS_CALL_THRESHOLD = 5`) unchanged**. Phase B refines the SIGNAL, not the cap. Hard upper bound remains `maxIterations` × `maxTotalInputTokens`.
+- **Error message updated**: AGENTIC_NO_PROGRESS errorResult message now says `"... was repeated N times without new file reads between repeats"` so operators see exactly why the loop bailed (vs the previous generic "repeated N times").
+
+### Behavioural impact
+
+- **Wins**: Gemini 3 Pro multi-file investigations that re-issue the same `grep`/`list_directory` between `read_file` calls now run to completion (or to maxIterations + rescue) instead of bailing prematurely. Today's empirical regression on the v1.14.1 self-review prompt (50% NO_PROGRESS rate at threshold-3, partially mitigated by threshold-5 in v1.14.4) is now structurally addressed.
+- **Negative pin preserved**: when the model truly is stuck (5× identical signature with NO new `read_file` between), dedupe still trips. The new test `content-aware: 5× same signature with NO file growth between WINS trips dedupe` pins this.
+- **No API/schema change.** structuredContent fields unchanged. `repeatedSignature` and `filesRead` continue to surface as before.
+
+### Coverage
+
+2 net new test cases in `test/unit/ask-agentic.test.ts`:
+
+- `content-aware: same signature does NOT trip dedupe when read_file growth happens between repeats` — scripts 5× same `grep` with `read_file` interspersed; loop reaches the scripted final-text on iter 6 (would have tripped at iter 5 pre-Phase-B).
+- `content-aware: 5× same signature with NO file growth between WINS trips dedupe` — negative pin: pure-grep loop with no file reads still bails at threshold-5. Also pins the new error message wording.
+
+Total suite: 758 passed | 9 skipped (was 756 in v1.15.3). Lint, typecheck, build all green on Node 22 and Node 24.
+
+### Notes
+
+- **Minor release.** Behaviour change observable only in the no-progress dedupe — affects which agentic calls bail vs continue. No interface changes; safe drop-in upgrade.
+- v1.16.x followups still in queue: R2 (`/6step` on structuredContent-on-MCP-error-channel first), T33 (ask_agentic streaming refactor — separate v1.7 cycle).
+
 ## [1.15.3] - 2026-04-30
 
 ### Added — P10 defensive integration test for `ask_agentic` rescue payload contract
