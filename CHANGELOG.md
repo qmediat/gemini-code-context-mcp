@@ -37,7 +37,7 @@ Total suite: 743 passed | 9 skipped (was 738 in v1.15.0). Lint, typecheck, build
 
 ### Notes
 
-- Patch-level release. Pure perceived-speed + UX improvement; no behaviour change for existing callers.
+- Patch-level release. **No API/schema change.** Default agentic tool-dispatch concurrency raised 3 → 10, which is an observable performance/parallelism change for callers who don't override — operators on resource-constrained hosts (low core counts, file-handle limits, container-restricted environments) can clamp via `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY=N` (numeric inputs clamp into `[1, 50]`; values like `0`/`-3` clamp UP to `1` for serial dispatch — Round-1 fix). System-instruction text (`SYSTEM_INSTRUCTION_AGENTIC` # STRATEGY) and tool descriptions also changed; observable to LLM clients reading `tools/list`. (Round-1 Copilot CCC3 — clarified wording per reviewer.)
 - v1.15.x followups still in queue: P10 (env-gated integration test), P2 Phase B (content-aware NO_PROGRESS dedupe), R2 (`/6step` on structuredContent-on-MCP-error-channel first), audit `ask.tool.ts` / `code.tool.ts` for safety-rules consistency, T33 (ask_agentic streaming refactor — separate v1.16/v1.7 cycle).
 
 ## [1.15.0] - 2026-04-30

@@ -2152,14 +2152,27 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
 
 // v1.15.1 P9_a — TOOL_EXECUTION_CONCURRENCY env override + clamp.
 // Tests the `resolveToolExecutionConcurrency()` helper directly. Uses
-// vi.stubEnv so the env var swap is auto-restored after each test (no
-// process-wide side effect that could affect later tests in this file).
+// vi.stubEnv with explicit beforeEach + afterEach `vi.unstubAllEnvs()` to
+// guarantee the env stubs don't leak to tests appended after this describe
+// block. (Round-1 Copilot CCC1 fix — vitest doesn't auto-restore stubs
+// without explicit lifecycle hooks unless `unstubEnvs: true` is set in
+// vitest.config.ts, which this repo doesn't enable.)
 describe('resolveToolExecutionConcurrency (v1.15.1 P9_a)', () => {
   beforeEach(() => {
     vi.unstubAllEnvs();
   });
 
-  it('returns default 10 when env var unset', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('returns default 10 when env var unset OR empty string', () => {
+    // Resolver short-circuits BOTH `undefined` (truly unset) AND `''` (empty
+    // string) to the default — same OR-branch in the source. Cover both
+    // semantically distinct cases here so the test name matches the body.
+    // (Round-1 Copilot CCC2 fix.)
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', undefined);
+    expect(resolveToolExecutionConcurrency()).toBe(10);
     vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '');
     expect(resolveToolExecutionConcurrency()).toBe(10);
   });
