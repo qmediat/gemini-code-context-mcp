@@ -101,7 +101,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        'Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract.',
+        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract. **v1.15.0:** rescue-attempted-but-failed paths additionally surface `structuredContent.rescueErrorCode` (`'TIMEOUT' | 'RATE_LIMIT' | 'NETWORK' | 'EMPTY_TEXT'`) + `rescueErrorMessage` (truncated to 500 chars) so wrappers can branch retry behaviour without log scraping.",
       ),
     maxTotalInputTokens: z
       .number()
@@ -251,6 +251,14 @@ const SYSTEM_INSTRUCTION_AGENTIC = [
  * (data-vs-instruction firewall) is therefore prepended below. A 3-of-3
  * cross-reviewer audit on 2026-04-30 (gemini-cli + gemini-chat + grok)
  * flagged the prior absence as an indirect-prompt-injection vector.
+ *
+ * v1.15.0 (C2): citation directive conditionalised symmetrically with the
+ * "Unknown" handling — both gemini-chat (Round-2) and Copilot (Round-1)
+ * flagged the v1.14.4 unconditional `Cite specific file:line` as a
+ * potential format-break for strict JSON / fixed-shape outputs (e.g., a
+ * pure JSON array of strings can't carry `(file:42)` annotations without
+ * mutating the data). Now reads "ONLY where the requested format provides
+ * a compatible place to put citations".
  */
 const SYSTEM_INSTRUCTION_FINALIZATION = [
   SYSTEM_INSTRUCTION_SAFETY,
@@ -263,7 +271,7 @@ const SYSTEM_INSTRUCTION_FINALIZATION = [
   '2. STRICTLY follow that requested structure.',
   '3. Synthesize the gathered evidence into the final answer and output it DIRECTLY in the requested structure. Provide NO preamble, NO apologies, NO "Here is the summary", and NO internal thinking or narrative notes.',
   '',
-  'If some details remain unverified, integrate an "Unknown" element ONLY if it is compatible with the parsed output shape (e.g., adds a row to a table, a field to a JSON object, a sub-bullet under a heading); never add extraneous keys or sections that would invalidate the requested format. Cite specific `file:line` for the claims you can support.',
+  'If some details remain unverified, integrate an "Unknown" element ONLY if it is compatible with the parsed output shape (e.g., adds a row to a table, a field to a JSON object, a sub-bullet under a heading); never add extraneous keys or sections that would invalidate the requested format. Cite specific `file:line` for the claims you can support — but ONLY where the requested format provides a compatible place to put citations (e.g., a sub-bullet, an additional column, embedded inside an existing string field); never break the requested structure to add citations.',
 ].join('\n');
 
 // ---------------------------------------------------------------------------
@@ -625,6 +633,14 @@ async function executeAskAgenticBody(
     let cumulativeInputTokens = 0;
     let cumulativeOutputTokens = 0;
     let cumulativeThinkingTokens = 0;
+    // P5 (v1.15.0): approximate token count of the tool-response Parts
+    // appended to `conversation` after the most recent iteration's
+    // `generateContent` returned. Folded into the rescue's
+    // `finalizationEstimate` so its TPM/budget reservation covers the data
+    // the rescue actually replays. Pre-P5 the estimate omitted this delta;
+    // with `TOOL_EXECUTION_CONCURRENCY = 3` reading large files, the rescue
+    // could under-reserve by 100k+ tokens and 429 mid-flight.
+    let lastToolResponseTokens = 0;
     let iterations = 0;
     // Tracks the most recent iteration's actual `promptTokenCount` (size of the
     // conversation as sent in the LAST loop iter). Used by the v1.14.2
@@ -850,6 +866,7 @@ async function executeAskAgenticBody(
       cumulativeOutputTokens += iterResult.usage.candidatesTokenCount;
       cumulativeThinkingTokens += iterResult.usage.thoughtsTokenCount;
       lastIterationPromptTokens = iterResult.usage.promptTokenCount;
+      lastToolResponseTokens = iterResult.toolResponseTokens; // P5 (v1.15.0)
 
       emitter.emit(
         `iter ${iterations}/${maxIterations}: ${iterResult.functionCallCount} tool calls, ${cumulativeInputTokens} in-tokens so far`,
@@ -970,6 +987,29 @@ async function executeAskAgenticBody(
     // cases (response never arrived to populate usageMetadata) and
     // inferring "fired" from usage would undercount the API call.
     let finalizationAttempted = false;
+    // P3 (v1.15.0): tracks whether the rescue's `await withNetworkRetry(...)`
+    // returned a response BEFORE any post-await processing (parsing
+    // candidates/parts, computing thinking summary, etc.) could throw. The
+    // pre-P3 try/catch routed BOTH "API failed" and "API succeeded but
+    // post-await parse threw" through the catch → cancelBudgetReservation,
+    // even though the second path's tokens WERE billed by Google. This
+    // flag is set IMMEDIATELY after the await returns and used in the new
+    // `finally` block to decide finalize-vs-cancel: success path gets
+    // `finalizeBudgetReservation` even if downstream parsing errored.
+    // (3-of-3 cross-reviewer /6step verdict: TRUE POSITIVE — grok F1.)
+    let apiCallSucceeded = false;
+    // P4 (v1.15.0): caller-visible rescue failure-class signal. Pre-P4 the
+    // rescue's catch block extracted the 429 hint server-side (good) but
+    // returned a generic `subReason: 'AGENTIC_MAX_ITERATIONS'` errorResult,
+    // forcing callers to grep server logs to distinguish 429 vs TIMEOUT vs
+    // network failure vs empty-text. Now surfaced as
+    // `structuredContent.rescueErrorCode` on the trailing errorResult so
+    // wrappers can branch retry behaviour without log scraping. Stays null
+    // when the rescue produced text successfully (the textResult path
+    // already signals via `convergenceForced: true`). Strict union — extend
+    // here when adding new error classes.
+    let rescueErrorCode: 'TIMEOUT' | 'RATE_LIMIT' | 'NETWORK' | 'EMPTY_TEXT' | null = null;
+    let rescueErrorMessage: string | null = null;
     // v1.14.2 Fix 5: tracks WHY the rescue pass was skipped, so the trailing
     // errorResult can emit a cause-specific message + structured field instead
     // of the misleading generic "Increase maxIterations or narrow your prompt"
@@ -991,9 +1031,19 @@ async function executeAskAgenticBody(
     // Fallback to the static estimate when the loop produced no usage record
     // (defensive — in practice rescue is gated on `iterations >= maxIterations`
     // so iter 1+ ran and lastIterationPromptTokens was populated).
+    //
+    // v1.15.0 (P5): also fold in `lastToolResponseTokens` — the
+    // tool-response Parts appended to `conversation` AFTER the last iteration's
+    // `generateContent` returned. The rescue's prompt replays the entire
+    // accumulated conversation, so its actual size ≈ last-iter prompt + the
+    // tool responses appended after. Pre-P5 a final iteration that issued 3
+    // concurrent `read_file` calls (with `TOOL_EXECUTION_CONCURRENCY = 3`)
+    // could append 100k+ tokens of file content the estimate missed, causing
+    // the rescue to under-reserve TPM and 429 mid-flight. (3-of-3 cross-reviewer
+    // /6step verdict: TRUE POSITIVE Medium — gcc-ask own F1.)
     const finalizationEstimate =
       lastIterationPromptTokens > 0
-        ? lastIterationPromptTokens + 5_000
+        ? lastIterationPromptTokens + lastToolResponseTokens + 5_000
         : PER_ITERATION_INPUT_TOKENS;
     const finalizationCostUsd = estimateCostUsd({
       model: resolved.resolved,
@@ -1101,6 +1151,11 @@ async function executeAskAgenticBody(
             },
           },
         );
+        // P3 (v1.15.0): the API call returned a response. Mark success
+        // IMMEDIATELY — before any post-await parsing that could throw —
+        // so the `finally` block routes cleanup to finalize (tokens were
+        // billed) rather than cancel (would pretend the call never happened).
+        apiCallSucceeded = true;
 
         const usage = response.usageMetadata;
         finalizationUsage = {
@@ -1119,65 +1174,108 @@ async function executeAskAgenticBody(
         finalizationThinkingSummary =
           thoughtTexts.length > 0 ? thoughtTexts.join('\n').slice(0, 1200) : null;
 
-        if (finalizationReservationId !== null) {
-          const actualCost = estimateCostUsd({
-            model: resolved.resolved,
-            uncachedInputTokens: finalizationUsage.promptTokenCount,
-            cachedInputTokens: 0,
-            outputTokens: finalizationUsage.candidatesTokenCount,
-            thinkingTokens: finalizationUsage.thoughtsTokenCount,
-          });
-          try {
-            ctx.manifest.finalizeBudgetReservation(finalizationReservationId, {
-              cachedTokens: 0,
-              uncachedTokens: finalizationUsage.promptTokenCount,
-              costUsdMicro: toMicrosUsd(actualCost),
-              durationMs: Date.now() - finalizationStarted,
-            });
-          } catch (finalizeErr) {
-            logger.error(
-              `ask_agentic finalization: finalize reservation failed: ${safeForLog(finalizeErr)}`,
-            );
-          }
-        }
-        if (finalizationThrottleId !== -1) {
-          ctx.throttle.release(finalizationThrottleId, finalizationUsage.promptTokenCount);
+        // P4 (v1.15.0): empty-text is a rescue failure mode (model dispatched,
+        // returned a candidate with no extractable text). Surface so callers
+        // can branch — distinct from timeouts / 429s / network errors.
+        if (finalizationText.length === 0) {
+          rescueErrorCode = 'EMPTY_TEXT';
         }
       } catch (finalErr) {
-        if (finalizationReservationId !== null) {
-          try {
-            ctx.manifest.cancelBudgetReservation(finalizationReservationId);
-          } catch (cancelErr) {
-            logger.error(
-              `ask_agentic finalization: cancelBudgetReservation failed: ${safeForLog(cancelErr)}`,
-            );
-          }
-        }
-        if (finalizationThrottleId !== -1) {
-          ctx.throttle.cancel(finalizationThrottleId);
-        }
         // v1.14.2 Fix 4: same retry-hint extraction as the per-iteration catch
         // — the rescue's generateContent can also 429, and the hint should
         // seed the throttle cache for future ask_agentic / ask / code calls.
-        const finalRetryDelayMs = isGemini429(finalErr)
-          ? parseRetryDelayMs(finalErr.message)
-          : null;
+        const isRescue429 = isGemini429(finalErr);
+        const finalRetryDelayMs = isRescue429 ? parseRetryDelayMs(finalErr.message) : null;
         if (finalRetryDelayMs !== null) {
           ctx.throttle.recordRetryHint(resolved.resolved, finalRetryDelayMs);
         }
-        // Best-effort: log and fall through to errorResult. The caller
-        // already burned the iteration budget and deserves a structured
-        // failure rather than a re-thrown SDK error.
+        // P4 (v1.15.0): classify rescue failure for caller-facing telemetry.
+        // Order matters — timeout is checked first because a 429 surfaced via
+        // an aborted-fetch can race with the timeout signal; we prefer the
+        // more user-actionable signal (timeout means "raise iterationTimeoutMs",
+        // 429 means "wait and retry"). Fallthrough to NETWORK for any other
+        // SDK / fetch error.
         if (isTimeoutAbort(finalErr)) {
+          rescueErrorCode = 'TIMEOUT';
           logger.warn('ask_agentic finalization: timed out after maxIterations exhaustion');
+        } else if (isRescue429) {
+          rescueErrorCode = 'RATE_LIMIT';
+          logger.warn(
+            `ask_agentic finalization: 429 rate-limit (retryDelay=${finalRetryDelayMs ?? 'unknown'}ms)`,
+          );
         } else {
+          rescueErrorCode = 'NETWORK';
           logger.warn(
             `ask_agentic finalization: pass failed: ${
               finalErr instanceof Error ? finalErr.message : String(finalErr)
             }`,
           );
         }
+        rescueErrorMessage =
+          finalErr instanceof Error
+            ? finalErr.message.slice(0, 500)
+            : String(finalErr).slice(0, 500);
       } finally {
+        // P3 (v1.15.0): cleanup routed by `apiCallSucceeded`, not by the
+        // try/catch boundary. Pre-P3 the try/catch routed cleanup based on
+        // whether ANY post-await statement threw — meaning a parse error
+        // after a successful API call would land in the catch and call
+        // `cancelBudgetReservation` despite tokens being billed. Now:
+        //   - apiCallSucceeded === true  → finalize budget + release throttle
+        //                                  (use estimate as fallback if
+        //                                  usageMetadata didn't populate)
+        //   - apiCallSucceeded === false → cancel budget + cancel throttle
+        //                                  (pre-dispatch failure or
+        //                                  await-itself threw — call never
+        //                                  reached Google's billing)
+        if (apiCallSucceeded) {
+          if (finalizationReservationId !== null) {
+            // If parse-after-await threw, finalizationUsage is still {0,0,0}.
+            // Fall back to `finalizationEstimate` for billing — under-billing
+            // a known-completed API call is a worse failure mode than
+            // over-billing on a parse-error edge case (the operator's
+            // dailyBudget cap stays a true upper bound either way).
+            const billedUncachedTokens =
+              finalizationUsage.promptTokenCount > 0
+                ? finalizationUsage.promptTokenCount
+                : finalizationEstimate;
+            const actualCost = estimateCostUsd({
+              model: resolved.resolved,
+              uncachedInputTokens: billedUncachedTokens,
+              cachedInputTokens: 0,
+              outputTokens: finalizationUsage.candidatesTokenCount,
+              thinkingTokens: finalizationUsage.thoughtsTokenCount,
+            });
+            try {
+              ctx.manifest.finalizeBudgetReservation(finalizationReservationId, {
+                cachedTokens: 0,
+                uncachedTokens: billedUncachedTokens,
+                costUsdMicro: toMicrosUsd(actualCost),
+                durationMs: Date.now() - finalizationStarted,
+              });
+            } catch (finalizeErr) {
+              logger.error(
+                `ask_agentic finalization: finalize reservation failed: ${safeForLog(finalizeErr)}`,
+              );
+            }
+          }
+          if (finalizationThrottleId !== -1) {
+            ctx.throttle.release(finalizationThrottleId, finalizationUsage.promptTokenCount);
+          }
+        } else {
+          if (finalizationReservationId !== null) {
+            try {
+              ctx.manifest.cancelBudgetReservation(finalizationReservationId);
+            } catch (cancelErr) {
+              logger.error(
+                `ask_agentic finalization: cancelBudgetReservation failed: ${safeForLog(cancelErr)}`,
+              );
+            }
+          }
+          if (finalizationThrottleId !== -1) {
+            ctx.throttle.cancel(finalizationThrottleId);
+          }
+        }
         finalizationTimeout.dispose();
       }
     }
@@ -1243,10 +1341,25 @@ async function executeAskAgenticBody(
       retryable: false,
       subReason: 'AGENTIC_MAX_ITERATIONS',
       ...(finalizationSkipReason !== null ? { finalizationSkipReason } : {}),
+      // P4 (v1.15.0): caller-visible rescue failure-class. Surfaces
+      // `'TIMEOUT' | 'RATE_LIMIT' | 'NETWORK' | 'EMPTY_TEXT'` when the
+      // rescue ran-but-failed; absent when rescue was skipped (daily
+      // budget) or when the rescue produced text (the textResult path
+      // already signals via convergenceForced: true). Wrappers can
+      // branch retry behaviour on this without log scraping.
+      ...(rescueErrorCode !== null ? { rescueErrorCode } : {}),
+      ...(rescueErrorMessage !== null ? { rescueErrorMessage } : {}),
       iterations,
       apiCalls,
       cumulativeInputTokens: totalCumulativeInputTokens,
       cumulativeOutputTokens: totalCumulativeOutputTokens,
+      // P8 (v1.15.0): include thinking tokens in the failure-path
+      // cumulative telemetry — pre-P8 the textResult path emitted
+      // `cumulativeThinkingTokens` (line ~1216) but the errorResult
+      // path dropped it, leaving operators with an under-reported
+      // billing footprint on rescue-attempted-but-failed calls.
+      // (TP from gemini-chat F5.)
+      cumulativeThinkingTokens: cumulativeThinkingTokens + finalizationUsage.thoughtsTokenCount,
       filesRead: filesReadSet.size,
     });
   } catch (err) {
@@ -1304,6 +1417,20 @@ interface IterationResult {
     thoughtsTokenCount: number;
   };
   thinkingSummary: string | null;
+  /** Approximate token count of the tool-response Parts appended to
+   * `conversation` after this iteration's `[model fc]` turn. Bytes/4
+   * heuristic — over-estimates dense Unicode but bias is intentional
+   * (post-loop rescue's TPM/budget reservation needs to over-reserve
+   * rather than under-reserve, which would risk a 429 mid-rescue).
+   *
+   * Used by the rescue's `finalizationEstimate` (P5/v1.15.0): the rescue
+   * replays the entire accumulated conversation, so its actual prompt
+   * size ≈ `lastIterationPromptTokens` + size of the tool-response Parts
+   * appended AFTER that iteration's `generateContent` returned. Pre-P5
+   * the estimate omitted the tool-response delta, undershooting by 100k+
+   * tokens when the final iter read 3 large files concurrently
+   * (`TOOL_EXECUTION_CONCURRENCY = 3`). */
+  toolResponseTokens: number;
 }
 
 async function runAgenticIteration(args: {
@@ -1392,6 +1519,9 @@ async function runAgenticIteration(args: {
       signatures: [],
       usage: usageOut,
       thinkingSummary,
+      // P5 (v1.15.0): final-text iteration appends nothing new to conversation
+      // (it's the iteration that exits the loop). No tool-response delta.
+      toolResponseTokens: 0,
     };
   }
 
@@ -1516,12 +1646,29 @@ async function runAgenticIteration(args: {
   const finalResponseParts = responseParts.filter((p): p is Part => p !== null);
   conversation.push({ role: 'user', parts: finalResponseParts });
 
+  // P5 (v1.15.0): bytes/4 heuristic for the tool-response payload size — the
+  // rescue's `finalizationEstimate` adds this to `lastIterationPromptTokens`
+  // so its TPM/budget reservation accounts for the data that was appended to
+  // `conversation` AFTER the iteration's `generateContent` returned (which
+  // is what the rescue's prompt will replay). Wrap stringify in try so a
+  // pathological circular-ref Part (shouldn't happen — Parts are POJOs from
+  // the SDK + our `read_file` output — but defensive) falls back to 0
+  // rather than blowing the loop. The static `PER_ITERATION_INPUT_TOKENS`
+  // fallback at the rescue site still covers the 0-token edge.
+  let toolResponseTokens = 0;
+  try {
+    toolResponseTokens = Math.ceil(JSON.stringify(finalResponseParts).length / 4);
+  } catch {
+    toolResponseTokens = 0;
+  }
+
   return {
     finalText: null,
     functionCallCount: functionCallParts.length,
     signatures: callSignatures,
     usage: usageOut,
     thinkingSummary,
+    toolResponseTokens,
   };
 }
 

@@ -844,7 +844,17 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
       ],
     });
     await askAgenticTool.execute(
-      { prompt: 'q', workspace: root, maxIterations: 1, thinkingLevel: 'HIGH' },
+      // P12 (v1.15.0): pass an explicit `maxOutputTokens` and assert it
+      // survives the rescue's `...baseConfigNoTools` spread + override.
+      // (Round-1 gcc-ask Nit — TP. Pre-P12 the test only checked tools=undefined,
+      // not the rest of baseConfig surviving cleanly.)
+      {
+        prompt: 'q',
+        workspace: root,
+        maxIterations: 1,
+        thinkingLevel: 'HIGH',
+        maxOutputTokens: 8192,
+      },
       ctx,
     );
 
@@ -865,6 +875,7 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
         tools?: unknown[];
         thinkingConfig?: { thinkingLevel?: string };
         systemInstruction?: string;
+        maxOutputTokens?: number;
       };
     };
     expect(finalConfig?.config?.toolConfig?.functionCallingConfig?.mode).toBe('NONE');
@@ -911,6 +922,21 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // preserved via `...baseConfig` spread (tested as `Array.isArray(...) === true`)
     // — that behavior wasted prompt tokens and contradicted the NONE-mode spec.
     expect(finalConfig?.config?.tools).toBeUndefined();
+    // P12 (v1.15.0): maxOutputTokens MUST survive the spread (caller's cap
+    // applies to the rescue too — otherwise a caller capping at 8k could see
+    // the rescue ignore the cap and emit up to the model default 65k).
+    expect(finalConfig?.config?.maxOutputTokens).toBe(8192);
+    // C2 (v1.15.0): citation directive must be CONDITIONAL on format
+    // compatibility, not unconditional. Pin the new wording so a future
+    // PR can't silently revert to the v1.14.4 unconditional `Cite specific
+    // file:line for the claims you can support`.
+    const finalizationInstrConditional = String(finalConfig?.config?.systemInstruction);
+    expect(finalizationInstrConditional).toContain(
+      'ONLY where the requested format provides a compatible place to put citations',
+    );
+    expect(finalizationInstrConditional).toContain(
+      'never break the requested structure to add citations',
+    );
   });
 
   it('finalization pass uses last-iteration prompt tokens for TPM reservation, not static estimate (v1.14.2)', async () => {
@@ -955,9 +981,79 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // Per-iter calls use static 50_000 (no usage record yet).
     expect(throttle.reserve).toHaveBeenNthCalledWith(1, expect.any(String), 50_000);
     expect(throttle.reserve).toHaveBeenNthCalledWith(2, expect.any(String), 50_000);
-    // Rescue pass uses lastIterationPromptTokens (250k) + 5k margin = 255_000.
-    // This is the load-bearing assertion — pre-v1.14.2 was hardcoded 50_000.
-    expect(throttle.reserve).toHaveBeenNthCalledWith(3, expect.any(String), 255_000);
+    // Rescue pass uses lastIterationPromptTokens (250k) + lastToolResponseTokens
+    // + 5k margin. Pre-v1.14.2 was hardcoded 50_000; v1.14.2 introduced the
+    // dynamic 250k+5k baseline; v1.15.0 (P5) additionally folds in
+    // `lastToolResponseTokens` (bytes/4 heuristic on the functionResponse
+    // Parts the prior iter appended to `conversation` — the rescue prompt
+    // replays them, so reservation must cover them too). For these tiny
+    // scripted mocks `toolResponseTokens` is a few dozen tokens; assert the
+    // rescue's reserve covers the v1.14.2 floor (255_000) AND folded the
+    // tool-response delta in (strictly greater than the floor).
+    const rescueReserveCall = throttle.reserve.mock.calls[2];
+    expect(rescueReserveCall?.[0]).toEqual(expect.any(String));
+    const rescueReserveTokens = rescueReserveCall?.[1] as number;
+    expect(rescueReserveTokens).toBeGreaterThanOrEqual(255_000);
+    // Bound the over-estimate so a pathological future change can't bloat
+    // the reservation arbitrarily — for these mocks the tool-response Parts
+    // are <1 KB, so toolResponseTokens should be well under 1_000.
+    expect(rescueReserveTokens).toBeLessThan(256_000);
+  });
+
+  it('P5 (v1.15.0): rescue reserve folds in lastToolResponseTokens for heavy final iters', async () => {
+    // Pre-P5: TPM reservation = lastIterationPromptTokens + 5k. Missed the
+    // tool-response Parts appended to `conversation` AFTER the iter's
+    // generateContent returned but BEFORE the rescue runs — the rescue
+    // replays the entire conversation, so its actual prompt size includes
+    // them. With `TOOL_EXECUTION_CONCURRENCY = 3` reading large files, this
+    // delta could be 100k+ tokens; under-reserving guaranteed a rescue 429.
+    // Post-P5: `lastToolResponseTokens` (bytes/4 of the appended Parts) is
+    // folded in. (3-of-3 cross-reviewer /6step verdict TP Medium — gcc-ask
+    // own F1.)
+    //
+    // This test scripts a final iter that issues a `read_file` returning a
+    // payload large enough that bytes/4 ≥ 10_000 tokens — well above the
+    // mock-jitter band so the toolResponseTokens contribution is provably
+    // load-bearing in the assertion. Pre-P5 the rescue would reserve only
+    // lastIterationPromptTokens (50k) + 5k margin = 55k. Post-P5 the
+    // reservation also covers the ~10k toolResponseTokens delta.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    // 40 KB file → bytes/4 in Part heuristic ≥ 10_000 tokens after JSON wrapping
+    const heavyContent = 'a'.repeat(40_000);
+    writeFileSync(join(root, 'big.ts'), heavyContent);
+    const { ctx, throttle } = buildCtx({
+      script: [
+        // Loop iter 1: prompt 50k tokens, model issues read_file('big.ts').
+        // The mock dispatch will populate the functionResponse with the file
+        // content, which gets appended to `conversation` as a tool-response
+        // Part — 40 KB of content + JSON framing.
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'big.ts' } }],
+          promptTokenCount: 50_000,
+        },
+        // Rescue: synthesises text.
+        { text: 'Synthesised answer from big.ts.' },
+      ],
+      tpmThrottleLimit: 80_000,
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 1 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    // 2 throttle.reserve calls: 1 loop iter + 1 rescue.
+    expect(throttle.reserve).toHaveBeenCalledTimes(2);
+    const rescueReserve = throttle.reserve.mock.calls[1]?.[1] as number;
+    // Pre-P5 floor (lastIterationPromptTokens + 5k margin) = 55_000.
+    // P5 must add the tool-response delta — the 40 KB file content alone
+    // (heuristic 40_000 / 4 = 10_000) plus JSON framing pushes the
+    // reservation strictly above 60_000.
+    expect(rescueReserve).toBeGreaterThan(60_000);
+    // Bound the upper estimate — the read_file response is ~40 KB raw + a
+    // few hundred bytes of JSON framing; bytes/4 ≤ 12_000 token-equivalents.
+    // Total reservation should stay under 75_000.
+    expect(rescueReserve).toBeLessThan(75_000);
   });
 
   it('finalization pass daily-budget reserve uses dynamic cost estimate (Fix 6.1 — symmetric with TPM reserve)', async () => {
@@ -1142,6 +1238,228 @@ describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () =
     await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
 
     expect(throttle.recordRetryHint).not.toHaveBeenCalled();
+  });
+
+  it('P11 (v1.15.0): finalization-pass 429 seeds throttle hint via rescue catch', async () => {
+    // v1.14.3 added 429 hint extraction in the rescue's catch block (mirrors
+    // the per-iter Fix 4). Pre-P11 there was NO test pinning that the rescue's
+    // catch correctly extracts + records the hint — a future refactor of
+    // the rescue catch could silently drop the extraction without CI
+    // catching. (gcc-ask own F2 from v1.14.4 review — TP Low.)
+    //
+    // Scenario: 2 loop iters succeed → maxIterations=2 hits → rescue
+    // dispatches → rescue's generateContent throws 429 with retryDelay=11s.
+    // Assert recordRetryHint called with ('gemini-3-pro-preview', 11_000)
+    // AND `rescueErrorCode === 'RATE_LIMIT'` surfaced to caller (P4 link).
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 429,
+      message: '{"error":{"code":429,"details":[{"retryDelay":"11s"}]}}',
+    });
+    const { ctx, throttle } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+    });
+    // 3rd generateContent (= the rescue) throws 429.
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    // P11: rescue's catch extracted + recorded the hint.
+    expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 11_000);
+    // P4 link: caller-visible rescueErrorCode = 'RATE_LIMIT'.
+    expect(result.structuredContent?.rescueErrorCode).toBe('RATE_LIMIT');
+    expect(String(result.structuredContent?.rescueErrorMessage)).toContain('429');
+    // apiCalls counts the rescue attempt: 2 iters + 1 rescue = 3.
+    expect(result.structuredContent?.apiCalls).toBe(3);
+  });
+});
+
+describe('ask_agentic loop — P4 rescue error classification (v1.15.0)', () => {
+  it('TIMEOUT: rescue iterationTimeoutMs fires → rescueErrorCode=TIMEOUT', async () => {
+    // P4 surfaces the rescue's failure class to the caller. TIMEOUT path:
+    // the rescue's `withNetworkRetry` aborts via `finalizationTimeout.signal`.
+    // Pre-P4 the caller saw only `subReason: 'AGENTIC_MAX_ITERATIONS'`; now
+    // they also see `rescueErrorCode: 'TIMEOUT'`.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // TimeoutError shape — `isTimeoutAbort` matches by `err.name === 'TimeoutError'`
+    // (walks `.cause` chain). Plain AbortError would NOT match (intentional —
+    // user-cancelled abort is distinct from a timeout abort).
+    const timeoutErr = new DOMException('Timed out after 60000 ms', 'TimeoutError');
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+    });
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      timeoutErr,
+    );
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(result.structuredContent?.rescueErrorCode).toBe('TIMEOUT');
+  });
+
+  it('NETWORK: non-429 non-timeout rescue throw → rescueErrorCode=NETWORK', async () => {
+    // Catch-all bucket for fetch-layer / SDK errors that aren't 429 + aren't
+    // an abort/timeout. Use HTTP 500 with numeric status so isTransientNetworkError
+    // returns false (no withNetworkRetry retry consumes the queued mock).
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+    });
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      Object.assign(new Error('http 500 internal server error'), { status: 500 }),
+    );
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(result.structuredContent?.rescueErrorCode).toBe('NETWORK');
+    expect(String(result.structuredContent?.rescueErrorMessage)).toContain('500');
+  });
+
+  it('EMPTY_TEXT: rescue returned empty text → rescueErrorCode=EMPTY_TEXT', async () => {
+    // The rescue dispatched, returned a candidate, but the extracted text
+    // was empty after .trim(). Distinct from rescue-throw cases — the API
+    // call SUCCEEDED so budget is finalized (not cancelled), but the
+    // caller still sees a structured failure (no synthesized text).
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+        { text: '' }, // rescue returns empty text
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(result.structuredContent?.rescueErrorCode).toBe('EMPTY_TEXT');
+    // No rescueErrorMessage on EMPTY_TEXT — the API didn't throw, so no
+    // exception message to surface.
+    expect(result.structuredContent?.rescueErrorMessage).toBeUndefined();
+  });
+
+  it('rescue success: no rescueErrorCode set (textResult path)', async () => {
+    // Negative pin: when the rescue produces text, we go through textResult
+    // (with convergenceForced: true) — rescueErrorCode must NOT appear on
+    // structuredContent. Catches a future refactor that accidentally sets
+    // the field on the success path.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { text: 'Final synthesis.' },
+      ],
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 1 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    expect(result.structuredContent?.rescueErrorCode).toBeUndefined();
+    expect(result.structuredContent?.rescueErrorMessage).toBeUndefined();
+  });
+});
+
+describe('ask_agentic loop — P3 budget routing on apiCallSucceeded (v1.15.0)', () => {
+  it('rescue API success → finalize (not cancel) even on benign post-await state', async () => {
+    // P3 split cleanup-routing on `apiCallSucceeded` (set IMMEDIATELY after
+    // the await returns) instead of try/catch boundary. Pre-P3 a parse-side
+    // throw after a successful await would route through catch →
+    // cancelBudgetReservation, leaking billed tokens. Post-P3 the await
+    // returning sets `apiCallSucceeded = true`, finally branch finalizes.
+    //
+    // This test pins the success path: rescue dispatches successfully, text
+    // is extracted, finalize is called (NOT cancel) and the recorded
+    // promptTokenCount matches usageMetadata.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, manifest } = buildCtx({
+      script: [
+        {
+          functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }],
+          promptTokenCount: 100,
+          candidatesTokenCount: 20,
+        },
+        { text: 'Synthesized.', promptTokenCount: 250, candidatesTokenCount: 50 },
+      ],
+      dailyBudgetUsd: 50,
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 1 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    // 2 reservations (1 iter + 1 rescue). Both should be FINALIZED.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(2);
+    // The rescue (2nd finalize) reports the rescue's actual promptTokenCount.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenLastCalledWith(
+      expect.any(Number),
+      expect.objectContaining({ uncachedTokens: 250 }),
+    );
+    // Cancel must NOT have fired.
+    expect(manifest.cancelBudgetReservation).not.toHaveBeenCalled();
+  });
+
+  it('rescue API throw → cancel (not finalize) — apiCallSucceeded stays false', async () => {
+    // Negative pin: when the rescue's await throws (network error before
+    // response arrives), apiCallSucceeded stays false → finally branch
+    // cancels. Pre-P3 same cleanup behaviour but routed through catch
+    // explicitly; post-P3 routed through finally via the flag. Either way
+    // the cancel must fire and finalize must NOT.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, manifest } = buildCtx({
+      script: [{ functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] }],
+      dailyBudgetUsd: 50,
+    });
+    // 2nd generateContent (rescue) throws 500 (non-transient — no retry).
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      Object.assign(new Error('http 500'), { status: 500 }),
+    );
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 1 },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    // 1 finalize (the loop iter) + 1 cancel (the rescue).
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
   });
 });
 

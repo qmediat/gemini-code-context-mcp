@@ -5,6 +5,42 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-04-30
+
+### Fixed — `ask_agentic` rescue: data-integrity, error differentiation, telemetry parity
+
+Closes 5 cross-reviewer TPs surfaced during the v1.14.4 review cycle (gcc-ask + gemini-cli + gemini-chat + grok + Copilot, all `/6step`-validated). All changes scoped to `src/tools/ask-agentic.tool.ts` rescue path; **no schema breaks** for existing callers — the new `structuredContent` fields are additive.
+
+- **P3 — `apiCallSucceeded` flag routes rescue cleanup via `finally`, not try/catch boundary** (grok F1 TP, fixes a pre-existing structural fragility). Pre-P3 the rescue's post-`await` parsing (response candidates / parts / thinking summary) lived in the same try block as `finalizeBudgetReservation`; any throw between the await returning and finalize being called would route through `catch → cancelBudgetReservation`, leaking billed tokens. Post-P3 the await returning sets `apiCallSucceeded = true` IMMEDIATELY (before any post-await parsing), and the `finally` block routes cleanup based on the flag: `success → finalize budget + release throttle`, `failure → cancel budget + cancel throttle`. Edge case — if parsing throws after a successful await, we still finalize using `finalizationEstimate` as the billed amount (under-billing a known-completed API call is a worse failure mode than over-billing on the parse-error edge).
+- **P4 — Caller-visible rescue failure-class via `rescueErrorCode` + `rescueErrorMessage`** (grok F2 PARTIAL TP). Pre-P4 the rescue's catch block extracted the 429 retry hint server-side (good) but always returned a generic `subReason: 'AGENTIC_MAX_ITERATIONS'` errorResult, forcing wrappers to grep server logs to distinguish 429 vs TIMEOUT vs network failure vs empty-text. Post-P4 the trailing errorResult surfaces `structuredContent.rescueErrorCode: 'TIMEOUT' | 'RATE_LIMIT' | 'NETWORK' | 'EMPTY_TEXT'` + `rescueErrorMessage` (truncated to 500 chars). Order in the catch — TIMEOUT first, then RATE_LIMIT, then NETWORK fallthrough — biases toward the more user-actionable signal. EMPTY_TEXT is the rescue-dispatched-but-returned-empty path; distinct from rescue-throw cases since the API call SUCCEEDED so budget IS finalized (not cancelled), but the caller still sees a structured failure.
+- **P5 — `lastToolResponseTokens` folded into rescue's `finalizationEstimate`** (gcc-ask own F1 TP Medium). Pre-P5 the rescue's TPM/budget reservation = `lastIterationPromptTokens + 5_000` margin. Missed the tool-response Parts appended to `conversation` AFTER the iteration's `generateContent` returned — the rescue prompt replays them, so the reservation undershot by the bytes/4 of those Parts. With `TOOL_EXECUTION_CONCURRENCY = 3` reading large files, this delta could be 100k+ tokens, causing the rescue to under-reserve TPM and 429 mid-flight. Post-P5 `IterationResult` exposes `toolResponseTokens` (bytes/4 heuristic) and the loop tracks `lastToolResponseTokens` symmetrically with `lastIterationPromptTokens`. Bias to over-estimate is intentional — over-reserve is harmless wait, under-reserve risks a 429.
+- **P8 — `cumulativeThinkingTokens` included in failure-path errorResult** (gemini-chat F5 TP Low). Pre-P8 the textResult path emitted `cumulativeThinkingTokens` (so successful rescues reported full billing footprint) but the errorResult path dropped it, leaving operators with under-reported telemetry on rescue-attempted-but-failed calls. Now reported on both paths.
+- **C2 — Citation directive in `SYSTEM_INSTRUCTION_FINALIZATION` is shape-aware** (gemini-chat Round-2 + Copilot Round-1 — 2 reviewers, TP Low). Pre-C2 the rescue's instruction unconditionally said `Cite specific file:line for the claims you can support`, which collides with strict-format outputs (e.g., a JSON array of strings can't carry `(file:42)` annotations without mutating data). Now reads `Cite specific file:line for the claims you can support — but ONLY where the requested format provides a compatible place to put citations (e.g., a sub-bullet, an additional column, embedded inside an existing string field); never break the requested structure to add citations.` Symmetric with the v1.14.4 conditional Unknown handling.
+
+### Behavioural impact
+
+- **No schema break.** All new `structuredContent` fields (`rescueErrorCode`, `rescueErrorMessage`, additional `cumulativeThinkingTokens` on the failure path) are additive; existing wrappers ignore them.
+- **Wrappers can now branch retry behaviour** on `rescueErrorCode` without log scraping — useful for orchestrators that want to retry-after-delay on `RATE_LIMIT`, raise-`iterationTimeoutMs` on `TIMEOUT`, or surface a different user-facing message on `EMPTY_TEXT`.
+- **Rescue billing now matches API truth** on parse-error edges (P3) and on heavy-final-iter scenarios (P5). Operators near their `dailyBudgetUsd` cap get a true upper bound regardless of which post-await branch fires.
+
+### Coverage
+
+8 net new test cases across `test/unit/ask-agentic.test.ts`:
+
+- `P5 (v1.15.0): rescue reserve folds in lastToolResponseTokens for heavy final iters` — scripts a 40 KB file read + asserts the rescue's TPM reservation strictly exceeds the v1.14.2 floor (255_000 + tool-response delta).
+- `P11 (v1.15.0): finalization-pass 429 seeds throttle hint via rescue catch` — scripts a 429 thrown from the rescue's `generateContent` + asserts both `throttle.recordRetryHint` was called AND `rescueErrorCode === 'RATE_LIMIT'` was surfaced.
+- `P4 rescue error classification (v1.15.0)` — 4-case describe block: TIMEOUT (DOMException TimeoutError), NETWORK (HTTP 500), EMPTY_TEXT (rescue dispatched + returned `{ text: '' }`), and a negative pin (rescue success → no rescueErrorCode set).
+- `P3 budget routing on apiCallSucceeded (v1.15.0)` — 2-case describe block: rescue success → finalize (NOT cancel) + correct `uncachedTokens` from usageMetadata; rescue throw → cancel (NOT finalize).
+- Existing TPM-reservation test updated to assert `>= 255_000` (v1.14.2 floor) AND the v1.15.0 P5 delta is non-zero (folded the tool-response tokens).
+- G2 finalization-config test extended with `maxOutputTokens: 8192` input + assertion that the rescue config preserves it (P12 — gcc-ask Nit TP). Plus new C2 assertions pinning the conditional citation wording (`ONLY where the requested format provides a compatible place to put citations`, `never break the requested structure to add citations`).
+
+Total suite: 736 passed | 9 skipped (was 728 | 9 in v1.14.4; +8 net new tests). Lint, typecheck, build all green on Node 22 and Node 24.
+
+### Notes
+
+- Minor release. Behaviour change is observable via the new `structuredContent` fields on rescue-attempted-but-failed paths; no breaking changes for callers reading only the existing fields.
+- v1.15.1+ followups tracked: P9_a (TOOL_EXECUTION_CONCURRENCY 3 → 10 + env-var kill switch), P9_b (batch-reads instruction in SYSTEM_INSTRUCTION_AGENTIC), P10 (env-gated integration smoke test against real Gemini API), P13 (`ask` vs `ask_agentic` positioning docs), P2 Phase B (content-aware NO_PROGRESS dedupe), R2 (structuredContent on MCP error channel — needs `/6step` first), audit `ask.tool.ts` / `code.tool.ts` for safety-rule consistency.
+
 ## [1.14.4] - 2026-04-30
 
 ### Fixed — `ask_agentic` reliability + rescue output discipline + rescue-pass safety
