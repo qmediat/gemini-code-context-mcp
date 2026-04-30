@@ -39,7 +39,6 @@ Total suite: 728 passed | 9 skipped (was 726 | 9 in v1.14.3; +2 net new tests). 
 
 - Patch-level release. Behaviour change is observable on (a) calls that previously failed with `AGENTIC_NO_PROGRESS` under HIGH thinking and (b) calls that hit the rescue path — both now produce higher-quality structured output. No public-API changes.
 - The shared `SYSTEM_INSTRUCTION_SAFETY` const is internal to `src/tools/ask-agentic.tool.ts` for this release; centralizing it across `ask.tool.ts` / `code.tool.ts` is tracked as a v1.15.0 followup.
-- Empirical replay benchmark methodology recorded at `.claude/local-benchmark-methodology.md` (gitignored).
 
 ## [1.14.3] - 2026-04-29
 
