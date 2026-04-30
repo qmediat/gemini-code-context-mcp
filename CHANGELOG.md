@@ -5,6 +5,40 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.1] - 2026-04-30
+
+### Changed — `ask_agentic` perceived speed + tool positioning
+
+Three coordinated changes shorten the agentic loop's wall-clock for typical workloads and clarify when to reach for `ask` vs `ask_agentic`. **No schema changes.** No public-API additions. All changes opt-in via existing call shape; operators can revert via env var.
+
+- **P9_a — `TOOL_EXECUTION_CONCURRENCY` default 3 → 10 + env override** (`GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`). Pre-bump rationale was conservative I/O parallelism on the SQLite-backed manifest + workspace mmap; in practice all four executors (`read_file`, `grep`, `find_files`, `list_directory`) are CPU-bound and parallelism-friendly. The 3-wide cap forced the model to serialise even small batches like 5 `read_file` calls into 2 round-trips of the iteration loop, eating ~30-60s of HIGH-thinking latency per artificial split. 10-wide handles the typical batch a Gemini 3 Pro response emits without queuing. New env var clamped to `[1, 50]` — kill switch for environments where filesystem contention or local I/O bandwidth makes wider concurrency counter-productive. Resolver function `resolveToolExecutionConcurrency()` exported for unit testing.
+- **P9_b — Batch-reads instruction added to `SYSTEM_INSTRUCTION_AGENTIC` `# STRATEGY` section.** Even with concurrency=10, the model often issued one tool call per turn instead of batching, eating the per-iteration thinking cost. New line: *"Batch your tool calls within a single iteration. If you need to read 5 files, issue all 5 `read_file` calls in ONE turn rather than one-per-iteration across 5 turns — each iteration costs 30-60s of thinking-token latency that you only pay once when calls are batched. The dispatcher runs the batch in parallel (up to 10 concurrent by default)."* Combined with P9_a, expected effect: agentic loops on a 5-file investigation drop from ~6 iterations (≈3-6 min) to ~3 iterations (≈1.5-3 min).
+- **P13 — `ask` vs `ask_agentic` positioning in tool descriptions.** Empirical from today's 6-way benchmark: users default to `ask_agentic` for "thoroughness" but `ask` (eager) is 3× faster on workspaces that fit the 1M token limit (206s vs 921-1210s). New descriptions:
+    - `ask`: *"Primary tool for codebase Q&A on workspaces that fit the model input-token limit (~1M tokens for Gemini Pro — covers most repos). Eager workspace upload + persistent Context Caching → repeat queries are ~20× faster and cheaper than re-sending the codebase each time. Falls back to `ask_agentic` automatically when the workspace exceeds the limit (set `onWorkspaceTooLarge: 'fallback-to-agentic'`). For repos that genuinely exceed 1M tokens or when only a handful of files matter, call `ask_agentic` directly."*
+    - `ask_agentic`: *"Surgical fallback for repos that exceed `ask`'s model input-token limit (~1M tokens for Gemini Pro), OR when you only need a handful of files (cheaper than eager-uploading a large repo). ... **Wall-clock is structurally slower than `ask`** — each iteration pays ~30-60s of HIGH-thinking latency, so a 20-iter call can take 10-20 minutes. For the fast path, use `ask`. For oversize repos or focused investigation, use `ask_agentic`."*
+
+### Behavioural impact
+
+- **Typical agentic-loop wall-clock**: shortened by ~30-50% on multi-file investigations because the model can batch reads into fewer iterations.
+- **Existing callers**: no API change. Operators who want the previous concurrency-3 behaviour set `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY=3`. Schema unchanged.
+- **MCP host UX**: tool descriptions in `tools/list` responses now steer LLM clients (Claude Code, etc.) toward `ask` first when the workspace fits, reducing unnecessary use of the slower agentic path.
+
+### Coverage
+
+4 net new test cases — all on the new `resolveToolExecutionConcurrency()` helper using `vi.stubEnv` for hermetic env-var manipulation:
+
+- `returns default 10 when env var unset`
+- `honours valid integer override (1 ≤ n ≤ 50)` — pins the boundaries
+- `clamps overshoot to 50 (pathological-config guard)` — `99999` → 50
+- `falls back to default on non-numeric / zero / negative input` — `'banana'`, `'0'`, `'-3'` → 10
+
+Total suite: 742 passed | 9 skipped (was 738 in v1.15.0). Lint, typecheck, build all green on Node 22 and Node 24.
+
+### Notes
+
+- Patch-level release. Pure perceived-speed + UX improvement; no behaviour change for existing callers.
+- v1.15.x followups still in queue: P10 (env-gated integration test), P2 Phase B (content-aware NO_PROGRESS dedupe), R2 (`/6step` on structuredContent-on-MCP-error-channel first), audit `ask.tool.ts` / `code.tool.ts` for safety-rules consistency, T33 (ask_agentic streaming refactor — separate v1.16/v1.7 cycle).
+
 ## [1.15.0] - 2026-04-30
 
 ### Fixed — `ask_agentic` rescue: data-integrity, error differentiation, telemetry parity

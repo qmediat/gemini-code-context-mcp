@@ -56,7 +56,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ApiError } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { askAgenticTool } from '../../src/tools/ask-agentic.tool.js';
+import {
+  askAgenticTool,
+  resolveToolExecutionConcurrency,
+} from '../../src/tools/ask-agentic.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 
 const mocks = vi.hoisted(() => ({
@@ -2144,5 +2147,43 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // observed in CI on Node 22 / Linux: 999ms elapsed (PR #35 round 1).
     expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(elapsedMs).toBeLessThan(5_000);
+  });
+});
+
+// v1.15.1 P9_a — TOOL_EXECUTION_CONCURRENCY env override + clamp.
+// Tests the `resolveToolExecutionConcurrency()` helper directly. Uses
+// vi.stubEnv so the env var swap is auto-restored after each test (no
+// process-wide side effect that could affect later tests in this file).
+describe('resolveToolExecutionConcurrency (v1.15.1 P9_a)', () => {
+  beforeEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('returns default 10 when env var unset', () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '');
+    expect(resolveToolExecutionConcurrency()).toBe(10);
+  });
+
+  it('honours valid integer override (1 ≤ n ≤ 50)', () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '5');
+    expect(resolveToolExecutionConcurrency()).toBe(5);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '1');
+    expect(resolveToolExecutionConcurrency()).toBe(1);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '50');
+    expect(resolveToolExecutionConcurrency()).toBe(50);
+  });
+
+  it('clamps overshoot to 50 (pathological-config guard)', () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '99999');
+    expect(resolveToolExecutionConcurrency()).toBe(50);
+  });
+
+  it('falls back to default on non-numeric / zero / negative input', () => {
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', 'banana');
+    expect(resolveToolExecutionConcurrency()).toBe(10);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '0');
+    expect(resolveToolExecutionConcurrency()).toBe(10);
+    vi.stubEnv('GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY', '-3');
+    expect(resolveToolExecutionConcurrency()).toBe(10);
   });
 });
