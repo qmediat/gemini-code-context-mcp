@@ -1027,8 +1027,16 @@ async function executeAskAgenticBody(
           prev && filesReadSizeAtIterEnd > prev.lastFilesReadSize ? 1 : (prev?.count ?? 0) + 1;
         signatureCounts.set(sig, { count, lastFilesReadSize: filesReadSizeAtIterEnd });
         if (count >= NO_PROGRESS_CALL_THRESHOLD) {
+          // R2 message enrichment (v1.16.1 — /6step PARTIAL TP): some MCP
+          // consumers (notably Claude Code's tool-result rendering) collapse
+          // isError responses to the message string only and don't surface
+          // `structuredContent` — wire format includes both per CallToolResultSchema
+          // (independent optional fields) but rendering is consumer-side. Mirror
+          // operator-actionable fields (iterations, filesRead) into the message
+          // string so they're visible regardless of consumer rendering. The
+          // structuredContent payload stays intact for any consumer that reads it.
           return errorResult(
-            `ask_agentic: no-progress loop detected — call '${sig.slice(0, 200)}' was repeated ${count} times without new file reads between repeats. Returning partial state.`,
+            `ask_agentic: no-progress loop detected — call '${sig.slice(0, 200)}' was repeated ${count} times without new file reads between repeats (after ${iterations} iter${iterations === 1 ? '' : 's'}, ${filesReadSet.size} file${filesReadSet.size === 1 ? '' : 's'} read). Returning partial state.`,
             {
               errorCode: 'UNKNOWN',
               retryable: false,
