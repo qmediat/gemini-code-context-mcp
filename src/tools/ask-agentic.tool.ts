@@ -1289,16 +1289,24 @@ async function executeAskAgenticBody(
         //                                  await-itself threw — call never
         //                                  reached Google's billing)
         if (apiCallSucceeded) {
+          // CC2 fix (v1.15.0 PR-Round-1, Copilot): hoist billedUncachedTokens
+          // OUTSIDE the budget-finalize branch so the throttle.release call
+          // below uses the SAME fallback. Pre-fix the asymmetry meant when
+          // Google's response omitted usageMetadata (rare but defended-against
+          // by the typeof guard at the parse site), budget finalize used
+          // `finalizationEstimate` (correct) but throttle.release passed 0,
+          // mutating the TPM window entry to 0 — under-throttling subsequent
+          // calls. Sharing the same fallback keeps both releases symmetric.
+          const billedUncachedTokens =
+            finalizationUsage.promptTokenCount > 0
+              ? finalizationUsage.promptTokenCount
+              : finalizationEstimate;
           if (finalizationReservationId !== null) {
             // If parse-after-await threw, finalizationUsage is still {0,0,0}.
             // Fall back to `finalizationEstimate` for billing — under-billing
             // a known-completed API call is a worse failure mode than
             // over-billing on a parse-error edge case (the operator's
             // dailyBudget cap stays a true upper bound either way).
-            const billedUncachedTokens =
-              finalizationUsage.promptTokenCount > 0
-                ? finalizationUsage.promptTokenCount
-                : finalizationEstimate;
             const actualCost = estimateCostUsd({
               model: resolved.resolved,
               uncachedInputTokens: billedUncachedTokens,
@@ -1320,7 +1328,10 @@ async function executeAskAgenticBody(
             }
           }
           if (finalizationThrottleId !== -1) {
-            ctx.throttle.release(finalizationThrottleId, finalizationUsage.promptTokenCount);
+            // CC2 fix: use billedUncachedTokens (shared with budget finalize)
+            // instead of raw `finalizationUsage.promptTokenCount` so the
+            // missing-usageMetadata edge doesn't under-throttle the TPM window.
+            ctx.throttle.release(finalizationThrottleId, billedUncachedTokens);
           }
         } else {
           if (finalizationReservationId !== null) {
@@ -1717,7 +1728,15 @@ async function runAgenticIteration(args: {
   // fallback at the rescue site still covers the 0-token edge.
   let toolResponseTokens = 0;
   try {
-    toolResponseTokens = Math.ceil(JSON.stringify(finalResponseParts).length / 4);
+    // CC1 fix (v1.15.0 PR-Round-1, Copilot): use UTF-8 BYTE length, not
+    // String#length. The latter returns UTF-16 code units — for non-ASCII
+    // content (CJK, emoji) it under-counts the UTF-8 byte size by 2-3x,
+    // re-introducing rescue under-reservation on multilingual workloads.
+    // Tokenizers approximate from UTF-8 bytes, so bytes/4 stays the
+    // intended heuristic; switching to Buffer.byteLength makes the
+    // implementation match the doc-comment's documented "bytes/4" semantics.
+    const serialized = JSON.stringify(finalResponseParts);
+    toolResponseTokens = Math.ceil(Buffer.byteLength(serialized, 'utf8') / 4);
   } catch {
     toolResponseTokens = 0;
   }
