@@ -5,6 +5,47 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.1] - 2026-04-30
+
+### Changed — `AGENTIC_NO_PROGRESS` error-message enrichment for consumer-rendering parity (R2)
+
+Closes the v1.14.4-cycle followup R2 (queued investigation: `structuredContent` dropped on MCP error channel).
+
+**Empirical observation across 2026-04-29 + 2026-04-30 benchmark replays**: when `ask_agentic` returns `isError`, some MCP consumers (notably Claude Code's tool-result renderer) display only the message string, not `structuredContent`. Operator-actionable triage fields (`apiCalls`, `iterations`, `repeatedSignature`, `cumulativeInputTokens`) are technically delivered over the wire but invisible in the rendered tool result.
+
+**`/6step` verdict: PARTIAL TP — consumer-side rendering, not our bug.** Verified empirically:
+- `src/tools/registry.ts:104-121` — `errorResult()` correctly populates BOTH `structuredContent` AND `isError: true`.
+- `src/server.ts:196-204` — server handler returns the raw tool result unfiltered.
+- `@modelcontextprotocol/sdk/dist/esm/types.d.ts:2601-2602` — `CallToolResultSchema` defines both fields as **independent optional**. Wire format preserves both per the MCP spec; collapsing to message-only is a consumer-rendering choice.
+
+### Workaround we control: message-string enrichment
+
+For the highest-traffic error path (`AGENTIC_NO_PROGRESS`), the message now mirrors `iterations` + `filesRead` into the rendered string so they're visible regardless of consumer rendering. The `structuredContent` payload stays intact for consumers that read it.
+
+**Before** (v1.16.0):
+> `ask_agentic: no-progress loop detected — call '${sig}' was repeated ${count} times without new file reads between repeats. Returning partial state.`
+
+**After** (v1.16.1):
+> `ask_agentic: no-progress loop detected — call '${sig}' was repeated ${count} times without new file reads between repeats (after ${iterations} iter, ${filesRead} files read). Returning partial state.`
+
+Other error paths (`AGENTIC_INPUT_BUDGET_EXCEEDED`, `AGENTIC_MAX_ITERATIONS`, `BUDGET_REJECT`, `TIMEOUT`, etc.) already include relevant context in the message — only `AGENTIC_NO_PROGRESS` was light on triage data.
+
+### Behavioural impact
+
+- **No API/schema change.** `structuredContent` fields unchanged.
+- **Operator UX**: Claude Code users seeing an `AGENTIC_NO_PROGRESS` failure now get iteration count + file-read count in the rendered error, matching the level of context already present in other error messages.
+- **No code change beyond the one message-format string** (~5 lines). New regex-based test pins the canonical `(after N iter, X files read)` shape.
+
+### Coverage
+
+759 passed | 9 skipped (no count change — pinned the new message shape via regex assertions in the existing content-aware-negative-pin test).
+
+### Notes
+
+- Patch-level release. Cosmetic operator-UX improvement only; structuredContent contract unchanged for any consumer that reads it.
+- Closes v1.14.4-cycle followup R2 (defer-with-investigation queue item).
+- Remaining v1.16.x followups: T33 (`ask_agentic` streaming refactor — separate v1.7 cycle).
+
 ## [1.16.0] - 2026-04-30
 
 ### Changed — `ask_agentic` NO_PROGRESS dedupe is now content-aware (P2 Phase B)

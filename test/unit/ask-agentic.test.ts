@@ -542,9 +542,14 @@ describe('ask_agentic loop — guards', () => {
     expect(String(result.structuredContent?.repeatedSignature)).toContain('grep');
     // Phase B error message includes "without new file reads between repeats"
     // — pin it so the operator-facing message stays accurate.
-    expect(String(result.content?.[0]?.text ?? '')).toContain(
-      'without new file reads between repeats',
-    );
+    const errorMessage = String(result.content?.[0]?.text ?? '');
+    expect(errorMessage).toContain('without new file reads between repeats');
+    // R2 message enrichment (v1.16.1): operator-actionable fields (iterations,
+    // filesRead) mirrored into the message string for consumers that don't
+    // render structuredContent on isError. Pin so a future PR can't remove
+    // them. Substring `(after N iter, X files read)` is the canonical shape.
+    expect(errorMessage).toMatch(/after \d+ iter/);
+    expect(errorMessage).toMatch(/\d+ files? read/);
   });
 
   it('triggers AGENTIC_MAX_ITERATIONS when loop never returns text', async () => {
