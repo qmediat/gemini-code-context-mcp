@@ -574,7 +574,7 @@ Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_F
 - New env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` for operator-level default.
 - Existing `iterationTimeoutMs` stays orthogonal (wall-clock cap; both can be set, whichever fires first wins).
 - `createTimeoutController` loop call site now passes composite `{ totalMs, stallMs }` opts.
-- TIMEOUT errorResult now surfaces `timeoutKind: 'stall' | 'total'` + both `timeoutMs` (active limit that fired) and `stallMs` (configured stall watchdog) — mirrors ask/code conventions.
+- TIMEOUT errorResult now surfaces `timeoutKind: 'stall' | 'total'` (the discriminator for which watchdog fired) + `timeoutMs` (the configured TOTAL wall-clock cap, or `null` when disabled — verbatim mirror of `ask.tool.ts:1132`) + `stallMs` (the configured stall watchdog, or `null` when disabled). Operators read `timeoutKind` to route retry policy; reading `timeoutMs` alone yields the configured total budget regardless of which knob actually fired.
 - Live `thinking: …` progress events (throttled to ~1.5s by `collectStream`) — UX parity with ask/code.
 
 **ACCEPTED-DEFERRED**: streaming the post-loop forced-finalization rescue pass.
