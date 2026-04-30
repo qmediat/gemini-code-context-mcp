@@ -27,10 +27,23 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
+import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
+/**
+ * `code` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
+ * data-vs-instruction firewall (added in v1.15.2 — pre-v1.15.2 `code` had no
+ * safety rules at all). The eager firewall is especially load-bearing for
+ * `code` because the model is already steered to emit code edits in OLD/NEW
+ * blocks that downstream consumers (Claude Code Edit-tool / IDE auto-apply)
+ * may apply automatically — a hijacked model with no firewall could emit
+ * malicious edits targeting unrelated files. Safety rules MUST come BEFORE
+ * the edit-format guidance so the firewall is established first.
+ */
 const SYSTEM_INSTRUCTION_CODE = [
+  SYSTEM_INSTRUCTION_SAFETY_EAGER,
+  '',
   'You are an expert software engineer. Generate production-quality, idiomatic code with proper error handling.',
   'Match the existing code style and conventions visible in the provided workspace context.',
   '',
