@@ -149,6 +149,7 @@ function buildCtx(args: {
 }): {
   ctx: ToolContext;
   generateContent: ReturnType<typeof vi.fn>;
+  generateContentStream: ReturnType<typeof vi.fn>;
   manifest: { reserveBudget: ReturnType<typeof vi.fn>; [k: string]: ReturnType<typeof vi.fn> };
   throttle: { reserve: ReturnType<typeof vi.fn>; [k: string]: ReturnType<typeof vi.fn> };
 } {
@@ -156,6 +157,24 @@ function buildCtx(args: {
   for (const s of args.script) {
     generateContent.mockResolvedValueOnce(buildResponse(s));
   }
+  // v1.16.2 (T33 TRIM): the loop now uses `generateContentStream`; the rescue
+  // still uses `generateContent`. To keep the long-standing test contract
+  // `generateContent.mock.calls[N]` reflecting EVERY dispatched call (loop +
+  // rescue) in ORDER — and to keep `generateContent.mockResolvedValueOnce(...)`
+  // chains as the single source of scripted responses — `generateContentStream`
+  // delegates to `generateContent` for both call-args recording and response
+  // consumption, then wraps the result in a single-chunk AsyncGenerator. A
+  // generateContent rejection (transient network, timeout) propagates as a
+  // stream-OPENING failure, which is what `withNetworkRetry` wraps in
+  // `runAgenticIteration` — exact same retry/error contract as the
+  // pre-streaming code path.
+  const generateContentStream = vi.fn().mockImplementation(async (callArg: unknown) => {
+    const response = await generateContent(callArg);
+    async function* singleChunk() {
+      yield response as unknown;
+    }
+    return singleChunk();
+  });
 
   // Budget-enforced scenarios get a real-ish reserveBudget that accepts by
   // default; tests override via `.mockReturnValueOnce({rejected:true,...})`
@@ -191,13 +210,15 @@ function buildCtx(args: {
       workspaceGuardRatio: 0.9,
       defaultModel: 'latest-pro-thinking',
     } as ToolContext['config'],
-    client: { models: { generateContent } } as unknown as ToolContext['client'],
+    client: {
+      models: { generateContent, generateContentStream },
+    } as unknown as ToolContext['client'],
     manifest: manifest as unknown as ToolContext['manifest'],
     ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle: throttle as unknown as ToolContext['throttle'],
   };
-  return { ctx, generateContent, manifest, throttle };
+  return { ctx, generateContent, generateContentStream, manifest, throttle };
 }
 
 // Defense-in-depth: any test that calls `vi.useFakeTimers()` and fails to
@@ -2298,6 +2319,255 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // observed in CI on Node 22 / Linux: 999ms elapsed (PR #35 round 1).
     expect(elapsedMs).toBeGreaterThanOrEqual(950);
     expect(elapsedMs).toBeLessThan(5_000);
+  });
+});
+
+// v1.16.2 (T33 TRIM) — stallMs heartbeat-aware watchdog tests.
+//
+// The loop now uses `generateContentStream` + `collectStream`. `stallMs`
+// resets on every chunk yielded — fires ONLY when the stream goes silent.
+// `iterationTimeoutMs` (totalMs) and `stallMs` are independent; whichever
+// fires first wins. These tests pin the wire-up:
+//   - stall fires within stallMs when stream goes silent (heartbeat dead)
+//   - total fires at iterationTimeoutMs even if chunks arriving (cost cap)
+//   - timeoutKind discriminates 'stall' vs 'total' in errorResult
+describe('ask_agentic loop — stallMs heartbeat watchdog (T33, v1.16.2)', () => {
+  it('fires stall TIMEOUT when stream yields one chunk then goes silent', async () => {
+    // Stall watchdog arms on the FIRST `recordChunk()` call (documented
+    // edge case in abort-timeout.ts:173-177 — a stream that NEVER yields
+    // any chunk relies on `timeoutMs` to rescue, not `stallMs`). To
+    // exercise the stall path we yield ONE priming chunk to arm the
+    // watchdog, then hang — modelling the real-world failure mode of
+    // a Gemini stream that started OK but the socket died mid-flight.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-stall-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent, generateContentStream } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    generateContentStream.mockReset();
+    generateContentStream.mockImplementationOnce(
+      (req: { config?: { abortSignal?: AbortSignal } }) => {
+        const signal = req.config?.abortSignal;
+        async function* primeThenHang() {
+          // Prime: a thought-only chunk arms the stall watchdog via
+          // recordChunk(). After this, no more chunks arrive until abort.
+          yield {
+            candidates: [{ content: { parts: [{ text: 'thinking…', thought: true }] } }],
+          } as unknown as Awaited<ReturnType<typeof generateContent>>;
+          // Hang: stall fires after stallMs of silence post-prime.
+          await new Promise<void>((_resolve, reject) => {
+            if (!signal) return reject(new Error('test invariant: abortSignal not plumbed'));
+            if (signal.aborted) return reject(signal.reason);
+            signal.addEventListener('abort', () => reject(signal.reason));
+          });
+        }
+        return Promise.resolve(primeThenHang());
+      },
+    );
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      // stallMs alone — no iterationTimeoutMs (proves stall fires independently
+      // of the total wall-clock cap).
+      { prompt: 'q', workspace: root, stallMs: 1_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutKind).toBe('stall');
+    // v1.16.2 PR-Round-1 (gemini Finding #2): structuredContent.timeoutMs
+    // mirrors ask/code — it ALWAYS reports the configured total wall-clock
+    // cap (or null when disabled), regardless of which watchdog fired.
+    // The active limit is signalled via `timeoutKind` + `stallMs` sibling.
+    expect(result.structuredContent?.timeoutMs).toBeNull();
+    expect(result.structuredContent?.stallMs).toBe(1_000);
+    expect(result.structuredContent?.iteration).toBe(1);
+    // Sanity: actually waited for the stall timer to fire (~1s) and didn't
+    // run away. 950ms lower bound matches the T19 setTimeout-precision
+    // slack already documented in the T19 end-to-end test.
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
+    expect(elapsedMs).toBeLessThan(5_000);
+  });
+
+  it('total fires (timeoutKind=total) when iterationTimeoutMs hits even if stallMs is also set', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-total-vs-stall-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent, generateContentStream } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    // Stream that yields a heartbeat chunk every 200ms, never finishing —
+    // with stallMs=5000 the stall would NEVER fire (heartbeat always resets
+    // it). iterationTimeoutMs=1000 must still fire as the cost cap.
+    generateContentStream.mockReset();
+    generateContentStream.mockImplementationOnce(
+      (req: { config?: { abortSignal?: AbortSignal } }) => {
+        const signal = req.config?.abortSignal;
+        async function* heartbeatForever() {
+          while (true) {
+            if (signal?.aborted) throw signal.reason;
+            await new Promise<void>((resolve, reject) => {
+              const t = setTimeout(resolve, 200);
+              signal?.addEventListener(
+                'abort',
+                () => {
+                  clearTimeout(t);
+                  reject(signal.reason);
+                },
+                { once: true },
+              );
+            });
+            // Empty thought-only chunk — proves that heartbeat keeps stall
+            // reset but doesn't bypass total.
+            yield {
+              candidates: [{ content: { parts: [{ text: '.', thought: true }] } }],
+            } as unknown as Awaited<ReturnType<typeof generateContent>>;
+          }
+        }
+        return Promise.resolve(heartbeatForever());
+      },
+    );
+
+    const startedAt = Date.now();
+    const result = await askAgenticTool.execute(
+      // stallMs (5s) is generously larger than the 200ms heartbeat — it would
+      // NEVER fire. iterationTimeoutMs (1s) is the active watchdog.
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 1_000, stallMs: 5_000 },
+      ctx,
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(result.structuredContent?.timeoutKind).toBe('total');
+    // v1.16.2 PR-Round-1 (gemini Finding #2): both `timeoutMs` (total) and
+    // `stallMs` (stall) reflect the CONFIGURED knobs — the discriminator is
+    // `timeoutKind`. Both populated here because both were set on the call.
+    expect(result.structuredContent?.timeoutMs).toBe(1_000);
+    expect(result.structuredContent?.stallMs).toBe(5_000);
+    expect(elapsedMs).toBeGreaterThanOrEqual(950);
+    expect(elapsedMs).toBeLessThan(5_000);
+  });
+
+  it('dispatches functionCall correctly when stream fragments fc into one chunk and terminator into the next (v1.16.2 PR-Round-1)', async () => {
+    // Regression pin for gemini Finding #1 (HIGH). Even if Gemini's current
+    // protocol typically packs functionCall + finishReason into one chunk,
+    // the loop must remain robust when fragmentation does occur — for
+    // example, when thinkingLevel: HIGH inserts a terminator-only chunk
+    // after the function-call chunk, OR a future SDK release changes
+    // chunking behaviour.
+    //
+    // Pre-fix collectStream's last-write-wins on candidates would overwrite
+    // chunk 1's functionCall with chunk 2's empty parts, the loop would
+    // treat the iteration as final-text, and the read_file would never
+    // dispatch. Post-fix collectStream's gate also requires non-empty
+    // parts — chunk 1's functionCall survives.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-fragmented-fc-'));
+    writeFileSync(join(root, 'a.ts'), 'export const answer = 42;');
+
+    const { ctx, generateContent, generateContentStream } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    // Iter 1: stream emits the read_file functionCall in chunk 1, then a
+    // terminator chunk with empty parts + finishReason in chunk 2. The
+    // load-bearing assertion: the functionCall is preserved across the
+    // fragmentation and gets dispatched.
+    generateContentStream.mockReset();
+    generateContentStream.mockImplementationOnce(() => {
+      async function* fragmentedFc() {
+        yield {
+          candidates: [
+            {
+              content: {
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }],
+              },
+            },
+          ],
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+        yield {
+          candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+          usageMetadata: {
+            promptTokenCount: 100,
+            candidatesTokenCount: 20,
+            thoughtsTokenCount: 0,
+          },
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+      }
+      return Promise.resolve(fragmentedFc());
+    });
+    // Iter 2: organic final text (no fragmentation needed; one-shot stream).
+    // Note: collectStream reads `chunk.text` (a getter on real
+    // GenerateContentResponse) — for plain-object chunks we expose it as a
+    // property so the text-concat path picks it up. Mirrors the buildResponse
+    // helper at line 134.
+    generateContentStream.mockImplementationOnce(() => {
+      async function* finalText() {
+        yield {
+          text: 'The answer is 42.',
+          candidates: [
+            {
+              content: { parts: [{ text: 'The answer is 42.' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 150,
+            candidatesTokenCount: 5,
+            thoughtsTokenCount: 0,
+          },
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+      }
+      return Promise.resolve(finalText());
+    });
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    // Load-bearing: the functionCall WAS dispatched (read_file ran against
+    // a.ts), the loop completed organically, and the final answer is text.
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.iterations).toBe(2);
+    expect(result.structuredContent?.filesRead).toBe(1);
+    const message = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+    expect(message).toBe('The answer is 42.');
+  });
+
+  it('timeoutKind="stall" surfaces a knob hint pointing at stallMs (not iterationTimeoutMs)', async () => {
+    // Tightly couples the user-visible error message to the active watchdog
+    // — operators triaging a 'stall' TIMEOUT should see `stallMs` in the
+    // message, not `iterationTimeoutMs`. Catches a future regression
+    // where the two messages get accidentally collapsed.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-stall-msg-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+
+    const { ctx, generateContent, generateContentStream } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    generateContentStream.mockReset();
+    generateContentStream.mockImplementationOnce(
+      (req: { config?: { abortSignal?: AbortSignal } }) => {
+        const signal = req.config?.abortSignal;
+        async function* primeThenHang() {
+          // Prime the stall watchdog with one chunk (see test 1 for rationale).
+          yield {
+            candidates: [{ content: { parts: [{ text: 'thinking…', thought: true }] } }],
+          } as unknown as Awaited<ReturnType<typeof generateContent>>;
+          await new Promise<void>((_resolve, reject) => {
+            if (!signal) return reject(new Error('test invariant'));
+            if (signal.aborted) return reject(signal.reason);
+            signal.addEventListener('abort', () => reject(signal.reason));
+          });
+        }
+        return Promise.resolve(primeThenHang());
+      },
+    );
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, stallMs: 1_000 },
+      ctx,
+    );
+    const message = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+    expect(message).toContain('stall');
+    expect(message).toContain('stallMs');
+    expect(message).toContain('GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS');
   });
 });
 

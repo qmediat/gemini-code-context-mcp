@@ -95,6 +95,47 @@ describe('collectStream — candidates last-non-empty-wins', () => {
     );
     expect(result.candidates?.[0]?.finishReason).toBe('STOP');
   });
+
+  it('does not overwrite with terminator-only candidates that have empty parts (v1.16.2 fragmentation guard)', async () => {
+    // Regression pin for the v1.16.2 PR-Round-1 fix (gemini Finding #1
+    // HIGH). Pre-fix, an early chunk carrying a `functionCall` Part could
+    // be silently overwritten by a final terminator chunk shaped like
+    // `{ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }`
+    // — non-empty outer array but empty inner parts. The naive outer-array
+    // length check accepted it, dropping the previous chunk's parts.
+    //
+    // ask_agentic's loop is the first consumer that reads
+    // `response.candidates[0].content.parts` directly off a CollectedResponse
+    // (ask + code use accumulated `response.text`). A terminator that
+    // dropped a `functionCall` would silently fail the agentic dispatch
+    // — the loop would treat the iteration as final-text.
+    //
+    // Post-fix the gate also requires `parts.length > 0`. The earlier
+    // chunk's `functionCall` Part survives.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [{ content: { parts: [] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 },
+        },
+      ]),
+    );
+    // The functionCall from chunk 1 must survive — that's the load-bearing
+    // assertion. usageMetadata still last-write-wins (separate code path).
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    expect(parts.length).toBe(1);
+    expect(parts[0]?.functionCall?.name).toBe('read_file');
+    expect(result.usageMetadata?.promptTokenCount).toBe(10);
+  });
 });
 
 describe('collectStream — thought parts', () => {

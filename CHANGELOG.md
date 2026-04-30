@@ -5,6 +5,62 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.2] - 2026-04-30
+
+### Changed — `ask_agentic` loop streaming + heartbeat-aware `stallMs` watchdog (T33 TRIM)
+
+`ask_agentic`'s main loop now uses `generateContentStream` + `collectStream` instead of non-streaming `generateContent`. Closes [T33](docs/FOLLOW-UP-PRS.md#t33-ask_agentic-streaming-migration--apply-heartbeat-aware-stall-watchdog-to-agentic-loops--shipped-in-v1162-trim-scope) — the last open item in the v1.6/v1.7 streaming refactor track. The post-loop forced-finalization rescue keeps the v1.15.0 P3 `apiCallSucceeded` non-streaming contract unchanged.
+
+**Why now**: `ask_agentic` was the last tool in the codebase still using non-streaming dispatch. Operator consequences:
+
+1. **No heartbeat-aware liveness watchdog.** Only wall-clock `iterationTimeoutMs` was available. A dead socket at second 5 of a 120s-budgeted iter wasted 115 seconds before the wall-clock fired. `stallMs` (the right knob per `ask`/`code` v1.12.0 conventions) closes that gap.
+2. **No live thought-chunk progress visibility.** During the 30-120s thinking window each iter, operators saw only iter-counter notifications between iters. `ask` + `code` already stream thought previews live; this brings parity.
+3. **UX inconsistency** — every other long-running tool in the codebase streams. `ask_agentic` was the outlier.
+
+### What's new
+
+- **`stallMs` per-call schema field** (1s–10min, optional) — heartbeat-aware stall watchdog that resets on every chunk yielded by `generateContentStream` (text or thought). Fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Documented as the right knob for "kill dead sockets quickly without penalising deep reasoning."
+- **`GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` env var** — fallback path identical to `ask`/`code` (`GEMINI_CODE_CONTEXT_ASK_STALL_MS`, `GEMINI_CODE_CONTEXT_CODE_STALL_MS`). Recommended: `60_000` (60s).
+- **`structuredContent.timeoutKind`** on `errorCode: 'TIMEOUT'` — `'stall' | 'total'` discriminates which watchdog fired. `timeoutMs` reports the configured TOTAL wall-clock cap (or `null` when disabled) — verbatim mirror of `ask.tool.ts:1132`; the new `stallMs` sibling field reports the configured stall watchdog (or `null` when disabled). Wrappers can apply different retry policies based on `timeoutKind` — `'stall'` is usually safe to retry (dead socket); `'total'` means raise `iterationTimeoutMs` or narrow the prompt.
+- **Live `thinking: …` progress events** — same UX as ask/code, throttled to ~1.5s by `collectStream` so the MCP host's progress channel doesn't get flooded on long thinking bursts.
+
+### What's preserved verbatim (TRIM scope)
+
+The v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to streaming. After cross-reviewer consultation (gcc-ask: GO full scope; grok: TRIM), TRIM was adopted:
+
+- **Rescue keeps `generateContent`** (not streaming) — see the dispatch site at `src/tools/ask-agentic.tool.ts` (search for the rescue's `// Each agentic iteration is its own` comment). The v1.15.0 P3+P4+P5 `apiCallSucceeded` contract — Google billed → finalize budget; not billed → cancel — was stabilized through 4 review rounds + `/6step` cross-corroboration. Streaming the rescue would re-open that recently-stabilized surface for marginal liveness gain on a once-per-call path.
+- **Mid-stream failures cannot be retried** (Gemini's `generateContentStream` has no resume) — the v1.6/v1.7 plan §11 explicitly cites this. The rescue's transient-failure budget routing depends on knowing whether the API was billed; partial-stream-then-fail blurs that signal. The loop tolerates a discarded mid-stream failure (next iteration retries the question); the rescue is the last shot before failing the whole call.
+- **Content-aware `signatureCounts` dedupe (v1.16.0)** unchanged — `collectStream` reassembles into the same `GenerateContentResponse` shape; `iterResult.signatures` extraction is identical.
+- **`withNetworkRetry` outer wrap** unchanged — wraps stream OPENING only, mirroring ask/code.
+- **`iterDispatched` flag (v1.14.x H2)** unchanged — set immediately before `generateContentStream` (which IS the dispatch).
+- **`createTimeoutController` rescue site** explicitly keeps `stallEnvVar: ''` — proves rescue is non-streaming and stall is intentionally disabled there.
+
+### Backward compatibility
+
+- **No breaking change.** `stallMs` is an optional new schema field; existing callers that don't set it see identical behavior to v1.16.1.
+- **`structuredContent` shape**: `timeoutMs` continues to report the configured TOTAL wall-clock cap (or `null` when disabled) — verbatim mirror of `ask.tool.ts:1132`. New sibling field `stallMs` reports the configured stall watchdog (or `null` when disabled). The discriminator for which one fired is the new `timeoutKind: 'stall' | 'total'` field. Wrappers that branched on `timeoutMs > X` pre-v1.16.2 see a stable contract — only `null` (disabled) is a new case, and existing branches handle it correctly because `null > X` is always `false`.
+- **Rescue path completely unchanged.** Operators who hit the rescue see byte-identical behavior to v1.16.1 (`convergenceForced`, `rescueErrorCode`, etc.).
+
+### PR-Round-1 review folds (gemini Finding #1 + #2)
+
+Round-1 cross-review (gemini-code-context + grok + codex) flagged two empirically verifiable issues. Both folded same PR per workflow:
+
+- **Finding #1 (HIGH) — `collectStream` candidate-preservation defensive gap (`src/tools/shared/stream-collector.ts:174-176`).** Pre-fix gate was `chunk.candidates.length > 0` (outer-array length only). If Gemini's stream protocol ever emits a final terminator shape like `{ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }`, the previous chunk's `functionCall` Part would be silently overwritten — the agentic loop would treat the iteration as final-text and never dispatch the tool. Fixed by adding a `parts.length > 0` gate on the inner array. Empirical current-protocol behaviour (functionCall + finishReason packed into one chunk) is preserved either way; this hardens against fragmentation patterns that future Gemini SDK / thinking-mode variants could legitimately introduce. Side-effect on `ask` / `code`: `lastCandidates.finishReason` may now come from a non-final chunk if the final chunk has no parts — observably equivalent for both, since they read accumulated `response.text`, not `candidates[0].finishReason`.
+- **Finding #2 (MEDIUM) — `timeoutMs` payload contract divergence from ask/code (`src/tools/ask-agentic.tool.ts`).** Initial commit collapsed `timeoutMs` to "the limit that fired" (stall value when stall fired). `ask.tool.ts:1132` always reports the configured total wall-clock cap regardless of which watchdog fired — the discriminator is `timeoutKind`. Reverted to ask/code parity: `timeoutMs` = configured total (or null), `stallMs` = configured stall (or null), `timeoutKind` = which one fired.
+
+Two new regression tests pin the fixes:
+- `test/unit/stream-collector.test.ts` — `does not overwrite with terminator-only candidates that have empty parts (v1.16.2 fragmentation guard)` — exercises the multi-chunk fragmentation pattern at the collector level.
+- `test/unit/ask-agentic.test.ts` — `dispatches functionCall correctly when stream fragments fc into one chunk and terminator into the next (v1.16.2 PR-Round-1)` — exercises the same pattern at the agentic-loop level, asserting that `read_file` actually dispatches and the loop reaches organic final-text.
+
+### Coverage
+
+764 passed | 9 skipped (759 → 762 in initial commit; 762 → 764 after Round-1 folds: added 2 regression tests for the fragmentation guard + adjusted 2 stallMs tests for the corrected `timeoutMs` semantics). All v1.15.0 rescue tests + v1.16.0 content-aware NO_PROGRESS tests still green — proves the TRIM scope-exclusion held.
+
+### Notes
+
+- The v1.6/v1.7 streaming refactor track is now FULLY SHIPPED across v1.6.0 (T19 timeout + AbortController), v1.7.0 (T20 ask/code streaming + T18 budget + D#7 status UX), and v1.16.2 (T33 ask_agentic loop streaming).
+- T34+ items in `docs/FOLLOW-UP-PRS.md` are smaller / unrelated.
+
 ## [1.16.1] - 2026-04-30
 
 ### Changed — `AGENTIC_NO_PROGRESS` error-message enrichment for consumer-rendering parity (R2)
