@@ -174,17 +174,26 @@ const DEFAULT_TOOL_EXECUTION_CONCURRENCY = 10;
  * predictable. Cost: one env-read per iter; negligible vs the
  * `generateContent` round-trip dominating wall-clock.
  *
- * Clamps to `[1, 50]`. Negative / zero / non-numeric / above-50 → fall back
+ * Clamps numeric inputs to `[1, 50]`. Only NaN / unset / empty falls back
  * to default. 50 cap prevents pathological "concurrency: 99999" misconfig
- * from spawning ~unbounded `read_file` Promise chains.
+ * from spawning ~unbounded `read_file` Promise chains. 0 / negative inputs
+ * clamp UP to 1 (= serial dispatch) — operators setting `0` or `-3` mean
+ * "minimise parallelism", not "use the default" (the v1.15.1 PR-Round-1
+ * 2-of-2 cross-reviewer correction: gemini-cli F2 + grok F1 flagged that
+ * silently mapping operator-supplied `0` back to 10× was the opposite of
+ * intent and a confusing UX on resource-constrained CI / Windows hosts).
  *
  * Exported for unit testing — not part of the public MCP surface. */
 export function resolveToolExecutionConcurrency(): number {
   const raw = process.env.GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY;
   if (raw === undefined || raw === '') return DEFAULT_TOOL_EXECUTION_CONCURRENCY;
   const parsed = Number.parseInt(raw, 10);
-  if (Number.isNaN(parsed) || parsed < 1) return DEFAULT_TOOL_EXECUTION_CONCURRENCY;
-  return Math.min(parsed, 50);
+  // Only NaN (genuinely malformed input like `'banana'`) falls back to
+  // default. Numeric inputs always clamp into [1, 50] so the operator's
+  // stated intent (lower bound = serial; upper bound = throughput cap)
+  // is honoured for any value parseInt can extract a number from.
+  if (Number.isNaN(parsed)) return DEFAULT_TOOL_EXECUTION_CONCURRENCY;
+  return Math.max(1, Math.min(parsed, 50));
 }
 /** If the SAME call signature (name + args) appears this many times, we
  * conclude the model is stuck in a loop and surface a partial answer.
@@ -253,7 +262,7 @@ const SYSTEM_INSTRUCTION_AGENTIC = [
   '2. Locate relevant symbols with `grep`',
   '3. Open only the handful of files that actually bear on the question via `read_file`',
   'When you have enough context, respond with a plain-text answer and make NO further tool calls.',
-  'Batch your tool calls within a single iteration. If you need to read 5 files, issue all 5 `read_file` calls in ONE turn rather than one-per-iteration across 5 turns — each iteration costs 30-60s of thinking-token latency that you only pay once when calls are batched. The dispatcher runs the batch in parallel (up to 10 concurrent by default).',
+  'Batch your tool calls within a single iteration. If you need to read 5 files, issue all 5 `read_file` calls in ONE turn rather than one-per-iteration across 5 turns — each iteration costs 30-60s of thinking-token latency that you only pay once when calls are batched. The dispatcher runs the batch in parallel (up to 10 concurrent by default). Only batch calls for paths you have already seen in prior tool results (e.g., from `list_directory`, `find_files`, or `grep` output) or that the user provided. Never synthesize or guess additional paths solely to fill a batch — a hallucinated path costs the same iteration latency as the split you were trying to avoid, and the executors will reject it.',
   '',
   '# DECISIVENESS',
   "Be decisive. Once you have read the relevant files and gathered evidence, produce your final answer. Continuing to call tools when you already have an answer is a failure mode — it wastes the user's budget and delays the response.",
