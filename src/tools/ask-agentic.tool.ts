@@ -279,7 +279,7 @@ const SYSTEM_INSTRUCTION_AGENTIC = [
  * evaluates the FULL conversation history including any malicious payloads
  * surfaced by prior `read_file` / `grep` results (LLM calls are stateless
  * per Gemini API semantics — each turn's output is generated under THAT
- * turn's systemInstruction). The shared `SYSTEM_INSTRUCTION_SAFETY` block
+ * turn's systemInstruction). The shared `SYSTEM_INSTRUCTION_SAFETY_AGENTIC` block
  * (data-vs-instruction firewall) is therefore prepended below. A 3-of-3
  * cross-reviewer audit on 2026-04-30 (gemini-cli + gemini-chat + grok)
  * flagged the prior absence as an indirect-prompt-injection vector.
