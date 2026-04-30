@@ -38,7 +38,7 @@ import type {
   ThinkingConfig,
   ThinkingLevel,
 } from '@google/genai';
-import { FunctionCallingConfigMode, Type as GeminiType } from '@google/genai';
+import { ApiError, FunctionCallingConfigMode, Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -101,7 +101,7 @@ export const askAgenticInputSchema = z
       .max(50)
       .optional()
       .describe(
-        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract. **v1.15.0:** rescue-attempted-but-failed paths additionally surface `structuredContent.rescueErrorCode` (`'TIMEOUT' | 'RATE_LIMIT' | 'NETWORK' | 'EMPTY_TEXT'`) + `rescueErrorMessage` (truncated to 500 chars) so wrappers can branch retry behaviour without log scraping.",
+        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract. **v1.15.0:** rescue-attempted-but-failed paths additionally surface `structuredContent.rescueErrorCode` (`'TIMEOUT' | 'RATE_LIMIT' | 'INTERNAL' | 'API_ERROR' | 'NETWORK' | 'EMPTY_TEXT'`) + `rescueErrorMessage` (truncated to 500 chars) so wrappers can branch retry behaviour without log scraping. Retry policy: TIMEOUT → raise iterationTimeoutMs; RATE_LIMIT → wait retry-hint window; INTERNAL → investigate code (don't retry blindly); API_ERROR → check status (don't retry 4xx); NETWORK → safe to retry; EMPTY_TEXT → narrow prompt.",
       ),
     maxTotalInputTokens: z
       .number()
@@ -1008,7 +1008,35 @@ async function executeAskAgenticBody(
     // when the rescue produced text successfully (the textResult path
     // already signals via `convergenceForced: true`). Strict union — extend
     // here when adding new error classes.
-    let rescueErrorCode: 'TIMEOUT' | 'RATE_LIMIT' | 'NETWORK' | 'EMPTY_TEXT' | null = null;
+    // v1.15.0 PR-Round-1 follow-up (X2/X3 — gemini-chat + grok HIGH/MEDIUM,
+    // /6step TP): split the catch-block fallthrough into more precise buckets.
+    // Pre-fix every non-timeout non-429 throw bucketed as 'NETWORK', which
+    // misled wrappers into retrying 4xx-other-than-429 ApiErrors (e.g., 400
+    // INVALID_ARGUMENT) as if they were transient connectivity drops.
+    //
+    // - 'TIMEOUT'    — iterationTimeoutMs fired (isTimeoutAbort)
+    // - 'RATE_LIMIT' — Google 429 (isGemini429: ApiError + status===429)
+    // - 'INTERNAL'   — `apiCallSucceeded === true` (await returned, but
+    //                  post-await processing threw — billed by Google,
+    //                  finalize budget per P3, but caller sees structured
+    //                  failure). Distinguishes "API ok, our code bug" from
+    //                  "API failure" so wrappers don't blindly retry our
+    //                  parse bugs.
+    // - 'API_ERROR'  — `instanceof ApiError` with status≠429 (4xx other
+    //                  than 429, or 5xx). Wrapper should NOT retry 4xx
+    //                  (fix the payload) but MAY retry 5xx with backoff.
+    // - 'NETWORK'    — fetch-layer / DNS / TCP / pre-dispatch SDK error.
+    //                  Real transient connectivity case; safe to retry.
+    // - 'EMPTY_TEXT' — set in success path: API returned, but extracted
+    //                  text was empty after .trim(). Budget IS finalized.
+    let rescueErrorCode:
+      | 'TIMEOUT'
+      | 'RATE_LIMIT'
+      | 'INTERNAL'
+      | 'API_ERROR'
+      | 'NETWORK'
+      | 'EMPTY_TEXT'
+      | null = null;
     let rescueErrorMessage: string | null = null;
     // v1.14.2 Fix 5: tracks WHY the rescue pass was skipped, so the trailing
     // errorResult can emit a cause-specific message + structured field instead
@@ -1190,11 +1218,24 @@ async function executeAskAgenticBody(
           ctx.throttle.recordRetryHint(resolved.resolved, finalRetryDelayMs);
         }
         // P4 (v1.15.0): classify rescue failure for caller-facing telemetry.
-        // Order matters — timeout is checked first because a 429 surfaced via
-        // an aborted-fetch can race with the timeout signal; we prefer the
-        // more user-actionable signal (timeout means "raise iterationTimeoutMs",
-        // 429 means "wait and retry"). Fallthrough to NETWORK for any other
-        // SDK / fetch error.
+        // Order matters — earlier branches signal the most user-actionable
+        // remediation:
+        //   1. TIMEOUT — raise iterationTimeoutMs / narrow prompt (iteration
+        //      timeout fired; checked first because a 429 surfaced via an
+        //      aborted-fetch can race the timeout signal).
+        //   2. RATE_LIMIT — wait the retry-hint window then retry (429).
+        //   3. INTERNAL — our code bug (post-await parse threw); operator
+        //      should NOT retry blindly. v1.15.0 PR-Round-1 follow-up
+        //      (X2/X3) — `apiCallSucceeded === true` means the await
+        //      returned cleanly; any throw past that point is processing
+        //      logic our side, not Gemini's API.
+        //   4. API_ERROR — Gemini API returned a non-429 4xx/5xx. Wrapper
+        //      should NOT retry 4xx (fix payload); MAY retry 5xx with
+        //      backoff. v1.15.0 PR-Round-1 follow-up — pre-fix all
+        //      ApiError-non-429 bucketed as NETWORK, breaking retry
+        //      policy decisions.
+        //   5. NETWORK — fetch-layer / DNS / TCP / SDK pre-dispatch.
+        //      Genuine transient connectivity case; safe to retry.
         if (isTimeoutAbort(finalErr)) {
           rescueErrorCode = 'TIMEOUT';
           logger.warn('ask_agentic finalization: timed out after maxIterations exhaustion');
@@ -1203,10 +1244,29 @@ async function executeAskAgenticBody(
           logger.warn(
             `ask_agentic finalization: 429 rate-limit (retryDelay=${finalRetryDelayMs ?? 'unknown'}ms)`,
           );
+        } else if (apiCallSucceeded) {
+          // X2/X3 fix: API roundtrip completed but post-await processing
+          // (response parsing, candidates/parts traversal, EMPTY_TEXT check)
+          // threw. Distinct from NETWORK — operator's wrapper should treat
+          // this as "investigate code bug, do not retry blindly".
+          rescueErrorCode = 'INTERNAL';
+          logger.warn(
+            `ask_agentic finalization: post-await processing failed: ${
+              finalErr instanceof Error ? finalErr.message : String(finalErr)
+            }`,
+          );
+        } else if (finalErr instanceof ApiError) {
+          // X2 fix: Gemini API returned a 4xx-other-than-429 or 5xx.
+          // Distinct from NETWORK so wrappers don't retry 400 INVALID_ARGUMENT
+          // forever.
+          rescueErrorCode = 'API_ERROR';
+          logger.warn(
+            `ask_agentic finalization: Gemini API returned ${finalErr.status ?? 'unknown'}: ${finalErr.message.slice(0, 200)}`,
+          );
         } else {
           rescueErrorCode = 'NETWORK';
           logger.warn(
-            `ask_agentic finalization: pass failed: ${
+            `ask_agentic finalization: network failure: ${
               finalErr instanceof Error ? finalErr.message : String(finalErr)
             }`,
           );

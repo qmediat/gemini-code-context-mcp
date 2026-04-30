@@ -1342,6 +1342,98 @@ describe('ask_agentic loop — P4 rescue error classification (v1.15.0)', () => 
     expect(String(result.structuredContent?.rescueErrorMessage)).toContain('500');
   });
 
+  it('API_ERROR: ApiError with non-429 status → rescueErrorCode=API_ERROR (X2 fix)', async () => {
+    // v1.15.0 PR-Round-1 follow-up (gemini-chat F1 + grok F1, /6step TP HIGH):
+    // pre-fix every non-429 ApiError bucketed as 'NETWORK', misleading wrappers
+    // into retrying 400 INVALID_ARGUMENT forever. Post-fix `instanceof ApiError`
+    // gates the API_ERROR bucket, distinct from genuine fetch-layer NETWORK
+    // failures. This test scripts a 400 (operator passed a malformed config /
+    // deprecated model) and asserts rescueErrorCode='API_ERROR' so wrappers
+    // can branch retry policy: 4xx = fix payload, don't retry; 5xx = retry
+    // with backoff; only NETWORK gets blind retry.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const apiErr = new ApiError({
+      status: 400,
+      message: '{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"bad payload"}}',
+    });
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+    });
+    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    expect(result.structuredContent?.rescueErrorCode).toBe('API_ERROR');
+    expect(String(result.structuredContent?.rescueErrorMessage)).toContain('400');
+    // ApiError 400 is NOT a 429 — must NOT seed retry hint (would mis-key
+    // the throttle for unrelated 400s).
+    // (No assertion needed beyond the rescueErrorCode shape; throttle hint
+    // gating is already pinned by the existing 429-retry-hint test suite.)
+  });
+
+  it('INTERNAL: post-await processing throws → rescueErrorCode=INTERNAL (X3 fix)', async () => {
+    // v1.15.0 PR-Round-1 follow-up (gemini-chat F2 + grok F2, /6step TP MEDIUM):
+    // pre-fix a parse error after a successful API call routed to the catch
+    // block as NETWORK, mixing "API ok, our code bug" with "API failure".
+    // Post-fix `apiCallSucceeded === true` distinguishes — INTERNAL means the
+    // await returned (Google billed) but downstream parsing threw.
+    //
+    // P3 invariant preserved: budget IS finalized (not cancelled) — tokens
+    // were billed regardless of our parse bug. Caller sees INTERNAL so they
+    // know to investigate the code, not retry blindly.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const { ctx, generateContent, manifest } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { functionCalls: [{ name: 'list_directory', args: { path: '.' } }] },
+      ],
+      dailyBudgetUsd: 50,
+    });
+    // Synthesize a response object that looks valid until post-await parsing
+    // tries to access `.candidates`. A Proxy with a throwing getter triggers
+    // the post-await throw without affecting the await itself.
+    const trojan = new Proxy(
+      { usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 0, thoughtsTokenCount: 0 } },
+      {
+        get(target, prop, receiver) {
+          if (prop === 'candidates') {
+            throw new TypeError('synthetic post-await parse failure');
+          }
+          return Reflect.get(target, prop, receiver);
+        },
+      },
+    );
+    generateContent.mockResolvedValueOnce(trojan);
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 2 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_MAX_ITERATIONS');
+    // X3 fix: classified as INTERNAL, not NETWORK.
+    expect(result.structuredContent?.rescueErrorCode).toBe('INTERNAL');
+    expect(String(result.structuredContent?.rescueErrorMessage)).toContain(
+      'synthetic post-await parse failure',
+    );
+    // P3 invariant: api call DID complete → budget MUST be finalized (not
+    // cancelled). 2 iter reservations + 1 rescue reservation = 3 finalize
+    // calls; cancel must NOT have fired for the rescue.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(3);
+    expect(manifest.cancelBudgetReservation).not.toHaveBeenCalled();
+  });
+
   it('EMPTY_TEXT: rescue returned empty text → rescueErrorCode=EMPTY_TEXT', async () => {
     // The rescue dispatched, returned a candidate, but the extracted text
     // was empty after .trim(). Distinct from rescue-throw cases — the API
