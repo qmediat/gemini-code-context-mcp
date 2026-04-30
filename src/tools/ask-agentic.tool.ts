@@ -659,8 +659,34 @@ async function executeAskAgenticBody(
     };
 
     const conversation: Content[] = [{ role: 'user', parts: [{ text: input.prompt }] }];
-    /** Call-signature → count, for no-progress detection. */
-    const signatureCounts = new Map<string, number>();
+    /** Call-signature → state, for content-aware no-progress detection.
+     *
+     * v1.16.0 (P2 Phase B): replaces the v1.14.4 simple counter with a
+     * content-aware version. Pre-Phase-B `signatureCounts: Map<string,
+     * number>` tracked repeat occurrences of the same signature and
+     * tripped after N repeats even if the model had made progress
+     * elsewhere since an earlier occurrence. That was empirically wrong
+     * on 2026-04-30 — Gemini 3 Pro under HIGH thinking re-runs the same
+     * `grep` while ALSO reading new files, which IS progress, but the
+     * simple counter still tripped.
+     *
+     * Phase B tracks `lastFilesReadSize` per signature: same signature
+     * counts toward the threshold ONLY if no `read_file` against an
+     * unseen path happened between repeats. If `filesReadSet` grew
+     * since the previous identical signature, count resets to 1
+     * (current call) — the model is exploring, not stuck.
+     *
+     * Why `read_file` specifically and not all tool calls? `list_directory`
+     * / `find_files` / `grep` are exploration without commitment. They
+     * tell us where to look but don't capture content into the
+     * conversation. `read_file` is the progress signal — it means
+     * "I found something worth examining" and grows the conversation
+     * the rescue path will replay.
+     *
+     * Threshold (NO_PROGRESS_CALL_THRESHOLD = 5) unchanged from v1.14.4
+     * — Phase B refines the SIGNAL, not the cap. Hard upper bound
+     * remains `maxIterations` × `maxTotalInputTokens`. */
+    const signatureCounts = new Map<string, { count: number; lastFilesReadSize: number }>();
     const filesReadSet = new Set<string>();
     let cumulativeInputTokens = 0;
     let cumulativeOutputTokens = 0;
@@ -953,16 +979,56 @@ async function executeAskAgenticBody(
         );
       }
 
-      // No-progress detection: if any single call signature has now been
-      // issued NO_PROGRESS_CALL_THRESHOLD times across the loop, bail with
-      // the best text we can extract.
+      // No-progress detection (v1.16.0 P2 Phase B — content-aware):
+      // bails when any single call signature has been issued
+      // `NO_PROGRESS_CALL_THRESHOLD` times without any new
+      // `filesReadSet` growth between repeats. If `filesReadSet` grew,
+      // the model is exploring (productive) — reset that signature's
+      // count to 1.
+      //
+      // Implementation note: capture `filesReadSet.size` ONCE per iter
+      // (after tool execution) so all signatures within the same iter
+      // see the same "size at end of this iter" snapshot. Without the
+      // snapshot, a single iter that issues `read_file` AND `grep` AND
+      // `read_file` would have a different `filesReadSet.size` per
+      // signature depending on tool-execution order — non-deterministic
+      // + wrong (the snapshot represents iter-level progress, not
+      // within-iter).
+      //
+      // AA1 fix (v1.16.0 PR-Round-1, 3-of-3 cross-corroborated TP HIGH):
+      // ALSO dedupe signatures WITHIN an iter before counting. The
+      // counter conceptually measures iters-spent-stuck, not raw
+      // emission count. If the model glitches and emits the same
+      // `grep` 5× in one parallel batch, that's pathological output
+      // for ONE iter — should count as +1 toward the threshold, not
+      // +5. Pre-AA1 the counter compounded 1→2→3→4→5 in a single
+      // iter, instantly tripping AGENTIC_NO_PROGRESS even though
+      // zero stuck-iters had elapsed.
+      //
+      // Tool-surface assumption (AA2 ACCEPTED-DEFERRED): `read_file`
+      // is the sole progress oracle because ask_agentic's tool
+      // surface is exclusively read-only (`read_file`, `grep`,
+      // `list_directory`, `find_files` — no write_file, no terminal
+      // exec). When a future PR adds workspace-mutating tools, this
+      // oracle MUST be expanded to track any state-changing tool
+      // call (e.g., a combined "workspace state version" counter)
+      // — otherwise a model iterating on edits + command execution
+      // would false-positive AGENTIC_NO_PROGRESS.
+      const filesReadSizeAtIterEnd = filesReadSet.size;
+      const uniqueSigsThisIter = new Set<string>();
       for (const { name, args } of iterResult.signatures) {
-        const sig = `${name}(${stableJson(args)})`;
-        const count = (signatureCounts.get(sig) ?? 0) + 1;
-        signatureCounts.set(sig, count);
+        uniqueSigsThisIter.add(`${name}(${stableJson(args)})`);
+      }
+      for (const sig of uniqueSigsThisIter) {
+        const prev = signatureCounts.get(sig);
+        // Reset count when files grew between identical signatures —
+        // model is making progress, not stuck. Otherwise increment.
+        const count =
+          prev && filesReadSizeAtIterEnd > prev.lastFilesReadSize ? 1 : (prev?.count ?? 0) + 1;
+        signatureCounts.set(sig, { count, lastFilesReadSize: filesReadSizeAtIterEnd });
         if (count >= NO_PROGRESS_CALL_THRESHOLD) {
           return errorResult(
-            `ask_agentic: no-progress loop detected — call '${sig.slice(0, 200)}' was repeated ${count} times. Returning partial state.`,
+            `ask_agentic: no-progress loop detected — call '${sig.slice(0, 200)}' was repeated ${count} times without new file reads between repeats. Returning partial state.`,
             {
               errorCode: 'UNKNOWN',
               retryable: false,

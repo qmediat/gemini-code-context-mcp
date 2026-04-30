@@ -401,6 +401,152 @@ describe('ask_agentic loop — guards', () => {
     expect(String(result.structuredContent?.responseText)).toContain('Final answer');
   });
 
+  it('content-aware: same signature does NOT trip dedupe when read_file growth happens between repeats (v1.16.0 P2 Phase B)', async () => {
+    // Phase B refines the dedupe SIGNAL: same call signature counts toward
+    // the threshold ONLY if no `read_file` against an unseen path happened
+    // between repeats. Pre-Phase-B simple counter tripped on 5× identical
+    // signatures regardless of progress; Phase B resets the count to 1
+    // when filesReadSet grows.
+    //
+    // Scenario: model issues `grep "FunctionCallingConfigMode"` 5×
+    // (same args, same signature) but ALSO reads 4 different files
+    // between repeats — each `read_file` grows filesReadSet. With
+    // content-aware dedupe, the repeated grep should NOT trip; loop
+    // should reach the scripted final-text on iter 6.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'a');
+    writeFileSync(join(root, 'b.ts'), 'b');
+    writeFileSync(join(root, 'c.ts'), 'c');
+    writeFileSync(join(root, 'd.ts'), 'd');
+    const repeatedGrep = {
+      name: 'grep' as const,
+      args: { pattern: 'FunctionCallingConfigMode' },
+    };
+    const { ctx } = buildCtx({
+      script: [
+        // Iter 1: grep + read_file('a.ts') in the same turn → filesReadSet
+        // grows from 0 to 1, AND the grep signature is recorded.
+        {
+          functionCalls: [
+            { id: 'i1-grep', ...repeatedGrep },
+            { id: 'i1-read', name: 'read_file', args: { path: 'a.ts' } },
+          ],
+        },
+        // Iter 2: grep + read_file('b.ts') → filesReadSet grows to 2.
+        // Phase B: filesReadDelta > 0 since prev → reset count to 1.
+        {
+          functionCalls: [
+            { id: 'i2-grep', ...repeatedGrep },
+            { id: 'i2-read', name: 'read_file', args: { path: 'b.ts' } },
+          ],
+        },
+        // Iter 3: grep + read_file('c.ts') → filesReadSet grows to 3 → reset.
+        {
+          functionCalls: [
+            { id: 'i3-grep', ...repeatedGrep },
+            { id: 'i3-read', name: 'read_file', args: { path: 'c.ts' } },
+          ],
+        },
+        // Iter 4: grep + read_file('d.ts') → filesReadSet grows to 4 → reset.
+        {
+          functionCalls: [
+            { id: 'i4-grep', ...repeatedGrep },
+            { id: 'i4-read', name: 'read_file', args: { path: 'd.ts' } },
+          ],
+        },
+        // Iter 5: grep alone, no new file. filesReadSet stays at 4.
+        // Phase B: filesReadDelta == 0 → count = prev.count + 1 = 2.
+        // Still under threshold 5 — must continue.
+        { functionCalls: [{ id: 'i5-grep', ...repeatedGrep }] },
+        // Iter 6: scripted final-text answer. Loop should reach this.
+        { text: 'Final answer after content-aware exploration.' },
+      ],
+    });
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'investigate', workspace: root, maxIterations: 6 },
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(String(result.structuredContent?.responseText)).toContain(
+      'Final answer after content-aware',
+    );
+    expect(result.structuredContent?.filesRead).toBe(4); // a, b, c, d
+  });
+
+  it('AA1 fix (v1.16.0 PR-Round-1): within-iter parallel duplicates count as +1, not +N', async () => {
+    // Pathological model output: same signature emitted 5× in ONE parallel
+    // batch (single iteration). Pre-AA1 the dedupe loop iterated raw
+    // signatures and compounded 1→2→3→4→5 in that single iter, instantly
+    // tripping AGENTIC_NO_PROGRESS even though zero stuck-iters had
+    // elapsed. Post-AA1 the dedupe loop hashes signatures into a Set
+    // first; same signature in same iter counts as +1 toward the threshold.
+    //
+    // 3-of-3 cross-corroborated TP HIGH (gemini-cli + gemini-chat NIT,
+    // grok HIGH — escalated severity per merge gate). Negative pin so a
+    // future refactor that drops the within-iter dedup is caught.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const sameGrep = { name: 'grep' as const, args: { pattern: 'foo' } };
+    const { ctx } = buildCtx({
+      script: [
+        // Iter 1: 5× identical grep in one parallel batch. Pre-AA1: trips
+        // immediately. Post-AA1: counts as +1, loop continues.
+        {
+          functionCalls: [
+            { id: 'p1', ...sameGrep },
+            { id: 'p2', ...sameGrep },
+            { id: 'p3', ...sameGrep },
+            { id: 'p4', ...sameGrep },
+            { id: 'p5', ...sameGrep },
+          ],
+        },
+        // Iter 2: scripted final-text answer. Loop should reach this
+        // because Iter 1's 5 dupes counted as 1 toward threshold.
+        { text: 'Final answer despite glitchy parallel batch.' },
+      ],
+    });
+
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, maxIterations: 3 },
+      ctx,
+    );
+
+    expect(result.isError).toBeUndefined();
+    expect(String(result.structuredContent?.responseText)).toContain('Final answer');
+    expect(result.structuredContent?.iterations).toBe(2);
+  });
+
+  it('content-aware: 5× same signature with NO file growth between repeats still trips dedupe (v1.16.0 P2 Phase B)', async () => {
+    // Negative pin for content-aware logic: when the model truly is stuck
+    // (issuing same signature with NO progress between repeats), dedupe
+    // MUST still trip. Identical to the v1.14.4 threshold-5 test but
+    // pinned again here under the v1.16.0 describe scope so a future
+    // refactor that breaks the negative case is caught at unit-test time.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    const callBody = { name: 'grep' as const, args: { pattern: 'foo' } };
+    const { ctx } = buildCtx({
+      script: [
+        { functionCalls: [{ id: 'iter-1', ...callBody }] },
+        { functionCalls: [{ id: 'iter-2', ...callBody }] },
+        { functionCalls: [{ id: 'iter-3', ...callBody }] },
+        { functionCalls: [{ id: 'iter-4', ...callBody }] },
+        { functionCalls: [{ id: 'iter-5', ...callBody }] }, // 5th, no file growth → trip
+      ],
+    });
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.subReason).toBe('AGENTIC_NO_PROGRESS');
+    expect(String(result.structuredContent?.repeatedSignature)).toContain('grep');
+    // Phase B error message includes "without new file reads between repeats"
+    // — pin it so the operator-facing message stays accurate.
+    expect(String(result.content?.[0]?.text ?? '')).toContain(
+      'without new file reads between repeats',
+    );
+  });
+
   it('triggers AGENTIC_MAX_ITERATIONS when loop never returns text', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
