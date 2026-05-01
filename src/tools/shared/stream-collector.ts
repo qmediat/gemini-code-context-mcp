@@ -141,13 +141,23 @@ export async function collectStream(
   // T35 (v1.16.3): accumulate parts from every chunk rather than picking the
   // "best" chunk's parts. Multi-chunk function calls and standalone signature
   // terminator Parts both depend on this — see file-level docstring.
-  const accumulatedParts: Part[] = [];
-  // Last seen candidate-scaffold — finishReason, safetyRatings,
+  //
+  // R1 fold (PR #59 — GPT F1 / Gemini F1 / Grok F2): per-candidate-index maps
+  // preserve the pre-T35 multi-candidate contract. Pre-T35 the synth was
+  // `lastCandidates = chunk.candidates` (full N-element array preserved).
+  // The initial T35 implementation collapsed to single-element synth which
+  // narrowed the type for any future caller that sets `candidateCount > 1`.
+  // Today no caller does, but `code.tool.ts:727` iterates ALL candidates
+  // (`for (const cand of candidates)`) so a future caller would silently
+  // lose candidates 1..N's parts/safety/grounding. Per-index maps keep the
+  // accumulation invariant for every emitted candidate.
+  const accumulatedPartsByIndex = new Map<number, Part[]>();
+  // Last seen candidate-scaffold per index — finishReason, safetyRatings,
   // groundingMetadata, citationMetadata. We DON'T accumulate these (each is
   // a standalone field where the latest authoritative value wins). On exit
-  // we overlay `accumulatedParts` onto the last scaffold to synthesise the
-  // returned `lastCandidates`.
-  let lastCandidateScaffold: Candidate | undefined;
+  // we overlay each index's accumulated parts onto its last scaffold to
+  // synthesise the returned `lastCandidates`.
+  const scaffoldsByIndex = new Map<number, Candidate>();
   let lastUsageMetadata: GenerateContentResponse['usageMetadata'];
   let chunkCount = 0;
   let firstChunkAt: number | null = null;
@@ -243,22 +253,35 @@ export async function collectStream(
       // (filter for `functionCall`, count thought parts) sees richer
       // input but each filter handles the extra Part variants without
       // change.
-      const candidate = chunk.candidates?.[0];
-      const incomingParts = candidate?.content?.parts;
-      if (Array.isArray(incomingParts) && incomingParts.length > 0) {
-        accumulatedParts.push(...incomingParts);
-      }
-      // Track the latest candidate scaffold for finishReason / safety
-      // ratings / grounding / citation metadata. Each chunk yields a
-      // fresh scaffold; finalisation overlays accumulatedParts onto the
-      // last seen one.
-      if (candidate) {
-        lastCandidateScaffold = candidate;
+      // Per-candidate-index accumulation. Today Gemini's streaming protocol
+      // emits candidateCount=1 by default (no caller in this codebase sets
+      // candidateCount>1 — verified by repo-wide grep). Per-index maps cost
+      // ~10 lines and preserve the pre-T35 contract for any future caller
+      // that does set candidateCount>1, matching `code.tool.ts:727`'s
+      // existing `for (const cand of candidates)` consumption pattern.
+      const candidates = chunk.candidates ?? [];
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        if (!cand) continue;
+        const incomingParts = cand.content?.parts;
+        if (Array.isArray(incomingParts) && incomingParts.length > 0) {
+          let bucket = accumulatedPartsByIndex.get(i);
+          if (!bucket) {
+            bucket = [];
+            accumulatedPartsByIndex.set(i, bucket);
+          }
+          bucket.push(...incomingParts);
+        }
+        // Track the latest candidate scaffold for this index. finishReason,
+        // safety ratings, grounding, citation metadata — each chunk yields
+        // a fresh scaffold per index; finalisation overlays per-index
+        // accumulated parts onto each index's last seen scaffold.
+        scaffoldsByIndex.set(i, cand);
       }
 
       // Thought-part extraction. `parts[i].thought === true` flags an
       // internal-reasoning chunk. Push to summary, throttle emit.
-      const candidates = chunk.candidates ?? [];
+      // (Reuses `candidates` from the per-index accumulation block above.)
       for (const cand of candidates) {
         const parts = cand.content?.parts ?? [];
         for (const part of parts) {
@@ -328,23 +351,26 @@ export async function collectStream(
   const thoughtsSummary =
     thoughtChunks.length > 0 ? thoughtChunks.join('\n').slice(0, THOUGHTS_SUMMARY_MAX_CHARS) : null;
 
-  // Synthesize final candidates by overlaying accumulatedParts onto the last
-  // seen candidate scaffold. When NO chunk yielded a candidate at all (e.g.
-  // text-only stream with naked `{ text: 'x' }` chunks), `lastCandidates`
-  // stays undefined — preserves the prior contract for the no-candidates
-  // path.
-  const lastCandidates: GenerateContentResponse['candidates'] = lastCandidateScaffold
-    ? [
-        {
-          ...lastCandidateScaffold,
-          content: {
-            ...(lastCandidateScaffold.content ?? {}),
-            role: lastCandidateScaffold.content?.role ?? 'model',
-            parts: accumulatedParts,
-          },
-        },
-      ]
-    : undefined;
+  // Synthesize final candidates by overlaying each index's accumulated parts
+  // onto that index's last seen scaffold. When NO chunk yielded a candidate
+  // at all (e.g. text-only stream with naked `{ text: 'x' }` chunks),
+  // `lastCandidates` stays undefined — preserves the prior contract for the
+  // no-candidates path. When chunks emitted candidateCount>1, every emitted
+  // index gets a synthesised entry, sorted by ordinal index — matches
+  // pre-T35 `lastCandidates = chunk.candidates` semantics.
+  const lastCandidates: GenerateContentResponse['candidates'] =
+    scaffoldsByIndex.size > 0
+      ? Array.from(scaffoldsByIndex.entries())
+          .sort(([a], [b]) => a - b)
+          .map(([i, scaffold]) => ({
+            ...scaffold,
+            content: {
+              ...(scaffold.content ?? {}),
+              role: scaffold.content?.role ?? 'model',
+              parts: accumulatedPartsByIndex.get(i) ?? [],
+            },
+          }))
+      : undefined;
 
   return {
     text,

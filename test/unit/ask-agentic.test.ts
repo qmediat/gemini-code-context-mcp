@@ -2464,9 +2464,14 @@ describe('ask_agentic loop — stallMs heartbeat watchdog (T33, v1.16.2)', () =>
     generateContent.mockReset();
     generateContentStream.mockReset();
     // Iter 1: empirical Gemini shape — functionCall in chunk 1, [{text:''}]
-    // terminator in chunk 2. Pre-fix: chunk 2 overwrites chunk 1 in
-    // lastCandidates → loop sees no functionCall → final-text path → empty.
-    // Post-fix: chunk 2 fails the content-bearing gate → chunk 1 wins.
+    // terminator in chunk 2. Pre-fix (v1.16.2): chunk 2 overwrites chunk 1
+    // in lastCandidates → loop sees no functionCall → final-text path →
+    // empty. Post-fix (v1.16.3 T35 — true parts accumulation): parts from
+    // both chunks are appended verbatim into a single candidate; the
+    // ask-agentic parts iterator (filters for `p.functionCall`) still sees
+    // chunk 1's functionCall and dispatches the tool call, while the
+    // chunk-2 empty-text Part is harmlessly retained alongside it
+    // (signature attachments via thoughtSignature can ride on either).
     generateContentStream.mockImplementationOnce(() => {
       async function* empiricalShape() {
         yield {

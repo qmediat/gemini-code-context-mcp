@@ -45,12 +45,23 @@ A single-FC smoke (Test 1) was sufficient to confirm Fix #1 against live Gemini.
 
 ### Coverage
 
-771 tests pass (766 → 771 in this release — added 5 regression pins covering the multi-chunk parts fragmentation cases: parallel-FC across 3 chunks pinning thoughtSignature on FC1, executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams).
+772 tests pass (766 → 772 across the full release, including the R1 fold-cycle pin documented below — net +6 over v1.16.2). The 5 T35-specific regression pins cover the multi-chunk parts fragmentation cases: parallel-FC across 3 chunks pinning thoughtSignature on FC1, executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams.
+
+### R1 fold-cycle (4-way: GPT + Gemini + Grok + Copilot)
+
+- **Fold A (GPT F1 / Gemini F1 / Grok F2 — 3-way consensus, /6step PARTIAL Medium):** synthesised candidates collapsed to single-element array, narrowing the pre-T35 `lastCandidates = chunk.candidates` contract. Per-index `Map<number, Part[]>` accumulation + `Map<number, Candidate>` scaffold tracking restore multi-candidate preservation for any future caller that sets `candidateCount > 1` (today none does — `code.tool.ts:727` already iterates ALL candidates so the type narrowing was a real regression-in-waiting).
+- **Fold B (GPT F2 — TP Medium):** added `it('preserves multi-candidate streams (candidateCount>1) with per-index parts accumulation')` regression pin.
+- **Fold D (Grok F1 — PARTIAL Low):** retitled the empty-text-terminator regression test to mention both the hotfix-A history and the T35 strengthening explicitly.
+- **Fold G (Copilot — TP Medium):** reconciled CHANGELOG T36 status with `docs/FOLLOW-UP-PRS.md` (T36 is RESOLVED-BY-T35, not "remains tracked").
+- **Fold H (Copilot — TP Low):** updated `ask-agentic.test.ts:2469` comment narrating "content-bearing gate" to describe the actual T35 accumulation behaviour.
+- **Accept-deferred C (Grok F3 — TP Medium):** end-to-end multi-FC + thoughtSignature test through `askAgenticTool.execute`. Covered at the collector contract level by `stream-collector.test.ts:189`. Live-API integration smoke is the documented next-PR scope (see Fix #2 closing notes above).
+- **Accept E (Grok F4 — Low):** test count "766 → 771" verified empirically post-R1 fold becomes 766 → 772; the "5 regression pins" wording in the original Coverage section refers to T35-specific pins — accurate at that scope.
+- **Accept F (Grok F5 — Low):** Keep-a-Changelog Unreleased + per-version compare-link not added; project's prior versions (v1.0.0 → v1.16.2) follow the same convention of only emitting the `[1.0.0]` link.
 
 ### Notes
 
 - Anyone on v1.16.2 with `ask_agentic` calls in production should upgrade IMMEDIATELY. Tool-calling iterations were silently failing on every prompt.
-- T35 (true parts accumulation) — closed in this release. T36 (`toolCall` predicate completeness for future Gemini server-side tools) remains tracked in `docs/FOLLOW-UP-PRS.md` and is unaffected (the accumulation contract handles `toolCall` exactly the same way as `functionCall`).
+- T35 (true parts accumulation) — closed in this release. T36 (`toolCall` predicate completeness for future Gemini server-side tools) is also resolved by T35 in v1.16.3 — the accumulation contract preserves any Part shape verbatim (functionCall, toolCall, executableCode, codeExecutionResult, thoughtSignature) without per-shape gating. See `docs/FOLLOW-UP-PRS.md` "T36" for the full rationale.
 - v1.6/v1.7 streaming refactor track still considered shipped — both fixes are defects in the v1.16.2 agentic-loop refactor, fixed in place.
 
 ## [1.16.2] - 2026-04-30

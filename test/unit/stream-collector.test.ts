@@ -98,7 +98,7 @@ describe('collectStream — candidate scaffold metadata last-write-wins', () => 
 });
 
 describe('collectStream — parts ACCUMULATE across chunks (T35, v1.16.3)', () => {
-  it('preserves functionCall from chunk 1 when chunk 2 carries an empty-text terminator (v1.16.3 hotfix-A regression pin)', async () => {
+  it('preserves functionCall AND empty-text terminator part from chunk 2 (v1.16.3 hotfix-A pin + T35 strengthening — both parts retained)', async () => {
     // Empirical raw-stream capture against live Gemini Pro on 2026-05-01
     // showed the canonical Gemini stream protocol pattern for tool-using
     // turns: the functionCall arrives in chunk 1 and a TERMINATOR shaped
@@ -378,6 +378,59 @@ describe('collectStream — parts ACCUMULATE across chunks (T35, v1.16.3)', () =
     const result = await collectStream(gen([{ text: 'a' }, { text: 'b' }]));
     expect(result.candidates).toBeUndefined();
     expect(result.text).toBe('ab');
+  });
+
+  it('preserves multi-candidate streams (candidateCount>1) with per-index parts accumulation (R1 fold)', async () => {
+    // Pre-T35 the synth was `lastCandidates = chunk.candidates` (full
+    // N-element array preserved under last-write-wins on each chunk).
+    // The initial T35 implementation (before R1 fold) collapsed synth to
+    // a single-element array, silently narrowing the type for any caller
+    // that requests `candidateCount > 1` via GenerationConfig.
+    //
+    // Today no caller in this codebase sets candidateCount>1 (verified by
+    // repo-wide grep), but `code.tool.ts:727` iterates ALL candidates with
+    // `for (const cand of candidates)` — a future caller adding multi-
+    // candidate would silently lose candidates 1..N's parts. This pin
+    // locks the per-index accumulation invariant.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: 'cand-0 chunk-1 ' }] },
+            },
+            {
+              content: { role: 'model', parts: [{ text: 'cand-1 chunk-1 ' }] },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: 'cand-0 chunk-2' }] },
+              finishReason: 'STOP',
+            },
+            {
+              content: { role: 'model', parts: [{ text: 'cand-1 chunk-2' }] },
+              finishReason: 'MAX_TOKENS',
+            },
+          ],
+        },
+      ]),
+    );
+    expect(result.candidates?.length).toBe(2);
+    // Index 0: parts from chunk 1 + chunk 2 accumulated; latest scaffold
+    // (chunk 2's `STOP` finishReason) wins.
+    expect(result.candidates?.[0]?.content?.parts?.length).toBe(2);
+    expect(result.candidates?.[0]?.content?.parts?.[0]?.text).toBe('cand-0 chunk-1 ');
+    expect(result.candidates?.[0]?.content?.parts?.[1]?.text).toBe('cand-0 chunk-2');
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
+    // Index 1: same pattern, distinct finishReason proves scaffolds aren't
+    // shared across indices.
+    expect(result.candidates?.[1]?.content?.parts?.length).toBe(2);
+    expect(result.candidates?.[1]?.content?.parts?.[0]?.text).toBe('cand-1 chunk-1 ');
+    expect(result.candidates?.[1]?.content?.parts?.[1]?.text).toBe('cand-1 chunk-2');
+    expect(result.candidates?.[1]?.finishReason).toBe('MAX_TOKENS');
   });
 });
 
