@@ -45,7 +45,7 @@ A single-FC smoke (Test 1) was sufficient to confirm Fix #1 against live Gemini.
 
 ### Coverage
 
-772 tests pass (766 → 772 across the full release, including the R1 fold-cycle pin documented below — net +6 over v1.16.2). The 5 T35-specific regression pins cover the multi-chunk parts fragmentation cases: parallel-FC across 3 chunks pinning thoughtSignature on FC1, executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams.
+773 tests pass (766 → 773 across the full release, including the R1 + R2 fold-cycle pins documented below — net +7 over v1.16.2). The 5 T35-specific regression pins cover the multi-chunk parts fragmentation cases: parallel-FC across 3 chunks pinning thoughtSignature on FC1, executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams.
 
 ### R1 fold-cycle (4-way: GPT + Gemini + Grok + Copilot)
 
@@ -57,6 +57,12 @@ A single-FC smoke (Test 1) was sufficient to confirm Fix #1 against live Gemini.
 - **Accept-deferred C (Grok F3 — TP Medium):** end-to-end multi-FC + thoughtSignature test through `askAgenticTool.execute`. Covered at the collector contract level by `stream-collector.test.ts:189`. Live-API integration smoke is the documented next-PR scope (see Fix #2 closing notes above).
 - **Accept E (Grok F4 — Low):** test count "766 → 771" verified empirically post-R1 fold becomes 766 → 772; the "5 regression pins" wording in the original Coverage section refers to T35-specific pins — accurate at that scope.
 - **Accept F (Grok F5 — Low):** Keep-a-Changelog Unreleased + per-version compare-link not added; project's prior versions (v1.0.0 → v1.16.2) follow the same convention of only emitting the `[1.0.0]` link.
+
+### R2 fold-cycle (3-way: GPT + Gemini + Grok)
+
+- **Fold I (GPT R2 F1 / Gemini R2 F1 — 2-way HIGH consensus, /6step TP Medium):** the R1-fold per-index Maps were keyed by the loop variable `i` (array position) rather than `cand.index ?? i`. Per `@google/genai` SDK `Candidate.index` doc: "The 0-based index of this candidate in the list of generated responses. Useful for distinguishing between multiple candidates when candidate_count > 1." Sparse stream emission like `candidates: [{ index: 1, content: ... }]` (only index 1, not 0) would have cross-wired that part into bucket 0. Fixed: keys now use `cand.index ?? i`, and the synth `.sort()` is now load-bearing because Map insertion order can diverge from ordinal index under sparse emission.
+- **Fold J (GPT R2 F2 / Grok R2 F1 — TP Low):** added `it('keys multi-candidate buckets by Candidate.index, not array position (R2 fold — sparse emission)')` regression pin that emits sparse + reverse-Map-insertion-order chunks and asserts ordinal output ordering with no cross-bucket bleed.
+- **Accept K (Grok R2 F2 — Nit):** the `.sort()` on `Array.from(Map.entries())` was flagged as redundant under R1's keying (Map preserves insertion order from the ascending-i loop). After Fold I the sort BECOMES load-bearing for sparse emission, so it stays — comment added explaining why.
 
 ### Notes
 

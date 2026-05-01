@@ -259,16 +259,25 @@ export async function collectStream(
       // ~10 lines and preserve the pre-T35 contract for any future caller
       // that does set candidateCount>1, matching `code.tool.ts:727`'s
       // existing `for (const cand of candidates)` consumption pattern.
+      //
+      // R2 fold (PR #59 — GPT R2 F1 / Gemini R2 F1, 2-way HIGH): key Maps by
+      // `cand.index ?? i` instead of array position alone. Per @google/genai
+      // SDK Candidate.index doc: "The 0-based index of this candidate in
+      // the list of generated responses. This is useful for distinguishing
+      // between multiple candidates when candidate_count > 1." Sparse stream
+      // emission like `candidates: [{ index: 1, content: ... }]` (only
+      // index 1, not 0) would otherwise cross-wire that part into bucket 0.
       const candidates = chunk.candidates ?? [];
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
         if (!cand) continue;
+        const cIdx = cand.index ?? i;
         const incomingParts = cand.content?.parts;
         if (Array.isArray(incomingParts) && incomingParts.length > 0) {
-          let bucket = accumulatedPartsByIndex.get(i);
+          let bucket = accumulatedPartsByIndex.get(cIdx);
           if (!bucket) {
             bucket = [];
-            accumulatedPartsByIndex.set(i, bucket);
+            accumulatedPartsByIndex.set(cIdx, bucket);
           }
           bucket.push(...incomingParts);
         }
@@ -276,7 +285,7 @@ export async function collectStream(
         // safety ratings, grounding, citation metadata — each chunk yields
         // a fresh scaffold per index; finalisation overlays per-index
         // accumulated parts onto each index's last seen scaffold.
-        scaffoldsByIndex.set(i, cand);
+        scaffoldsByIndex.set(cIdx, cand);
       }
 
       // Thought-part extraction. `parts[i].thought === true` flags an
@@ -358,6 +367,12 @@ export async function collectStream(
   // no-candidates path. When chunks emitted candidateCount>1, every emitted
   // index gets a synthesised entry, sorted by ordinal index — matches
   // pre-T35 `lastCandidates = chunk.candidates` semantics.
+  //
+  // The .sort() is load-bearing under R2 fold's `cand.index ?? i` keying:
+  // sparse emission (chunk 1 emits index 1 first, chunk 2 emits index 0)
+  // would yield Map insertion order [1, 0] without the sort, mis-ordering
+  // the final candidates array. Map preserves insertion order, so sort is
+  // the only guarantee of ordinal output ordering.
   const lastCandidates: GenerateContentResponse['candidates'] =
     scaffoldsByIndex.size > 0
       ? Array.from(scaffoldsByIndex.entries())

@@ -432,6 +432,77 @@ describe('collectStream — parts ACCUMULATE across chunks (T35, v1.16.3)', () =
     expect(result.candidates?.[1]?.content?.parts?.[1]?.text).toBe('cand-1 chunk-2');
     expect(result.candidates?.[1]?.finishReason).toBe('MAX_TOKENS');
   });
+
+  it('keys multi-candidate buckets by Candidate.index, not array position (R2 fold — sparse emission)', async () => {
+    // Per @google/genai SDK Candidate.index doc: "The 0-based index of this
+    // candidate in the list of generated responses. Useful for
+    // distinguishing between multiple candidates when candidate_count > 1."
+    // Gemini's streaming protocol may emit a chunk with ONLY a non-zero
+    // index — e.g. `candidates: [{ index: 1, content: {...} }]` — when
+    // upstream incremental updates land on only one candidate at a time.
+    //
+    // Pre-R2-fold the Map key was the loop variable `i`, so a chunk
+    // emitting only index=1 would cross-wire that candidate's parts into
+    // bucket 0. Post-R2-fold the key is `cand.index ?? i`, so the bucket
+    // tracks the model's ordinal correctly. Also verifies that synthesis
+    // sort() preserves ordinal output ordering when Map insertion order
+    // happens to be reverse (chunk 1 inserts index 1 first; chunk 2
+    // inserts index 0 first).
+    const result = await collectStream(
+      gen([
+        // Chunk 1: ONLY index 1 emits (sparse, no index 0 yet).
+        {
+          candidates: [
+            {
+              index: 1,
+              content: { role: 'model', parts: [{ text: 'cand-1 first ' }] },
+            },
+          ],
+        },
+        // Chunk 2: now index 0 emits (Map insertion order is [1, 0]).
+        {
+          candidates: [
+            {
+              index: 0,
+              content: { role: 'model', parts: [{ text: 'cand-0 first' }] },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+        // Chunk 3: only index 1 emits a continuation + finish (sparse again,
+        // verifying the per-index scaffold last-write-wins really IS per-index).
+        {
+          candidates: [
+            {
+              index: 1,
+              content: { role: 'model', parts: [{ text: 'cand-1 cont' }] },
+              finishReason: 'MAX_TOKENS',
+            },
+          ],
+        },
+      ]),
+    );
+    expect(result.candidates?.length).toBe(2);
+    // Output ordered by ordinal index, NOT Map insertion order (which is [1, 0]
+    // because chunk 1 inserted index 1 first).
+    expect(result.candidates?.[0]?.index).toBe(0);
+    expect(result.candidates?.[1]?.index).toBe(1);
+    // Index 0: only chunk 2 contributes a part; chunk 1's index-1 part MUST
+    // NOT bleed into bucket 0, and chunk 3 doesn't emit index 0 at all.
+    const cand0Parts = result.candidates?.[0]?.content?.parts ?? [];
+    expect(cand0Parts.length).toBe(1);
+    expect(cand0Parts[0]?.text).toBe('cand-0 first');
+    // Chunk 2's STOP scaffold for index 0 is the last-seen scaffold for that
+    // index — chunk 3 didn't emit index 0, so no overwrite.
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
+    // Index 1: chunk 1 + chunk 3 contributions; chunk 2's index-0 part MUST
+    // NOT bleed in.
+    const cand1Parts = result.candidates?.[1]?.content?.parts ?? [];
+    expect(cand1Parts.length).toBe(2);
+    expect(cand1Parts[0]?.text).toBe('cand-1 first ');
+    expect(cand1Parts[1]?.text).toBe('cand-1 cont');
+    expect(result.candidates?.[1]?.finishReason).toBe('MAX_TOKENS');
+  });
 });
 
 describe('collectStream — thought parts', () => {
