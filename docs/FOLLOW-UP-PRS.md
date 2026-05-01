@@ -595,6 +595,57 @@ The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to s
 
 ---
 
+## T35. `collectStream` — true parts accumulation across chunks (multi-chunk parts-fragmentation)
+
+**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #2 — surfaced while reviewing the v1.16.3 fix scope. **Defer-followup, not blocking.**
+
+**Why:** v1.16.3 changes `collectStream`'s `lastCandidates` rule from "last chunk with non-empty parts array" to "last chunk with at least one content-bearing part". This closes the empirical Gemini empty-text-terminator regression that broke `ask_agentic` (PR #59 root cause). However it does NOT solve a related class:
+
+> If Gemini emits `executableCode` in chunk 1 and `codeExecutionResult` in chunk 2 (both content-bearing under v1.16.3's gate), `lastCandidates` ends as chunk 2 and chunk 1's `executableCode` is lost.
+
+`code.tool.ts:726-733` iterates `response.candidates` extracting BOTH `executableCode` and `codeExecutionResult` parts. The author comment at line 720-723 (`// We still iterate candidates here for executableCode / codeExecutionResult parts (those aren't accumulated by collectStream — they're full per-chunk artefacts).`) shows the author was AWARE that collectStream's last-write-wins on candidates is fragile for code-execution chunks.
+
+This bug is NOT introduced by v1.16.3. Pre-v1.16.2 outer-array gate had the same vulnerability — chunk 1's `executableCode` would have been overwritten by chunk 2's `codeExecutionResult` either way.
+
+**Currently zero empirical reports** of `code` returning incomplete executableCode/codeExecutionResult output. Gemini's empirical protocol may pack both into a single chunk (similar to how it packs functionCall + finishReason together pre-v1.16.3 expectation). Fix-on-evidence preferred over fix-on-spec.
+
+**Scope (when fired):**
+- Refactor `collectStream` to ACCUMULATE parts across chunks (concatenate into a running `accumulatedParts: Part[]` array).
+- Synthesize the final `lastCandidates` from `[{ content: { parts: accumulatedParts, role: 'model' }, finishReason: <last seen> }]`.
+- Side-effect on consumers: `ask_agentic` would now see the FULL conversation including both pre-functionCall thoughts AND the functionCall — current behavior keeps only one chunk's parts, accumulation keeps all. Need to verify `iterResult.signatures` extraction + content-aware NO_PROGRESS dedupe (v1.16.0) still work correctly.
+- Tests:
+  - Multi-chunk thought + functionCall + terminator: assert all parts preserved.
+  - Multi-chunk executableCode + codeExecutionResult: assert both extracted by `code.tool.ts`.
+  - Regression: existing v1.16.3 fragmentation-guard tests still green.
+
+**Sizing:** ~3-4 hours — collector refactor + downstream-consumer verification + 4-5 new tests + CHANGELOG entry.
+
+**Blocked on:** an empirical report (operator-side) of incomplete `code` execution output, OR a Gemini stream-protocol change that fragments `code` parts. Neither has fired in the v1.14.x → v1.16.3 cycle.
+
+---
+
+## T36. `collectStream` content-bearing predicate — add `toolCall` for SDK type completeness
+
+**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #3 — ACCEPTED-DEFERRED. **Not blocking, defensive completeness only.**
+
+**Why:** v1.16.3's `hasContentBearingPart` predicate covers six Part variants (`functionCall`, `executableCode`, `codeExecutionResult`, `fileData`, `inlineData`, non-empty `text`). The `@google/genai` SDK Part interface (`node_modules/@google/genai/dist/genai.d.ts:8801-8804`) also defines:
+- `toolCall?: ToolCall` — server-side tool invocation (a server-side variant of `functionCall`)
+- `toolResponse?: ToolResponse` — request-side, never appears in stream responses
+
+If Gemini ever introduces server-side tool execution and emits a chunk with ONLY `toolCall` content (no functionCall, no other variants), v1.16.3's gate would reject it as a non-content-bearing chunk and a previous chunk with content-bearing parts would survive in `lastCandidates`. This is wrong — a `toolCall`-only chunk IS content-bearing.
+
+**Empirically not currently triggered.** Our tools (`ask`, `code`, `ask_agentic`) configure `tools: [{functionDeclarations: [...]}]` — Gemini emits `functionCall`, never `toolCall`. Future expansion (e.g. enabling Google's grounded-search tool which DOES use server-side `toolCall`) would surface this.
+
+**Scope (when fired):**
+- Add `p.toolCall != null` to the `.some()` predicate in `src/tools/shared/stream-collector.ts:198`.
+- Add 1 unit test pinning a `toolCall`-only chunk's preservation.
+
+**Sizing:** ~10 minutes (1-line code change + 1 test + comment update).
+
+**Blocked on:** any future use of server-side Gemini tools (grounded search, code execution as server-side tool, etc.). Add proactively if T35 (parts accumulation) lands, since the broader refactor would naturally bring this in.
+
+---
+
 ## T31. `refreshFileFingerprints` — skip memo-hit rows to avoid WAL churn
 
 **Source:** PR #45 / 6step round-3 review, finding #4 (Grok P2 ACCEPTED).
