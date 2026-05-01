@@ -595,54 +595,21 @@ The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to s
 
 ---
 
-## T35. `collectStream` — true parts accumulation across chunks (multi-chunk parts-fragmentation)
+## T35. `collectStream` — true parts accumulation across chunks (multi-chunk parts-fragmentation) — **RESOLVED in v1.16.3 same-release fold**
 
-**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #2 — surfaced while reviewing the v1.16.3 fix scope. **Defer-followup, not blocking.**
+**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #2 — initially deferred, then escalated to active when end-to-end MCP smoke-test against live Gemini Pro on 2026-05-01 surfaced the empirical multi-file failure (Test 5). T35's deferral premise ("currently zero empirical reports") no longer held.
 
-**Why:** v1.16.3 changes `collectStream`'s `lastCandidates` rule from "last chunk with non-empty parts array" to "last chunk with at least one content-bearing part". This closes the empirical Gemini empty-text-terminator regression that broke `ask_agentic` (PR #59 root cause). However it does NOT solve a related class:
+**Empirical trigger:** Test 5 of the documented v1.16.3 hotfix smoke plan: `ask_agentic({ prompt: "Read package.json, server.json, CHANGELOG.md..." })` against `gemini-pro-latest` returned 400 "Function call default_api:read_file ... missing thought_signature, position 2" — Gemini's `<index of contents array>` content-block error per https://ai.google.dev/gemini-api/docs/thought-signatures. Hotfix-A's content-bearing-parts gate kept ONE chunk (single-FC works) but lost FC1's signature when parallel functionCalls fragmented across separate chunks under last-write-wins.
 
-> If Gemini emits `executableCode` in chunk 1 and `codeExecutionResult` in chunk 2 (both content-bearing under v1.16.3's gate), `lastCandidates` ends as chunk 2 and chunk 1's `executableCode` is lost.
+**Resolution (v1.16.3 same-release fold):** `collectStream` no longer gates / overwrites — it ACCUMULATES `parts` across every chunk verbatim. Empty-text terminator parts, parallel `functionCall` parts, and standalone signature-bearing parts are preserved exactly as Gemini emitted them. The candidate scaffold (`finishReason`, `safetyRatings`, `groundingMetadata`, `citationMetadata`) stays last-write-wins; on stream exit we synthesise the final `candidates` shape by overlaying the accumulated `parts` onto the last seen scaffold. Five new regression tests pin: parallel-FC across 3 chunks (signature on FC1 preserved), executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams. See CHANGELOG `[1.16.3]` Fix #2 for full rationale.
 
-`code.tool.ts:726-733` iterates `response.candidates` extracting BOTH `executableCode` and `codeExecutionResult` parts. The author comment at line 720-723 (`// We still iterate candidates here for executableCode / codeExecutionResult parts (those aren't accumulated by collectStream — they're full per-chunk artefacts).`) shows the author was AWARE that collectStream's last-write-wins on candidates is fragile for code-execution chunks.
-
-This bug is NOT introduced by v1.16.3. Pre-v1.16.2 outer-array gate had the same vulnerability — chunk 1's `executableCode` would have been overwritten by chunk 2's `codeExecutionResult` either way.
-
-**Currently zero empirical reports** of `code` returning incomplete executableCode/codeExecutionResult output. Gemini's empirical protocol may pack both into a single chunk (similar to how it packs functionCall + finishReason together pre-v1.16.3 expectation). Fix-on-evidence preferred over fix-on-spec.
-
-**Scope (when fired):**
-- Refactor `collectStream` to ACCUMULATE parts across chunks (concatenate into a running `accumulatedParts: Part[]` array).
-- Synthesize the final `lastCandidates` from `[{ content: { parts: accumulatedParts, role: 'model' }, finishReason: <last seen> }]`.
-- Side-effect on consumers: `ask_agentic` would now see the FULL conversation including both pre-functionCall thoughts AND the functionCall — current behavior keeps only one chunk's parts, accumulation keeps all. Need to verify `iterResult.signatures` extraction + content-aware NO_PROGRESS dedupe (v1.16.0) still work correctly.
-- Tests:
-  - Multi-chunk thought + functionCall + terminator: assert all parts preserved.
-  - Multi-chunk executableCode + codeExecutionResult: assert both extracted by `code.tool.ts`.
-  - Regression: existing v1.16.3 fragmentation-guard tests still green.
-
-**Sizing:** ~3-4 hours — collector refactor + downstream-consumer verification + 4-5 new tests + CHANGELOG entry.
-
-**Blocked on:** an empirical report (operator-side) of incomplete `code` execution output, OR a Gemini stream-protocol change that fragments `code` parts. Neither has fired in the v1.14.x → v1.16.3 cycle.
+**Side-effects verified clean:** `ask_agentic` `iterResult.signatures` extraction operates on the `parts` array — no behavioural change since we still iterate functionCall-bearing parts. Content-aware NO_PROGRESS dedupe (v1.16.0) keys on `(name, args)` pairs in `signatures` — no change. `ask` and `code` text extraction reads concatenated `text` field, not parts — no change. `code.tool.ts` `executableCode` / `codeExecutionResult` extraction now correct (closes T35's secondary class — bonus fix). 771 tests pass.
 
 ---
 
-## T36. `collectStream` content-bearing predicate — add `toolCall` for SDK type completeness
+## T36. `collectStream` content-bearing predicate — add `toolCall` for SDK type completeness — **RESOLVED-BY-T35 in v1.16.3**
 
-**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #3 — ACCEPTED-DEFERRED. **Not blocking, defensive completeness only.**
-
-**Why:** v1.16.3's `hasContentBearingPart` predicate covers six Part variants (`functionCall`, `executableCode`, `codeExecutionResult`, `fileData`, `inlineData`, non-empty `text`). The `@google/genai` SDK Part interface (`node_modules/@google/genai/dist/genai.d.ts:8801-8804`) also defines:
-- `toolCall?: ToolCall` — server-side tool invocation (a server-side variant of `functionCall`)
-- `toolResponse?: ToolResponse` — request-side, never appears in stream responses
-
-If Gemini ever introduces server-side tool execution and emits a chunk with ONLY `toolCall` content (no functionCall, no other variants), v1.16.3's gate would reject it as a non-content-bearing chunk and a previous chunk with content-bearing parts would survive in `lastCandidates`. This is wrong — a `toolCall`-only chunk IS content-bearing.
-
-**Empirically not currently triggered.** Our tools (`ask`, `code`, `ask_agentic`) configure `tools: [{functionDeclarations: [...]}]` — Gemini emits `functionCall`, never `toolCall`. Future expansion (e.g. enabling Google's grounded-search tool which DOES use server-side `toolCall`) would surface this.
-
-**Scope (when fired):**
-- Add `p.toolCall != null` to the `.some()` predicate in `src/tools/shared/stream-collector.ts:198`.
-- Add 1 unit test pinning a `toolCall`-only chunk's preservation.
-
-**Sizing:** ~10 minutes (1-line code change + 1 test + comment update).
-
-**Blocked on:** any future use of server-side Gemini tools (grounded search, code execution as server-side tool, etc.). Add proactively if T35 (parts accumulation) lands, since the broader refactor would naturally bring this in.
+**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #3 — original concern was the `hasContentBearingPart` predicate's coverage of `toolCall`. **Closed because T35 removed the predicate entirely** — the new accumulation contract appends every Part verbatim regardless of its variant, so `toolCall`-only chunks are preserved by construction. No follow-up needed.
 
 ---
 

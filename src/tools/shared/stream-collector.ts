@@ -20,10 +20,24 @@
  *     currently does, since it would only fire if Google changed the stream
  *     protocol.)
  *
- *   - **`candidates` last-write-wins**: finish reasons, safety ratings, and
- *     groundingMetadata only become authoritative on the final chunk —
- *     earlier chunks may report "STOP_REASON_UNSPECIFIED" mid-stream. We keep
- *     the last non-empty `candidates` array.
+ *   - **`candidates.content.parts` ACCUMULATES across chunks** (T35,
+ *     v1.16.3): `parts` from every chunk are appended to a running array
+ *     rather than overwritten. Required for multi-chunk function calling —
+ *     Gemini emits parallel `functionCall` Parts across separate chunks,
+ *     and the `thoughtSignature` mandated on the FIRST `functionCall` Part
+ *     (Gemini 3 contract — see ai.google.dev/gemini-api/docs/thought-signatures)
+ *     would be silently dropped by any last-write-wins gate. Empty-text
+ *     terminator Parts are also preserved because Google's docs note that
+ *     during streaming, a model response may carry a `thoughtSignature`
+ *     in a part with an empty text string. Filtering them would discard
+ *     load-bearing signature material.
+ *
+ *   - **Candidate METADATA (`finishReason`, safetyRatings, groundingMetadata,
+ *     citationMetadata) last-write-wins**: only become authoritative on
+ *     the final chunk — earlier chunks may report
+ *     "STOP_REASON_UNSPECIFIED" mid-stream. We retain the LAST chunk's
+ *     candidate scaffold and synthesise the final `candidates` array on
+ *     exit by overlaying the accumulated `parts` onto it.
  *
  *   - **Thought chunks (`part.thought === true`)** are forwarded to
  *     `onThoughtChunk` immediately as they arrive, but the callback fires
@@ -50,7 +64,7 @@
  *     branch invalidates and opens a NEW full stream. Discards partial.
  */
 
-import type { GenerateContentResponse } from '@google/genai';
+import type { Candidate, GenerateContentResponse, Part } from '@google/genai';
 
 const DEFAULT_THOUGHT_EMIT_THROTTLE_MS = 1500;
 const THOUGHTS_SUMMARY_MAX_CHARS = 1200;
@@ -124,7 +138,16 @@ export async function collectStream(
 
   const textChunks: string[] = [];
   const thoughtChunks: string[] = [];
-  let lastCandidates: GenerateContentResponse['candidates'];
+  // T35 (v1.16.3): accumulate parts from every chunk rather than picking the
+  // "best" chunk's parts. Multi-chunk function calls and standalone signature
+  // terminator Parts both depend on this — see file-level docstring.
+  const accumulatedParts: Part[] = [];
+  // Last seen candidate-scaffold — finishReason, safetyRatings,
+  // groundingMetadata, citationMetadata. We DON'T accumulate these (each is
+  // a standalone field where the latest authoritative value wins). On exit
+  // we overlay `accumulatedParts` onto the last scaffold to synthesise the
+  // returned `lastCandidates`.
+  let lastCandidateScaffold: Candidate | undefined;
   let lastUsageMetadata: GenerateContentResponse['usageMetadata'];
   let chunkCount = 0;
   let firstChunkAt: number | null = null;
@@ -169,56 +192,68 @@ export async function collectStream(
       const chunkText = chunk.text ?? '';
       if (chunkText.length > 0) textChunks.push(chunkText);
 
-      // Last candidates with content-bearing parts wins.
+      // Accumulate parts across chunks (T35, v1.16.3).
       //
-      // History — three iterations:
+      // History — four iterations:
       //
       // **v1.7.0 → v1.16.1**: gate was `chunk.candidates.length > 0` (outer
-      // array length only). Correct for the ask/code text-extraction path
-      // (which reads accumulated `response.text`, not
-      // `candidates[0].content.parts`). But v1.16.2's ask_agentic streaming
-      // migration is the first consumer that reads
+      // array length only) under last-write-wins semantics. Correct for the
+      // ask/code text-extraction path (which reads accumulated
+      // `response.text`, not `candidates[0].content.parts`). But v1.16.2's
+      // ask_agentic streaming migration was the first consumer that reads
       // `candidates[0].content.parts` directly to extract `functionCall`
-      // Parts.
+      // Parts — last-write-wins is fragile here.
       //
       // **v1.16.2** (PR #58 Round-1 fold of gemini Finding #1): gate
       // tightened to also require `parts.length > 0`. Closed the case
       // `{ candidates: [{ content: { parts: [], finishReason: 'STOP' }}] }`
       // — non-empty outer, empty inner.
       //
-      // **v1.16.3** (this fix): empirical raw-stream capture against live
-      // Gemini Pro showed a third pattern that v1.16.2 still missed —
-      // Gemini emits the functionCall in chunk 1 and a TERMINATOR with
-      // shape `{ candidates: [{ content: { parts: [{ text: '' }] },
-      // finishReason: 'STOP' }] }` in chunk 2. `parts.length === 1` (the
-      // empty-text Part) so v1.16.2's gate accepted it, overwriting the
-      // functionCall and silently dropping every tool dispatch on Gemini
-      // Pro + Flash. ask_agentic showed `(model returned empty response)`
-      // every call against tool-using prompts, regardless of stallMs/total.
+      // **v1.16.3 hotfix-A** (interim): gate strengthened further to require
+      // AT LEAST ONE content-bearing part. Closed the empirical Gemini
+      // empty-text-terminator pattern (`parts: [{ text: '' }]` after the
+      // functionCall chunk). But still last-write-wins — under multi-chunk
+      // function calling (parallel `functionCall` Parts across separate
+      // chunks, or `thoughtSignature` carried on a standalone empty-text
+      // terminator), earlier chunks were silently dropped, including the
+      // Gemini-3-mandated signature on the FIRST functionCall part.
+      // Empirically reproduced by Test 5 — multi-file ask_agentic prompt
+      // returned 400 "missing thought_signature, position 2" against live
+      // Gemini Pro on 2026-05-01.
       //
-      // Fix: require AT LEAST ONE part to carry actual content — any
-      // non-text Part (functionCall, executableCode, codeExecutionResult,
-      // fileData, inlineData) OR a text part with non-empty string. An
-      // empty-text terminator chunk (whether the array is `[]`, `[{}]`,
-      // or `[{text: ''}]`) does not pass.
+      // **v1.16.3 (T35, this fix)**: ACCUMULATE parts across every chunk.
+      // Filtering is wrong by construction — Google's docs explicitly state
+      // (https://ai.google.dev/gemini-api/docs/thought-signatures):
+      //   "During a model response not containing a FC with a streaming
+      //    request, the model may return the thought signature in a part
+      //    with an empty text content part. It is advisable to parse the
+      //    entire request until the `finish_reason` is returned"
+      // and (function-calling docs):
+      //   "Don't merge a Part containing a signature with one that does not.
+      //    This breaks the positional context of the thought."
+      // Accumulating preserves every Part exactly as Gemini emitted it —
+      // signature attachments, parallel functionCall Parts, executableCode
+      // chunks followed by codeExecutionResult chunks, and so on.
       //
-      // Side-effect on ask/code: `lastCandidates.finishReason` may now
-      // come from a non-final chunk if the final chunk's parts are all
-      // empty. Neither `ask` nor `code` reads finishReason off the
-      // CollectedResponse — both extract via `response.text` (concatenated
-      // across chunks) — so this is observably equivalent for them.
-      const candidateParts = chunk.candidates?.[0]?.content?.parts ?? [];
-      const hasContentBearingPart = candidateParts.some(
-        (p) =>
-          p.functionCall != null ||
-          p.executableCode != null ||
-          p.codeExecutionResult != null ||
-          p.fileData != null ||
-          p.inlineData != null ||
-          (typeof p.text === 'string' && p.text.length > 0),
-      );
-      if (chunk.candidates && chunk.candidates.length > 0 && hasContentBearingPart) {
-        lastCandidates = chunk.candidates;
+      // Side-effect on ask/code: `response.candidates[0].content.parts`
+      // now contains every emitted Part (including thought parts and any
+      // empty-text terminator parts). Neither tool reads parts directly
+      // for text extraction — both go through accumulated `response.text`
+      // — so behaviour is observably equivalent. ask_agentic's parts-iter
+      // (filter for `functionCall`, count thought parts) sees richer
+      // input but each filter handles the extra Part variants without
+      // change.
+      const candidate = chunk.candidates?.[0];
+      const incomingParts = candidate?.content?.parts;
+      if (Array.isArray(incomingParts) && incomingParts.length > 0) {
+        accumulatedParts.push(...incomingParts);
+      }
+      // Track the latest candidate scaffold for finishReason / safety
+      // ratings / grounding / citation metadata. Each chunk yields a
+      // fresh scaffold; finalisation overlays accumulatedParts onto the
+      // last seen one.
+      if (candidate) {
+        lastCandidateScaffold = candidate;
       }
 
       // Thought-part extraction. `parts[i].thought === true` flags an
@@ -292,6 +327,24 @@ export async function collectStream(
   const text = textChunks.join('');
   const thoughtsSummary =
     thoughtChunks.length > 0 ? thoughtChunks.join('\n').slice(0, THOUGHTS_SUMMARY_MAX_CHARS) : null;
+
+  // Synthesize final candidates by overlaying accumulatedParts onto the last
+  // seen candidate scaffold. When NO chunk yielded a candidate at all (e.g.
+  // text-only stream with naked `{ text: 'x' }` chunks), `lastCandidates`
+  // stays undefined — preserves the prior contract for the no-candidates
+  // path.
+  const lastCandidates: GenerateContentResponse['candidates'] = lastCandidateScaffold
+    ? [
+        {
+          ...lastCandidateScaffold,
+          content: {
+            ...(lastCandidateScaffold.content ?? {}),
+            role: lastCandidateScaffold.content?.role ?? 'model',
+            parts: accumulatedParts,
+          },
+        },
+      ]
+    : undefined;
 
   return {
     text,

@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.16.3] - 2026-05-01
 
-### Fixed — `ask_agentic` empty-text-terminator regression (HOTFIX)
+### Fixed — `ask_agentic` streaming hotfix (combined: empty-text terminator + multi-chunk parts fragmentation, HOTFIX)
+
+**v1.16.3 ships TWO related fixes for the v1.16.2 streaming regression**, folded into a single release because the second was discovered during end-to-end MCP smoke-test of the first.
+
+#### Fix #1 — empty-text-terminator regression
 
 **Reproduction:** v1.16.2 ask_agentic returned `(model returned empty response)` on every tool-using prompt against live Gemini Pro / Flash. Symptoms surfaced minutes after v1.16.2 published, on the first end-to-end smoke test from the global install.
 
@@ -17,24 +21,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 v1.16.2's `collectStream` gate required `parts.length > 0` to preserve a chunk's `lastCandidates`. Chunk 2 has `parts.length === 1` (one element with empty text + finishReason), so the gate ACCEPTED it and overwrote chunk 1's functionCall. The agentic loop then saw zero functionCallParts and routed to the final-text path, returning the empty string fallback.
 
-**Fix:** strengthen the gate to require AT LEAST ONE part to carry actual content — any non-text Part (`functionCall`, `executableCode`, `codeExecutionResult`, `fileData`, `inlineData`) OR a text Part with non-empty string. Empty-text terminator chunks (whether shaped as `[]`, `[{}]`, or `[{ text: '' }]`) now fail the gate; the previous chunk's functionCall survives.
+#### Fix #2 — multi-chunk parts fragmentation (T35)
 
-**Pre-existing in v1.16.2 only.** v1.16.1 and earlier used non-streaming `generateContent` for ask_agentic — never affected.
+**Reproduction:** during end-to-end MCP smoke-test of Fix #1 against live Gemini Pro, single-FC prompts (Tests 1–4) all passed. Test 5 (multi-file prompt: "read package.json, server.json, CHANGELOG.md") failed with Gemini 400: `Function call default_api:read_file ... missing thought_signature, position 2`.
 
-### Why v1.16.2's review cycle missed it
+**Root cause:** Fix #1 used a content-bearing-parts gate over `lastCandidates = chunk.candidates` last-write-wins semantics. When Gemini emits PARALLEL `functionCall` Parts across separate chunks, each chunk's parts overwrite the prior chunk's. The Gemini-3 contract (https://ai.google.dev/gemini-api/docs/thought-signatures) mandates that the thought signature on the FIRST functionCall part be returned in the next-turn replay. Last-write-wins drops chunk-1's signature; iteration 2's `generateContent` sees a model turn whose first FC has no signature; Gemini 400s. Pre-existing fragility — masked by Fix #1's complete failure mode in v1.16.2 (no FCs ever made it through the loop, so multi-FC was never reached).
+
+**Fix:** `collectStream` no longer gates or overwrites — it ACCUMULATES `parts` across every chunk verbatim. Empty-text terminator parts, parallel `functionCall` Parts, and standalone signature-bearing parts are all preserved exactly as Gemini emitted them. The candidate scaffold (`finishReason`, `safetyRatings`, `groundingMetadata`, `citationMetadata`) stays last-write-wins; on stream exit we synthesise the final `candidates` shape by overlaying the accumulated `parts` onto the last seen scaffold.
+
+This also closes the documented `code` tool fragility (T35 secondary): `executableCode` in chunk 1 + `codeExecutionResult` in chunk 2 now both reach `code.tool.ts`'s extractor.
+
+**Pre-existing in v1.16.2 only.** v1.16.1 and earlier used non-streaming `generateContent` for ask_agentic — never affected by either fix.
+
+### Why v1.16.2's review cycle missed Fix #1
 
 The v1.16.2 PR went through the standard review cycle: 3-way Round-1 (gemini + grok + codex), 3-way Round-2 verification, Copilot review, all CI checks green. Gemini Round-1 specifically called out this CLASS of bug (terminator-only chunks dropping functionCall) and a fix was folded — but the fix targeted the SHAPE `parts: []` (empty array) and missed the empirical SHAPE `parts: [{ text: '' }]` (length-1 array with empty content). Unit tests pinned the `[]` shape but not the `[{ text: '' }]` shape because no one captured a raw stream from live Gemini before merging.
 
-**Process update:** the new `test/integration/real-gemini.smoke.test.ts` (v1.15.3 P10) will be extended in a follow-up PR with an env-gated streaming + tool-calling smoke test that exercises the loop against the real API. A pre-merge live smoke would have caught this in 6 seconds.
+### Why v1.16.3 hotfix-A's first MCP smoke pass missed Fix #2
+
+A single-FC smoke (Test 1) was sufficient to confirm Fix #1 against live Gemini. Multi-FC parallel was filed as T35 (deferred-with-documentation) on the explicit reasoning "currently zero empirical reports". Tests 1–4 of the documented end-to-end smoke plan passed; Test 5 (multi-file) was the first empirical report — fold it in same release.
+
+**Process update:** the new `test/integration/real-gemini.smoke.test.ts` (v1.15.3 P10) will be extended in a follow-up PR with env-gated streaming + tool-calling smokes for BOTH single-FC and parallel-multi-FC prompts. A pre-merge live smoke covering both would have caught Fix #2 in seconds.
 
 ### Coverage
 
-766 tests pass (764 → 766 — added two regression pins for the empirical `[{ text: '' }]` terminator shape, one at the `collectStream` level and one at the `ask_agentic` loop level).
+771 tests pass (766 → 771 in this release — added 5 regression pins covering the multi-chunk parts fragmentation cases: parallel-FC across 3 chunks pinning thoughtSignature on FC1, executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams).
 
 ### Notes
 
-- Anyone on v1.16.2 with `ask_agentic` calls in production should upgrade IMMEDIATELY. Tool-calling iterations were silently failing.
-- v1.6/v1.7 streaming refactor track still considered shipped — this is purely a defect in the v1.16.2 agentic-loop refactor, fixed in place.
+- Anyone on v1.16.2 with `ask_agentic` calls in production should upgrade IMMEDIATELY. Tool-calling iterations were silently failing on every prompt.
+- T35 (true parts accumulation) — closed in this release. T36 (`toolCall` predicate completeness for future Gemini server-side tools) remains tracked in `docs/FOLLOW-UP-PRS.md` and is unaffected (the accumulation contract handles `toolCall` exactly the same way as `functionCall`).
+- v1.6/v1.7 streaming refactor track still considered shipped — both fixes are defects in the v1.16.2 agentic-loop refactor, fixed in place.
 
 ## [1.16.2] - 2026-04-30
 
