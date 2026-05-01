@@ -33,11 +33,17 @@
  *     load-bearing signature material.
  *
  *   - **Candidate METADATA (`finishReason`, safetyRatings, groundingMetadata,
- *     citationMetadata) last-write-wins**: only become authoritative on
- *     the final chunk — earlier chunks may report
- *     "STOP_REASON_UNSPECIFIED" mid-stream. We retain the LAST chunk's
- *     candidate scaffold and synthesise the final `candidates` array on
- *     exit by overlaying the accumulated `parts` onto it.
+ *     citationMetadata) last-write-wins per-index**: only become
+ *     authoritative on the final candidate-bearing chunk — earlier chunks
+ *     may report "STOP_REASON_UNSPECIFIED" mid-stream. We retain the last
+ *     CANDIDATE-BEARING chunk's scaffold per `cand.index` (a chunk emitting
+ *     `candidates: []` does NOT clear earlier scaffolds — only chunks that
+ *     emit a candidate at index i overwrite scaffold[i]). On exit we
+ *     synthesise the final `candidates` array by overlaying each index's
+ *     accumulated `parts` onto its retained scaffold. R1 (PR #59) made the
+ *     scaffold tracking per-index via `Map<number, Candidate>`; R2 keys it
+ *     by `cand.index ?? i` so sparse emission (`candidates: [{index: 1}]`)
+ *     doesn't cross-wire into bucket 0.
  *
  *   - **Thought chunks (`part.thought === true`)** are forwarded to
  *     `onThoughtChunk` immediately as they arrive, but the callback fires

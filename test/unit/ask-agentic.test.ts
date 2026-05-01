@@ -2455,8 +2455,13 @@ describe('ask_agentic loop — stallMs heartbeat watchdog (T33, v1.16.2)', () =>
     // `(model returned empty response)` on every tool-using prompt — both
     // gemini-pro-latest and gemini-flash-latest. Raw chunk capture revealed
     // the empirical terminator shape `[{text: ''}]` (length 1) which slipped
-    // through v1.16.2's `parts.length > 0` gate. v1.16.3 fix requires AT
-    // LEAST ONE part with actual content.
+    // through v1.16.2's `parts.length > 0` gate. v1.16.3 instead does true
+    // parts accumulation: later chunks append their parts verbatim, so an
+    // empty-text terminator no longer suppresses an earlier chunk's
+    // functionCall — the ask-agentic parts iterator filters for
+    // `p.functionCall` and the chunk-2 empty-text Part is harmlessly retained
+    // alongside it. (Historical hotfix-A approach was a content-bearing-parts
+    // gate; superseded by accumulation in this same release.)
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-empty-text-terminator-'));
     writeFileSync(join(root, 'a.ts'), 'export const answer = 42;');
 
