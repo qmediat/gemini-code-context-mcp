@@ -75,8 +75,8 @@ describe('collectStream — usageMetadata last-write-wins', () => {
   });
 });
 
-describe('collectStream — candidates last-non-empty-wins', () => {
-  it('captures the last non-empty candidates array', async () => {
+describe('collectStream — candidate scaffold metadata last-write-wins', () => {
+  it('captures finishReason from the latest candidate-bearing chunk', async () => {
     const result = await collectStream(
       gen([
         { candidates: [{ content: { parts: [{ text: 'first' }] }, finishReason: undefined }] },
@@ -86,7 +86,7 @@ describe('collectStream — candidates last-non-empty-wins', () => {
     expect(result.candidates?.[0]?.finishReason).toBe('STOP');
   });
 
-  it('does not overwrite with empty candidates', async () => {
+  it('preserves earlier scaffold when a later chunk has no candidates', async () => {
     const result = await collectStream(
       gen([
         { candidates: [{ content: { parts: [{ text: 'kept' }] }, finishReason: 'STOP' }] },
@@ -95,23 +95,73 @@ describe('collectStream — candidates last-non-empty-wins', () => {
     );
     expect(result.candidates?.[0]?.finishReason).toBe('STOP');
   });
+});
 
-  it('does not overwrite with terminator-only candidates that have empty parts (v1.16.2 fragmentation guard)', async () => {
-    // Regression pin for the v1.16.2 PR-Round-1 fix (gemini Finding #1
-    // HIGH). Pre-fix, an early chunk carrying a `functionCall` Part could
-    // be silently overwritten by a final terminator chunk shaped like
+describe('collectStream — parts ACCUMULATE across chunks (T35, v1.16.3)', () => {
+  it('preserves functionCall AND empty-text terminator part from chunk 2 (v1.16.3 hotfix-A pin + T35 strengthening — both parts retained)', async () => {
+    // Empirical raw-stream capture against live Gemini Pro on 2026-05-01
+    // showed the canonical Gemini stream protocol pattern for tool-using
+    // turns: the functionCall arrives in chunk 1 and a TERMINATOR shaped
+    // `{ candidates: [{ content: { parts: [{ text: '' }] },
+    // finishReason: 'STOP' }] }` in chunk 2.
+    //
+    // Pre-T35 (v1.16.3 hotfix-A) used a content-bearing-parts gate +
+    // last-write-wins, which kept the functionCall. T35 (true parts
+    // accumulation) goes further: ALL parts from every chunk are
+    // appended verbatim. This means the empty-text Part from the
+    // terminator is also preserved — Google's docs explicitly state
+    // (ai.google.dev/gemini-api/docs/thought-signatures): "the model
+    // may return the thought signature in a part with an empty text
+    // content part". Filtering would discard load-bearing signature
+    // material.
+    //
+    // The functionCall preservation invariant — the original v1.16.3
+    // ask_agentic-empty-response regression test — stays load-bearing.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'package.json' } } }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: '' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: { promptTokenCount: 1397, candidatesTokenCount: 12 },
+        },
+      ]),
+    );
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    // T35: BOTH parts preserved (functionCall + terminator empty-text). The
+    // terminator part is harmless to ask_agentic's functionCall extractor
+    // (filters for `p.functionCall`) and to ask/code (which read
+    // `response.text` not parts).
+    expect(parts.length).toBe(2);
+    expect(parts[0]?.functionCall?.name).toBe('read_file');
+    expect(parts[1]?.text).toBe('');
+    // finishReason still last-write-wins on the candidate scaffold.
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
+    expect(result.usageMetadata?.promptTokenCount).toBe(1397);
+  });
+
+  it('preserves functionCall from chunk 1 when chunk 2 has empty parts (v1.16.2 fragmentation guard regression pin)', async () => {
+    // Original v1.16.2 PR-Round-1 fix (gemini Finding #1 HIGH). Pre-fix, an
+    // early chunk carrying a `functionCall` Part could be silently
+    // overwritten by a final terminator chunk shaped like
     // `{ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }`
-    // — non-empty outer array but empty inner parts. The naive outer-array
-    // length check accepted it, dropping the previous chunk's parts.
+    // — non-empty outer array but empty inner parts.
     //
-    // ask_agentic's loop is the first consumer that reads
-    // `response.candidates[0].content.parts` directly off a CollectedResponse
-    // (ask + code use accumulated `response.text`). A terminator that
-    // dropped a `functionCall` would silently fail the agentic dispatch
-    // — the loop would treat the iteration as final-text.
-    //
-    // Post-fix the gate also requires `parts.length > 0`. The earlier
-    // chunk's `functionCall` Part survives.
+    // T35 accumulation: chunk 2 contributes nothing (empty parts array),
+    // so accumulatedParts stays at chunk 1's contribution.
     const result = await collectStream(
       gen([
         {
@@ -129,12 +179,329 @@ describe('collectStream — candidates last-non-empty-wins', () => {
         },
       ]),
     );
-    // The functionCall from chunk 1 must survive — that's the load-bearing
-    // assertion. usageMetadata still last-write-wins (separate code path).
     const parts = result.candidates?.[0]?.content?.parts ?? [];
     expect(parts.length).toBe(1);
     expect(parts[0]?.functionCall?.name).toBe('read_file');
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
     expect(result.usageMetadata?.promptTokenCount).toBe(10);
+  });
+
+  it('preserves Gemini-3 thoughtSignature on FIRST functionCall when parallel functionCalls span 3 chunks (T35 primary regression — was Test 5 fail)', async () => {
+    // Reproduces the Test 5 failure mode that motivated T35. Empirical
+    // chunk capture against live Gemini Pro on a multi-file ask_agentic
+    // prompt was prevented by sandbox credential gating, but the failure
+    // mode is exactly the documented contract violation: Gemini 3
+    // attaches a `thoughtSignature` to the FIRST functionCall part
+    // (mandatory per ai.google.dev/gemini-api/docs/thought-signatures).
+    //
+    // Chunk pattern under fragmentation (one observed possibility):
+    //   chunk 1: parts: [{ functionCall: read_file(p1), thoughtSignature: 'X' }]
+    //   chunk 2: parts: [{ functionCall: read_file(p2) }]
+    //   chunk 3: parts: [{ functionCall: read_file(p3) }]
+    //   chunk 4: parts: [{ text: '' }]   (terminator)
+    //
+    // Pre-T35 last-write-wins kept ONLY chunk 3's parts (single FC, no
+    // sig); ask_agentic pushed it as model turn 1; iteration 2's
+    // generateContent returned 400 "missing thought_signature" against
+    // the model turn at position 2 of the contents array.
+    //
+    // T35: accumulate every part, signature stays on chunk 1's FC.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    functionCall: { name: 'read_file', args: { path: 'package.json' } },
+                    thoughtSignature: 'sig-base64-from-gemini-3',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'server.json' } } }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'CHANGELOG.md' } } }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: '' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: { promptTokenCount: 2000, candidatesTokenCount: 30 },
+        },
+      ]),
+    );
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    // All 3 functionCalls + the empty-text terminator → 4 parts.
+    expect(parts.length).toBe(4);
+    expect(parts[0]?.functionCall?.args?.path).toBe('package.json');
+    // CRITICAL: signature on FC1 must survive accumulation. This is the
+    // load-bearing assertion that closes Test 5 against live Gemini.
+    expect(parts[0]?.thoughtSignature).toBe('sig-base64-from-gemini-3');
+    expect(parts[1]?.functionCall?.args?.path).toBe('server.json');
+    expect(parts[2]?.functionCall?.args?.path).toBe('CHANGELOG.md');
+    expect(parts[3]?.text).toBe('');
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
+  });
+
+  it('preserves thoughtSignature on a standalone empty-text terminator part (Gemini docs streaming guidance)', async () => {
+    // ai.google.dev/gemini-api/docs/thought-signatures, verbatim:
+    // "During a model response not containing a FC with a streaming
+    //  request, the model may return the thought signature in a part
+    //  with an empty text content part."
+    //
+    // Pre-T35 (hotfix-A) gate REJECTED parts where every entry was either
+    // empty text or non-content-bearing — would have dropped a signature
+    // on a standalone `{ text: '', thoughtSignature: 'X' }` part.
+    // Accumulation keeps it intact for the next-turn replay.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text: 'The answer is 42.' }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ text: '', thoughtSignature: 'sig-on-terminator' }],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+      ]),
+    );
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    expect(parts.length).toBe(2);
+    expect(parts[0]?.text).toBe('The answer is 42.');
+    expect(parts[1]?.thoughtSignature).toBe('sig-on-terminator');
+  });
+
+  it('preserves executableCode + codeExecutionResult across two chunks (T35 secondary — closes the documented `code` tool fragility)', async () => {
+    // T35 docs (PR #59) noted that `code.tool.ts:726-733` iterates
+    // `response.candidates[0].content.parts` to extract BOTH
+    // `executableCode` and `codeExecutionResult`. Pre-T35 last-write-wins
+    // would have dropped chunk 1's `executableCode` if Gemini emitted
+    // them in separate chunks — empirically not yet observed but covered
+    // by the same accumulation contract.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ executableCode: { language: 'PYTHON', code: 'print(2+2)' } }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  { codeExecutionResult: { outcome: 'OUTCOME_OK', output: '4\n' } },
+                  { text: 'Two plus two is 4.' },
+                ],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+      ]),
+    );
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    expect(parts.length).toBe(3);
+    expect(parts[0]?.executableCode?.code).toBe('print(2+2)');
+    expect(parts[1]?.codeExecutionResult?.output).toBe('4\n');
+    expect(parts[2]?.text).toBe('Two plus two is 4.');
+  });
+
+  it('synthesises content.role = "model" when the latest scaffold lacks one', async () => {
+    // Defensive: some chunks carry `content` without an explicit `role`.
+    // The synthesised result should always carry a `role: 'model'` so
+    // downstream consumers (ask-agentic pushing model turn to
+    // conversation history) don't see a malformed turn.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }],
+              },
+            },
+          ],
+        },
+      ]),
+    );
+    expect(result.candidates?.[0]?.content?.role).toBe('model');
+  });
+
+  it('returns undefined candidates when no chunk yielded a candidate at all', async () => {
+    // Text-only stream where chunks come as naked `{ text: 'x' }` (no
+    // candidates wrapper). Preserves the prior contract — `candidates`
+    // stays undefined, downstream callers fall back to `text`.
+    const result = await collectStream(gen([{ text: 'a' }, { text: 'b' }]));
+    expect(result.candidates).toBeUndefined();
+    expect(result.text).toBe('ab');
+  });
+
+  it('preserves multi-candidate streams (candidateCount>1) with per-index parts accumulation (R1 fold)', async () => {
+    // Pre-T35 the synth was `lastCandidates = chunk.candidates` (full
+    // N-element array preserved under last-write-wins on each chunk).
+    // The initial T35 implementation (before R1 fold) collapsed synth to
+    // a single-element array, silently narrowing the type for any caller
+    // that requests `candidateCount > 1` via GenerationConfig.
+    //
+    // Today no caller in this codebase sets candidateCount>1 (verified by
+    // repo-wide grep), but `code.tool.ts:727` iterates ALL candidates with
+    // `for (const cand of candidates)` — a future caller adding multi-
+    // candidate would silently lose candidates 1..N's parts. This pin
+    // locks the per-index accumulation invariant.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: 'cand-0 chunk-1 ' }] },
+            },
+            {
+              content: { role: 'model', parts: [{ text: 'cand-1 chunk-1 ' }] },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: 'cand-0 chunk-2' }] },
+              finishReason: 'STOP',
+            },
+            {
+              content: { role: 'model', parts: [{ text: 'cand-1 chunk-2' }] },
+              finishReason: 'MAX_TOKENS',
+            },
+          ],
+        },
+      ]),
+    );
+    expect(result.candidates?.length).toBe(2);
+    // Index 0: parts from chunk 1 + chunk 2 accumulated; latest scaffold
+    // (chunk 2's `STOP` finishReason) wins.
+    expect(result.candidates?.[0]?.content?.parts?.length).toBe(2);
+    expect(result.candidates?.[0]?.content?.parts?.[0]?.text).toBe('cand-0 chunk-1 ');
+    expect(result.candidates?.[0]?.content?.parts?.[1]?.text).toBe('cand-0 chunk-2');
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
+    // Index 1: same pattern, distinct finishReason proves scaffolds aren't
+    // shared across indices.
+    expect(result.candidates?.[1]?.content?.parts?.length).toBe(2);
+    expect(result.candidates?.[1]?.content?.parts?.[0]?.text).toBe('cand-1 chunk-1 ');
+    expect(result.candidates?.[1]?.content?.parts?.[1]?.text).toBe('cand-1 chunk-2');
+    expect(result.candidates?.[1]?.finishReason).toBe('MAX_TOKENS');
+  });
+
+  it('keys multi-candidate buckets by Candidate.index, not array position (R2 fold — sparse emission)', async () => {
+    // Per @google/genai SDK Candidate.index doc: "The 0-based index of this
+    // candidate in the list of generated responses. Useful for
+    // distinguishing between multiple candidates when candidate_count > 1."
+    // Gemini's streaming protocol may emit a chunk with ONLY a non-zero
+    // index — e.g. `candidates: [{ index: 1, content: {...} }]` — when
+    // upstream incremental updates land on only one candidate at a time.
+    //
+    // Pre-R2-fold the Map key was the loop variable `i`, so a chunk
+    // emitting only index=1 would cross-wire that candidate's parts into
+    // bucket 0. Post-R2-fold the key is `cand.index ?? i`, so the bucket
+    // tracks the model's ordinal correctly. Also verifies that synthesis
+    // sort() preserves ordinal output ordering when Map insertion order
+    // happens to be reverse (chunk 1 inserts index 1 first; chunk 2
+    // inserts index 0 first).
+    const result = await collectStream(
+      gen([
+        // Chunk 1: ONLY index 1 emits (sparse, no index 0 yet).
+        {
+          candidates: [
+            {
+              index: 1,
+              content: { role: 'model', parts: [{ text: 'cand-1 first ' }] },
+            },
+          ],
+        },
+        // Chunk 2: now index 0 emits (Map insertion order is [1, 0]).
+        {
+          candidates: [
+            {
+              index: 0,
+              content: { role: 'model', parts: [{ text: 'cand-0 first' }] },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+        // Chunk 3: only index 1 emits a continuation + finish (sparse again,
+        // verifying the per-index scaffold last-write-wins really IS per-index).
+        {
+          candidates: [
+            {
+              index: 1,
+              content: { role: 'model', parts: [{ text: 'cand-1 cont' }] },
+              finishReason: 'MAX_TOKENS',
+            },
+          ],
+        },
+      ]),
+    );
+    expect(result.candidates?.length).toBe(2);
+    // Output ordered by ordinal index, NOT Map insertion order (which is [1, 0]
+    // because chunk 1 inserted index 1 first).
+    expect(result.candidates?.[0]?.index).toBe(0);
+    expect(result.candidates?.[1]?.index).toBe(1);
+    // Index 0: only chunk 2 contributes a part; chunk 1's index-1 part MUST
+    // NOT bleed into bucket 0, and chunk 3 doesn't emit index 0 at all.
+    const cand0Parts = result.candidates?.[0]?.content?.parts ?? [];
+    expect(cand0Parts.length).toBe(1);
+    expect(cand0Parts[0]?.text).toBe('cand-0 first');
+    // Chunk 2's STOP scaffold for index 0 is the last-seen scaffold for that
+    // index — chunk 3 didn't emit index 0, so no overwrite.
+    expect(result.candidates?.[0]?.finishReason).toBe('STOP');
+    // Index 1: chunk 1 + chunk 3 contributions; chunk 2's index-0 part MUST
+    // NOT bleed in.
+    const cand1Parts = result.candidates?.[1]?.content?.parts ?? [];
+    expect(cand1Parts.length).toBe(2);
+    expect(cand1Parts[0]?.text).toBe('cand-1 first ');
+    expect(cand1Parts[1]?.text).toBe('cand-1 cont');
+    expect(result.candidates?.[1]?.finishReason).toBe('MAX_TOKENS');
   });
 });
 

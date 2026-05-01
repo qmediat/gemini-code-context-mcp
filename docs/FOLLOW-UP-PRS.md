@@ -595,6 +595,24 @@ The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to s
 
 ---
 
+## T35. `collectStream` — true parts accumulation across chunks (multi-chunk parts-fragmentation) — **RESOLVED in v1.16.3 same-release fold**
+
+**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #2 — initially deferred, then escalated to active when end-to-end MCP smoke-test against live Gemini Pro on 2026-05-01 surfaced the empirical multi-file failure (Test 5). T35's deferral premise ("currently zero empirical reports") no longer held.
+
+**Empirical trigger:** Test 5 of the documented v1.16.3 hotfix smoke plan: `ask_agentic({ prompt: "Read package.json, server.json, CHANGELOG.md..." })` against `gemini-pro-latest` returned 400 "Function call default_api:read_file ... missing thought_signature, position 2" — Gemini's `<index of contents array>` content-block error per https://ai.google.dev/gemini-api/docs/thought-signatures. Hotfix-A's content-bearing-parts gate kept ONE chunk (single-FC works) but lost FC1's signature when parallel functionCalls fragmented across separate chunks under last-write-wins.
+
+**Resolution (v1.16.3 same-release fold):** `collectStream` no longer gates / overwrites — it ACCUMULATES `parts` across every chunk verbatim. Empty-text terminator parts, parallel `functionCall` parts, and standalone signature-bearing parts are preserved exactly as Gemini emitted them. The candidate scaffold (`finishReason`, `safetyRatings`, `groundingMetadata`, `citationMetadata`) stays last-write-wins; on stream exit we synthesise the final `candidates` shape by overlaying the accumulated `parts` onto the last seen scaffold. Five new regression tests pin: parallel-FC across 3 chunks (signature on FC1 preserved), executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams. See CHANGELOG `[1.16.3]` Fix #2 for full rationale.
+
+**Side-effects verified clean:** `ask_agentic` `iterResult.signatures` extraction operates on the `parts` array — no behavioural change since we still iterate functionCall-bearing parts. Content-aware NO_PROGRESS dedupe (v1.16.0) keys on `(name, args)` pairs in `signatures` — no change. `ask` and `code` text extraction reads concatenated `text` field, not parts — no change. `code.tool.ts` `executableCode` / `codeExecutionResult` extraction now correct (closes T35's secondary class — bonus fix). 771 tests pass.
+
+---
+
+## T36. `collectStream` content-bearing predicate — add `toolCall` for SDK type completeness — **RESOLVED-BY-T35 in v1.16.3**
+
+**Source:** PR #59 (v1.16.3 hotfix) `/6step` Finding #3 — original concern was the `hasContentBearingPart` predicate's coverage of `toolCall`. **Closed because T35 removed the predicate entirely** — the new accumulation contract appends every Part verbatim regardless of its variant, so `toolCall`-only chunks are preserved by construction. No follow-up needed.
+
+---
+
 ## T31. `refreshFileFingerprints` — skip memo-hit rows to avoid WAL churn
 
 **Source:** PR #45 / 6step round-3 review, finding #4 (Grok P2 ACCEPTED).

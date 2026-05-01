@@ -20,10 +20,30 @@
  *     currently does, since it would only fire if Google changed the stream
  *     protocol.)
  *
- *   - **`candidates` last-write-wins**: finish reasons, safety ratings, and
- *     groundingMetadata only become authoritative on the final chunk —
- *     earlier chunks may report "STOP_REASON_UNSPECIFIED" mid-stream. We keep
- *     the last non-empty `candidates` array.
+ *   - **`candidates.content.parts` ACCUMULATES across chunks** (T35,
+ *     v1.16.3): `parts` from every chunk are appended to a running array
+ *     rather than overwritten. Required for multi-chunk function calling —
+ *     Gemini emits parallel `functionCall` Parts across separate chunks,
+ *     and the `thoughtSignature` mandated on the FIRST `functionCall` Part
+ *     (Gemini 3 contract — see ai.google.dev/gemini-api/docs/thought-signatures)
+ *     would be silently dropped by any last-write-wins gate. Empty-text
+ *     terminator Parts are also preserved because Google's docs note that
+ *     during streaming, a model response may carry a `thoughtSignature`
+ *     in a part with an empty text string. Filtering them would discard
+ *     load-bearing signature material.
+ *
+ *   - **Candidate METADATA (`finishReason`, safetyRatings, groundingMetadata,
+ *     citationMetadata) last-write-wins per-index**: only become
+ *     authoritative on the final candidate-bearing chunk — earlier chunks
+ *     may report "STOP_REASON_UNSPECIFIED" mid-stream. We retain the last
+ *     CANDIDATE-BEARING chunk's scaffold per `cand.index` (a chunk emitting
+ *     `candidates: []` does NOT clear earlier scaffolds — only chunks that
+ *     emit a candidate at index i overwrite scaffold[i]). On exit we
+ *     synthesise the final `candidates` array by overlaying each index's
+ *     accumulated `parts` onto its retained scaffold. R1 (PR #59) made the
+ *     scaffold tracking per-index via `Map<number, Candidate>`; R2 keys it
+ *     by `cand.index ?? i` so sparse emission (`candidates: [{index: 1}]`)
+ *     doesn't cross-wire into bucket 0.
  *
  *   - **Thought chunks (`part.thought === true`)** are forwarded to
  *     `onThoughtChunk` immediately as they arrive, but the callback fires
@@ -50,7 +70,7 @@
  *     branch invalidates and opens a NEW full stream. Discards partial.
  */
 
-import type { GenerateContentResponse } from '@google/genai';
+import type { Candidate, GenerateContentResponse, Part } from '@google/genai';
 
 const DEFAULT_THOUGHT_EMIT_THROTTLE_MS = 1500;
 const THOUGHTS_SUMMARY_MAX_CHARS = 1200;
@@ -124,7 +144,26 @@ export async function collectStream(
 
   const textChunks: string[] = [];
   const thoughtChunks: string[] = [];
-  let lastCandidates: GenerateContentResponse['candidates'];
+  // T35 (v1.16.3): accumulate parts from every chunk rather than picking the
+  // "best" chunk's parts. Multi-chunk function calls and standalone signature
+  // terminator Parts both depend on this — see file-level docstring.
+  //
+  // R1 fold (PR #59 — GPT F1 / Gemini F1 / Grok F2): per-candidate-index maps
+  // preserve the pre-T35 multi-candidate contract. Pre-T35 the synth was
+  // `lastCandidates = chunk.candidates` (full N-element array preserved).
+  // The initial T35 implementation collapsed to single-element synth which
+  // narrowed the type for any future caller that sets `candidateCount > 1`.
+  // Today no caller does, but `code.tool.ts:727` iterates ALL candidates
+  // (`for (const cand of candidates)`) so a future caller would silently
+  // lose candidates 1..N's parts/safety/grounding. Per-index maps keep the
+  // accumulation invariant for every emitted candidate.
+  const accumulatedPartsByIndex = new Map<number, Part[]>();
+  // Last seen candidate-scaffold per index — finishReason, safetyRatings,
+  // groundingMetadata, citationMetadata. We DON'T accumulate these (each is
+  // a standalone field where the latest authoritative value wins). On exit
+  // we overlay each index's accumulated parts onto its last scaffold to
+  // synthesise the returned `lastCandidates`.
+  const scaffoldsByIndex = new Map<number, Candidate>();
   let lastUsageMetadata: GenerateContentResponse['usageMetadata'];
   let chunkCount = 0;
   let firstChunkAt: number | null = null;
@@ -169,45 +208,95 @@ export async function collectStream(
       const chunkText = chunk.text ?? '';
       if (chunkText.length > 0) textChunks.push(chunkText);
 
-      // Last candidates with non-empty parts wins.
+      // Accumulate parts across chunks (T35, v1.16.3).
       //
-      // Pre-v1.16.2 the gate was `chunk.candidates.length > 0` (outer-array
-      // check only). That correctly preserved finishReason / safety ratings
-      // from final chunks for the v1.7.0 ask/code text-extraction path
-      // (which reads accumulated `response.text`, not `candidates[0].parts`).
-      // The v1.16.2 ask_agentic streaming migration is the first consumer
-      // that reads `candidates[0].content.parts` directly — to extract
-      // `functionCall` Parts on each loop iteration. If Gemini's stream
-      // protocol ever emits a final terminator chunk shape like
-      // `{ candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] }`
-      // — non-empty outer array but empty inner parts — the prior gate
-      // would silently overwrite a previous chunk that carried the actual
-      // `functionCall`, dropping the tool dispatch.
+      // History — four iterations:
       //
-      // Defensive fix: gate also on `parts.length > 0`. The empirical
-      // current-protocol behaviour (functionCall + finishReason emitted
-      // together in one chunk) is preserved either way; this hardens
-      // against a fragmentation pattern that future Gemini SDK versions
-      // OR thinking-mode variants could legitimately introduce. Flagged
-      // by gemini Round-1 review on PR #58 as a HIGH-severity defensive
-      // gap.
+      // **v1.7.0 → v1.16.1**: gate was `chunk.candidates.length > 0` (outer
+      // array length only) under last-write-wins semantics. Correct for the
+      // ask/code text-extraction path (which reads accumulated
+      // `response.text`, not `candidates[0].content.parts`). But v1.16.2's
+      // ask_agentic streaming migration was the first consumer that reads
+      // `candidates[0].content.parts` directly to extract `functionCall`
+      // Parts — last-write-wins is fragile here.
       //
-      // Side-effect on ask/code: `lastCandidates.finishReason` may now come
-      // from a non-final chunk if the final chunk has no parts. Neither
-      // `ask` nor `code` reads finishReason off the CollectedResponse —
-      // both extract via `response.text` (concatenated) — so this is
-      // observably equivalent for them.
-      if (
-        chunk.candidates &&
-        chunk.candidates.length > 0 &&
-        (chunk.candidates[0]?.content?.parts?.length ?? 0) > 0
-      ) {
-        lastCandidates = chunk.candidates;
+      // **v1.16.2** (PR #58 Round-1 fold of gemini Finding #1): gate
+      // tightened to also require `parts.length > 0`. Closed the case
+      // `{ candidates: [{ content: { parts: [], finishReason: 'STOP' }}] }`
+      // — non-empty outer, empty inner.
+      //
+      // **v1.16.3 hotfix-A** (interim): gate strengthened further to require
+      // AT LEAST ONE content-bearing part. Closed the empirical Gemini
+      // empty-text-terminator pattern (`parts: [{ text: '' }]` after the
+      // functionCall chunk). But still last-write-wins — under multi-chunk
+      // function calling (parallel `functionCall` Parts across separate
+      // chunks, or `thoughtSignature` carried on a standalone empty-text
+      // terminator), earlier chunks were silently dropped, including the
+      // Gemini-3-mandated signature on the FIRST functionCall part.
+      // Empirically reproduced by Test 5 — multi-file ask_agentic prompt
+      // returned 400 "missing thought_signature, position 2" against live
+      // Gemini Pro on 2026-05-01.
+      //
+      // **v1.16.3 (T35, this fix)**: ACCUMULATE parts across every chunk.
+      // Filtering is wrong by construction — Google's docs explicitly state
+      // (https://ai.google.dev/gemini-api/docs/thought-signatures):
+      //   "During a model response not containing a FC with a streaming
+      //    request, the model may return the thought signature in a part
+      //    with an empty text content part. It is advisable to parse the
+      //    entire request until the `finish_reason` is returned"
+      // and (function-calling docs):
+      //   "Don't merge a Part containing a signature with one that does not.
+      //    This breaks the positional context of the thought."
+      // Accumulating preserves every Part exactly as Gemini emitted it —
+      // signature attachments, parallel functionCall Parts, executableCode
+      // chunks followed by codeExecutionResult chunks, and so on.
+      //
+      // Side-effect on ask/code: `response.candidates[0].content.parts`
+      // now contains every emitted Part (including thought parts and any
+      // empty-text terminator parts). Neither tool reads parts directly
+      // for text extraction — both go through accumulated `response.text`
+      // — so behaviour is observably equivalent. ask_agentic's parts-iter
+      // (filter for `functionCall`, count thought parts) sees richer
+      // input but each filter handles the extra Part variants without
+      // change.
+      // Per-candidate-index accumulation. Today Gemini's streaming protocol
+      // emits candidateCount=1 by default (no caller in this codebase sets
+      // candidateCount>1 — verified by repo-wide grep). Per-index maps cost
+      // ~10 lines and preserve the pre-T35 contract for any future caller
+      // that does set candidateCount>1, matching `code.tool.ts:727`'s
+      // existing `for (const cand of candidates)` consumption pattern.
+      //
+      // R2 fold (PR #59 — GPT R2 F1 / Gemini R2 F1, 2-way HIGH): key Maps by
+      // `cand.index ?? i` instead of array position alone. Per @google/genai
+      // SDK Candidate.index doc: "The 0-based index of this candidate in
+      // the list of generated responses. This is useful for distinguishing
+      // between multiple candidates when candidate_count > 1." Sparse stream
+      // emission like `candidates: [{ index: 1, content: ... }]` (only
+      // index 1, not 0) would otherwise cross-wire that part into bucket 0.
+      const candidates = chunk.candidates ?? [];
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        if (!cand) continue;
+        const cIdx = cand.index ?? i;
+        const incomingParts = cand.content?.parts;
+        if (Array.isArray(incomingParts) && incomingParts.length > 0) {
+          let bucket = accumulatedPartsByIndex.get(cIdx);
+          if (!bucket) {
+            bucket = [];
+            accumulatedPartsByIndex.set(cIdx, bucket);
+          }
+          bucket.push(...incomingParts);
+        }
+        // Track the latest candidate scaffold for this index. finishReason,
+        // safety ratings, grounding, citation metadata — each chunk yields
+        // a fresh scaffold per index; finalisation overlays per-index
+        // accumulated parts onto each index's last seen scaffold.
+        scaffoldsByIndex.set(cIdx, cand);
       }
 
       // Thought-part extraction. `parts[i].thought === true` flags an
       // internal-reasoning chunk. Push to summary, throttle emit.
-      const candidates = chunk.candidates ?? [];
+      // (Reuses `candidates` from the per-index accumulation block above.)
       for (const cand of candidates) {
         const parts = cand.content?.parts ?? [];
         for (const part of parts) {
@@ -276,6 +365,33 @@ export async function collectStream(
   const text = textChunks.join('');
   const thoughtsSummary =
     thoughtChunks.length > 0 ? thoughtChunks.join('\n').slice(0, THOUGHTS_SUMMARY_MAX_CHARS) : null;
+
+  // Synthesize final candidates by overlaying each index's accumulated parts
+  // onto that index's last seen scaffold. When NO chunk yielded a candidate
+  // at all (e.g. text-only stream with naked `{ text: 'x' }` chunks),
+  // `lastCandidates` stays undefined — preserves the prior contract for the
+  // no-candidates path. When chunks emitted candidateCount>1, every emitted
+  // index gets a synthesised entry, sorted by ordinal index — matches
+  // pre-T35 `lastCandidates = chunk.candidates` semantics.
+  //
+  // The .sort() is load-bearing under R2 fold's `cand.index ?? i` keying:
+  // sparse emission (chunk 1 emits index 1 first, chunk 2 emits index 0)
+  // would yield Map insertion order [1, 0] without the sort, mis-ordering
+  // the final candidates array. Map preserves insertion order, so sort is
+  // the only guarantee of ordinal output ordering.
+  const lastCandidates: GenerateContentResponse['candidates'] =
+    scaffoldsByIndex.size > 0
+      ? Array.from(scaffoldsByIndex.entries())
+          .sort(([a], [b]) => a - b)
+          .map(([i, scaffold]) => ({
+            ...scaffold,
+            content: {
+              ...(scaffold.content ?? {}),
+              role: scaffold.content?.role ?? 'model',
+              parts: accumulatedPartsByIndex.get(i) ?? [],
+            },
+          }))
+      : undefined;
 
   return {
     text,

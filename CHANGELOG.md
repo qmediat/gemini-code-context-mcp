@@ -5,6 +5,71 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.3] - 2026-05-01
+
+### Fixed — `ask_agentic` streaming hotfix (combined: empty-text terminator + multi-chunk parts fragmentation, HOTFIX)
+
+**v1.16.3 ships TWO related fixes for the v1.16.2 streaming regression**, folded into a single release because the second was discovered during end-to-end MCP smoke-test of the first.
+
+#### Fix #1 — empty-text-terminator regression
+
+**Reproduction:** v1.16.2 ask_agentic returned `(model returned empty response)` on every tool-using prompt against live Gemini Pro / Flash. Symptoms surfaced minutes after v1.16.2 published, on the first end-to-end smoke test from the global install.
+
+**Root cause:** Gemini's actual stream protocol for tool-using turns emits TWO chunks:
+- Chunk 1: `{ candidates: [{ content: { parts: [{ functionCall: {...} }] } }] }` (the actual tool call)
+- Chunk 2: `{ candidates: [{ content: { parts: [{ text: '' }] }, finishReason: 'STOP' }] }` (terminator)
+
+v1.16.2's `collectStream` gate required `parts.length > 0` to preserve a chunk's `lastCandidates`. Chunk 2 has `parts.length === 1` (one element with empty text + finishReason), so the gate ACCEPTED it and overwrote chunk 1's functionCall. The agentic loop then saw zero functionCallParts and routed to the final-text path, returning the empty string fallback.
+
+#### Fix #2 — multi-chunk parts fragmentation (T35)
+
+**Reproduction:** during end-to-end MCP smoke-test of Fix #1 against live Gemini Pro, single-FC prompts (Tests 1–4) all passed. Test 5 (multi-file prompt: "read package.json, server.json, CHANGELOG.md") failed with Gemini 400: `Function call default_api:read_file ... missing thought_signature, position 2`.
+
+**Root cause:** Fix #1 used a content-bearing-parts gate over `lastCandidates = chunk.candidates` last-write-wins semantics. When Gemini emits PARALLEL `functionCall` Parts across separate chunks, each chunk's parts overwrite the prior chunk's. The Gemini-3 contract (https://ai.google.dev/gemini-api/docs/thought-signatures) mandates that the thought signature on the FIRST functionCall part be returned in the next-turn replay. Last-write-wins drops chunk-1's signature; iteration 2's `generateContent` sees a model turn whose first FC has no signature; Gemini 400s. Pre-existing fragility — masked by Fix #1's complete failure mode in v1.16.2 (no FCs ever made it through the loop, so multi-FC was never reached).
+
+**Fix:** `collectStream` no longer gates or overwrites — it ACCUMULATES `parts` across every chunk verbatim. Empty-text terminator parts, parallel `functionCall` Parts, and standalone signature-bearing parts are all preserved exactly as Gemini emitted them. The candidate scaffold (`finishReason`, `safetyRatings`, `groundingMetadata`, `citationMetadata`) stays last-write-wins; on stream exit we synthesise the final `candidates` shape by overlaying the accumulated `parts` onto the last seen scaffold.
+
+This also closes the documented `code` tool fragility (T35 secondary): `executableCode` in chunk 1 + `codeExecutionResult` in chunk 2 now both reach `code.tool.ts`'s extractor.
+
+**Pre-existing in v1.16.2 only.** v1.16.1 and earlier used non-streaming `generateContent` for ask_agentic — never affected by either fix.
+
+### Why v1.16.2's review cycle missed Fix #1
+
+The v1.16.2 PR went through the standard review cycle: 3-way Round-1 (gemini + grok + codex), 3-way Round-2 verification, Copilot review, all CI checks green. Gemini Round-1 specifically called out this CLASS of bug (terminator-only chunks dropping functionCall) and a fix was folded — but the fix targeted the SHAPE `parts: []` (empty array) and missed the empirical SHAPE `parts: [{ text: '' }]` (length-1 array with empty content). Unit tests pinned the `[]` shape but not the `[{ text: '' }]` shape because no one captured a raw stream from live Gemini before merging.
+
+### Why v1.16.3 hotfix-A's first MCP smoke pass missed Fix #2
+
+A single-FC smoke (Test 1) was sufficient to confirm Fix #1 against live Gemini. Multi-FC parallel was filed as T35 (deferred-with-documentation) on the explicit reasoning "currently zero empirical reports". Tests 1–4 of the documented end-to-end smoke plan passed; Test 5 (multi-file) was the first empirical report — fold it in same release.
+
+**Process update:** the new `test/integration/real-gemini.smoke.test.ts` (v1.15.3 P10) will be extended in a follow-up PR with env-gated streaming + tool-calling smokes for BOTH single-FC and parallel-multi-FC prompts. A pre-merge live smoke covering both would have caught Fix #2 in seconds.
+
+### Coverage
+
+773 tests pass (766 → 773 across the full release, including the R1 + R2 fold-cycle pins documented below — net +7 over v1.16.2). The 5 T35-specific regression pins cover the multi-chunk parts fragmentation cases: parallel-FC across 3 chunks pinning thoughtSignature on FC1, executableCode + codeExecutionResult cross-chunk, standalone signature on empty-text terminator, content.role synthesis, candidates-undefined preservation for naked-text streams.
+
+### R1 fold-cycle (4-way: GPT + Gemini + Grok + Copilot)
+
+- **Fold A (GPT F1 / Gemini F1 / Grok F2 — 3-way consensus, /6step PARTIAL Medium):** synthesised candidates collapsed to single-element array, narrowing the pre-T35 `lastCandidates = chunk.candidates` contract. Per-index `Map<number, Part[]>` accumulation + `Map<number, Candidate>` scaffold tracking restore multi-candidate preservation for any future caller that sets `candidateCount > 1` (today none does — `code.tool.ts:727` already iterates ALL candidates so the type narrowing was a real regression-in-waiting).
+- **Fold B (GPT F2 — TP Medium):** added `it('preserves multi-candidate streams (candidateCount>1) with per-index parts accumulation')` regression pin.
+- **Fold D (Grok F1 — PARTIAL Low):** retitled the empty-text-terminator regression test to mention both the hotfix-A history and the T35 strengthening explicitly.
+- **Fold G (Copilot — TP Medium):** reconciled CHANGELOG T36 status with `docs/FOLLOW-UP-PRS.md` (T36 is RESOLVED-BY-T35, not "remains tracked").
+- **Fold H (Copilot — TP Low):** updated `ask-agentic.test.ts:2469` comment narrating "content-bearing gate" to describe the actual T35 accumulation behaviour.
+- **Accept-deferred C (Grok F3 — TP Medium):** end-to-end multi-FC + thoughtSignature test through `askAgenticTool.execute`. Covered at the collector contract level by `stream-collector.test.ts:189`. Live-API integration smoke is the documented next-PR scope (see Fix #2 closing notes above).
+- **Accept E (Grok F4 — Low):** test count "766 → 771" verified empirically post-R1 fold becomes 766 → 772; the "5 regression pins" wording in the original Coverage section refers to T35-specific pins — accurate at that scope.
+- **Accept F (Grok F5 — Low):** Keep-a-Changelog Unreleased + per-version compare-link not added; project's prior versions (v1.0.0 → v1.16.2) follow the same convention of only emitting the `[1.0.0]` link.
+
+### R2 fold-cycle (3-way: GPT + Gemini + Grok)
+
+- **Fold I (GPT R2 F1 / Gemini R2 F1 — 2-way HIGH consensus, /6step TP Medium):** the R1-fold per-index Maps were keyed by the loop variable `i` (array position) rather than `cand.index ?? i`. Per `@google/genai` SDK `Candidate.index` doc: "The 0-based index of this candidate in the list of generated responses. Useful for distinguishing between multiple candidates when candidate_count > 1." Sparse stream emission like `candidates: [{ index: 1, content: ... }]` (only index 1, not 0) would have cross-wired that part into bucket 0. Fixed: keys now use `cand.index ?? i`, and the synth `.sort()` is now load-bearing because Map insertion order can diverge from ordinal index under sparse emission.
+- **Fold J (GPT R2 F2 / Grok R2 F1 — TP Low):** added `it('keys multi-candidate buckets by Candidate.index, not array position (R2 fold — sparse emission)')` regression pin that emits sparse + reverse-Map-insertion-order chunks and asserts ordinal output ordering with no cross-bucket bleed.
+- **Accept K (Grok R2 F2 — Nit):** the `.sort()` on `Array.from(Map.entries())` was flagged as redundant under R1's keying (Map preserves insertion order from the ascending-i loop). After Fold I the sort BECOMES load-bearing for sparse emission, so it stays — comment added explaining why.
+
+### Notes
+
+- Anyone on v1.16.2 with `ask_agentic` calls in production should upgrade IMMEDIATELY. Tool-calling iterations were silently failing on every prompt.
+- T35 (true parts accumulation) — closed in this release. T36 (`toolCall` predicate completeness for future Gemini server-side tools) is also resolved by T35 in v1.16.3 — the accumulation contract preserves any Part shape verbatim (functionCall, toolCall, executableCode, codeExecutionResult, thoughtSignature) without per-shape gating. See `docs/FOLLOW-UP-PRS.md` "T36" for the full rationale.
+- v1.6/v1.7 streaming refactor track still considered shipped — both fixes are defects in the v1.16.2 agentic-loop refactor, fixed in place.
+
 ## [1.16.2] - 2026-04-30
 
 ### Changed — `ask_agentic` loop streaming + heartbeat-aware `stallMs` watchdog (T33 TRIM)
