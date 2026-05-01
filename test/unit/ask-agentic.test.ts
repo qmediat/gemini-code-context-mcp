@@ -2450,6 +2450,81 @@ describe('ask_agentic loop — stallMs heartbeat watchdog (T33, v1.16.2)', () =>
     expect(elapsedMs).toBeLessThan(5_000);
   });
 
+  it('dispatches functionCall when terminator chunk carries [{text: ""}] not [] (v1.16.3 hotfix — empirical Gemini Pro/Flash pattern)', async () => {
+    // Live API smoke against v1.16.2 published binary on 2026-05-01 returned
+    // `(model returned empty response)` on every tool-using prompt — both
+    // gemini-pro-latest and gemini-flash-latest. Raw chunk capture revealed
+    // the empirical terminator shape `[{text: ''}]` (length 1) which slipped
+    // through v1.16.2's `parts.length > 0` gate. v1.16.3 fix requires AT
+    // LEAST ONE part with actual content.
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-empty-text-terminator-'));
+    writeFileSync(join(root, 'a.ts'), 'export const answer = 42;');
+
+    const { ctx, generateContent, generateContentStream } = buildCtx({ script: [] });
+    generateContent.mockReset();
+    generateContentStream.mockReset();
+    // Iter 1: empirical Gemini shape — functionCall in chunk 1, [{text:''}]
+    // terminator in chunk 2. Pre-fix: chunk 2 overwrites chunk 1 in
+    // lastCandidates → loop sees no functionCall → final-text path → empty.
+    // Post-fix: chunk 2 fails the content-bearing gate → chunk 1 wins.
+    generateContentStream.mockImplementationOnce(() => {
+      async function* empiricalShape() {
+        yield {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'a.ts' } } }],
+              },
+            },
+          ],
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+        yield {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: '' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 1397,
+            candidatesTokenCount: 12,
+            thoughtsTokenCount: 0,
+          },
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+      }
+      return Promise.resolve(empiricalShape());
+    });
+    // Iter 2: final-text response.
+    generateContentStream.mockImplementationOnce(() => {
+      async function* finalText() {
+        yield {
+          text: 'The answer is 42.',
+          candidates: [
+            {
+              content: { parts: [{ text: 'The answer is 42.' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: {
+            promptTokenCount: 200,
+            candidatesTokenCount: 5,
+            thoughtsTokenCount: 0,
+          },
+        } as unknown as Awaited<ReturnType<typeof generateContent>>;
+      }
+      return Promise.resolve(finalText());
+    });
+
+    const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
+
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent?.iterations).toBe(2);
+    expect(result.structuredContent?.filesRead).toBe(1);
+    const message = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+    expect(message).toBe('The answer is 42.');
+  });
+
   it('dispatches functionCall correctly when stream fragments fc into one chunk and terminator into the next (v1.16.2 PR-Round-1)', async () => {
     // Regression pin for gemini Finding #1 (HIGH). Even if Gemini's current
     // protocol typically packs functionCall + finishReason into one chunk,

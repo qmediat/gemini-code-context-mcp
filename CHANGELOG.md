@@ -5,6 +5,37 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.3] - 2026-05-01
+
+### Fixed — `ask_agentic` empty-text-terminator regression (HOTFIX)
+
+**Reproduction:** v1.16.2 ask_agentic returned `(model returned empty response)` on every tool-using prompt against live Gemini Pro / Flash. Symptoms surfaced minutes after v1.16.2 published, on the first end-to-end smoke test from the global install.
+
+**Root cause:** Gemini's actual stream protocol for tool-using turns emits TWO chunks:
+- Chunk 1: `{ candidates: [{ content: { parts: [{ functionCall: {...} }] } }] }` (the actual tool call)
+- Chunk 2: `{ candidates: [{ content: { parts: [{ text: '' }] }, finishReason: 'STOP' }] }` (terminator)
+
+v1.16.2's `collectStream` gate required `parts.length > 0` to preserve a chunk's `lastCandidates`. Chunk 2 has `parts.length === 1` (one element with empty text + finishReason), so the gate ACCEPTED it and overwrote chunk 1's functionCall. The agentic loop then saw zero functionCallParts and routed to the final-text path, returning the empty string fallback.
+
+**Fix:** strengthen the gate to require AT LEAST ONE part to carry actual content — any non-text Part (`functionCall`, `executableCode`, `codeExecutionResult`, `fileData`, `inlineData`) OR a text Part with non-empty string. Empty-text terminator chunks (whether shaped as `[]`, `[{}]`, or `[{ text: '' }]`) now fail the gate; the previous chunk's functionCall survives.
+
+**Pre-existing in v1.16.2 only.** v1.16.1 and earlier used non-streaming `generateContent` for ask_agentic — never affected.
+
+### Why v1.16.2's review cycle missed it
+
+The v1.16.2 PR went through the standard review cycle: 3-way Round-1 (gemini + grok + codex), 3-way Round-2 verification, Copilot review, all CI checks green. Gemini Round-1 specifically called out this CLASS of bug (terminator-only chunks dropping functionCall) and a fix was folded — but the fix targeted the SHAPE `parts: []` (empty array) and missed the empirical SHAPE `parts: [{ text: '' }]` (length-1 array with empty content). Unit tests pinned the `[]` shape but not the `[{ text: '' }]` shape because no one captured a raw stream from live Gemini before merging.
+
+**Process update:** the new `test/integration/real-gemini.smoke.test.ts` (v1.15.3 P10) will be extended in a follow-up PR with an env-gated streaming + tool-calling smoke test that exercises the loop against the real API. A pre-merge live smoke would have caught this in 6 seconds.
+
+### Coverage
+
+766 tests pass (764 → 766 — added two regression pins for the empirical `[{ text: '' }]` terminator shape, one at the `collectStream` level and one at the `ask_agentic` loop level).
+
+### Notes
+
+- Anyone on v1.16.2 with `ask_agentic` calls in production should upgrade IMMEDIATELY. Tool-calling iterations were silently failing.
+- v1.6/v1.7 streaming refactor track still considered shipped — this is purely a defect in the v1.16.2 agentic-loop refactor, fixed in place.
+
 ## [1.16.2] - 2026-04-30
 
 ### Changed — `ask_agentic` loop streaming + heartbeat-aware `stallMs` watchdog (T33 TRIM)

@@ -96,6 +96,49 @@ describe('collectStream — candidates last-non-empty-wins', () => {
     expect(result.candidates?.[0]?.finishReason).toBe('STOP');
   });
 
+  it('does not overwrite with terminator-only candidates whose parts carry only empty text (v1.16.3 hotfix)', async () => {
+    // Empirical raw-stream capture against live Gemini Pro on 2026-05-01
+    // showed the actual fragmentation pattern v1.16.2 missed: Gemini emits
+    // the functionCall in chunk 1 and a TERMINATOR shaped
+    // `{ candidates: [{ content: { parts: [{ text: '' }] },
+    // finishReason: 'STOP' }] }` in chunk 2 — `parts.length === 1` (a
+    // single empty-text Part) so v1.16.2's `parts.length > 0` gate
+    // accepted it, overwriting the functionCall. ask_agentic returned
+    // `(model returned empty response)` on every tool-using prompt.
+    //
+    // v1.16.3 strengthens the gate to require AT LEAST ONE part to carry
+    // actual content (functionCall / executableCode / codeExecutionResult /
+    // fileData / inlineData / non-empty text). An empty-text terminator
+    // chunk fails the gate; the previous chunk's functionCall survives.
+    const result = await collectStream(
+      gen([
+        {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [{ functionCall: { name: 'read_file', args: { path: 'package.json' } } }],
+              },
+            },
+          ],
+        },
+        {
+          candidates: [
+            {
+              content: { role: 'model', parts: [{ text: '' }] },
+              finishReason: 'STOP',
+            },
+          ],
+          usageMetadata: { promptTokenCount: 1397, candidatesTokenCount: 12 },
+        },
+      ]),
+    );
+    const parts = result.candidates?.[0]?.content?.parts ?? [];
+    expect(parts.length).toBe(1);
+    expect(parts[0]?.functionCall?.name).toBe('read_file');
+    expect(result.usageMetadata?.promptTokenCount).toBe(1397);
+  });
+
   it('does not overwrite with terminator-only candidates that have empty parts (v1.16.2 fragmentation guard)', async () => {
     // Regression pin for the v1.16.2 PR-Round-1 fix (gemini Finding #1
     // HIGH). Pre-fix, an early chunk carrying a `functionCall` Part could
