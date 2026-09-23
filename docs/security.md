@@ -48,6 +48,6 @@ Your Gemini API key and your workspace content. We treat them with different thr
 
 ## Reporting vulnerabilities
 
-Email **contact@qmt.email** with subject `[SECURITY] gemini-code-context-mcp`. Please don't open a public GitHub issue for a security report — we'd rather respond and coordinate disclosure first.
+Use GitHub's private [Report a vulnerability](https://github.com/qmediat/gemini-code-context-mcp/security/advisories/new) form, or email **security@qmediat.io** with subject `[SECURITY] gemini-code-context-mcp`. Please don't open a public GitHub issue for a security report — we'd rather respond and coordinate disclosure first.
 
 Response SLA for the first 30 days post-release: acknowledgement within 48 h, triage within 72 h, patch for high-severity within 7 days.

@@ -5,6 +5,15 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- `SECURITY.md` and `docs/security.md` name the company security mailbox `security@qmediat.io` (one address across
+  every published qmediat package) next to GitHub's private reporting form.
+- `README.md` gains a "Trademarks and affiliation" section: Gemini is Google's trademark; this integration is
+  independent and not endorsed by Google; use of the Gemini API through it is subject to Google's terms.
+
 ## [1.16.4] - 2026-09-23
 
 ### Fixed

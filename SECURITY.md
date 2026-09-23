@@ -13,7 +13,7 @@ Only the latest published version on npm receives security fixes.
 
 Preferred: open a private report through GitHub's **[Report a vulnerability](https://github.com/qmediat/gemini-code-context-mcp/security/advisories/new)** form (Security tab → Advisories). It reaches the maintainers privately and tracks the fix and the disclosure.
 
-Alternatively email **contact@qmt.email** with the subject line `[SECURITY] gemini-code-context-mcp`.
+Alternatively email **security@qmediat.io** with the subject line `[SECURITY] gemini-code-context-mcp`.
 
 Do not open public GitHub issues for security reports. We acknowledge receipt within 48 hours and aim to publish a fix within 7 days for high-severity issues.
 
