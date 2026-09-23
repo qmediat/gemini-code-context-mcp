@@ -1,3 +1,12 @@
+<p align="left">
+  <a href="https://www.qmediat.io/open-source?utm_source=oss-readme&utm_medium=gemini-code-context-mcp&utm_campaign=open-source">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/qmediat/.github/main/assets/qmediat-wordmark-light.svg">
+      <img src="https://raw.githubusercontent.com/qmediat/.github/main/assets/qmediat-wordmark-dark.svg" alt="Quantum Media Technologies" height="40">
+    </picture>
+  </a>
+</p>
+
 # `@qmediat.io/gemini-code-context-mcp`
 
 > **Give Claude Code persistent memory of your codebase, backed by Gemini's 2M-token context.**
@@ -228,3 +237,7 @@ Gemini is a trademark of Google. This is an independent, community-maintained in
 MIT © [Quantum Media Technologies sp. z o.o.](https://www.qmediat.io) — see [LICENSE](./LICENSE).
 
 Part of qmediat's [open-source portfolio](https://www.qmediat.io/open-source).
+
+---
+
+Made by [Quantum Media Technologies](https://www.qmediat.io/open-source?utm_source=oss-readme&utm_medium=gemini-code-context-mcp&utm_campaign=open-source) · [more open source from qmediat](https://www.qmediat.io/open-source?utm_source=oss-readme&utm_medium=gemini-code-context-mcp&utm_campaign=open-source)
