@@ -31,16 +31,18 @@ function model(id: string, inputTokenLimit: number): ModelInfo {
   };
 }
 
-// The registry's own order: pro tier first, then flash by ID descending — `omni` sorts before the digits.
+// The registry's comparator: tier by ID substring (`pro` before `flash` before `lite`, so
+// `gemini-flash-lite-latest` ranks as flash), then ID descending — `omni` sorts before the digits
+// and `flash-lite-latest` before `flash-latest`.
 const LIVE_ORDER: ModelInfo[] = [
   model('gemini-pro-latest', 1_048_576),
   model('gemini-3.1-pro-preview', 1_048_576),
   model('gemini-omni-flash-preview', 131_072),
   model('gemini-omni-1.1-flash', 131_072),
+  model('gemini-flash-lite-latest', 1_048_576),
   model('gemini-flash-latest', 1_048_576),
   model('gemini-3.8-flash', 1_048_576),
   model('gemini-3.7-flash', 1_048_576),
-  model('gemini-flash-lite-latest', 1_048_576),
 ];
 
 describe('resolveModel — Interactions-API-only models never satisfy a text alias', () => {

@@ -20,7 +20,7 @@ Do not open public GitHub issues for security reports. We acknowledge receipt wi
 ## Dependencies and supply chain
 
 - Dependabot security updates are enabled; vulnerable transitive dependencies are refreshed in patch releases.
-- CI refuses a build with a known high-severity advisory (`npm audit --audit-level=high`).
+- CI and the release workflow refuse a build with a known high-severity advisory in the shipped dependency tree (`npm audit --omit=dev --audit-level=high`).
 - Releases are published to npm from GitHub Actions with provenance attestations (`npm publish --provenance`); the npm page of every version links the workflow run that built it.
 
 ## Security design

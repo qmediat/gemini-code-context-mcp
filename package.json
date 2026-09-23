@@ -57,8 +57,8 @@
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0",
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@google/genai": "^1.52.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^12.9.0",
     "zod": "^3.23.0",
     "zod-to-json-schema": "^3.24.0"
