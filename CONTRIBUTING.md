@@ -80,7 +80,7 @@ The dev server resolves its state to `<XDG_STATE_HOME>/qmediat/gemini-code-conte
 2. **Write tests** — every new utility gets unit tests; every new tool gets integration tests (mocked SDK is fine for PR CI; real API for local development).
 3. **Keep the diff small** — one logical change per PR. If you need to refactor in the process, submit the refactor as a separate PR first.
 4. **Run `npm run lint` and `npm run typecheck`** before pushing.
-5. **Add a changeset** — `npx changeset` and pick the appropriate semver bump.
+5. **Add a CHANGELOG entry** — under the next version heading in `CHANGELOG.md` (Keep a Changelog format: Added / Changed / Fixed / Security), with the semver bump the change implies.
 6. **Open a PR** against `main` with a clear description and link to any relevant issue.
 
 ## Code style

@@ -12,10 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`latest-flash` resolved to an Interactions-API-only model and every call failed with HTTP 400.** Google's
   `gemini-omni-*` family (`gemini-omni-flash-preview`, `gemini-omni-1.1-flash`) is served only by the Interactions
   API, yet `ListModels` advertises `generateContent` for it, and the registry's version-descending sort places
-  `omni` ahead of every `gemini-N.M-flash`. The taxonomy now classifies `omni` as `agent` (not drop-in replaceable),
-  the resolver keeps `omni` in its non-text-gen marker list, and `latest-flash` resolves to `gemini-flash-latest`
+  `omni` ahead of every `gemini-N.M-flash`. The taxonomy now classifies `omni` as `agent` (not drop-in replaceable)
+  with an anchored rule, and `latest-flash` resolves to `gemini-flash-latest`
   again (Google's rolling alias — `gemini-3.8-flash` on 2026-09-23). Regression tests cover both IDs. `gemini-pro-latest` and `gemini-flash-latest` (Google's rolling aliases) were
   verified against the live API and are unaffected.
+
+### Changed
+
+- `server.json` (MCP registry manifest) is bumped with the package, and the release workflow refuses a tag whose
+  manifest versions differ from `package.json`.
+- `CONTRIBUTING.md` and the PR template asked for a changeset; the repository never had a `.changeset/` setup and
+  the CHANGELOG is the release record, so both now ask for a CHANGELOG entry.
 
 ### Security
 
