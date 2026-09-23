@@ -5,6 +5,41 @@ All notable changes to `@qmediat.io/gemini-code-context-mcp` will be documented 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.4] - 2026-09-23
+
+### Fixed
+
+- **`latest-flash` resolved to an Interactions-API-only model and every call failed with HTTP 400.** Google's
+  `gemini-omni-*` family (`gemini-omni-flash-preview`, `gemini-omni-1.1-flash`) is served only by the Interactions
+  API, yet `ListModels` advertises `generateContent` for it, and the registry's version-descending sort places
+  `omni` ahead of every `gemini-N.M-flash`. The taxonomy now classifies `omni` as `agent` (not drop-in replaceable)
+  with an anchored rule, and `latest-flash` resolves to `gemini-flash-latest`
+  again (Google's rolling alias — `gemini-3.8-flash` on 2026-09-23). Regression tests cover both IDs. `gemini-pro-latest` and `gemini-flash-latest` (Google's rolling aliases) were
+  verified against the live API and are unaffected.
+
+### Changed
+
+- `server.json` (MCP registry manifest) is bumped with the package, and the release workflow refuses a tag whose
+  manifest versions differ from `package.json`.
+- `CONTRIBUTING.md` and the PR template asked for a changeset; the repository never had a `.changeset/` setup and
+  the CHANGELOG is the release record, so both now ask for a CHANGELOG entry.
+
+### Security
+
+- Dependency refresh to close every open Dependabot advisory (69 alerts, 25 high — all transitive):
+  `@modelcontextprotocol/sdk` 1.30.0, `@google/genai` 1.52.0, `hono` 4.13.8, `fast-uri` 3.1.8, `qs` 6.16.0,
+  `body-parser` 2.3.0, `ip-address` 10.7.2, `protobufjs` 7.6.6, `ws` 8.21.3. `npm audit` reports 0 vulnerabilities.
+  The published floors are raised to the versions this release was tested with (`@modelcontextprotocol/sdk` ^1.30.0,
+  `@google/genai` ^1.52.0). The advisories are in transitive dependencies under caret ranges, so a project that
+  already has this package in its lockfile keeps its old tree until it runs `npm update` (or `npm audit fix`);
+  a fresh install gets the refreshed tree.
+- CI and the release workflow refuse a build with a known high-severity advisory in the shipped dependency tree
+  (`npm audit --omit=dev --audit-level=high`; the dev toolchain stays covered by Dependabot alerts);
+  the CI token is read-only (`permissions: contents: read`).
+- Dependabot security updates are enabled on the repository.
+- `SECURITY.md`: the supported-versions table still described the pre-1.0 state; it now names the latest 1.x
+  release as the supported one and points to GitHub's private vulnerability reporting form first.
+
 ## [1.16.3] - 2026-05-01
 
 ### Fixed — `ask_agentic` streaming hotfix (combined: empty-text terminator + multi-chunk parts fragmentation, HOTFIX)

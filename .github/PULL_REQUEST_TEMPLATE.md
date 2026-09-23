@@ -20,6 +20,6 @@
 - [ ] `npm run typecheck` passes
 - [ ] `npm run test` passes
 
-## Changeset
+## Changelog
 
-- [ ] I added a changeset (`npx changeset`)
+- [ ] I added an entry to `CHANGELOG.md` under the next version (Keep a Changelog: Added / Changed / Fixed / Security)

@@ -47,7 +47,7 @@ caller takes responsibility).
 | `audio-generation` | TTS, music generation, dialog-native audio | `lyria-3-pro-preview`, `*-tts`, `*-native-audio-*` | — |
 | `video-generation` | Video synthesis | `veo-3`, `veo-3.1-preview` | — |
 | `embedding` | Vector embeddings | `text-embedding-004`, `gemini-embedding-001` | — |
-| `agent` | Specialised agents (not drop-in text models) | `gemini-deep-research-*`, `*-customtools` | — |
+| `agent` | Specialised agents and Interactions-API-only models (not drop-in text models) | `gemini-deep-research-*`, `*-customtools`, `gemini-omni-*` | — |
 | `unknown` | Family we haven't classified yet | A newly-released Google model not in our rules | — (aliases refuse; explicit ID pass fails category check) |
 
 ## Capability flags

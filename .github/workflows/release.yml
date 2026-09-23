@@ -53,6 +53,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Audit (refuse a release with a known high-severity advisory in the shipped tree)
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Verify tag matches package.json version
         # Prevents shipping a tag that disagrees with package.json (e.g. if
         # someone forgets to bump version before tagging). The tag name arrives
@@ -65,6 +68,18 @@ jobs:
             exit 1
           fi
           echo "Tag $GITHUB_REF_NAME matches package.json version $PKG_VERSION"
+
+      - name: Verify server.json versions match package.json
+        # The MCP registry manifest carries the version twice (top level and the npm package entry);
+        # a release whose manifest lags the package advertises stale metadata to the registry.
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          node -e '
+            const s = require("./server.json"); const v = process.argv[1];
+            const seen = [s.version, ...(s.packages ?? []).map((p) => p.version)];
+            if (seen.some((x) => x !== v)) { console.error(`server.json versions ${JSON.stringify(seen)} != package.json ${v}`); process.exit(1); }
+            console.log(`server.json versions match ${v}`);
+          ' "$PKG_VERSION"
 
       - name: Publish to npm
         env:
