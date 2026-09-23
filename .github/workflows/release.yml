@@ -1,100 +1,130 @@
 name: Release
 
-# Fires on any `v*` tag push. Full flow: validate (lint + typecheck + unit
-# tests + build) → publish to npm with provenance → create GitHub Release with
-# auto-generated notes.
-#
-# Required repository secret: NPM_TOKEN — an npm "Automation" access token
-# (NOT a classic token) with the scope `@qmediat.io` and "Publish" permission.
-# Create at https://www.npmjs.com/settings/qmediat/tokens/granular-access-tokens.
+# A pushed tag v<version> (equal to package.json) → verify (read-only job: tag, manifest and CHANGELOG checks, typecheck, tests, audit of the shipped
+# tree) → publish (the only job with the publishing permissions; installs with --ignore-scripts, skips a version
+# already on npm so a re-run is safe) → GitHub Release from the CHANGELOG section (created or updated).
+# `workflow_dispatch` with `tag` releases an existing tag with THIS workflow definition (a tag pushed earlier would
+# otherwise run the workflow as it was at that tag).
+# Publishing needs the npm publishing credential NPM_TOKEN (an npm "Automation" token with publish rights on
+# @qmediat.io) visible to this repository, or npm Trusted Publishing configured for this workflow.
+# Actions are pinned to full commit SHAs; Dependabot keeps the pins current.
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release with the current workflow (v<version>)"
+        required: true
+        type: string
 
-permissions:
-  contents: write      # create GitHub Release
-  id-token: write      # provenance signing via OIDC
+permissions: {}
 
 jobs:
-  release:
-    name: Publish to npm + GitHub Release
+  verify:
+    name: Verify the tagged tree
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          # Full history so release notes can reference prior commits
-          # and provenance can link back to an auditable build record.
-          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Resolve the release tag
+        run: echo "TAG=${INPUT_TAG:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
+      - name: Tag must be v<package.json version>
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "v$pkg" ]; then
+            echo "::error ::tag $TAG must be v$pkg (package.json version with the v prefix)"
+            exit 1
+          fi
+
+      - name: server.json versions must equal package.json
+        run: |
+          node -e '
+            const s = require("./server.json"); const v = require("./package.json").version;
+            const seen = [s.version, ...(s.packages ?? []).map((p) => p.version)];
+            if (seen.some((x) => x !== v)) { console.error(`server.json versions ${JSON.stringify(seen)} != package.json ${v}`); process.exit(1); }
+            console.log(`server.json versions match ${v}`);
+          '
+      - name: CHANGELOG.md must have a section for this version
+        run: |
+          v="${TAG#v}"
+          awk -v v="$v" 'index($0, "## [" v "]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error ::CHANGELOG.md has no section for [$v]"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+
+  publish:
+    name: Publish to npm + GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Unit tests
-        # Integration tests auto-skip without GEMINI_API_KEY, so CI runs the
-        # unit + mock tests only. Real-API smoke lives in local dev workflows.
-        run: npm test
-
-      - name: Build
-        run: npm run build
-
-      - name: Audit (refuse a release with a known high-severity advisory in the shipped tree)
-        run: npm audit --omit=dev --audit-level=high
-
-      - name: Verify tag matches package.json version
-        # Prevents shipping a tag that disagrees with package.json (e.g. if
-        # someone forgets to bump version before tagging). The tag name arrives
-        # as refs/tags/v1.2.3; we strip the prefix and compare.
+      - name: Resolve the release tag
+        run: echo "TAG=${INPUT_TAG:-$GITHUB_REF_NAME}" >> "$GITHUB_ENV"
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+      - name: CHANGELOG.md must have a section for this version
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PKG_VERSION="$(node -p "require('./package.json').version")"
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-            echo "::error ::Tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+          v="${TAG#v}"
+          awk -v v="$v" 'index($0, "## [" v "]") == 1 {p=1; next} /^## \[/ {p=0} p' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error ::CHANGELOG.md has no section for [$v]"
             exit 1
           fi
-          echo "Tag $GITHUB_REF_NAME matches package.json version $PKG_VERSION"
 
-      - name: Verify server.json versions match package.json
-        # The MCP registry manifest carries the version twice (top level and the npm package entry);
-        # a release whose manifest lags the package advertises stale metadata to the registry.
-        run: |
-          PKG_VERSION="$(node -p "require('./package.json').version")"
-          node -e '
-            const s = require("./server.json"); const v = process.argv[1];
-            const seen = [s.version, ...(s.packages ?? []).map((p) => p.version)];
-            if (seen.some((x) => x !== v)) { console.error(`server.json versions ${JSON.stringify(seen)} != package.json ${v}`); process.exit(1); }
-            console.log(`server.json versions match ${v}`);
-          ' "$PKG_VERSION"
+      - run: npm ci --ignore-scripts
+      - run: npm run build
 
-      - name: Publish to npm
+      # Resumable: a re-run after a failed later step skips a version that is already on the registry.
+      - name: Publish to npm (provenance) unless this version is already published
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        # --provenance links the tarball to this exact workflow run,
-        # producing a public supply-chain attestation on npmjs.com.
-        # --access public is required for the first publish of a scoped package
-        # and harmless on subsequent publishes.
-        run: npm publish --provenance --access public
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          v="$(node -p "require('./package.json').version")"
+          if [ "$(npm view "$name@$v" version 2>/dev/null)" = "$v" ]; then
+            echo "$name@$v is already on npm; skipping publish"
+          else
+            npm publish --provenance --access public --ignore-scripts
+          fi
 
-      - name: Create GitHub Release
+      - name: GitHub Release from the CHANGELOG section (created or updated)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --latest
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
