@@ -64,6 +64,8 @@ describe('categorizeModel — current Gemini lineup', () => {
     // Agents
     ['gemini-deep-research-pro', 'agent'],
     ['gemini-3-pro-customtools', 'agent'],
+    ['gemini-omni-flash-preview', 'agent'],
+    ['gemini-omni-1.1-flash', 'agent'],
   ];
 
   for (const [modelId, expected] of cases) {
@@ -92,6 +94,11 @@ describe('categorizeModel — precedence (the invariant v1.4.0 fixes)', () => {
 
   it('gemini-deep-research-pro is agent, not text-reasoning', () => {
     expect(categorizeModel('gemini-deep-research-pro')).toBe('agent');
+  });
+
+  it('gemini-omni-flash-preview is agent, NOT text-fast (Interactions API only, v1.16.4)', () => {
+    expect(categorizeModel('gemini-omni-flash-preview')).toBe('agent');
+    expect(categorizeModel('gemini-omni-1.1-flash')).toBe('agent');
   });
 
   it('lite wins over flash when both match (lite is the more specific tier)', () => {

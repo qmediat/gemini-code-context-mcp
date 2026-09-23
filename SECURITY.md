@@ -2,17 +2,26 @@
 
 ## Supported versions
 
-Until v1.0.0 is released, this project is in pre-release and not yet recommended for production use.
+Only the latest published version on npm receives security fixes.
 
 | Version | Supported |
 |---|---|
-| < 1.0.0 | ❌ pre-release, no security guarantees |
+| latest 1.x | ✅ |
+| older 1.x | ❌ upgrade to the latest release |
 
 ## Reporting a vulnerability
 
-Please report security vulnerabilities privately to **contact@qmt.email** with the subject line `[SECURITY] gemini-code-context-mcp`.
+Preferred: open a private report through GitHub's **[Report a vulnerability](https://github.com/qmediat/gemini-code-context-mcp/security/advisories/new)** form (Security tab → Advisories). It reaches the maintainers privately and tracks the fix and the disclosure.
 
-Do not open public GitHub issues for security reports. We will acknowledge receipt within 48 hours and aim to publish a fix within 7 days for high-severity issues.
+Alternatively email **contact@qmt.email** with the subject line `[SECURITY] gemini-code-context-mcp`.
+
+Do not open public GitHub issues for security reports. We acknowledge receipt within 48 hours and aim to publish a fix within 7 days for high-severity issues.
+
+## Dependencies and supply chain
+
+- Dependabot security updates are enabled; vulnerable transitive dependencies are refreshed in patch releases.
+- CI refuses a build with a known high-severity advisory (`npm audit --audit-level=high`).
+- Releases are published to npm from GitHub Actions with provenance attestations (`npm publish --provenance`); the npm page of every version links the workflow run that built it.
 
 ## Security design
 

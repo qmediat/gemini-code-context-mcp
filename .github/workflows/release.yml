@@ -53,6 +53,9 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Audit (refuse a release with a known high-severity advisory)
+        run: npm audit --audit-level=high
+
       - name: Verify tag matches package.json version
         # Prevents shipping a tag that disagrees with package.json (e.g. if
         # someone forgets to bump version before tagging). The tag name arrives

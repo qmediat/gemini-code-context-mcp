@@ -105,6 +105,15 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // replaceable with a text model" (flagged by GPT PR #22 review).
   { pattern: /(?:^|-)live(?:-|$)/i, category: 'agent', costTier: 'standard' },
 
+  // === Interactions API only (not `generateContent`) ===
+  // `gemini-omni-*` (`gemini-omni-flash-preview`, `gemini-omni-1.1-flash`) is
+  // served only by the Interactions API. `ListModels` still advertises
+  // `generateContent` for it, and a text prompt returns
+  // 400 "This model only supports Interactions API." Unclassified, the family
+  // sorts ahead of every `gemini-N.M-flash` (`o` > digits in the version-desc
+  // sort) and `latest-flash` resolves to it. Must classify before the flash rule.
+  { pattern: /(?:^|-)omni(?:-|$)/i, category: 'agent', costTier: 'standard' },
+
   // === Embeddings ===
   // Token-boundary anchoring: matches `text-embedding-004`,
   // `gemini-embedding-001` etc., rejects hypothetical `foo-embedding-like-helper`.

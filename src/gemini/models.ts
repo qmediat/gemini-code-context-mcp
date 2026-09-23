@@ -53,6 +53,7 @@ const NON_TEXT_GEN_MARKERS = [
   'lyria',
   'research',
   'customtools',
+  'omni',
 ] as const;
 
 function hasNonTextGenMarker(modelId: string): boolean {
