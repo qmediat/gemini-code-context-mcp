@@ -218,6 +218,11 @@ This project is built and maintained by **[Quantum Media Technologies sp. z o.o.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md). Short version: TypeScript strict, `npm run lint && npm run typecheck && npm test`, add a changeset, open a PR.
 
+
+## Trademarks and affiliation
+
+Gemini is a trademark of Google. This is an independent, community-maintained integration published by Quantum Media Technologies sp. z o.o.; it is not affiliated with, sponsored by or endorsed by Google. Use of the Gemini API or CLI through this server is subject to Google's own terms and to your own API key or account.
+
 ## License
 
 MIT © [Quantum Media Technologies sp. z o.o.](https://www.qmediat.io) — see [LICENSE](./LICENSE).
