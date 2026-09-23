@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The README opens with the Quantum Media Technologies wordmark and closes with a "Made by" line, both linking to www.qmediat.io/open-source; `package.json` `homepage` points there and `author` is the company line every qmediat package uses.
 - `SECURITY.md` and `docs/security.md` name the company security mailbox `security@qmediat.io` (one address across
   every published qmediat package) next to GitHub's private reporting form.
 - `README.md` gains a "Trademarks and affiliation" section: Gemini is Google's trademark; this integration is

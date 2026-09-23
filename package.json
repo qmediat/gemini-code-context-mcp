@@ -13,7 +13,7 @@
     "code-review",
     "2m-context"
   ],
-  "homepage": "https://github.com/qmediat/gemini-code-context-mcp#readme",
+  "homepage": "https://www.qmediat.io/open-source",
   "bugs": {
     "url": "https://github.com/qmediat/gemini-code-context-mcp/issues"
   },
@@ -22,11 +22,7 @@
     "url": "git+https://github.com/qmediat/gemini-code-context-mcp.git"
   },
   "license": "MIT",
-  "author": {
-    "name": "Quantum Media Technologies sp. z o.o.",
-    "email": "contact@qmt.email",
-    "url": "https://www.qmediat.io"
-  },
+  "author": "Quantum Media Technologies <dev@qmediat.io> (https://www.qmediat.io)",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
