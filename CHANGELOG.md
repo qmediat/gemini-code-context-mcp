@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Releases are staged on npm instead of published directly: the release workflow runs `npm stage publish`
   (Trusted Publishing, provenance), and a version becomes public only when a maintainer approves it on
-  npmjs.com with two-factor authentication; the workflow installs npm 11.15.0 or later for it.
+  npmjs.com with two-factor authentication; the workflow pins npm 11.20.0 for it (staged publishing needs 11.15.0+).
 - The README opens with the Quantum Media Technologies wordmark and closes with a "Made by" line, both linking to www.qmediat.io/open-source; `package.json` `homepage` points there and `author` is the company line every qmediat package uses.
 - `SECURITY.md` and `docs/security.md` name the company security mailbox `security@qmediat.io` (one address across
   every published qmediat package) next to GitHub's private reporting form.
