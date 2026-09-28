@@ -225,7 +225,7 @@ This project is built and maintained by **[Quantum Media Technologies sp. z o.o.
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). Short version: TypeScript strict, `npm run lint && npm run typecheck && npm test`, add a changeset, open a PR.
+See [CONTRIBUTING.md](./CONTRIBUTING.md). Short version: TypeScript strict, `npm run lint && npm run typecheck && npm test`, add a CHANGELOG entry, open a PR.
 
 
 ## Trademarks and affiliation

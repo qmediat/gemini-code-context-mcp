@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Contributors add an entry to `CHANGELOG.md` for a user-visible change; the unused `@changesets/cli` dev
+  dependency is gone (the repository never had a `.changeset/` setup, and releases take their notes from this file).
 - Releases are staged on npm instead of published directly: the release workflow runs `npm stage publish`
   (Trusted Publishing, provenance), and a version becomes public only when a maintainer approves it on
   npmjs.com with two-factor authentication; the workflow pins npm 11.20.0 for it (staged publishing needs 11.15.0+).
