@@ -6,8 +6,10 @@
 #
 # Grouping strategy:
 #   - Security updates: always individual PRs, no grouping, no delay.
-#   - Non-security patch/minor: grouped weekly into one PR per ecosystem to
-#     reduce review fatigue.
+#   - Non-security patch/minor: grouped weekly into ONE PR per ecosystem to
+#     reduce review fatigue. One group per ecosystem: Dependabot puts a
+#     dependency in the FIRST group it matches, so a separate patch group with
+#     `patterns: "*"` left a minor group with nothing to update.
 #   - Major updates: individual PRs for dedicated review (breaking-change risk).
 
 version: 2
@@ -29,16 +31,11 @@ updates:
       prefix-development: "chore(dev-deps)"
       include: scope
     groups:
-      non-major-patches:
-        applies-to: version-updates
-        update-types:
-          - patch
-        patterns:
-          - "*"
-      non-major-minor:
+      non-major:
         applies-to: version-updates
         update-types:
           - minor
+          - patch
         patterns:
           - "*"
     ignore:
