@@ -231,7 +231,7 @@ gemini-code-context-mcp/
 ├── .github/
 │   ├── workflows/
 │   │   ├── ci.yml                      # test+build+lint na PR
-│   │   ├── release.yml                 # changesets → npm + GH release
+│   │   ├── release.yml                 # tag + CHANGELOG → npm stage publish + GH release
 │   │   └── codeql.yml
 │   ├── ISSUE_TEMPLATE/
 │   └── PULL_REQUEST_TEMPLATE.md
@@ -317,7 +317,6 @@ gemini-code-context-mcp/
 - `@types/node@^22`
 - `@types/better-sqlite3`
 - `tsx@^4`
-- `@changesets/cli`
 - `@biomejs/biome`
 
 **Peer (runtime host):**

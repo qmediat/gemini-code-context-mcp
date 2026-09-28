@@ -14,7 +14,7 @@ Everything you produce in this repo — code, comments, commit messages, documen
 
 - TypeScript strict, no `any`, no default exports. See [CONTRIBUTING.md](./CONTRIBUTING.md).
 - `npm run lint && npm run typecheck && npm test` must pass before any commit.
-- Add a changeset (`npx changeset`) for any user-visible change.
+- Add an entry to `CHANGELOG.md` for any user-visible change (the release workflow takes the notes from it).
 - See [PLAN.md](./PLAN.md) for active work and [docs/KNOWN-DEFICITS.md](./docs/KNOWN-DEFICITS.md) / [docs/FOLLOW-UP-PRS.md](./docs/FOLLOW-UP-PRS.md) for tracked debt.
 
 ## Local dev gotcha — npx fails inside this repo
