@@ -45,8 +45,4 @@ yarn-error.log*
 *.db-wal
 *.db-shm
 
-# Changesets
-.changeset/*.md
-!.changeset/README.md
-!.changeset/config.json
 .claude/scheduled_tasks.lock
