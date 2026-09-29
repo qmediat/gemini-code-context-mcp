@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `better-sqlite3` 13 (was 12.11.1). Its native binding uses N-API and ships inside the package for macOS (arm64, x64),
+  Linux glibc and musl (arm64, x64) and Windows (arm64, x64): installing no longer runs `prebuild-install` or downloads
+  a binary, installs with `--ignore-scripts` work, and a Node.js upgrade no longer breaks the binding ("compiled against
+  a different Node.js version"). Other platforms no longer compile the binding during install. The unpacked dependency
+  is 27.3 MB (12.11.1: 10.4 MB plus the one binary it downloaded). Bundled SQLite 3.53.4.
+
 ## [1.16.5] - 2026-09-29
 
 ### Changed
