@@ -137,6 +137,37 @@ function addColumnIfMissing(db: DatabaseType, table: string, column: string, typ
   }
 }
 
+/**
+ * Opens the database file. better-sqlite3 13 ships its native binding prebuilt for macOS, Linux (glibc and musl) and
+ * Windows on x64 and arm64, and no longer compiles one during install; on any other platform the first open fails with
+ * a bare "Cannot find module …/better_sqlite3.node". That error becomes one that names the platform and the way out.
+ */
+export function openDatabase(
+  dbPath: string,
+  open: (path: string) => DatabaseType = (path) => new Database(path),
+): DatabaseType {
+  try {
+    return open(dbPath);
+  } catch (err) {
+    if (!isMissingBinding(err)) throw err;
+    const message = [
+      `better-sqlite3 has no prebuilt native binding for ${process.platform}-${process.arch}`,
+      '(prebuilt: macOS, Linux glibc and musl, Windows — x64 and arm64).',
+      'Build it once with `npm run build-release` in the better-sqlite3 package directory',
+      '(needs Python and a C++ toolchain), or run the server on a supported platform.',
+    ].join(' ');
+    throw new Error(message, { cause: err });
+  }
+}
+
+function isMissingBinding(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    (err as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND' &&
+    err.message.includes('better_sqlite3.node')
+  );
+}
+
 export class ManifestDb {
   private readonly db: DatabaseType;
 
@@ -145,7 +176,7 @@ export class ManifestDb {
     const stateDir = pathOverride ? dirname(pathOverride) : qmediatStateDir();
     mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 
-    this.db = new Database(dbPath);
+    this.db = openDatabase(dbPath);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('foreign_keys = ON');
