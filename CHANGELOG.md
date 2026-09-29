@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.5] - 2026-09-29
+
 ### Changed
 
 - Contributors add an entry to `CHANGELOG.md` for a user-visible change; the unused `@changesets/cli` dev
@@ -19,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every published qmediat package) next to GitHub's private reporting form.
 - `README.md` gains a "Trademarks and affiliation" section: Gemini is Google's trademark; this integration is
   independent and not endorsed by Google; use of the Gemini API through it is subject to Google's terms.
+- Development: the project builds with TypeScript 7 (the native compiler). The published JavaScript is byte-identical
+  to 1.16.4; the type declarations describe the same types (only the order of union members and properties and the
+  quote style differ) and the source maps are regenerated. The TypeScript 7 npm package ships only `tsc` — no
+  `tsserver` and no JavaScript API — so an editor set to use the workspace TypeScript version cannot load it from
+  `node_modules`; use the editor's bundled one.
 
 ## [1.16.4] - 2026-09-23
 
@@ -1513,5 +1520,5 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.16.5...HEAD
 [1.0.0]: https://github.com/qmediat/gemini-code-context-mcp/releases/tag/v1.0.0
