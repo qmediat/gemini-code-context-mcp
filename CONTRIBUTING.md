@@ -14,6 +14,10 @@ npm run typecheck
 npm test
 ```
 
+The project compiles with TypeScript 7 (the native compiler). Its npm package ships only `tsc` — no `tsserver` —
+so an editor set to use the workspace TypeScript version cannot load it from `node_modules`; keep the editor's
+bundled TypeScript.
+
 ## Local MCP setup (testing your changes)
 
 If you want to test your local changes inside an MCP host (Claude Code, Claude Desktop, Cursor, …), **do not** copy the README's `npx -y @qmediat.io/gemini-code-context-mcp` invocation as-is. That command pulls the **published** version from npm — it ignores your working tree — and additionally fails with `command not found` when launched from inside this repo (the local `package.json` collides with the published name during `npx` resolution).
