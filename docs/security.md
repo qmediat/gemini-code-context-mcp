@@ -36,7 +36,7 @@ Your Gemini API key and your workspace content. We treat them with different thr
 
 - **Anyone with shell access on your machine.** Root, another user with access to `~/.config/qmediat/`, or a compromised shell can read the credentials file. Use full-disk encryption.
 - **A malicious MCP host reading your workspace.** If you don't trust Claude Code/Desktop/Cursor, an MCP server running underneath them is not your largest threat.
-- **Compromised `npm` registry.** We can't prevent a supply-chain attack on our own package. Mitigations: (a) lockfile-based installs (`npm ci`), (b) optional npm provenance (post-v1.0 via GitHub Actions), (c) public signed release tags.
+- **Compromised `npm` registry.** We can't prevent a supply-chain attack on our own package. Mitigations: (a) lockfile-based installs (`npm ci`), (b) every release is built by GitHub Actions with an npm provenance attestation and staged; it becomes public when a maintainer approves it with 2FA, and only that way while the package's trusted publisher on npmjs.com allows staging and not a direct `npm publish`, (c) public signed release tags.
 
 ## Incident response (if your key leaks)
 
