@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `package.json` names the `bin` path as `dist/index.js` — the form npm publishes, so a publish prints no auto-correction.
+
 ## [1.17.0] - 2026-09-29
 
 ### Changed
