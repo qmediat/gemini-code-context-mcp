@@ -2,7 +2,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { ManifestDb } from '../../src/manifest/db.js';
+import { ManifestDb, openDatabase } from '../../src/manifest/db.js';
 
 describe('ManifestDb', () => {
   let db: ManifestDb;
@@ -697,5 +697,37 @@ describe('ManifestDb', () => {
         db2.close();
       }
     });
+  });
+});
+
+describe('openDatabase', () => {
+  const missingBinding = (): never => {
+    const err = new Error(
+      "Cannot find module '/x/node_modules/better-sqlite3/build/Release/better_sqlite3.node'",
+    ) as NodeJS.ErrnoException;
+    err.code = 'MODULE_NOT_FOUND';
+    throw err;
+  };
+
+  it('names the platform and the way out when better-sqlite3 has no binding for it', () => {
+    let thrown: unknown;
+    try {
+      openDatabase('/x/manifest.db', missingBinding);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toContain(`${process.platform}-${process.arch}`);
+    expect((thrown as Error).message).toContain('npm run build-release');
+    expect(((thrown as Error).cause as NodeJS.ErrnoException).code).toBe('MODULE_NOT_FOUND');
+  });
+
+  it('passes every other error through unchanged', () => {
+    const other = new TypeError('Cannot open database because the directory does not exist');
+    expect(() =>
+      openDatabase('/x/manifest.db', () => {
+        throw other;
+      }),
+    ).toThrow(other);
   });
 });

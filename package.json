@@ -55,13 +55,13 @@
   "dependencies": {
     "@google/genai": "^1.52.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "better-sqlite3": "^12.9.0",
+    "better-sqlite3": "^13.0.3",
     "zod": "^3.23.0",
     "zod-to-json-schema": "^3.24.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",
-    "@types/better-sqlite3": "^7.6.0",
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^5.0.2",
     "tsx": "^4.19.0",
