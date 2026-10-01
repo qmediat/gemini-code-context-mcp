@@ -28,7 +28,12 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
-import { resolveServiceTier, serviceTierConfig, tierErrorCode } from './shared/service-tier.js';
+import {
+  resolveServiceTier,
+  serviceTierConfig,
+  statusOf,
+  tierErrorCode,
+} from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
@@ -217,12 +222,6 @@ export function parseCodeBlocks(text: string): Array<{ lang: string; content: st
     blocks.push({ lang: lang ?? '', content });
   }
   return blocks;
-}
-
-/** The HTTP status an SDK error carries, if any. */
-function statusOf(err: unknown): number | undefined {
-  const status = (err as { status?: unknown } | null)?.status;
-  return typeof status === 'number' ? status : undefined;
 }
 
 export const codeTool: ToolDefinition<CodeInput> = {
@@ -772,11 +771,14 @@ async function executeCodeBody(
           // error) would mask the timeout; outer catch would map to UNKNOWN
           // instead of TIMEOUT.
           if (isTimeoutAbort(retryErr)) throw retryErr;
-          throw new Error(
-            `code retry after stale cache failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`,
-            { cause: err },
+          throw Object.assign(
+            new Error(
+              `code retry after stale cache failed: ${
+                retryErr instanceof Error ? retryErr.message : String(retryErr)
+              }`,
+              { cause: err },
+            ),
+            { status: statusOf(retryErr) }, // a 429/503 on the retry keeps its status for the error code
           );
         }
       } else {

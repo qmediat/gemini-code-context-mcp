@@ -14,9 +14,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  attachmentParts,
-  estimateAttachmentTokens,
+  attachmentTokens,
   inspectAttachments,
+  pdfPageCount,
+  readAttachments,
 } from '../../src/attachments.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
@@ -338,9 +339,9 @@ describe('attachments between inspection and read (1.19.0)', () => {
     const [a] = await inspectAttachments([swap], dir);
     unlinkSync(swap);
     symlinkSync(secret, swap);
-    await expect(attachmentParts([a as NonNullable<typeof a>])).rejects.toThrow(/swap\.png/);
+    await expect(readAttachments([a as NonNullable<typeof a>])).rejects.toThrow(/swap\.png/);
     unlinkSync(swap);
-    await expect(attachmentParts([a as NonNullable<typeof a>])).rejects.toThrow(/swap\.png/);
+    await expect(readAttachments([a as NonNullable<typeof a>])).rejects.toThrow(/swap\.png/);
   });
 
   it('a file that grew after inspection is refused without being read whole; the total is re-checked', async () => {
@@ -348,14 +349,14 @@ describe('attachments between inspection and read (1.19.0)', () => {
     writeFileSync(grow, PNG);
     const [a] = await inspectAttachments([grow], dir);
     truncateSync(grow, 10 * 1024 * 1024 + 1);
-    await expect(attachmentParts([a as NonNullable<typeof a>])).rejects.toThrow(/at read, above/);
+    await expect(readAttachments([a as NonNullable<typeof a>])).rejects.toThrow(/at read, above/);
   });
 
-  it('a deleted attachment surfaces as ATTACHMENT_INVALID through ask, not UNKNOWN', async () => {
+  it('the bytes are in hand before the workspace is prepared: a file deleted during prepareContext still goes out', async () => {
     const gone = join(dir, 'gone.png');
     writeFileSync(gone, PNG);
     mocks.prepareContext.mockImplementation(async () => {
-      unlinkSync(gone); // the window between inspection and read
+      unlinkSync(gone); // after the read: nothing left to lose
       return {
         cacheId: null,
         inlineContents: [],
@@ -367,16 +368,31 @@ describe('attachments between inspection and read (1.19.0)', () => {
     });
     const { ctx, sent } = buildCtx();
     const result = await askTool.execute({ prompt: 'q', workspace: dir, attachments: [gone] }, ctx);
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent?.errorCode).toBe('ATTACHMENT_INVALID');
-    expect(sent).toHaveLength(0);
+    expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+    expect(lastUserParts(sentAt(sent, 0))).toHaveLength(2);
   });
 
-  it('attachment tokens are an upper bound that raises the cost estimate', () => {
-    const image = { path: '/x/a.png', root: '/x', mimeType: 'image/png', bytes: 1 };
-    const pdf = { path: '/x/b.pdf', root: '/x', mimeType: 'application/pdf', bytes: 500 * 1024 };
-    expect(estimateAttachmentTokens([image])).toBe(24 * 258);
-    expect(estimateAttachmentTokens([pdf])).toBe(10 * 258);
+  it('the total cap is enforced before a file is read, not after every file is in memory', async () => {
+    const a = join(dir, 'ta.png');
+    const b = join(dir, 'tb.png');
+    writeFileSync(a, PNG);
+    writeFileSync(b, PNG);
+    const [ia, ib] = await inspectAttachments([a, b], dir);
+    truncateSync(a, 8 * 1024 * 1024);
+    truncateSync(b, 8 * 1024 * 1024);
+    await expect(
+      readAttachments([ia as NonNullable<typeof ia>, ib as NonNullable<typeof ib>]),
+    ).rejects.toThrow(/at read/);
+  });
+
+  it('attachment tokens are an upper bound from the bytes: 24 tiles per image, a PDF by its page objects or 1000', () => {
+    const threePages = Buffer.from(
+      '%PDF-1.4\n1 0 obj << /Type /Pages /Kids [] >> endobj\n2 0 obj << /Type /Page >> endobj\n3 0 obj<</Type/Page>>endobj\n4 0 obj << /Type /Page /Parent 1 0 R >> endobj\n',
+    );
+    expect(pdfPageCount(threePages)).toBe(3);
+    expect(pdfPageCount(Buffer.from('%PDF-1.5 objects in a compressed stream'))).toBe(1000);
+    expect(attachmentTokens('application/pdf', threePages)).toBe(3 * 258);
+    expect(attachmentTokens('image/png', PNG)).toBe(24 * 258);
     const base = {
       model: 'gemini-3-pro-preview',
       workspaceBytes: 4_000,
@@ -386,5 +402,36 @@ describe('attachments between inspection and read (1.19.0)', () => {
     expect(estimatePreCallCostUsd({ ...base, extraInputTokens: 24 * 258 })).toBeGreaterThan(
       estimatePreCallCostUsd(base),
     );
+  });
+
+  it('a bad attachment costs nothing: no budget reservation, no throttle reservation, no call', async () => {
+    const gone = join(dir, 'gone2.png');
+    writeFileSync(gone, PNG);
+    const { ctx, sent } = buildCtx();
+    const manifest = ctx.manifest as unknown as { reserveBudget: ReturnType<typeof vi.fn> };
+    const throttle = ctx.throttle as unknown as { reserve: ReturnType<typeof vi.fn> };
+    mocks.prepareContext.mockImplementation(async () => {
+      throw new Error('prepareContext must not run: the attachment failed before it');
+    });
+    unlinkSync(gone);
+    const result = await askTool.execute({ prompt: 'q', workspace: dir, attachments: [gone] }, ctx);
+    expect(result.structuredContent?.errorCode).toBe('ATTACHMENT_INVALID');
+    expect(manifest.reserveBudget).not.toHaveBeenCalled();
+    expect(throttle.reserve).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+  });
+
+  it('attachment tokens count toward WORKSPACE_TOO_LARGE: a PDF without visible page objects fills a small window', async () => {
+    const opaque = join(dir, 'opaque.pdf');
+    writeFileSync(opaque, '%PDF-1.5 compressed object streams, no page objects in clear');
+    mocks.resolveModel.mockResolvedValue({ ...resolved(true), inputTokenLimit: 100_000 });
+    const { ctx, sent } = buildCtx();
+    const result = await askTool.execute(
+      { prompt: 'q', workspace: dir, attachments: [opaque], preflightMode: 'heuristic' },
+      ctx,
+    );
+    expect(result.isError, String(result.content[0]?.text)).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('WORKSPACE_TOO_LARGE');
+    expect(sent).toHaveLength(0);
   });
 });

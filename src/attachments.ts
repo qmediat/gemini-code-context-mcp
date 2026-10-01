@@ -40,26 +40,29 @@ export interface Attachment {
 export const TOKENS_PER_IMAGE_OR_PAGE = 258;
 /** A large image is tiled 768×768: an upper bound for a 10 MB photo (about 4000×3000 → 20 tiles, rounded up). */
 export const MAX_TILES_PER_IMAGE = 24;
-/** A PDF page is rarely under 50 KB; bytes / 50 KB is an upper bound on pages, capped at Gemini's 1000. */
-export const PDF_BYTES_PER_PAGE_LOWER_BOUND = 50 * 1024;
+/** Gemini reads at most this many pages of a PDF. */
 export const MAX_PDF_PAGES = 1000;
 
-/** An UPPER-BOUND token estimate of the attachments, for the preflight, the budget and the throttle: the real count
- * needs the image dimensions and the PDF page count, which this server does not read. */
-export function estimateAttachmentTokens(attachments: readonly Attachment[]): number {
-  let tokens = 0;
-  for (const a of attachments) {
-    if (a.mimeType === 'application/pdf') {
-      const pages = Math.min(
-        MAX_PDF_PAGES,
-        Math.max(1, Math.ceil(a.bytes / PDF_BYTES_PER_PAGE_LOWER_BOUND)),
-      );
-      tokens += pages * TOKENS_PER_IMAGE_OR_PAGE;
-    } else {
-      tokens += MAX_TILES_PER_IMAGE * TOKENS_PER_IMAGE_OR_PAGE;
-    }
-  }
-  return tokens;
+/** The page objects of a PDF (`/Type /Page`, not `/Pages`); a PDF that keeps them in compressed object streams shows
+ * none and is taken as Gemini's maximum — an upper bound, never an undercount. */
+const PDF_PAGE_OBJECT = /\/Type\s*\/Page(?![s\w])/g;
+
+export function pdfPageCount(data: Buffer): number {
+  const found = data.toString('latin1').match(PDF_PAGE_OBJECT)?.length ?? 0;
+  return found === 0 ? MAX_PDF_PAGES : Math.min(MAX_PDF_PAGES, found);
+}
+
+/** An UPPER-BOUND token estimate of one attachment from its bytes: an image as the most tiles Gemini makes of a 10 MB
+ * photo, a PDF by its page objects (or Gemini's maximum when they are not visible). */
+export function attachmentTokens(mimeType: string, data: Buffer): number {
+  if (mimeType === 'application/pdf') return pdfPageCount(data) * TOKENS_PER_IMAGE_OR_PAGE;
+  return MAX_TILES_PER_IMAGE * TOKENS_PER_IMAGE_OR_PAGE;
+}
+
+export interface ReadAttachments {
+  readonly parts: Part[];
+  /** The upper-bound token estimate of every part, for the preflight, the budget and the throttle. */
+  readonly tokens: number;
 }
 
 export class AttachmentError extends Error {
@@ -152,23 +155,22 @@ async function sizeOf(path: string): Promise<number> {
  * put in its place fails to open), measured through the open descriptor, read up to its size plus one byte so a file
  * that grew is caught without being materialised, and the total is checked again. Every failure is an
  * AttachmentError. */
-export async function attachmentParts(attachments: readonly Attachment[]): Promise<Part[]> {
+export async function readAttachments(
+  attachments: readonly Attachment[],
+): Promise<ReadAttachments> {
   const parts: Part[] = [];
+  let tokens = 0;
   let total = 0;
   for (const a of attachments) {
-    const data = await readAttachment(a);
+    const data = await readAttachment(a, MAX_ATTACHMENTS_TOTAL_BYTES - total); // what the total still allows
     total += data.length;
+    tokens += attachmentTokens(a.mimeType, data);
     parts.push({ inlineData: { mimeType: a.mimeType, data: data.toString('base64') } });
   }
-  if (total > MAX_ATTACHMENTS_TOTAL_BYTES) {
-    throw new AttachmentError(
-      `attachments total ${total} bytes at read, above this server's cap ${MAX_ATTACHMENTS_TOTAL_BYTES}`,
-    );
-  }
-  return parts;
+  return { parts, tokens };
 }
 
-async function readAttachment(a: Attachment): Promise<Buffer> {
+async function readAttachment(a: Attachment, roomLeft: number): Promise<Buffer> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     const { absolutePath } = await resolveInsideWorkspace(a.root, a.path);
@@ -182,6 +184,11 @@ async function readAttachment(a: Attachment): Promise<Buffer> {
     if (info.size > MAX_ATTACHMENT_BYTES) {
       throw new AttachmentError(
         `attachment ${a.path}: ${info.size} bytes at read, above ${MAX_ATTACHMENT_BYTES}`,
+      );
+    }
+    if (info.size > roomLeft) {
+      throw new AttachmentError(
+        `attachment ${a.path}: ${info.size} bytes at read would take the attachments above this server's cap ${MAX_ATTACHMENTS_TOTAL_BYTES}`,
       );
     }
     return await readExactly(handle, info.size, a.path);

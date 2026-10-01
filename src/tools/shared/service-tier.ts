@@ -18,6 +18,12 @@ export function serviceTierConfig(
   return tier === 'flex' ? { serviceTier: ServiceTier.FLEX } : {};
 }
 
+/** The HTTP status an SDK error carries, if any. */
+export function statusOf(err: unknown): number | undefined {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === 'number' ? status : undefined;
+}
+
 /** The error code for a request the tier refused: a 429 or 503 is retryable by the client, nothing else is known. */
 export function tierErrorCode(httpStatus: number | undefined): {
   errorCode: string;

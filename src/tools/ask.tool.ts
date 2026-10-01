@@ -22,9 +22,8 @@ import {
   MAX_ATTACHMENTS,
   MAX_ATTACHMENTS_TOTAL_BYTES,
   MAX_ATTACHMENT_BYTES,
-  attachmentParts,
-  estimateAttachmentTokens,
   inspectAttachments,
+  readAttachments,
 } from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
@@ -41,7 +40,12 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
-import { resolveServiceTier, serviceTierConfig, tierErrorCode } from './shared/service-tier.js';
+import {
+  resolveServiceTier,
+  serviceTierConfig,
+  statusOf,
+  tierErrorCode,
+} from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
@@ -211,12 +215,6 @@ export const askInputSchema = z
 
 export type AskInput = z.infer<typeof askInputSchema>;
 
-/** The HTTP status an SDK error carries, if any. */
-function statusOf(err: unknown): number | undefined {
-  const status = (err as { status?: unknown } | null)?.status;
-  return typeof status === 'number' ? status : undefined;
-}
-
 export const askTool: ToolDefinition<AskInput> = {
   name: 'ask',
   title: 'Ask Gemini',
@@ -298,9 +296,14 @@ async function executeAskBody(
         { errorCode: 'ATTACHMENTS_UNSUPPORTED', resolvedModel: resolved.resolved },
       );
     }
+    // inspected and read here — before the preflight, the budget reservation and the throttle, so a bad file costs
+    // nothing and the bytes decide the token estimate (a PDF's page objects)
     let attached: Awaited<ReturnType<typeof inspectAttachments>>;
+    let extraParts: Part[];
+    let attachmentTokens: number;
     try {
       attached = await inspectAttachments(attachmentPaths, workspaceRoot);
+      ({ parts: extraParts, tokens: attachmentTokens } = await readAttachments(attached));
     } catch (err) {
       if (!(err instanceof AttachmentError)) throw err;
       return errorResult(`ask: ${err.message}`, {
@@ -440,7 +443,6 @@ async function executeAskBody(
     // Tier 2 = real `countTokens` call when near the cliff). Closes T17
     // (`bytes/4` undercount on dense Unicode). See `src/gemini/token-counter.ts`.
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-    const attachmentTokens = estimateAttachmentTokens(attached); // an upper bound: images by tile count, PDFs by page
     const estimatedInputTokens =
       Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4) + attachmentTokens;
 
@@ -486,6 +488,8 @@ async function executeAskBody(
         // maps it to `errorCode: 'TIMEOUT'` immediately.
         signal: abortSignal,
       });
+      // the attachments' upper-bound tokens join the count, whichever way it was made: the window must hold them too
+      preflight = { ...preflight, effectiveTokens: preflight.effectiveTokens + attachmentTokens };
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
       if (preflight.effectiveTokens > threshold) {
         const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
@@ -830,17 +834,6 @@ async function executeAskBody(
         ? { includeThoughts: true }
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
     const tierField = serviceTierConfig(serviceTier);
-    // the bytes are read only now — after the size preflight and the budget reservation refused nothing
-    let extraParts: Part[];
-    try {
-      extraParts = await attachmentParts(attached);
-    } catch (err) {
-      if (!(err instanceof AttachmentError)) throw err;
-      return errorResult(`ask: ${err.message}`, {
-        errorCode: 'ATTACHMENT_INVALID',
-        retryable: false,
-      });
-    }
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
@@ -999,11 +992,14 @@ async function executeAskBody(
           // Otherwise preserve the ORIGINAL stale-cache error as `cause` so
           // ops can root-cause diagnostics across both the first 404 and any
           // rebuild-time failure.
-          throw new Error(
-            `ask retry after stale cache failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`,
-            { cause: err },
+          throw Object.assign(
+            new Error(
+              `ask retry after stale cache failed: ${
+                retryErr instanceof Error ? retryErr.message : String(retryErr)
+              }`,
+              { cause: err },
+            ),
+            { status: statusOf(retryErr) }, // a 429/503 on the retry keeps its status for the error code
           );
         }
       } else {
