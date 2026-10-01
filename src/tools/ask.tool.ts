@@ -176,7 +176,7 @@ export const askInputSchema = z
       .max(MAX_ATTACHMENTS)
       .optional()
       .describe(
-        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply). They are part of THIS question only, never of the workspace cache, and their tokens enter the size preflight, the budget reservation and the TPM throttle as an upper-bound estimate (an image as 24 tiles × 258 tokens, a PDF as one page per 50 KB). The model must support vision; a model without it is refused by name. Not available with the ask_agentic fallback.`,
+        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply). They are part of THIS question only, never of the workspace cache, and their tokens enter the size preflight, the budget reservation and the TPM throttle as an upper-bound estimate (an image as 24 tiles × 258 tokens; a PDF as its page count × 258 — from the page tree's /Count, or Gemini's 1000-page maximum when the tree is in compressed object streams). The model must support vision; a model without it is refused by name. Not available with the ask_agentic fallback.`,
       ),
     serviceTier: z
       .enum(['standard', 'flex'])
@@ -293,7 +293,11 @@ async function executeAskBody(
     if (attachmentPaths.length > 0 && !resolved.capabilities.supportsVision) {
       return errorResult(
         `ask: ${attachmentPaths.length} attachment(s) given, but ${safeForLog(resolved.resolved)} does not support vision — use \`latest-vision\` or a model that lists it`,
-        { errorCode: 'ATTACHMENTS_UNSUPPORTED', resolvedModel: resolved.resolved },
+        {
+          errorCode: 'ATTACHMENTS_UNSUPPORTED',
+          resolvedModel: resolved.resolved,
+          serviceTier: resolveServiceTier(input.serviceTier, ctx.config.serviceTier),
+        },
       );
     }
     // inspected and read here — before the preflight, the budget reservation and the throttle, so a bad file costs
@@ -303,12 +307,16 @@ async function executeAskBody(
     let attachmentTokens: number;
     try {
       attached = await inspectAttachments(attachmentPaths, workspaceRoot);
-      ({ parts: extraParts, tokens: attachmentTokens } = await readAttachments(attached));
+      ({ parts: extraParts, tokens: attachmentTokens } = await readAttachments(
+        attached,
+        abortSignal,
+      ));
     } catch (err) {
       if (!(err instanceof AttachmentError)) throw err;
       return errorResult(`ask: ${err.message}`, {
         errorCode: 'ATTACHMENT_INVALID',
         retryable: false,
+        serviceTier: resolveServiceTier(input.serviceTier, ctx.config.serviceTier),
       });
     }
     const serviceTier = resolveServiceTier(input.serviceTier, ctx.config.serviceTier);
@@ -505,7 +513,12 @@ async function executeAskBody(
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic' && attached.length > 0) {
           return errorResult(
             'ask: the workspace is too large for the eager path and `attachments` cannot follow the ask_agentic fallback (it sends no inline parts); drop the attachments or narrow the workspace',
-            { errorCode: 'WORKSPACE_TOO_LARGE', retryable: false, attachments: attached.length },
+            {
+              errorCode: 'WORKSPACE_TOO_LARGE',
+              retryable: false,
+              attachments: attached.length,
+              serviceTier,
+            },
           );
         }
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
@@ -665,6 +678,7 @@ async function executeAskBody(
           `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
+            serviceTier,
             retryable: false,
             estimatedInputTokens: preflight.effectiveTokens,
             tokenCountMethod: preflight.method,
@@ -715,7 +729,7 @@ async function executeAskBody(
         const spentUsd = reserve.spentMicros / 1_000_000;
         return errorResult(
           `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false },
+          { errorCode: 'BUDGET_REJECT', retryable: false, serviceTier },
         );
       }
       reservationId = reserve.id;

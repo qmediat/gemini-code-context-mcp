@@ -157,12 +157,13 @@ async function sizeOf(path: string): Promise<number> {
  * AttachmentError. */
 export async function readAttachments(
   attachments: readonly Attachment[],
+  signal?: AbortSignal,
 ): Promise<ReadAttachments> {
   const parts: Part[] = [];
   let tokens = 0;
   let total = 0;
   for (const a of attachments) {
-    const data = await readAttachment(a, MAX_ATTACHMENTS_TOTAL_BYTES - total); // what the total still allows
+    const data = await readAttachment(a, MAX_ATTACHMENTS_TOTAL_BYTES - total, signal); // what the total still allows
     total += data.length;
     tokens += attachmentTokens(a.mimeType, data);
     parts.push({ inlineData: { mimeType: a.mimeType, data: data.toString('base64') } });
@@ -170,17 +171,27 @@ export async function readAttachments(
   return { parts, tokens };
 }
 
-async function readAttachment(a: Attachment, roomLeft: number): Promise<Buffer> {
+async function readAttachment(
+  a: Attachment,
+  roomLeft: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    const { absolutePath } = await resolveInsideWorkspace(a.root, a.path);
-    if (absolutePath !== a.path) {
-      throw new AttachmentError(`attachment ${a.path}: now resolves elsewhere (${absolutePath})`);
-    }
-    handle = await open(absolutePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    handle = await open(a.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); // a symlink leaf fails to open
     const info = await handle.stat();
     if (!info.isFile())
       throw new AttachmentError(`attachment ${a.path}: not a regular file at read`);
+    // The file behind the descriptor must be the one the path names inside the workspace NOW: the path is resolved
+    // again (a parent swapped for a symlink resolves elsewhere and is refused) and its inode compared with the
+    // descriptor's — a swap of any component between that check and the open cannot change what was opened.
+    const { absolutePath } = await resolveInsideWorkspace(a.root, a.path);
+    const named = await lstat(absolutePath);
+    if (absolutePath !== a.path || named.dev !== info.dev || named.ino !== info.ino) {
+      throw new AttachmentError(
+        `attachment ${a.path}: is not the workspace file it was when inspected`,
+      );
+    }
     if (info.size > MAX_ATTACHMENT_BYTES) {
       throw new AttachmentError(
         `attachment ${a.path}: ${info.size} bytes at read, above ${MAX_ATTACHMENT_BYTES}`,
@@ -191,9 +202,10 @@ async function readAttachment(a: Attachment, roomLeft: number): Promise<Buffer> 
         `attachment ${a.path}: ${info.size} bytes at read would take the attachments above this server's cap ${MAX_ATTACHMENTS_TOTAL_BYTES}`,
       );
     }
-    return await readExactly(handle, info.size, a.path);
+    return await readExactly(handle, info.size, a.path, signal);
   } catch (err) {
     if (err instanceof AttachmentError) throw err;
+    if (signal?.aborted && err === signal.reason) throw err; // a timeout or cancellation keeps its identity
     const why =
       err instanceof SandboxError
         ? `${err.code}: ${err.message}`
@@ -206,16 +218,29 @@ async function readAttachment(a: Attachment, roomLeft: number): Promise<Buffer> 
   }
 }
 
-/** Reads `size` bytes and one more: a file that has more than `size` bytes grew after it was measured. */
+/** Reads `size` bytes and one more, a chunk at a time so a timeout or cancellation ends it: a file that has more than
+ * `size` bytes grew after it was measured. */
+const READ_CHUNK = 1024 * 1024;
 async function readExactly(
   handle: Awaited<ReturnType<typeof open>>,
   size: number,
   path: string,
+  signal?: AbortSignal,
 ): Promise<Buffer> {
   const buffer = Buffer.alloc(size + 1);
   let read = 0;
   for (;;) {
-    const { bytesRead } = await handle.read(buffer, read, buffer.length - read, read);
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : new AttachmentError(`attachment ${path}: read aborted`);
+    }
+    const { bytesRead } = await handle.read(
+      buffer,
+      read,
+      Math.min(READ_CHUNK, buffer.length - read),
+      read,
+    );
     if (bytesRead === 0) break;
     read += bytesRead;
     if (read > size) throw new AttachmentError(`attachment ${path}: grew while being read`);

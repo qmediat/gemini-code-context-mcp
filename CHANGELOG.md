@@ -18,13 +18,15 @@ From the 2026-10-01 comparison with Google's own tools and the community (`docs/
   question in the user turn, with or without a Context Cache (a cache hit without attachments still sends the bare
   prompt). They belong to one question, never to the workspace cache. A path must be inside the workspace (the same
   realpath jail as `ask_agentic`, its secret rules included), a symlink is refused, every file is checked (type, size,
-  readability) by `stat` before any is read and re-checked at read; the bytes are read only after the size preflight
-  and the budget reservation passed. A model without vision is refused by name (`ATTACHMENTS_UNSUPPORTED`), a bad
+  readability) by `stat` before any is read and re-checked at read. A model without vision is refused by name (`ATTACHMENTS_UNSUPPORTED`), a bad
   file is `ATTACHMENT_INVALID` (`retryable: false`), the `ask_agentic` fallback cannot carry them and says so.
   Attachment tokens enter the preflight, the budget reservation and the throttle as an upper-bound estimate (24 tiles ×
-  258 per image, a page per 50 KB × 258 per PDF, at most 1000 pages); the ledger records what Gemini billed. The bytes
-  are read through an O_NOFOLLOW descriptor after a second jail check, measured through it and read to their size plus
-  one byte, so a file swapped for a symlink or grown between inspection and read is refused (`ATTACHMENT_INVALID`).
+  258 per image; a PDF's page count × 258, from the page tree's `/Count` in the bytes, or Gemini's 1000-page maximum
+  when the tree sits in compressed object streams); the ledger records what Gemini billed. The bytes are read right
+  after the model is resolved — before the preflight and every reservation, so a refused file costs nothing — through an
+  O_NOFOLLOW descriptor whose inode is compared with the re-resolved workspace path, measured through it and read in
+  chunks (stopped by `timeoutMs`) to the size plus one byte, so a file swapped for a symlink (leaf or parent) or grown
+  between inspection and read is refused (`ATTACHMENT_INVALID`).
   `structuredContent.attachments` lists what was sent. The `latest-vision` alias finally has an input to see; the
   Flash-Lite models count as vision-capable now (Google lists image and PDF input on them).
 - `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`
