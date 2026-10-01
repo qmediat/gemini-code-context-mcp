@@ -10,7 +10,13 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
+import {
+  type Content,
+  type GenerateContentConfig,
+  ServiceTier,
+  type ThinkingConfig,
+  type ThinkingLevel,
+} from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
@@ -139,6 +145,12 @@ export const codeInputSchema = z
       .optional()
       .describe(
         'Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Recommended setting: `60_000` (60s). When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_STALL_MS`, then to disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.',
+      ),
+    serviceTier: z
+      .enum(['standard', 'flex'])
+      .optional()
+      .describe(
+        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency, may be refused under load with 429 — the usual retry applies); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`.",
       ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
@@ -338,6 +350,7 @@ async function executeCodeBody(
     modelAudit = {
       resolvedModel: resolved.resolved,
       configuredModelReplaced: choice.replacedDefault ?? null,
+      serviceTier: input.serviceTier ?? ctx.config.serviceTier,
     };
     if (choice.replacedDefault !== undefined) {
       emitter.emit(
@@ -613,6 +626,8 @@ async function executeCodeBody(
         'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
       );
     }
+    const serviceTier = input.serviceTier ?? ctx.config.serviceTier;
+    const tierField = serviceTier === 'flex' ? { serviceTier: ServiceTier.FLEX } : {};
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
@@ -625,12 +640,14 @@ async function executeCodeBody(
           cachedContent: cacheId,
           thinkingConfig,
           ...maxOutputField,
+          ...tierField,
         };
       }
       // Without cache (or cache bypassed for codeExecution): pass full config.
       return {
         systemInstruction: SYSTEM_INSTRUCTION_CODE,
         thinkingConfig,
+        ...tierField,
         ...maxOutputField,
         ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
       };

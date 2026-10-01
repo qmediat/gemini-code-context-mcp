@@ -9,8 +9,16 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
+import {
+  type Content,
+  type GenerateContentConfig,
+  type Part,
+  ServiceTier,
+  type ThinkingConfig,
+  type ThinkingLevel,
+} from '@google/genai';
 import { z } from 'zod';
+import { attachmentParts, inspectAttachments } from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -151,6 +159,19 @@ export const askInputSchema = z
       .describe(
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
+    attachments: z
+      .array(z.string().min(1))
+      .max(8)
+      .optional()
+      .describe(
+        'Local image or PDF files (png, jpg, jpeg, webp, gif, pdf; up to 8, 10 MB each, 20 MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are absolute or relative to the workspace. They are part of THIS question only, never of the workspace cache. The model must support vision (`latest-vision`, or a pro/flash model that lists vision); a model without it is refused by name. Not available with the ask_agentic fallback.',
+      ),
+    serviceTier: z
+      .enum(['standard', 'flex'])
+      .optional()
+      .describe(
+        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency, requests may be refused under load with 429 — the usual retry applies); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`.",
+      ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
       .optional()
@@ -254,6 +275,18 @@ async function executeAskBody(
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
     resolvedModelKey = resolved.resolved;
+
+    // v1.19.0 — attachments ride with the prompt as inline parts; the model must see images.
+    const attachmentPaths = input.attachments ?? [];
+    if (attachmentPaths.length > 0 && !resolved.capabilities.supportsVision) {
+      return errorResult(
+        `ask: ${attachmentPaths.length} attachment(s) given, but ${safeForLog(resolved.resolved)} does not support vision — use \`latest-vision\` or a model that lists it`,
+        { errorCode: 'ATTACHMENTS_UNSUPPORTED', resolvedModel: resolved.resolved },
+      );
+    }
+    const attached = await inspectAttachments(attachmentPaths, workspaceRoot);
+    const extraParts: Part[] = await attachmentParts(attached);
+    const serviceTier = input.serviceTier ?? ctx.config.serviceTier;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — build the scan memo from previously-stored file rows so the
@@ -441,6 +474,12 @@ async function executeAskBody(
         // workspace) and re-translates `timeoutMs` to `iterationTimeoutMs`
         // (per-iteration cap; total wall-clock can be N × that). Cost +
         // timing shape genuinely changes — opt-in is the right default.
+        if (input.onWorkspaceTooLarge === 'fallback-to-agentic' && attached.length > 0) {
+          return errorResult(
+            'ask: the workspace is too large for the eager path and `attachments` cannot follow the ask_agentic fallback (it sends no inline parts); drop the attachments or narrow the workspace',
+            { errorCode: 'WORKSPACE_TOO_LARGE', retryable: false, attachments: attached.length },
+          );
+        }
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
           logger.warn(
             `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
@@ -763,22 +802,28 @@ async function executeAskBody(
       : effectiveThinkingBudget === null
         ? { includeThoughts: true }
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
+    const tierField = serviceTier === 'flex' ? { serviceTier: ServiceTier.FLEX } : {};
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
       return cacheId
-        ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField }
+        ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField, ...tierField }
         : {
             systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
             thinkingConfig,
             ...maxOutputField,
+            ...tierField,
           };
     };
+    // The user turn: the attachments first, the question last; with a cache the turn still carries the parts.
+    const userTurn: Content = { role: 'user', parts: [...extraParts, { text: input.prompt }] };
     const buildContents = (
       cacheId: string | null,
       inline: typeof ctxPrep.inlineContents,
-    ): string | Content[] =>
-      cacheId ? input.prompt : [...inline, { role: 'user', parts: [{ text: input.prompt }] }];
+    ): string | Content[] => {
+      if (cacheId) return extraParts.length === 0 ? input.prompt : [userTurn];
+      return [...inline, userTurn];
+    };
 
     // Track the prepared-context used for the FINAL successful call. Starts
     // pointing at the initial ctxPrep; retry branch below reassigns to the
@@ -1025,6 +1070,8 @@ async function executeAskBody(
     const metadata: Record<string, unknown> = {
       resolvedModel: resolved.resolved,
       requestedModel: resolved.requested,
+      serviceTier,
+      attachments: attached.map((a) => ({ path: a.path, mimeType: a.mimeType, bytes: a.bytes })),
       fallbackApplied: resolved.fallbackApplied,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,

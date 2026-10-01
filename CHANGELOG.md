@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-10-01
+
+From the 2026-10-01 comparison with Google's own tools and the community (`docs/COMPETITION-2026-10-01.md`).
+
+### Added
+
+- `ask` takes `attachments`: up to 8 local image or PDF files (png, jpg, jpeg, webp, gif, pdf; 10 MB each, 20 MB
+  together — Gemini's inline limit), sent as `inlineData` parts before the question in the user turn, with or without
+  a Context Cache. They belong to one question, never to the workspace cache. Every file is checked (type, size,
+  readability) before any is read; a model without vision is refused by name (`ATTACHMENTS_UNSUPPORTED`); the
+  `ask_agentic` fallback cannot carry them and says so. `structuredContent.attachments` lists what was sent. The
+  `latest-vision` alias finally has an input to see.
+- `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`:
+  `flex` is Google's half-price tier (longer latency, may be refused under load with 429 — the usual retry applies).
+  Reported as `serviceTier` in `structuredContent`.
+
 ## [1.18.0] - 2026-10-01
 
 ### Fixed
