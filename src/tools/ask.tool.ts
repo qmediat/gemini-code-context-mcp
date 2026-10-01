@@ -1,9 +1,10 @@
 /**
  * `ask` tool — Q&A / long-context analysis against a workspace.
  *
- * Uses the Persistent Context Cache when available, reducing repeat-query cost
- * and latency. First call on a workspace: ~30–45 s (upload + build). Subsequent
- * calls with unchanged files: ~2–3 s.
+ * Sends the scanned workspace with the question. Implicit caching by default
+ * (inline content, Gemini's automatic prefix cache); `cachingMode: 'explicit'`
+ * uploads the workspace once and builds a persistent Context Cache (measured
+ * 2026-04-22 on a 670 k-token workspace: first call ~125 s, repeats ~14 s).
  */
 
 import { createHash } from 'node:crypto';

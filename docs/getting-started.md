@@ -51,7 +51,7 @@ or edit `~/.claude.json` and add:
 }
 ```
 
-Restart Claude Code. You should see `gemini-code-context` in the MCP tools list with five tools: `ask`, `code`, `status`, `reindex`, `clear`.
+Restart Claude Code. You should see `gemini-code-context` in the MCP tools list with six tools: `ask`, `ask_agentic`, `code`, `status`, `reindex`, `clear`.
 
 ### Claude Desktop
 
@@ -67,7 +67,7 @@ In Claude Code, ask:
 
 > Use `gemini-code-context.ask` to summarize the architecture of this codebase.
 
-On a fresh workspace this will take ~30–45 s (scan + upload + cache build). Every follow-up question with the same codebase will be ~2–3 s.
+The first question scans the workspace; every follow-up reuses the scan. In the default implicit mode each question sends the workspace text and Gemini's automatic prefix cache decides any discount; with `cachingMode: "explicit"` the first question also uploads the workspace and builds a Context Cache (125 s measured on a 670 k-token workspace, repeats ~14 s).
 
 Check what you've spent and how much context is cached:
 

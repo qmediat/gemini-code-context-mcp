@@ -53,7 +53,7 @@ Walks a workspace directory:
 
 The magic:
 
-- `files-uploader.ts` uploads scanned files to the Gemini Files API, deduping by content hash against the manifest. Files API enforces a 48 h auto-delete; we track `expires_at = uploaded_at + 47 h` for a safety margin.
+- `files-uploader.ts` (explicit `cachingMode` only) uploads scanned files to the Gemini Files API, deduping by content hash against the manifest. Files API enforces a 48 h auto-delete; we track `expires_at = uploaded_at + 47 h` for a safety margin.
 - `cache-manager.ts` creates Gemini Context Caches keyed by `(workspaceRoot, filesHash, model, systemPromptHash)`. Falls back to inline file parts when caching isn't supported or the API rejects the build.
 - `ttl-watcher.ts` runs a 5-minute tick. Hot workspaces (used in the last 10 minutes) get their cache TTL refreshed via `caches.update`. Cold workspaces expire.
 

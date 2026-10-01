@@ -9,7 +9,7 @@ Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by c
 | Line item | Typical rate |
 |---|---|
 | Input tokens (uncached) | $3.50 / M for Pro, $0.30 / M for Flash |
-| Input tokens (cached) | ~$0.87 / M for Pro (≈ 25 % of uncached) |
+| Input tokens (cached, explicit mode) | ~$0.87 / M for Pro (≈ 25 % of uncached — the estimator's assumption when a model lists no cached rate; check Google's current price) |
 | Output tokens | $10.50 / M for Pro, $2.50 / M for Flash |
 | Thinking tokens (Pro) | Billed as output |
 | Cache storage | $4.50 / M tokens / hour (Pro); prorated |
@@ -41,7 +41,7 @@ Cache storage (1 h avg): 500 k × 1 h × $4.50/M/h  = $2.25
                                                 = ~$12.57 / day
 ```
 
-**~64 % savings**, and the first call's 45 s latency drops to 2 s on repeats.
+**~64 % savings** in explicit `cachingMode` (measured 2026-04-22: first call ~125 s, repeats ~14 s on a 670 k-token workspace). In the default implicit mode there is no cache storage charge and no guaranteed discount: a repeat costs at most the inline price.
 
 ## Tools for cost control
 
@@ -55,7 +55,7 @@ Cache storage (1 h avg): 500 k × 1 h × $4.50/M/h  = $2.25
 
 | Tool | First call | Repeat call (cached) |
 |---|---|---|
-| `ask` | Full input price + output | Cached input rate + output (~25 % + output) |
+| `ask` | Full input price + output | explicit mode: cached input rate + output; implicit mode: at most the inline price |
 | `code` | Full input + thinking + output | Cached + thinking + output |
 | `status` | Free — reads SQLite only, optional `models.list()` call is 1 lightweight HTTP request |
 | `reindex` | Free on our side; next `ask`/`code` rebuilds the cache at full input price |
