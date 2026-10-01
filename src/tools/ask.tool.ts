@@ -27,10 +27,13 @@ import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import {
+  SERVICE_TIER_DESCRIPTION,
+  ServiceTierError,
+  networkAttempts,
   resolveServiceTier,
   serviceTierConfig,
   statusOf,
-  tierErrorCode,
+  tierErrorMeta,
 } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
@@ -157,12 +160,7 @@ export const askInputSchema = z
       .describe(
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
-    serviceTier: z
-      .enum(['standard', 'flex'])
-      .optional()
-      .describe(
-        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry — the result says RATE_LIMITED / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price.",
-      ),
+    serviceTier: z.enum(['standard', 'flex']).optional().describe(SERVICE_TIER_DESCRIPTION),
     cachingMode: z
       .enum(['explicit', 'implicit'])
       .optional()
@@ -266,7 +264,21 @@ async function executeAskBody(
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
     resolvedModelKey = resolved.resolved;
-    const serviceTier = resolveServiceTier(input.serviceTier, ctx.config.serviceTier);
+    let serviceTier: 'standard' | 'flex';
+    try {
+      serviceTier = resolveServiceTier(
+        input.serviceTier,
+        ctx.config.serviceTier,
+        ctx.config.vertex,
+      );
+    } catch (err) {
+      if (!(err instanceof ServiceTierError)) throw err;
+      return errorResult(`ask: ${err.message}`, {
+        errorCode: err.code,
+        retryable: false,
+        serviceTier: 'flex',
+      });
+    }
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — build the scan memo from previously-stored file rows so the
@@ -455,6 +467,12 @@ async function executeAskBody(
         // (per-iteration cap; total wall-clock can be N × that). Cost +
         // timing shape genuinely changes — opt-in is the right default.
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
+          if (serviceTier === 'flex') {
+            const note =
+              'ask: the ask_agentic fallback has no service tier — this call runs standard, not flex';
+            emitter.emit(note);
+            logger.warn(note);
+          }
           logger.warn(
             `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
           );
@@ -549,6 +567,7 @@ async function executeAskBody(
           const wrappedStructured: Record<string, unknown> = {
             fallbackApplied: 'ask_agentic',
             serviceTier: 'standard', // ask_agentic has no tier: the fallback runs standard whatever was asked
+            ...(serviceTier === 'flex' ? { serviceTierDowngraded: 'flex' } : {}),
             fallbackReason: 'WORKSPACE_TOO_LARGE',
             preflightEstimate: {
               tokens: preflight.effectiveTokens,
@@ -611,6 +630,7 @@ async function executeAskBody(
           `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
+            serviceTier,
             retryable: false,
             estimatedInputTokens: preflight.effectiveTokens,
             tokenCountMethod: preflight.method,
@@ -820,6 +840,7 @@ async function executeAskBody(
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
           }),
         {
+          attempts: networkAttempts(serviceTier), // a flex request is never re-sent
           signal: abortSignal,
           onRetry: (attempt, retryErr) => {
             logger.warn(
@@ -902,6 +923,7 @@ async function executeAskBody(
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
               }),
             {
+              attempts: networkAttempts(serviceTier),
               signal: abortSignal,
               onRetry: (attempt, retryErr) => {
                 logger.warn(
@@ -933,14 +955,14 @@ async function executeAskBody(
           // Otherwise preserve the ORIGINAL stale-cache error as `cause` so
           // ops can root-cause diagnostics across both the first 404 and any
           // rebuild-time failure.
-          throw Object.assign(
-            new Error(
-              `ask retry after stale cache failed: ${
-                retryErr instanceof Error ? retryErr.message : String(retryErr)
-              }`,
-              { cause: err },
-            ),
-            { status: statusOf(retryErr) }, // a 429/503 on the retry keeps its status for the error code
+          // an HTTP error on the retry (a 429/503) IS the error: thrown as the SDK made it, so its status and the
+          // throttle's retry hint are read as usual; only a status-less failure is wrapped over the stale 404
+          if (statusOf(retryErr) !== undefined) throw retryErr;
+          throw new Error(
+            `ask retry after stale cache failed: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`,
+            { cause: err },
           );
         }
       } else {
@@ -1155,12 +1177,13 @@ async function executeAskBody(
         timeoutMs: ms,
         stallMs,
         retryable: true,
+        serviceTier: input.serviceTier ?? ctx.config.serviceTier,
       });
     }
-    const httpStatus = statusOf(err) ?? statusOf((err as { cause?: unknown }).cause);
+    const httpStatus = statusOf(err);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorCode(httpStatus),
-      serviceTier: resolveServiceTier(input.serviceTier, ctx.config.serviceTier),
+      ...tierErrorMeta(err),
+      serviceTier: input.serviceTier ?? ctx.config.serviceTier,
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {

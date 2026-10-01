@@ -73,6 +73,8 @@ export interface Config {
    * and falls back to standard.
    */
   serviceTier: 'standard' | 'flex';
+  /** `GEMINI_USE_VERTEX=true`: the Vertex AI backend, where the flex tier is not available through this SDK. */
+  vertex: boolean;
   /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
    * `0` disables the throttle entirely; positive integer caps how many input
@@ -222,16 +224,23 @@ export function loadConfig(): Config {
     forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
     forceRescan: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_RESCAN'),
     cachingMode: readCachingModeEnv(),
-    serviceTier: readServiceTierEnv(),
+    serviceTier: readServiceTierEnv(process.env.GEMINI_USE_VERTEX === 'true'),
+    vertex: process.env.GEMINI_USE_VERTEX === 'true',
   };
 }
 
 /** `GEMINI_CODE_CONTEXT_SERVICE_TIER`: `standard` (default) or `flex`; anything else warns and is standard. */
-function readServiceTierEnv(): 'standard' | 'flex' {
+export function readServiceTierEnv(vertex = false): 'standard' | 'flex' {
   const raw = process.env.GEMINI_CODE_CONTEXT_SERVICE_TIER;
   if (raw === undefined) return 'standard';
   const v = raw.trim().toLowerCase();
   if (v === '') return 'standard';
+  if (v === 'flex' && vertex) {
+    console.error(
+      '[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_SERVICE_TIER=flex is not available on the Vertex AI backend (the SDK sends no tier there); using standard',
+    );
+    return 'standard';
+  }
   if (v === 'standard' || v === 'flex') return v;
   console.error(
     `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_SERVICE_TIER=${safeForLog(raw)} is not 'standard' or 'flex'; using standard`,

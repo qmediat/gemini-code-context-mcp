@@ -7,10 +7,16 @@ import { mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readServiceTierEnv } from '../../src/config.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
-import { statusOf, tierErrorCode } from '../../src/tools/shared/service-tier.js';
+import {
+  networkAttempts,
+  resolveServiceTier,
+  statusOf,
+  tierErrorMeta,
+} from '../../src/tools/shared/service-tier.js';
 import {
   FLEX_PRICE_FACTOR,
   estimateCostUsd,
@@ -88,6 +94,7 @@ function buildCtx(
       tpmThrottleLimit: 0,
       forceMaxOutputTokens: false,
       serviceTier: 'standard',
+      vertex: false,
       defaultModel: 'latest-pro',
       workspaceGuardRatio: 0.8,
       ...configOverrides,
@@ -208,7 +215,7 @@ describe('service tier (1.19.0)', () => {
 
   it('a 429 or 503 is reported as a retryable tier error with the tier, not UNKNOWN', async () => {
     for (const [status, code] of [
-      [429, 'RATE_LIMITED'],
+      [429, 'RATE_LIMIT'],
       [503, 'OVERLOADED'],
     ] as const) {
       const { ctx } = buildCtx({ serviceTier: 'flex' }, () => {
@@ -220,7 +227,16 @@ describe('service tier (1.19.0)', () => {
       expect(result.structuredContent?.retryable).toBe(true);
       expect(result.structuredContent?.serviceTier).toBe('flex');
     }
-    expect(tierErrorCode(500)).toEqual({ errorCode: 'UNKNOWN' });
+    expect(tierErrorMeta(Object.assign(new Error('x'), { status: 500 }))).toEqual({
+      errorCode: 'UNKNOWN',
+    });
+    expect(
+      tierErrorMeta(
+        Object.assign(new Error('{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}'), {
+          status: 429,
+        }),
+      ),
+    ).toEqual({ errorCode: 'RATE_LIMIT', retryable: true, retryAfterMs: 7_000 });
     expect(statusOf(Object.assign(new Error('x'), { status: 429 }))).toBe(429);
     expect(statusOf(new Error('x'))).toBeUndefined();
   });
@@ -245,7 +261,125 @@ describe('service tier (1.19.0)', () => {
     });
     const result = await askTool.execute({ prompt: 'q', workspace: dir }, ctx);
     expect(result.isError).toBe(true);
-    expect(result.structuredContent?.errorCode).toBe('RATE_LIMITED');
+    expect(result.structuredContent?.errorCode).toBe('RATE_LIMIT');
     expect(result.structuredContent?.httpStatus).toBe(429);
+  });
+
+  it('a status-less failure on the stale-cache retry reports no httpStatus (the stale 404 is not the error)', async () => {
+    let calls = 0;
+    const { ctx } = buildCtx({}, () => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error('cache gone'), { status: 404 });
+      throw new Error('boom');
+    });
+    mocks.isStaleCacheError.mockImplementation(
+      (e: unknown) => (e as { status?: number }).status === 404,
+    );
+    mocks.prepareContext.mockResolvedValue({
+      cacheId: 'cachedContents/abc',
+      inlineContents: [],
+      reused: true,
+      rebuilt: false,
+      inlineOnly: false,
+      uploaded: { failedCount: 0, failures: [] },
+    });
+    const result = await askTool.execute({ prompt: 'q', workspace: dir }, ctx);
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    expect(result.structuredContent?.httpStatus).toBeUndefined();
+  });
+
+  it('a flex request is sent once: a connection failure is not re-sent; standard keeps its three attempts', async () => {
+    const flex = buildCtx({}, () => {
+      throw new TypeError('fetch failed');
+    });
+    const standard = buildCtx({}, () => {
+      throw new TypeError('fetch failed');
+    });
+    await askTool.execute(
+      { prompt: 'q', workspace: dir, serviceTier: 'flex', timeoutMs: 30_000 },
+      flex.ctx,
+    );
+    expect(flex.sent).toHaveLength(1);
+    await askTool.execute({ prompt: 'q', workspace: dir, timeoutMs: 30_000 }, standard.ctx);
+    expect(standard.sent).toHaveLength(3);
+    expect(networkAttempts('flex')).toBe(1);
+    expect(networkAttempts('standard')).toBe(3);
+  }, 30_000);
+
+  it('on Vertex a per-call flex is refused by name; an operator default of flex runs standard', async () => {
+    const { ctx, sent } = buildCtx({ vertex: true, serviceTier: 'flex' });
+    const refused = await askTool.execute(
+      { prompt: 'q', workspace: dir, serviceTier: 'flex' },
+      ctx,
+    );
+    expect(refused.isError).toBe(true);
+    expect(refused.structuredContent?.errorCode).toBe('SERVICE_TIER_UNSUPPORTED');
+    expect(sent).toHaveLength(0);
+    const defaulted = await askTool.execute({ prompt: 'q', workspace: dir }, ctx);
+    expect(defaulted.structuredContent?.serviceTier).toBe('standard');
+    expect('serviceTier' in sentAt(sent, 0).config).toBe(false);
+    const code = await codeTool.execute({ task: 'x', workspace: dir, serviceTier: 'flex' }, ctx);
+    expect(code.structuredContent?.errorCode).toBe('SERVICE_TIER_UNSUPPORTED');
+    expect(resolveServiceTier(undefined, 'flex', true)).toBe('standard');
+  });
+
+  it('the operator knob is trimmed and case-insensitive; an invalid value is standard; flex on Vertex is standard', () => {
+    const saved = process.env.GEMINI_CODE_CONTEXT_SERVICE_TIER;
+    const set = (value: string | undefined) => {
+      if (value === undefined)
+        Reflect.deleteProperty(process.env, 'GEMINI_CODE_CONTEXT_SERVICE_TIER');
+      else process.env.GEMINI_CODE_CONTEXT_SERVICE_TIER = value;
+    };
+    try {
+      set('  FLEX ');
+      expect(readServiceTierEnv()).toBe('flex');
+      expect(readServiceTierEnv(true)).toBe('standard');
+      set('fast');
+      expect(readServiceTierEnv()).toBe('standard');
+      set(undefined);
+      expect(readServiceTierEnv()).toBe('standard');
+    } finally {
+      set(saved);
+    }
+  });
+
+  it('code on the cached path sends the tier, and its usage row is written at the flex price', async () => {
+    mocks.prepareContext.mockResolvedValue({
+      cacheId: 'cachedContents/abc',
+      inlineContents: [],
+      reused: true,
+      rebuilt: false,
+      inlineOnly: false,
+      uploaded: { failedCount: 0, failures: [] },
+    });
+    const flex = buildCtx({ serviceTier: 'flex' });
+    const standard = buildCtx();
+    await codeTool.execute({ task: 'x', workspace: dir }, flex.ctx);
+    await codeTool.execute({ task: 'x', workspace: dir }, standard.ctx);
+    expect(sentAt(flex.sent, 0).config.serviceTier).toBe('flex');
+    expect(sentAt(flex.sent, 0).config.cachedContent).toBe('cachedContents/abc');
+    const rowOf = (ctx: ToolContext) =>
+      (ctx.manifest as unknown as { insertUsageMetric: ReturnType<typeof vi.fn> }).insertUsageMetric
+        .mock.calls[0]?.[0] as { costUsdMicro: number } | undefined;
+    const flexRow = rowOf(flex.ctx);
+    const standardRow = rowOf(standard.ctx);
+    expect(flexRow?.costUsdMicro).toBeDefined();
+    expect(flexRow?.costUsdMicro).toBeCloseTo(
+      (standardRow?.costUsdMicro ?? 0) * FLEX_PRICE_FACTOR,
+      -1,
+    );
+  });
+
+  it('a flex timeout reports the tier too', async () => {
+    const { ctx } = buildCtx({}, () => {
+      const e = new Error('aborted');
+      e.name = 'AbortError';
+      throw e;
+    });
+    const result = await askTool.execute(
+      { prompt: 'q', workspace: dir, serviceTier: 'flex', timeoutMs: 1_000 },
+      ctx,
+    );
+    expect(result.structuredContent?.serviceTier).toBe('flex');
   });
 });

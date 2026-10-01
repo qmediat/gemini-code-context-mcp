@@ -674,3 +674,9 @@ waits at most 300 s for the response headers by default; a queued flex stream pa
 which `withNetworkRetry` treats as transient and re-sends up to three times. Not reproduced live. Fix: an undici
 `Agent` with `headersTimeout` ≥ 15 min set as the SDK's dispatcher when the tier is flex (`httpOptions` or
 `setGlobalDispatcher`), with a test on a slow fake server. Owner @qmt, the next release after 1.19.0.
+
+## DEF-FLEX-02 — record the service tier on usage rows (2026-10-01, cross-review of 1.19.0)
+
+`insertUsageMetric` rows carry the halved cost of a flex call but not the tier, so `status` and an audit cannot tell
+a flex call from a cheap standard one. Fix: a `serviceTier` column (migration), written by ask/code, shown by `status`.
+Owner @qmt, the next release after 1.19.0.

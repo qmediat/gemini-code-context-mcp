@@ -29,10 +29,13 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import {
+  SERVICE_TIER_DESCRIPTION,
+  ServiceTierError,
+  networkAttempts,
   resolveServiceTier,
   serviceTierConfig,
   statusOf,
-  tierErrorCode,
+  tierErrorMeta,
 } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
@@ -146,12 +149,7 @@ export const codeInputSchema = z
       .describe(
         'Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Recommended setting: `60_000` (60s). When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_STALL_MS`, then to disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.',
       ),
-    serviceTier: z
-      .enum(['standard', 'flex'])
-      .optional()
-      .describe(
-        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry — the result says RATE_LIMITED / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price.",
-      ),
+    serviceTier: z.enum(['standard', 'flex']).optional().describe(SERVICE_TIER_DESCRIPTION),
     cachingMode: z
       .enum(['explicit', 'implicit'])
       .optional()
@@ -347,7 +345,21 @@ async function executeCodeBody(
     const resolved = choice.resolved;
     // The same two fields on every result after this point, error results included: an audit of a failed call
     // can still tell a fallback from a caller's choice.
-    const serviceTier = resolveServiceTier(input.serviceTier, ctx.config.serviceTier);
+    let serviceTier: 'standard' | 'flex';
+    try {
+      serviceTier = resolveServiceTier(
+        input.serviceTier,
+        ctx.config.serviceTier,
+        ctx.config.vertex,
+      );
+    } catch (err) {
+      if (!(err instanceof ServiceTierError)) throw err;
+      return errorResult(`code: ${err.message}`, {
+        errorCode: err.code,
+        retryable: false,
+        serviceTier: 'flex',
+      });
+    }
     modelAudit = {
       resolvedModel: resolved.resolved,
       configuredModelReplaced: choice.replacedDefault ?? null,
@@ -678,6 +690,7 @@ async function executeCodeBody(
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
           }),
         {
+          attempts: networkAttempts(serviceTier), // a flex request is never re-sent
           signal: abortSignal,
           onRetry: (attempt, retryErr) => {
             logger.warn(
@@ -744,6 +757,7 @@ async function executeCodeBody(
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
               }),
             {
+              attempts: networkAttempts(serviceTier),
               signal: abortSignal,
               onRetry: (attempt, retryErr) => {
                 logger.warn(
@@ -771,14 +785,12 @@ async function executeCodeBody(
           // error) would mask the timeout; outer catch would map to UNKNOWN
           // instead of TIMEOUT.
           if (isTimeoutAbort(retryErr)) throw retryErr;
-          throw Object.assign(
-            new Error(
-              `code retry after stale cache failed: ${
-                retryErr instanceof Error ? retryErr.message : String(retryErr)
-              }`,
-              { cause: err },
-            ),
-            { status: statusOf(retryErr) }, // a 429/503 on the retry keeps its status for the error code
+          if (statusOf(retryErr) !== undefined) throw retryErr; // an HTTP error on the retry is the error itself
+          throw new Error(
+            `code retry after stale cache failed: ${
+              retryErr instanceof Error ? retryErr.message : String(retryErr)
+            }`,
+            { cause: err },
           );
         }
       } else {
@@ -992,9 +1004,9 @@ async function executeCodeBody(
         ...modelAudit,
       });
     }
-    const httpStatus = statusOf(err) ?? statusOf((err as { cause?: unknown }).cause);
+    const httpStatus = statusOf(err);
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorCode(httpStatus),
+      ...tierErrorMeta(err),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       ...modelAudit,
     });

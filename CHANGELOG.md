@@ -17,9 +17,13 @@ From the 2026-10-01 comparison with Google's own tools and the community (`docs/
   (trimmed, case-insensitive; an invalid value warns on stderr and is standard): `flex` is Google's half-price tier
   (longer latency). The cost estimate, the usage ledger and the daily budget use the flex price. A request flex refuses
   under load (429/503) is NOT retried by this server — the network retry covers connection failures only; the result
-  says `RATE_LIMITED` / `OVERLOADED`, `retryable: true` (a 429/503 on the stale-cache retry keeps its status), and the
-  client retries. Reported as `serviceTier` on every result, errors included; the `ask_agentic` fallback runs standard
-  and reports it. The fetch headers timeout on flex is a registered follow-up (DEF-FLEX-01).
+  says `RATE_LIMIT` / `OVERLOADED`, `retryable: true` with Google's retry hint when it sent one (a 429/503 on the
+  stale-cache retry is reported as itself), and the client retries; a flex request is sent exactly once — the server's
+  own network retry is off for it, every send being billed. Reported as `serviceTier` on every result, errors and
+  timeouts included; the `ask_agentic` fallback runs standard and says so (progress line, warning,
+  `serviceTierDowngraded`). Not available on the Vertex AI backend (the SDK sends no tier there, js-genai#1468): a
+  per-call `flex` is refused by name, a default of `flex` runs standard with a startup warning. Registered follow-ups:
+  DEF-FLEX-01 (the fetch headers timeout on flex), DEF-FLEX-02 (the usage rows do not record the tier yet).
 
 ## [1.18.0] - 2026-10-01
 
