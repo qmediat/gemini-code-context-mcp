@@ -290,6 +290,19 @@ describe('service tier (1.19.0)', () => {
     expect(result.structuredContent?.httpStatus).toBeUndefined();
   });
 
+  it('a failure before any response is NETWORK_ERROR, retryable — on flex after the single attempt', async () => {
+    const { ctx } = buildCtx({}, () => {
+      throw new TypeError('fetch failed');
+    });
+    const result = await askTool.execute(
+      { prompt: 'q', workspace: dir, serviceTier: 'flex', timeoutMs: 30_000 },
+      ctx,
+    );
+    expect(result.structuredContent?.errorCode).toBe('NETWORK_ERROR');
+    expect(result.structuredContent?.retryable).toBe(true);
+    expect(result.structuredContent?.serviceTier).toBe('flex');
+  });
+
   it('a flex request is sent once: a connection failure is not re-sent; standard keeps its three attempts', async () => {
     const flex = buildCtx({}, () => {
       throw new TypeError('fetch failed');

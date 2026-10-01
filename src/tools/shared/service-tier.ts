@@ -6,13 +6,14 @@
  * SDK does not send), so flex there would be billed standard while this server charged half: a per-call `flex` on
  * Vertex is refused, an operator default of `flex` on Vertex runs standard with a startup warning. */
 import { type GenerateContentConfig, ServiceTier } from '@google/genai';
+import { isTransientNetworkError } from '../../gemini/retry.js';
 import { isGemini429, parseRetryDelayMs } from './throttle.js';
 
 export type ServiceTierName = 'standard' | 'flex';
 
 /** One text for both tools' `serviceTier` parameter. */
 export const SERVICE_TIER_DESCRIPTION =
-  "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry and never re-sends — the result says RATE_LIMIT / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price. Not available on the Vertex AI backend (refused by name).";
+  "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry and never re-sends — the result says RATE_LIMIT / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price. A flex request queued longer than Node's 300 s header wait fails as NETWORK_ERROR, retryable (the server does not raise that wait yet). Not available on the Vertex AI backend (refused by name).";
 
 export class ServiceTierError extends Error {
   readonly code = 'SERVICE_TIER_UNSUPPORTED';
@@ -58,7 +59,7 @@ export function statusOf(err: unknown): number | undefined {
 }
 
 export interface TierErrorMeta {
-  readonly errorCode: 'RATE_LIMIT' | 'OVERLOADED' | 'UNKNOWN';
+  readonly errorCode: 'RATE_LIMIT' | 'OVERLOADED' | 'NETWORK_ERROR' | 'UNKNOWN';
   readonly retryable?: boolean;
   /** Google's retry hint on a 429, when it sent one. */
   readonly retryAfterMs?: number;
@@ -66,7 +67,9 @@ export interface TierErrorMeta {
 
 /** The error code of a refused request, whatever the tier: 429 (RATE_LIMIT — the spelling ask_agentic uses) with the
  * retry hint when Google sent one, 503 (OVERLOADED), both retryable by the client; anything else is unknown. */
-export function tierErrorMeta(err: unknown): TierErrorMeta {
+/** `afterResponse`: the stream had opened when the failure came — a second send would bill the work again, so the
+ * client is not told to retry. */
+export function tierErrorMeta(err: unknown, afterResponse = false): TierErrorMeta {
   const status = statusOf(err);
   if (status === 429) {
     const hint = isGemini429(err) ? parseRetryDelayMs(err.message) : null; // the hint only from the SDK's own 429
@@ -77,5 +80,9 @@ export function tierErrorMeta(err: unknown): TierErrorMeta {
     };
   }
   if (status === 503) return { errorCode: 'OVERLOADED', retryable: true };
+  // a failure before any response (a reset, DNS, undici's 300 s header wait on a queued flex request): the client
+  // may send again — on flex this server never does
+  if (isTransientNetworkError(err))
+    return { errorCode: 'NETWORK_ERROR', retryable: !afterResponse };
   return { errorCode: 'UNKNOWN' };
 }

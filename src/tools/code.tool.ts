@@ -309,6 +309,8 @@ async function executeCodeBody(
   // Canonical resolved-model string for retry-hint seeding (T22a).
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
+  // once a stream opened, a later transport failure is mid-stream: billed work, not to be re-sent
+  let streamOpened = false;
   let modelAudit: Record<string, unknown> = {};
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
@@ -358,6 +360,8 @@ async function executeCodeBody(
         errorCode: err.code,
         retryable: false,
         serviceTier: 'flex',
+        resolvedModel: resolved.resolved,
+        configuredModelReplaced: choice.replacedDefault ?? null,
       });
     }
     modelAudit = {
@@ -701,6 +705,7 @@ async function executeCodeBody(
           },
         },
       );
+      streamOpened = true;
       response = await collectStream(stream, {
         signal: abortSignal,
         onThoughtChunk: (text) => {
@@ -768,6 +773,7 @@ async function executeCodeBody(
               },
             },
           );
+          streamOpened = true;
           response = await collectStream(retryStream, {
             signal: abortSignal,
             onThoughtChunk: (text) => {
@@ -1006,8 +1012,9 @@ async function executeCodeBody(
     }
     const httpStatus = statusOf(err);
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err),
+      ...tierErrorMeta(err, streamOpened),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
+      serviceTier: input.serviceTier ?? ctx.config.serviceTier, // before the model is resolved: the requested tier
       ...modelAudit,
     });
   } finally {

@@ -223,6 +223,8 @@ async function executeAskBody(
   // `reserve` used. `model` at the top of execute is the request alias
   // ("latest-pro-thinking") — different key, different bucket.
   let resolvedModelKey: string | null = null;
+  // once a stream opened, a later transport failure is mid-stream: billed work, not to be re-sent
+  let streamOpened = false;
   // the tier this call runs on once resolved (Vertex may force standard); before that, the requested one is reported
   let serviceTier: 'standard' | 'flex' | undefined;
   const reportedTier = (): 'standard' | 'flex' =>
@@ -280,6 +282,7 @@ async function executeAskBody(
         errorCode: err.code,
         retryable: false,
         serviceTier: 'flex',
+        resolvedModel: resolved.resolved,
       });
     }
 
@@ -854,6 +857,7 @@ async function executeAskBody(
           },
         },
       );
+      streamOpened = true;
       response = await collectStream(stream, {
         signal: abortSignal,
         onThoughtChunk: (text) => {
@@ -937,6 +941,7 @@ async function executeAskBody(
               },
             },
           );
+          streamOpened = true;
           response = await collectStream(retryStream, {
             signal: abortSignal,
             onThoughtChunk: (text) => {
@@ -1185,7 +1190,7 @@ async function executeAskBody(
     }
     const httpStatus = statusOf(err);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err),
+      ...tierErrorMeta(err, streamOpened),
       serviceTier: reportedTier(),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
