@@ -67,6 +67,13 @@ export interface Config {
    */
   cachingMode: 'explicit' | 'implicit';
   /**
+   * v1.19.0+: Gemini service tier for `ask` / `code` when the per-call `serviceTier` is unset. `'flex'` is Google's
+   * half-price tier with higher latency and possible 429/503 under load (not retried here); `'standard'` is the
+   * default. Env `GEMINI_CODE_CONTEXT_SERVICE_TIER` (trimmed, case-insensitive); an invalid value warns at startup
+   * and falls back to standard.
+   */
+  serviceTier: 'standard' | 'flex';
+  /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
    * `0` disables the throttle entirely; positive integer caps how many input
    * tokens (cached + uncached) we'll let fly to Gemini inside any 60-second
@@ -215,5 +222,19 @@ export function loadConfig(): Config {
     forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
     forceRescan: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_RESCAN'),
     cachingMode: readCachingModeEnv(),
+    serviceTier: readServiceTierEnv(),
   };
+}
+
+/** `GEMINI_CODE_CONTEXT_SERVICE_TIER`: `standard` (default) or `flex`; anything else warns and is standard. */
+function readServiceTierEnv(): 'standard' | 'flex' {
+  const raw = process.env.GEMINI_CODE_CONTEXT_SERVICE_TIER;
+  if (raw === undefined) return 'standard';
+  const v = raw.trim().toLowerCase();
+  if (v === '') return 'standard';
+  if (v === 'standard' || v === 'flex') return v;
+  console.error(
+    `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_SERVICE_TIER=${safeForLog(raw)} is not 'standard' or 'flex'; using standard`,
+  );
+  return 'standard';
 }

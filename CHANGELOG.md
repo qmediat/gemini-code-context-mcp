@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-10-01
+
+From the 2026-10-01 comparison with Google's own tools and the community (`docs/COMPETITION-2026-10-01.md`).
+
+### Added
+
+- `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`
+  (trimmed, case-insensitive; an invalid value warns on stderr and is standard): `flex` is Google's half-price tier
+  (longer latency). The cost estimate, the usage ledger and the daily budget use the flex price. A request flex refuses
+  under load (429/503) is NOT retried by this server — the network retry covers connection failures only; the result
+  says `RATE_LIMITED` / `OVERLOADED`, `retryable: true` (a 429/503 on the stale-cache retry keeps its status), and the
+  client retries. Reported as `serviceTier` on every result, errors included; the `ask_agentic` fallback runs standard
+  and reports it. The fetch headers timeout on flex is a registered follow-up (DEF-FLEX-01).
+
 ## [1.18.0] - 2026-10-01
 
 ### Fixed

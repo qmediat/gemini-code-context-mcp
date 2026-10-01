@@ -26,6 +26,12 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import {
+  resolveServiceTier,
+  serviceTierConfig,
+  statusOf,
+  tierErrorCode,
+} from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
@@ -151,6 +157,12 @@ export const askInputSchema = z
       .describe(
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
+    serviceTier: z
+      .enum(['standard', 'flex'])
+      .optional()
+      .describe(
+        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry — the result says RATE_LIMITED / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price.",
+      ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
       .optional()
@@ -254,6 +266,7 @@ async function executeAskBody(
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
     resolvedModelKey = resolved.resolved;
+    const serviceTier = resolveServiceTier(input.serviceTier, ctx.config.serviceTier);
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — build the scan memo from previously-stored file rows so the
@@ -535,6 +548,7 @@ async function executeAskBody(
 
           const wrappedStructured: Record<string, unknown> = {
             fallbackApplied: 'ask_agentic',
+            serviceTier: 'standard', // ask_agentic has no tier: the fallback runs standard whatever was asked
             fallbackReason: 'WORKSPACE_TOO_LARGE',
             preflightEstimate: {
               tokens: preflight.effectiveTokens,
@@ -624,6 +638,7 @@ async function executeAskBody(
     if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
       const estimateUsd = estimatePreCallCostUsd({
         model: resolved.resolved,
+        serviceTier,
         workspaceBytes,
         promptChars: input.prompt.length,
         // Budget reservation uses the effective cap (explicit-user-cap
@@ -645,7 +660,7 @@ async function executeAskBody(
         const spentUsd = reserve.spentMicros / 1_000_000;
         return errorResult(
           `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false },
+          { errorCode: 'BUDGET_REJECT', retryable: false, serviceTier },
         );
       }
       reservationId = reserve.id;
@@ -763,15 +778,17 @@ async function executeAskBody(
       : effectiveThinkingBudget === null
         ? { includeThoughts: true }
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
+    const tierField = serviceTierConfig(serviceTier);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
       return cacheId
-        ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField }
+        ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField, ...tierField }
         : {
             systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
             thinkingConfig,
             ...maxOutputField,
+            ...tierField,
           };
     };
     const buildContents = (
@@ -916,11 +933,14 @@ async function executeAskBody(
           // Otherwise preserve the ORIGINAL stale-cache error as `cause` so
           // ops can root-cause diagnostics across both the first 404 and any
           // rebuild-time failure.
-          throw new Error(
-            `ask retry after stale cache failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`,
-            { cause: err },
+          throw Object.assign(
+            new Error(
+              `ask retry after stale cache failed: ${
+                retryErr instanceof Error ? retryErr.message : String(retryErr)
+              }`,
+              { cause: err },
+            ),
+            { status: statusOf(retryErr) }, // a 429/503 on the retry keeps its status for the error code
           );
         }
       } else {
@@ -960,6 +980,7 @@ async function executeAskBody(
 
     const cost = estimateCostUsd({
       model: resolved.resolved,
+      serviceTier,
       uncachedInputTokens: uncached,
       cachedInputTokens: cached,
       outputTokens: output,
@@ -1025,6 +1046,7 @@ async function executeAskBody(
     const metadata: Record<string, unknown> = {
       resolvedModel: resolved.resolved,
       requestedModel: resolved.requested,
+      serviceTier,
       fallbackApplied: resolved.fallbackApplied,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,
@@ -1135,9 +1157,10 @@ async function executeAskBody(
         retryable: true,
       });
     }
-    const httpStatus = (err as { status?: number }).status;
+    const httpStatus = statusOf(err) ?? statusOf((err as { cause?: unknown }).cause);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      errorCode: 'UNKNOWN',
+      ...tierErrorCode(httpStatus),
+      serviceTier: resolveServiceTier(input.serviceTier, ctx.config.serviceTier),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {
