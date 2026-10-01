@@ -518,6 +518,7 @@ describe('ask attachments: the count Gemini gives', () => {
     expect(result.isError, String(result.content[0]?.text)).toBe(true);
     expect(result.structuredContent?.errorCode).toBe('WORKSPACE_TOO_LARGE');
     expect(result.structuredContent?.estimatedInputTokens).toBeGreaterThanOrEqual(COUNTED);
+    expect(String(result.content[0]?.text)).toMatch(/carries no attachments/); // ask_agentic cannot take them
     expect((result.structuredContent?.attachments as unknown[]).length).toBe(1);
     expect(sent).toHaveLength(0);
   });
