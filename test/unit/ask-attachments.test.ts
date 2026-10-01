@@ -2,13 +2,26 @@
  * v1.19.0 — `ask` attachments (inline image/PDF parts) and the service tier, on the same harness as the throttle
  * suite: the workspace, the model and the context are mocked; `generateContentStream` records what would be sent.
  */
-import { mkdtempSync, realpathSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  realpathSync,
+  symlinkSync,
+  truncateSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  attachmentParts,
+  estimateAttachmentTokens,
+  inspectAttachments,
+} from '../../src/attachments.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { estimatePreCallCostUsd } from '../../src/utils/cost-estimator.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -144,29 +157,29 @@ function lastUserParts(sent: Sent): Array<Record<string, unknown>> {
   return user?.parts ?? [];
 }
 
-describe('ask attachments and service tier (1.19.0)', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.validateWorkspacePath.mockReturnValue(undefined);
-    mocks.scanWorkspace.mockResolvedValue({
-      workspaceRoot: dir,
-      filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
-      skippedTooLarge: 0,
-      truncated: false,
-    });
-    mocks.resolveModel.mockResolvedValue(resolved(true));
-    mocks.prepareContext.mockResolvedValue({
-      cacheId: null,
-      inlineContents: [{ role: 'user', parts: [{ text: 'workspace' }] }],
-      reused: false,
-      rebuilt: false,
-      inlineOnly: true,
-      uploaded: { failedCount: 0, failures: [] },
-    });
-    mocks.isStaleCacheError.mockReturnValue(false);
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.validateWorkspacePath.mockReturnValue(undefined);
+  mocks.scanWorkspace.mockResolvedValue({
+    workspaceRoot: dir,
+    filesHash: 'abc',
+    files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
+    skippedTooLarge: 0,
+    truncated: false,
   });
+  mocks.resolveModel.mockResolvedValue(resolved(true));
+  mocks.prepareContext.mockResolvedValue({
+    cacheId: null,
+    inlineContents: [{ role: 'user', parts: [{ text: 'workspace' }] }],
+    reused: false,
+    rebuilt: false,
+    inlineOnly: true,
+    uploaded: { failedCount: 0, failures: [] },
+  });
+  mocks.isStaleCacheError.mockReturnValue(false);
+});
 
+describe('ask attachments and service tier (1.19.0)', () => {
   it('an attachment becomes an inlineData part before the question, in the last user turn', async () => {
     const { ctx, sent } = buildCtx();
     const result = await askTool.execute(
@@ -225,9 +238,11 @@ describe('ask attachments and service tier (1.19.0)', () => {
       workspaceRoot: dir,
       filesHash: 'big',
       files: Array.from({ length: 50 }, (_, i) => ({
-        path: `f${i}.ts`,
+        relpath: `f${i}.ts`,
+        absolutePath: join(dir, `f${i}.ts`),
         size: 400_000,
-        hash: `h${i}`,
+        contentHash: `h${i}`,
+        mtimeMs: 0,
       })),
       skippedTooLarge: 0,
       truncated: false,
@@ -243,8 +258,10 @@ describe('ask attachments and service tier (1.19.0)', () => {
       },
       ctx,
     );
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent?.errorCode).toBe('WORKSPACE_TOO_LARGE');
+    expect(result.isError, String(result.content[0]?.text)).toBe(true);
+    expect(result.structuredContent?.errorCode, String(result.content[0]?.text)).toBe(
+      'WORKSPACE_TOO_LARGE',
+    );
     expect(String(result.content[0]?.text)).toMatch(/attachments/);
     expect(sent).toHaveLength(0);
   });
@@ -311,5 +328,63 @@ describe('ask attachments and service tier (1.19.0)', () => {
     expect(code.isError, String(code.content[0]?.text)).not.toBe(true);
     expect(code.structuredContent?.serviceTier).toBe('flex');
     expect(sentAt(sent, 2).config.serviceTier).toBe('flex');
+  });
+});
+
+describe('attachments between inspection and read (1.19.0)', () => {
+  it('a file swapped for a symlink after inspection is refused at read; a deleted one too', async () => {
+    const swap = join(dir, 'swap.png');
+    writeFileSync(swap, PNG);
+    const [a] = await inspectAttachments([swap], dir);
+    unlinkSync(swap);
+    symlinkSync(secret, swap);
+    await expect(attachmentParts([a as NonNullable<typeof a>])).rejects.toThrow(/swap\.png/);
+    unlinkSync(swap);
+    await expect(attachmentParts([a as NonNullable<typeof a>])).rejects.toThrow(/swap\.png/);
+  });
+
+  it('a file that grew after inspection is refused without being read whole; the total is re-checked', async () => {
+    const grow = join(dir, 'grow.png');
+    writeFileSync(grow, PNG);
+    const [a] = await inspectAttachments([grow], dir);
+    truncateSync(grow, 10 * 1024 * 1024 + 1);
+    await expect(attachmentParts([a as NonNullable<typeof a>])).rejects.toThrow(/at read, above/);
+  });
+
+  it('a deleted attachment surfaces as ATTACHMENT_INVALID through ask, not UNKNOWN', async () => {
+    const gone = join(dir, 'gone.png');
+    writeFileSync(gone, PNG);
+    mocks.prepareContext.mockImplementation(async () => {
+      unlinkSync(gone); // the window between inspection and read
+      return {
+        cacheId: null,
+        inlineContents: [],
+        reused: false,
+        rebuilt: false,
+        inlineOnly: true,
+        uploaded: { failedCount: 0, failures: [] },
+      };
+    });
+    const { ctx, sent } = buildCtx();
+    const result = await askTool.execute({ prompt: 'q', workspace: dir, attachments: [gone] }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('ATTACHMENT_INVALID');
+    expect(sent).toHaveLength(0);
+  });
+
+  it('attachment tokens are an upper bound that raises the cost estimate', () => {
+    const image = { path: '/x/a.png', root: '/x', mimeType: 'image/png', bytes: 1 };
+    const pdf = { path: '/x/b.pdf', root: '/x', mimeType: 'application/pdf', bytes: 500 * 1024 };
+    expect(estimateAttachmentTokens([image])).toBe(24 * 258);
+    expect(estimateAttachmentTokens([pdf])).toBe(10 * 258);
+    const base = {
+      model: 'gemini-3-pro-preview',
+      workspaceBytes: 4_000,
+      promptChars: 40,
+      expectedOutputTokens: 100,
+    };
+    expect(estimatePreCallCostUsd({ ...base, extraInputTokens: 24 * 258 })).toBeGreaterThan(
+      estimatePreCallCostUsd(base),
+    );
   });
 });

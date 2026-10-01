@@ -219,6 +219,12 @@ export function parseCodeBlocks(text: string): Array<{ lang: string; content: st
   return blocks;
 }
 
+/** The HTTP status an SDK error carries, if any. */
+function statusOf(err: unknown): number | undefined {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === 'number' ? status : undefined;
+}
+
 export const codeTool: ToolDefinition<CodeInput> = {
   name: 'code',
   title: 'Delegate coding to Gemini',
@@ -984,7 +990,7 @@ async function executeCodeBody(
         ...modelAudit,
       });
     }
-    const httpStatus = (err as { status?: number }).status;
+    const httpStatus = statusOf(err) ?? statusOf((err as { cause?: unknown }).cause);
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
       ...tierErrorCode(httpStatus),
       ...(httpStatus !== undefined ? { httpStatus } : {}),

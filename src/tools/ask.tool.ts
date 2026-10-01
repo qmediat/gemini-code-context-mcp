@@ -23,6 +23,7 @@ import {
   MAX_ATTACHMENTS_TOTAL_BYTES,
   MAX_ATTACHMENT_BYTES,
   attachmentParts,
+  estimateAttachmentTokens,
   inspectAttachments,
 } from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
@@ -171,7 +172,7 @@ export const askInputSchema = z
       .max(MAX_ATTACHMENTS)
       .optional()
       .describe(
-        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply). They are part of THIS question only, never of the workspace cache, and their tokens are NOT counted by the size preflight, the budget reservation or the TPM throttle (an image is about 258 tokens, a PDF page as much). The model must support vision; a model without it is refused by name. Not available with the ask_agentic fallback.`,
+        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply). They are part of THIS question only, never of the workspace cache, and their tokens enter the size preflight, the budget reservation and the TPM throttle as an upper-bound estimate (an image as 24 tiles × 258 tokens, a PDF as one page per 50 KB). The model must support vision; a model without it is refused by name. Not available with the ask_agentic fallback.`,
       ),
     serviceTier: z
       .enum(['standard', 'flex'])
@@ -209,6 +210,12 @@ export const askInputSchema = z
   });
 
 export type AskInput = z.infer<typeof askInputSchema>;
+
+/** The HTTP status an SDK error carries, if any. */
+function statusOf(err: unknown): number | undefined {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === 'number' ? status : undefined;
+}
 
 export const askTool: ToolDefinition<AskInput> = {
   name: 'ask',
@@ -433,7 +440,9 @@ async function executeAskBody(
     // Tier 2 = real `countTokens` call when near the cliff). Closes T17
     // (`bytes/4` undercount on dense Unicode). See `src/gemini/token-counter.ts`.
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-    const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4);
+    const attachmentTokens = estimateAttachmentTokens(attached); // an upper bound: images by tile count, PDFs by page
+    const estimatedInputTokens =
+      Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4) + attachmentTokens;
 
     // v1.5.0 preflight (rebuilt in v1.10.0 on top of `countTokens`) — refuse
     // immediately if the estimated input doesn't fit under the model's
@@ -680,6 +689,7 @@ async function executeAskBody(
       const estimateUsd = estimatePreCallCostUsd({
         model: resolved.resolved,
         serviceTier,
+        extraInputTokens: attachmentTokens,
         workspaceBytes,
         promptChars: input.prompt.length,
         // Budget reservation uses the effective cap (explicit-user-cap
@@ -821,7 +831,16 @@ async function executeAskBody(
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
     const tierField = serviceTierConfig(serviceTier);
     // the bytes are read only now — after the size preflight and the budget reservation refused nothing
-    const extraParts: Part[] = await attachmentParts(attached);
+    let extraParts: Part[];
+    try {
+      extraParts = await attachmentParts(attached);
+    } catch (err) {
+      if (!(err instanceof AttachmentError)) throw err;
+      return errorResult(`ask: ${err.message}`, {
+        errorCode: 'ATTACHMENT_INVALID',
+        retryable: false,
+      });
+    }
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
@@ -1202,7 +1221,7 @@ async function executeAskBody(
         retryable: true,
       });
     }
-    const httpStatus = (err as { status?: number }).status;
+    const httpStatus = statusOf(err) ?? statusOf((err as { cause?: unknown }).cause);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
       ...tierErrorCode(httpStatus),
       serviceTier: resolveServiceTier(input.serviceTier, ctx.config.serviceTier),
