@@ -229,7 +229,9 @@ async function executeCodeBody(
   workspaceRoot: string,
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
-  const modelRequest = input.model ?? 'latest-pro-thinking';
+  // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile), as ask and ask_agentic read it;
+  // the alias is the last resort for a context built without one.
+  const modelRequest = input.model ?? ctx.config.defaultModel ?? 'latest-pro-thinking';
   const expectEdits = input.expectEdits ?? true;
   const codeExecution = input.codeExecution ?? false;
 

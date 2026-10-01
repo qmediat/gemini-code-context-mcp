@@ -103,7 +103,7 @@ Aliases are **category-safe** — they resolve against a known functional catego
 
 | Alias | Category | Typical use |
 |---|---|---|
-| `latest-pro-thinking` *(default)* | `text-reasoning` + thinking | Code review, deep analysis — the costlier thinking tier, so set a budget. `ask`/`ask_agentic` take the default from `GEMINI_CODE_CONTEXT_DEFAULT_MODEL`; `code` always uses this alias unless the call passes `model` |
+| `latest-pro-thinking` *(default for every tool)* | `text-reasoning` + thinking | Code review, deep analysis — the costlier thinking tier, so set a budget. `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` or a per-call `model` overrides it (`code` reads the configured default since 1.18.0) |
 | `latest-pro` | `text-reasoning` | Best pro-tier text model |
 | `latest-flash` | `text-fast` | Fast Q&A, cheap |
 | `latest-lite` | `text-lite` | Simplest / cheapest |
@@ -175,7 +175,7 @@ Every env var, auth tier and per-call override is listed in [`docs/configuration
 | `GEMINI_API_KEY` | — | Fallback (Tier 3; emits a warning) |
 | `GEMINI_USE_VERTEX` + `GOOGLE_CLOUD_PROJECT` | — | Enable Vertex AI backend |
 | `GEMINI_DAILY_BUDGET_USD` | unlimited | Hard cap on daily spend; honoured by `ask`, `code`, and `ask_agentic` (per-iteration) |
-| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` | Alias or literal ID for `ask` and `ask_agentic` (`code` reads only its per-call `model`); the default is the thinking tier, so budgets should assume it |
+| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` | Alias or literal ID, read by `ask`, `ask_agentic` and `code` (a per-call `model` wins); the default is the thinking tier, so budgets should assume it |
 | `GEMINI_CODE_CONTEXT_CACHING_MODE` *(v1.14.0+)* | `implicit` | `implicit` (inline, Gemini's automatic prefix cache) or `explicit` (Files API + Context Cache) for every `ask` / `code` call; per-call `cachingMode` wins |
 | `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` | `3600` | Context Cache TTL (explicit mode) |
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |

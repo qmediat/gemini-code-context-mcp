@@ -65,6 +65,7 @@ function createThrottleSpy(): ThrottleSpy {
 }
 
 interface BuildCtxOptions {
+  defaultModel?: string;
   readonly tpmThrottleLimit?: number;
   readonly generateContent?: ReturnType<typeof vi.fn>;
   readonly forceMaxOutputTokens?: boolean;
@@ -108,6 +109,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       cacheMinTokens: 1_024,
       tpmThrottleLimit: opts.tpmThrottleLimit ?? 80_000,
       forceMaxOutputTokens: opts.forceMaxOutputTokens ?? false,
+      defaultModel: opts.defaultModel ?? 'latest-pro-thinking',
     } as ToolContext['config'],
     client: {
       models: { generateContent, generateContentStream },
@@ -349,5 +351,46 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     await codeTool.execute({ task: 'refactor', maxOutputTokens: 1_000_000 }, ctx);
     const config = lastGenerateContentCall(generateContent);
     expect(config.maxOutputTokens).toBe(65_536);
+  });
+});
+
+describe('code.tool.ts model default (1.18.0): the configured default, like ask and ask_agentic', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.validateWorkspacePath.mockReturnValue(undefined);
+    mocks.scanWorkspace.mockResolvedValue({
+      workspaceRoot: '/fake',
+      filesHash: 'abc',
+      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
+      skippedTooLarge: 0,
+      truncated: false,
+    });
+    mocks.resolveModel.mockResolvedValue({
+      requested: 'latest-flash',
+      resolved: 'gemini-3-flash-preview',
+      inputTokenLimit: 1_000_000,
+      outputTokenLimit: 65_536,
+      fallbackApplied: false,
+      category: 'text-fast',
+      capabilities: {
+        supportsThinking: true,
+        supportsCaching: true,
+        supportsVision: false,
+        supportsCodeExecution: true,
+      },
+    });
+  });
+
+  it('a call without `model` asks for ctx.config.defaultModel (GEMINI_CODE_CONTEXT_DEFAULT_MODEL / the profile)', async () => {
+    const { ctx } = buildCtx({ defaultModel: 'latest-flash' });
+    await codeTool.execute({ task: 'x' }, ctx);
+    expect(mocks.resolveModel).toHaveBeenCalled();
+    expect(mocks.resolveModel.mock.calls[0]?.[0]).toBe('latest-flash');
+  });
+
+  it('a per-call `model` wins over the configured default', async () => {
+    const { ctx } = buildCtx({ defaultModel: 'latest-flash' });
+    await codeTool.execute({ task: 'x', model: 'latest-pro' }, ctx);
+    expect(mocks.resolveModel.mock.calls[0]?.[0]).toBe('latest-pro');
   });
 });

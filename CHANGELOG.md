@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-10-01
+
+### Fixed
+
+- `code` reads the configured default model (`GEMINI_CODE_CONTEXT_DEFAULT_MODEL`, then the credentials profile), as `ask` and `ask_agentic` always did; before, a `code` call without `model` used `latest-pro-thinking` whatever the operator configured. A per-call `model` still wins. Two tests pin it.
+
 ## [1.17.1] - 2026-10-01
 
 ### Changed

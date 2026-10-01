@@ -19,7 +19,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_USE_VERTEX` | `false` | Set `true` + `GOOGLE_CLOUD_PROJECT` to use Vertex AI |
 | `GOOGLE_CLOUD_PROJECT` | — | GCP project for Vertex |
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Region for Vertex |
-| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` *(read by `ask` and `ask_agentic`; `code` takes only a per-call `model`)* | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID. Default picks the newest Pro model with reasoning support; override to `latest-pro` if you want non-thinking variants, or to a flash alias for cost-sensitive workloads. |
+| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` *(read by every tool since 1.18.0; a per-call `model` wins)* | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID. Default picks the newest Pro model with reasoning support; override to `latest-pro` if you want non-thinking variants, or to a flash alias for cost-sensitive workloads. |
 | `GEMINI_DAILY_BUDGET_USD` | unlimited | Hard cap; refuses calls over the cap until UTC midnight |
 | `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` | `3600` | Context Cache TTL (Gemini enforces ≥ 60 s) |
 | `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS` | `1024` | Minimum estimated tokens required before attempting `caches.create`. Below this we skip the cache build and use inline parts. Gemini currently enforces 1024; expose this knob so operators can adjust without a patch release if Google changes the floor. |
@@ -100,7 +100,7 @@ The server enumerates models available to your API key at startup, classifies ea
 | Alias | Category | Picks |
 |---|---|---|
 | `latest-pro` | `text-reasoning` | Newest pro-tier text model |
-| `latest-pro-thinking` | `text-reasoning` + `supportsThinking` | Newest pro model with reasoning support (the default; `code` uses it whenever the call passes no `model`) |
+| `latest-pro-thinking` | `text-reasoning` + `supportsThinking` | Newest pro model with reasoning support (the default for every tool) |
 | `latest-flash` | `text-fast` | Newest flash-tier text model |
 | `latest-lite` | `text-lite` | Newest lite-tier (cheapest) text model |
 | `latest-vision` | `text-reasoning` ∪ `text-fast` + `supportsVision` | Newest vision-capable text model |
