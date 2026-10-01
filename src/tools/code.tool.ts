@@ -13,6 +13,7 @@ import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
@@ -21,6 +22,7 @@ import {
   WorkspaceValidationError,
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
+import type { ResolvedModel } from '../types.js';
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
@@ -72,9 +74,10 @@ export const codeInputSchema = z
     workspace: z.string().optional().describe('Workspace path (default: cwd).'),
     model: z
       .string()
+      .min(1)
       .optional()
       .describe(
-        "Model alias or literal ID. Defaults to 'latest-pro-thinking' for strongest coding performance.",
+        "Model alias or literal ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile); a configured default that resolves but cannot reason or think (a flash/lite tier) is replaced by 'latest-pro-thinking' for this tool and the response says so (configuredModelReplaced); a model named here is never replaced.",
       ),
     thinkingBudget: z
       .number()
@@ -223,13 +226,56 @@ export const codeTool: ToolDefinition<CodeInput> = {
   },
 };
 
+const CODE_FALLBACK_MODEL = 'latest-pro-thinking';
+const CODE_CATEGORY: readonly ['text-reasoning'] = ['text-reasoning'];
+
+interface CodeModelChoice {
+  resolved: ResolvedModel;
+  /** The configured default this call did not use, when `code` fell back to the alias; absent otherwise. */
+  replacedDefault?: string;
+}
+
+/**
+ * `code` needs a reasoning model that thinks (it always sends a thinking budget or level). A model the caller named is
+ * resolved as asked and a category mismatch is the caller's error, as before. The CONFIGURED default (`fromConfig`) is
+ * honoured when it resolves to such a model; when it resolves but cannot (a flash or lite alias or ID set for cheaper
+ * `ask` calls, or a model without thinking), `code` uses the alias instead and says so — in the log and in the response
+ * (`configuredModelReplaced`). A configured default that does not resolve at all fails the call, as it fails `ask`.
+ */
+async function resolveCodeModel(
+  requested: string,
+  fromConfig: boolean,
+  client: Parameters<typeof resolveModel>[1],
+): Promise<CodeModelChoice> {
+  const replaceable = fromConfig && requested !== CODE_FALLBACK_MODEL;
+  let why: string;
+  try {
+    const resolved = await resolveModel(requested, client, { requiredCategory: CODE_CATEGORY });
+    if (!replaceable || resolved.capabilities.supportsThinking) return { resolved };
+    why = `resolves to ${safeForLog(resolved.resolved)}, which does not support thinking`;
+  } catch (err) {
+    if (!replaceable || !(err instanceof ModelCategoryMismatchError)) throw err;
+    why = `is '${safeForLog(err.actualCategory)}', not a reasoning model`;
+  }
+  logger.warn(
+    `code: the configured default model ${safeForLog(requested)} ${why} — using ${CODE_FALLBACK_MODEL} for this call (set GEMINI_CODE_CONTEXT_DEFAULT_MODEL to a thinking pro alias, or pass model per call)`,
+  );
+  const resolved = await resolveModel(CODE_FALLBACK_MODEL, client, {
+    requiredCategory: CODE_CATEGORY,
+  });
+  return { resolved, replacedDefault: requested };
+}
+
 async function executeCodeBody(
   input: CodeInput,
   ctx: Parameters<typeof codeTool.execute>[1],
   workspaceRoot: string,
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
-  const modelRequest = input.model ?? 'latest-pro-thinking';
+  // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile, then the alias — loadConfig always
+  // sets it), as ask and ask_agentic read it. `resolveCodeModel` keeps `code` on a thinking reasoning model when the
+  // configured default is not one, and the response names the replaced default.
+  const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL; // the last ?? as ask_agentic has it
   const expectEdits = input.expectEdits ?? true;
   const codeExecution = input.codeExecution ?? false;
 
@@ -253,6 +299,7 @@ async function executeCodeBody(
   // Canonical resolved-model string for retry-hint seeding (T22a).
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
+  let modelAudit: Record<string, unknown> = {};
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
   // See ask.tool.ts for rationale; same shape here.
@@ -284,9 +331,19 @@ async function executeCodeBody(
     // (which may share `pro` tokens with text models in Google's registry)
     // from reaching `generateContent` with a code-review prompt — the
     // primary motivation for the v1.4.0 taxonomy work.
-    const resolved = await resolveModel(modelRequest, ctx.client, {
-      requiredCategory: ['text-reasoning'],
-    });
+    const choice = await resolveCodeModel(modelRequest, input.model == null, ctx.client);
+    const resolved = choice.resolved;
+    // The same two fields on every result after this point, error results included: an audit of a failed call
+    // can still tell a fallback from a caller's choice.
+    modelAudit = {
+      resolvedModel: resolved.resolved,
+      configuredModelReplaced: choice.replacedDefault ?? null,
+    };
+    if (choice.replacedDefault !== undefined) {
+      emitter.emit(
+        `configured default model ${safeForLog(choice.replacedDefault)} replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
+      );
+    }
     resolvedModelKey = resolved.resolved;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
@@ -421,7 +478,7 @@ async function executeCodeBody(
             contextWindowTokens: contextWindow,
             thresholdTokens: threshold,
             guardRatio: ctx.config.workspaceGuardRatio,
-            resolvedModel: resolved.resolved,
+            ...modelAudit,
             filesIndexed: scan.files.length,
           },
         );
@@ -455,7 +512,7 @@ async function executeCodeBody(
         const spentUsd = reserve.spentMicros / 1_000_000;
         return errorResult(
           `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false },
+          { errorCode: 'BUDGET_REJECT', retryable: false, ...modelAudit },
         );
       }
       reservationId = reserve.id;
@@ -814,7 +871,7 @@ async function executeCodeBody(
     }
 
     const structured: Record<string, unknown> = {
-      resolvedModel: resolved.resolved,
+      ...modelAudit,
       requestedModel: resolved.requested,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,
@@ -910,12 +967,14 @@ async function executeCodeBody(
         timeoutMs: ms,
         stallMs,
         retryable: true,
+        ...modelAudit,
       });
     }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...modelAudit,
     });
   } finally {
     timeoutController.dispose();

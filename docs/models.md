@@ -66,7 +66,7 @@ Orthogonal to category — multiple can apply to a single model:
 | Alias | Category set | Extra filter | Notes |
 |---|---|---|---|
 | `latest-pro` | `text-reasoning` | — | Newest pro-tier text model |
-| `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | The default: `ask`/`ask_agentic` when `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` is unset, `code` whenever the call passes no `model`; preferred for deep work |
+| `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | The default for every tool when `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` is unset; preferred for deep work |
 | `latest-flash` | `text-fast` | — | Faster + cheaper than pro; no deep thinking |
 | `latest-lite` | `text-lite` | — | Cheapest tier; limited capabilities |
 | `latest-vision` | `text-reasoning` or `text-fast` | `supportsVision=true` | Screenshot analysis, image Q&A |
@@ -80,7 +80,8 @@ falling to a different category.
 ### Code review (the primary use case)
 
 ```jsonc
-// Default — no `model` needed; code tool uses `latest-pro-thinking`.
+// Default — no `model` needed; code uses the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile,
+// then `latest-pro-thinking`), replaced by `latest-pro-thinking` when that default cannot reason or think.
 { "tool": "code", "task": "Review my PR for memory safety issues" }
 ```
 

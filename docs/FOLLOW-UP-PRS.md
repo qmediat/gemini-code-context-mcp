@@ -666,7 +666,3 @@ The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to s
 **Blocked on:** Need for a destructive migration. The `addColumnIfMissing` idempotent pattern is sufficient until a column needs to disappear or change shape.
 
 ---
-
-## `code` ignores `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` (found 2026-10-01, docs audit round r1)
-
-`src/tools/code.tool.ts` resolves `input.model ?? 'latest-pro-thinking'`, while `ask` and `ask_agentic` resolve `input.model ?? ctx.config.defaultModel` (the env var, then the profile, then `latest-pro-thinking`). An operator who sets `GEMINI_CODE_CONTEXT_DEFAULT_MODEL=latest-flash` gets flash for `ask` and the thinking Pro tier for every `code` call. 1.17.1 documents the difference; the fix is one line plus a test that `code` honours the configured default — a behaviour change, so a minor release with its own review.

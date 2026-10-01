@@ -6,12 +6,12 @@
     "url": "https://github.com/qmediat/gemini-code-context-mcp",
     "source": "github"
   },
-  "version": "1.17.1",
+  "version": "1.18.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@qmediat.io/gemini-code-context-mcp",
-      "version": "1.17.1",
+      "version": "1.18.0",
       "transport": {
         "type": "stdio"
       },
@@ -53,7 +53,7 @@
         },
         {
           "name": "GEMINI_CODE_CONTEXT_DEFAULT_MODEL",
-          "description": "Model alias (`latest-pro-thinking`, `latest-pro`, `latest-flash`, `latest-lite`, `latest-vision`) or literal model ID. Default: `latest-pro-thinking` (the thinking tier).",
+          "description": "Model alias (`latest-pro-thinking`, `latest-pro`, `latest-flash`, `latest-lite`, `latest-vision`) or literal model ID, read by ask, ask_agentic and code. Default: `latest-pro-thinking` (the thinking tier). code replaces a configured default that resolves but cannot reason or think with `latest-pro-thinking` and reports it as `configuredModelReplaced`; a default that does not resolve fails every tool.",
           "isRequired": false,
           "format": "string",
           "isSecret": false
