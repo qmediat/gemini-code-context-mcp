@@ -31,7 +31,7 @@ Then restart Claude Code. That's it.
 | Tool names | `ask-gemini`, `brainstorm`, `fetch-chunk`, `ping`, `Help`, `timeout-test` | `ask`, `code`, `status`, `reindex`, `clear` |
 | Default model | Hardcoded `gemini-2.5-pro` on main, `gemini-3.1-pro-preview` on npm v1.1.4 — frozen, no env var override | Dynamic alias `latest-pro` — resolves against your API key tier at startup |
 | Quota fallback | Hardcoded to `gemini-2.5-flash` | Generic `models.list()` → pick best available |
-| Repeat queries | No caching — each call re-tokenises referenced files | Persistent Context Cache — typically ~5× faster, ~4× cheaper on repeat queries |
+| Repeat queries | No caching — each call re-tokenises referenced files | One workspace scan reused; implicit caching by default, an explicit Context Cache on request (measured ~8× faster, ~4× cheaper on repeats in explicit mode) |
 | Coding delegation | Prompt-injected OLD/NEW format (`changeMode`) | Native `thinkingConfig` + optional `codeExecution` |
 | Auth | Inherits `gemini` CLI auth (browser OAuth or `GEMINI_API_KEY` env) | 3-tier: Vertex ADC / profile file (chmod 0600) / env var |
 | Cost control | — | Daily budget cap in USD |
@@ -53,8 +53,8 @@ If you had custom agents or workflows that referenced jamubc tool names, here's 
 ## What you'll gain
 
 1. **Maintained.** We respond to issues in under 48 h during the first 30 days post-launch.
-2. **Faster by default.** The context cache is on by default. You don't have to think about it.
-3. **Cheaper.** Cached input tokens are billed at ~25 % of the uncached rate; most queries after the first hit the cache.
+2. **One scan, many questions.** The workspace is scanned once and reused; implicit caching is the default, an explicit Context Cache is one parameter away (`cachingMode: "explicit"`).
+3. **Cheaper on repeats in explicit mode.** Cached input is billed at Google's cached-input price (the estimator assumes 25 % of the input rate when a model lists none); the implicit default has no guaranteed discount.
 4. **Secure.** No API keys in `~/.claude.json`. Daily budget cap out of the box. Fingerprint-only logs.
 5. **Future-proof.** Model names aren't hardcoded. When Gemini 4 ships, `latest-pro` picks it up.
 
@@ -79,7 +79,7 @@ Then update `~/.claude.json` with the `npx` command from the TL;DR above.
 
 ### The server starts but `ask` fails with "No models available"
 
-Your API key's tier doesn't reach any Gemini model. Check [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Paid tier gets 2M context + access to `-pro` and `-pro-thinking` models.
+Your API key's tier doesn't reach any Gemini model. Check [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Paid tier gets the 1M-token context + access to `-pro` and `-pro-thinking` models.
 
 ### "Daily budget cap reached"
 
@@ -87,7 +87,7 @@ You (or someone with your key) have spent the configured `GEMINI_DAILY_BUDGET_US
 
 ### First query is slow, even on repeat
 
-Check `status`. If `cache_id` is `null`, caching isn't active — probably because the model doesn't support long context. Try `ask({ model: "latest-pro" })` explicitly.
+Check `status`. In the default implicit mode there is no `cache_id` — every question carries the workspace and only Gemini's automatic cache can shorten it. For a persistent cache call `ask({ cachingMode: "explicit" })`; if `cache_id` stays `null` there, the model may not support caching — try `ask({ model: "latest-pro" })`.
 
 ### I want jamubc tools back
 

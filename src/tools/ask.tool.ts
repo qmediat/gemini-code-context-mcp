@@ -1,9 +1,10 @@
 /**
  * `ask` tool — Q&A / long-context analysis against a workspace.
  *
- * Uses the Persistent Context Cache when available, reducing repeat-query cost
- * and latency. First call on a workspace: ~30–45 s (upload + build). Subsequent
- * calls with unchanged files: ~2–3 s.
+ * Sends the scanned workspace with the question. Implicit caching by default
+ * (inline content, Gemini's automatic prefix cache); `cachingMode: 'explicit'`
+ * uploads the workspace once and builds a persistent Context Cache (measured
+ * 2026-04-22 on a 670 k-token workspace: first call ~125 s, repeats ~14 s).
  */
 
 import { createHash } from 'node:crypto';
@@ -185,7 +186,7 @@ export const askTool: ToolDefinition<AskInput> = {
   name: 'ask',
   title: 'Ask Gemini',
   description:
-    'Primary tool for codebase Q&A on workspaces that fit the model input-token limit (~1M tokens for Gemini Pro — covers most repos). Eager workspace upload + persistent Context Caching → repeat queries are ~20× faster and cheaper than re-sending the codebase each time. Falls back to `ask_agentic` automatically when the workspace exceeds the limit (set `onWorkspaceTooLarge: "fallback-to-agentic"`). For repos that genuinely exceed 1M tokens or when only a handful of files matter, call `ask_agentic` directly.',
+    'Primary tool for codebase Q&A on workspaces that fit the model input-token limit (~1M tokens for Gemini Pro — covers most repos). Eager: the scanned workspace goes with the question (implicit caching by default; `cachingMode: "explicit"` builds a persistent Context Cache — measured ~8× faster and ~4× cheaper on repeat queries than sending the codebase inline). Falls back to `ask_agentic` automatically when the workspace exceeds the limit (set `onWorkspaceTooLarge: "fallback-to-agentic"`). For repos that genuinely exceed 1M tokens or when only a handful of files matter, call `ask_agentic` directly.',
   schema: askInputSchema,
 
   async execute(input, ctx) {

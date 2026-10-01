@@ -19,7 +19,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_USE_VERTEX` | `false` | Set `true` + `GOOGLE_CLOUD_PROJECT` to use Vertex AI |
 | `GOOGLE_CLOUD_PROJECT` | — | GCP project for Vertex |
 | `GOOGLE_CLOUD_LOCATION` | `us-central1` | Region for Vertex |
-| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID. Default picks the newest Pro model with reasoning support; override to `latest-pro` if you want non-thinking variants, or to a flash alias for cost-sensitive workloads. |
+| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` *(read by `ask` and `ask_agentic`; `code` takes only a per-call `model`)* | Alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`) or literal model ID. Default picks the newest Pro model with reasoning support; override to `latest-pro` if you want non-thinking variants, or to a flash alias for cost-sensitive workloads. |
 | `GEMINI_DAILY_BUDGET_USD` | unlimited | Hard cap; refuses calls over the cap until UTC midnight |
 | `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` | `3600` | Context Cache TTL (Gemini enforces ≥ 60 s) |
 | `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS` | `1024` | Minimum estimated tokens required before attempting `caches.create`. Below this we skip the cache build and use inline parts. Gemini currently enforces 1024; expose this knob so operators can adjust without a patch release if Google changes the floor. |
@@ -36,6 +36,8 @@ The server picks the highest-trust source available, in this order:
 | `XDG_CONFIG_HOME` | — | Override the config directory (defaults to `~/.config`) |
 | `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` *(v1.6.0+)* | disabled | Wall-clock timeout in ms for `ask`. Bounded `[1000, 1_800_000]` (1 s to 30 min). Aborts the in-flight `generateContent` request via `AbortController` when exceeded. Empty / `0` / negative = disabled. Per-call `ask({ timeoutMs })` always wins. **Caveat:** `AbortSignal` is client-only — Gemini may still finish server-side and bill for completed work (per `@google/genai` SDK docs). |
 | `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS` *(v1.6.0+)* | disabled | Same shape as the `ask` variant, applied to the `code` tool. Per-call override: `code({ timeoutMs })`. |
+| `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` *(v1.14.4+)* | disabled | Per-iteration heartbeat-aware stall watchdog for `ask_agentic` in ms (1 s – 10 min): resets on every streamed chunk (text or thought) and aborts the iteration when the stream goes silent for that long. Per-call `stallMs` overrides. |
+| `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY` *(v1.15.1+)* | `10` | How many sandboxed tool calls of one `ask_agentic` iteration run at once; clamped to `[1, 50]` (`1` = serial, for hosts where parallel file reads hurt). |
 | `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` *(v1.6.0+)* | disabled | Per-iteration cap for `ask_agentic`. Bounds each loop iteration (one `generateContent` + possible tool calls) independently. A single hung iteration aborts the whole agentic call with `errorCode: "TIMEOUT"` — continuing with partial state would leave the conversation structurally incomplete (the failed iteration's function-call results never came back). Per-call override: `ask_agentic({ iterationTimeoutMs })`. |
 | `GEMINI_CODE_CONTEXT_ASK_STALL_MS` *(v1.12.0+)* | disabled | Heartbeat-aware stall watchdog for `ask`. Bounded `[1000, 600000]` (1 s to 10 min). Resets on every chunk (text or thought) — fires only when the stream goes silent for this long. Does NOT fire while the model is actively thinking; the streaming heartbeat (~1500 ms via thought chunks) keeps the watchdog reset. Recommended setting: `60000` (60 s) — Gemini Pro can pause 15-30 s mid-reasoning between thought chunks under heavy thinking; 60 s absorbs that jitter while still killing dead sockets ~30× faster than the wall-clock alternative. Independent of `..._TIMEOUT_MS` — both can be set; whichever fires first wins. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"`. Per-call override: `ask({ stallMs })`. |
 | `GEMINI_CODE_CONTEXT_CODE_STALL_MS` *(v1.12.0+)* | disabled | Same shape as the `ask` variant, applied to the `code` tool. Per-call override: `code({ stallMs })`. |
@@ -98,7 +100,7 @@ The server enumerates models available to your API key at startup, classifies ea
 | Alias | Category | Picks |
 |---|---|---|
 | `latest-pro` | `text-reasoning` | Newest pro-tier text model |
-| `latest-pro-thinking` | `text-reasoning` + `supportsThinking` | Newest pro model with reasoning support (default for `code`) |
+| `latest-pro-thinking` | `text-reasoning` + `supportsThinking` | Newest pro model with reasoning support (the default; `code` uses it whenever the call passes no `model`) |
 | `latest-flash` | `text-fast` | Newest flash-tier text model |
 | `latest-lite` | `text-lite` | Newest lite-tier (cheapest) text model |
 | `latest-vision` | `text-reasoning` ∪ `text-fast` + `supportsVision` | Newest vision-capable text model |

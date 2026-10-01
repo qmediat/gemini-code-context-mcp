@@ -13,7 +13,7 @@ Your Gemini API key and your workspace content. We treat them with different thr
 
 ### Workspace content
 
-- **Uploaded to Google's Files API on first `ask`/`code`.** Google auto-deletes after 48 h. Re-uploaded on next use if needed.
+- **Sent to Gemini with every `ask`/`code` call** (implicit mode, the default). In explicit `cachingMode` the workspace is **uploaded to Google's Files API** once and held in a Context Cache; Google auto-deletes the files after 48 h, and they are re-uploaded on the next use if needed.
 - **Not sent anywhere else.** The manifest (cache IDs, hashes) stays local in `~/.qmediat/gemini-code-context-mcp/manifest.db`.
 - **No telemetry by default.** Setting `GEMINI_CODE_CONTEXT_TELEMETRY=true` is reserved for future opt-in anonymous usage counts (not implemented in v1.0).
 
