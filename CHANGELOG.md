@@ -25,8 +25,9 @@ Second of the two PRs that replace #91 (`docs/DESIGN-attachments.md` holds the m
   1090 tokens on gemini-3-flash and 259 on 2.5-flash-lite, so no local figure would do); a count that cannot be
   obtained refuses the call (`ATTACHMENT_TOKENS_UNCOUNTED`, retryable). Inspection, read and count happen before the
   preflight and every reservation, so a bad file costs nothing: a model without vision is `ATTACHMENTS_UNSUPPORTED`,
-  a bad file `ATTACHMENT_INVALID` (`retryable: false`), a request whose encoded attachments plus inline workspace and
-  prompt would cross Google's 20 MB inline limit `REQUEST_TOO_LARGE`, the `ask_agentic` fallback cannot carry them
+  a bad file `ATTACHMENT_INVALID` (`retryable: false`), a request whose conservative size (the attachments encoded, the
+  workspace bodies with their markers, the prompt, the system instruction, the JSON framing) would cross Google's
+  20 MB inline limit `REQUEST_TOO_LARGE`, the `ask_agentic` fallback cannot carry them
   and says so.
   `structuredContent.attachments` lists what was sent and `attachmentTokens` what Gemini counted. The `latest-vision`
   alias finally has an input to see.

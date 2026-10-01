@@ -57,7 +57,7 @@ Orthogonal to category — multiple can apply to a single model:
 | Flag | Meaning |
 |---|---|
 | `supportsThinking` | Model supports reasoning / extended thinking (Gemini 2.5+, Gemini 3.x) |
-| `supportsVision` | Accepts image / screenshot input (most Gemini models except `*-lite` and embeddings) |
+| `supportsVision` | Accepts image / PDF input (every text-generation tier, Flash-Lite included since v1.20.0; not embeddings or media generation) |
 | `supportsCodeExecution` | Works with the `code_execution` tool (all text-gen tiers) |
 | `costTier` | `premium` (pro / image-gen / music), `standard` (flash), `budget` (lite / embeddings), `unknown` |
 

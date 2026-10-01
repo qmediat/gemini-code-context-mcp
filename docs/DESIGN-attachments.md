@@ -27,9 +27,10 @@ interface ReadAttachments { parts: Part[]; bytes: number }   // the inline parts
 
 Caps (this server's, under every figure Google publishes): 8 files, 10 MB per file, 14 MB raw in total
 (≈ 18.7 MB once base64-encoded, under the 20 MB-including-text figure for images). Google's 20 MB limit on one
-inline request (files, prompt and system instruction together) is checked after the scan with the encoded attachment
-bytes plus the workspace and prompt bytes, whatever the caching mode (an explicit cache may not be built and the call
-then runs inline): over it, `REQUEST_TOO_LARGE` before any reservation. Accepted types by extension,
+inline request (files, prompt and system instruction together) is checked after the scan with a conservative size of
+the request — every attachment base64-encoded on its own, the workspace bodies with their `--- FILE:` markers, the
+prompt, the system instruction, 64 bytes of JSON framing per part plus 1 KB — whatever the caching mode (an explicit
+cache may not be built and the call then runs inline): over it, `REQUEST_TOO_LARGE` before any reservation. Accepted types by extension,
 confirmed by the first bytes (PNG / JPEG / WebP / PDF magic) once read: a mismatch is refused by name.
 
 ## Threat model — what is defended, what is not
@@ -42,7 +43,7 @@ Defended:
 - a file that is not the inspected one at read (deleted, replaced, shrunk, grown): the read opens the inspected
   canonical path and accepts only the inspected `(dev, ino)` and size behind the descriptor (both from `stat` with
   `bigint`, exact on 64-bit inode numbers), then reads `size + 1` bytes in 1 MB chunks (stops on the call's timeout)
-  so a file that grows during the read is caught — no second walk of the path, so there is nothing to toggle around a
+  so a file that grows during the read is caught, and one that ends early shrank — no second walk of the path, so there is nothing to toggle around a
   re-resolution;
 - a file whose bytes are not its declared type: the magic check after the read (Gemini 3 answers 400
   `INVALID_ARGUMENT` to such a part; a Flash-Lite model counts it — the refusal is uniform and local);
@@ -55,7 +56,9 @@ Residual: inode reuse after a deletion within the call — theoretical, not defe
 
 ## Token count — measured, not estimated
 
-The size preflight, the budget reservation and the TPM throttle need the attachments' tokens. They are obtained from
+The size preflight, the budget reservation and the TPM throttle need the attachments' tokens; a usable total is a
+positive integer (a non-empty part cannot count zero or a fraction). The count also weighs on the preflight's
+heuristic-vs-exact decision (`extraTokens`): a workspace well under the cliff alone may be near it with the parts. They are obtained from
 Gemini's `countTokens` on the assembled parts — one free call carrying only the parts, right after the read, so the
 workspace preflight keeps its own cache key `(filesHash, prompt, model)` and its heuristic tier. Measured on
 2026-10-01 with the project's key: a 1×1 PNG counts 1090 tokens on `gemini-3-flash-preview` and 259 on
@@ -86,7 +89,7 @@ and maps to `TIMEOUT`. The ledger settles what Gemini billed.
 | Case | Result |
 |---|---|
 | model without vision | `ATTACHMENTS_UNSUPPORTED`, `retryable: false`, before any call |
-| path outside the workspace, symlink, secret, bad type or magic, size, unreadable, swapped at read | `ATTACHMENT_INVALID`, `retryable: false`, before any reservation |
+| path outside the workspace, symlink, secret, bad type or magic, size, unreadable, swapped at read, a bad workspace root, more than 8 files (the schema does not cap the list, so the refusal is this one, not a generic argument error) | `ATTACHMENT_INVALID`, `retryable: false`, before any reservation |
 | countTokens unavailable or malformed for the parts | `ATTACHMENT_TOKENS_UNCOUNTED`, retryable only after a transient failure, before any reservation |
 | countTokens answers 400 to the parts | `ATTACHMENT_INVALID`, `retryable: false` |
 | encoded attachments + workspace + prompt over Google's 20 MB inline request limit | `REQUEST_TOO_LARGE`, `retryable: false`, before any reservation |

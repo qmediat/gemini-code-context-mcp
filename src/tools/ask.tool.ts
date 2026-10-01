@@ -181,11 +181,10 @@ export const askInputSchema = z
       ),
     serviceTier: z.enum(['standard', 'flex']).optional().describe(SERVICE_TIER_DESCRIPTION),
     attachments: z
-      .array(z.string().min(1))
-      .max(MAX_ATTACHMENTS)
+      .array(z.string().min(1)) // the count cap is inspectAttachments' (ATTACHMENT_INVALID), not the schema's
       .optional()
       .describe(
-        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline before the question — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply, the first bytes must match the type). They belong to THIS question only, never to the workspace cache. Their tokens are counted by Gemini (one free countTokens call) and enter the size preflight, the budget reservation and the TPM throttle; a count that cannot be obtained refuses the call (ATTACHMENT_TOKENS_UNCOUNTED, retryable). The model must support vision (ATTACHMENTS_UNSUPPORTED otherwise); a bad file is ATTACHMENT_INVALID, never retryable, and costs nothing. Not available with the ask_agentic fallback.`,
+        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline before the question — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply, the first bytes must match the type). They belong to THIS question only, never to the workspace cache. Their tokens are counted by Gemini (one free countTokens call) and enter the size preflight, the budget reservation and the TPM throttle; a count that cannot be obtained refuses the call (ATTACHMENT_TOKENS_UNCOUNTED — retryable after a transient failure: no status, 429, 5xx; not after 401/403/404; a 400 means Gemini refused the parts: ATTACHMENT_INVALID). The model must support vision (ATTACHMENTS_UNSUPPORTED otherwise); a bad file is ATTACHMENT_INVALID, never retryable, and costs nothing. Not available with the ask_agentic fallback.`,
       ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
@@ -295,23 +294,38 @@ async function attachmentsOrRefusal(
   }
 }
 
+/** The bytes of one workspace file as the request carries it: its body and its `--- FILE: <relpath> ---` marker. */
+const FILE_MARKER_BYTES = '\n\n--- FILE:  ---\n\n'.length;
+function inlineFileBytes(files: readonly { relpath: string; size: number }[]): number {
+  return files.reduce(
+    (sum, f) => sum + f.size + Buffer.byteLength(f.relpath, 'utf8') + FILE_MARKER_BYTES,
+    0,
+  );
+}
+
 /** Google's inline request limit holds whatever the caching mode (an explicit cache may not be built and the call
- * then runs inline): the refusal, before any reservation, when the encoded attachments plus the workspace and the
- * prompt would cross it; nothing otherwise. */
+ * then runs inline): the refusal, before any reservation, when a conservative size of the request — the attachments
+ * encoded, the workspace bodies with their markers, the prompt, the system instruction, the JSON framing — crosses
+ * it; nothing otherwise. */
 function inlineRequestRefusal(
   prepared: PreparedAttachments,
-  workspaceBytes: number,
+  files: readonly { relpath: string; size: number }[],
   prompt: string,
   serviceTier: 'standard' | 'flex',
 ): TextToolResult | undefined {
   if (prepared.attached.length === 0) return undefined;
+  const textBytes =
+    inlineFileBytes(files) +
+    Buffer.byteLength(prompt, 'utf8') +
+    Buffer.byteLength(SYSTEM_INSTRUCTION_Q_AND_A, 'utf8');
   const requestBytes = inlineRequestBytes(
-    prepared.bytes,
-    workspaceBytes + Buffer.byteLength(prompt, 'utf8'),
+    prepared.attached.map((a) => a.bytes),
+    textBytes,
+    files.length + 2, // the prompt and the system instruction
   );
   if (requestBytes <= INLINE_REQUEST_LIMIT_BYTES) return undefined;
   return errorResult(
-    `ask: the inline request would carry ${requestBytes} bytes (the attachments base64-encoded, the workspace and the prompt), above Google's ${INLINE_REQUEST_LIMIT_BYTES}-byte limit for inline data; use fewer or smaller attachments, or narrow the workspace with includeGlobs / excludeGlobs`,
+    `ask: the inline request would carry ${requestBytes} bytes (the attachments base64-encoded, the workspace with its file markers, the prompt, the system instruction and the JSON framing), above Google's ${INLINE_REQUEST_LIMIT_BYTES}-byte limit for inline data; use fewer or smaller attachments, or narrow the workspace with includeGlobs / excludeGlobs`,
     {
       errorCode: 'REQUEST_TOO_LARGE',
       retryable: false,
@@ -559,12 +573,7 @@ async function executeAskBody(
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
     const estimatedInputTokens =
       Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4) + attachmentTokens;
-    const inlineRefusal = inlineRequestRefusal(
-      attachments,
-      workspaceBytes,
-      input.prompt,
-      serviceTier,
-    );
+    const inlineRefusal = inlineRequestRefusal(attachments, scan.files, input.prompt, serviceTier);
     if (inlineRefusal !== undefined) return inlineRefusal;
 
     // v1.5.0 preflight (rebuilt in v1.10.0 on top of `countTokens`) — refuse
@@ -601,6 +610,7 @@ async function executeAskBody(
         filesHash: scan.filesHash,
         ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
         inputTokenLimit: contextWindow,
+        extraTokens: attachmentTokens, // weighs on the heuristic-vs-exact decision, added to the count below
         // Thread the user's `timeoutMs` AbortSignal so a hung countTokens
         // call doesn't bleed past the user's stated wall-clock budget. The
         // SDK's `CountTokensConfig` accepts `abortSignal`; on cancellation

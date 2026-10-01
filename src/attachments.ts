@@ -35,9 +35,22 @@ export const MAX_ATTACHMENTS = 8;
  * built, and the call then runs inline), before any reservation. */
 export const INLINE_REQUEST_LIMIT_BYTES = 20_000_000;
 
-/** The bytes an inline request carries for `rawBytes` of attachments beside `textBytes` of workspace and prompt. */
-export function inlineRequestBytes(rawBytes: number, textBytes: number): number {
-  return Math.ceil(rawBytes / 3) * 4 + textBytes;
+/** JSON framing allowed per part of the request (role, keys, quotes, commas) and once for the envelope. */
+const REQUEST_FRAMING_BYTES_PER_PART = 64;
+const REQUEST_FRAMING_BYTES = 1024;
+
+/** A conservative size of the inline request: every attachment base64-encoded on its own (padding per file), the
+ * text the request carries (workspace bodies with their file markers, the prompt, the system instruction) and the
+ * JSON framing of every part. */
+export function inlineRequestBytes(
+  attachmentBytes: readonly number[],
+  textBytes: number,
+  textParts: number,
+): number {
+  const encoded = attachmentBytes.reduce((sum, b) => sum + Math.ceil(b / 3) * 4, 0);
+  const framing =
+    REQUEST_FRAMING_BYTES + REQUEST_FRAMING_BYTES_PER_PART * (attachmentBytes.length + textParts);
+  return encoded + textBytes + framing;
 }
 
 const SUPPORTED_ATTACHMENT_EXTENSIONS: readonly string[] = Object.keys(MIME_BY_EXTENSION);
@@ -128,7 +141,9 @@ export async function inspectAttachments(
     throw new AttachmentError(`${paths.length} attachments; at most ${MAX_ATTACHMENTS} per call`);
   }
   if (paths.length === 0) return [];
-  const root = await resolveWorkspaceRoot(workspaceRoot); // canonical, as the jail compares
+  const root = await resolveWorkspaceRoot(workspaceRoot).catch((err: unknown) => {
+    throw new AttachmentError(`workspace ${workspaceRoot}: ${describe(err)}`);
+  }); // canonical, as the jail compares
   const out: Attachment[] = [];
   let total = 0;
   for (const raw of paths) {
@@ -237,7 +252,7 @@ async function readAttachment(
 }
 
 /** Reads `size` bytes and one more, a chunk at a time so a timeout or cancellation ends it: a file that has more than
- * `size` bytes grew after it was measured. */
+ * `size` bytes grew after it was measured, one that ends before `size` shrank. */
 const READ_CHUNK = 1024 * 1024;
 async function readExactly(
   handle: FileHandle,
@@ -263,6 +278,7 @@ async function readExactly(
     read += bytesRead;
     if (read > size) throw new AttachmentError(`attachment ${path}: grew while being read`);
   }
+  if (read !== size) throw new AttachmentError(`attachment ${path}: shrank while being read`);
   return buffer.subarray(0, read);
 }
 
@@ -302,7 +318,8 @@ export async function countAttachmentTokens(
       { cause: err },
     );
   }
-  if (typeof total !== 'number' || !Number.isFinite(total) || total < 0) {
+  // a non-empty part cannot count zero or a fraction: such a total would reserve nothing
+  if (typeof total !== 'number' || !Number.isInteger(total) || total <= 0) {
     throw new AttachmentTokensUncountedError(
       `countTokens returned no usable total for the attachments (${String(total)})`,
       true,

@@ -25,7 +25,7 @@ import {
 } from '../../src/attachments.js';
 import type { PreparedContext } from '../../src/cache/cache-manager.js';
 import type { ScanResult } from '../../src/indexer/workspace-scanner.js';
-import { askTool } from '../../src/tools/ask.tool.js';
+import { askInputSchema, askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 
 const mocks = vi.hoisted(() => ({
@@ -396,6 +396,16 @@ describe('ask attachments: what is refused, before any reservation', () => {
     expect(many.structuredContent?.errorCode).toBe('ATTACHMENT_INVALID');
     expect(String(many.content[0]?.text)).toMatch(/at most 8/);
     expect(sent).toHaveLength(0);
+    // the schema lets a ninth file through so the refusal above is the one a real MCP call gets
+    expect(
+      askInputSchema.safeParse({
+        prompt: 'q',
+        attachments: Array.from({ length: 9 }, () => 'a.png'),
+      }).success,
+    ).toBe(true);
+    await expect(inspectAttachments([shot], join(dir, 'no-such-root'))).rejects.toBeInstanceOf(
+      AttachmentError,
+    );
     const eightA = pngOfSize('eight-a.png', 8 * 1024 * 1024);
     const eightB = pngOfSize('eight-b.png', 8 * 1024 * 1024);
     await expect(inspectAttachments([eightA, eightB], dir)).rejects.toThrow(
@@ -486,6 +496,18 @@ describe('ask attachments: the count Gemini gives', () => {
     expect(micros(withIt)).toBeGreaterThan(micros(without));
   });
 
+  it('the counted tokens weigh on the heuristic-vs-exact decision: a small workspace with heavy attachments is counted exactly', async () => {
+    mocks.resolveModel.mockResolvedValue({ ...resolved(true), inputTokenLimit: 1_000_000 });
+    const { ctx, sent, countTokens } = buildCtx();
+    countTokens.mockResolvedValueOnce({ totalTokens: 900_000 }); // the parts; the preflight's own call answers COUNTED
+    const result = await askTool.execute({ prompt: 'q', workspace: dir, attachments: [spec] }, ctx);
+    expect(result.isError, String(result.content[0]?.text)).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('WORKSPACE_TOO_LARGE');
+    expect(result.structuredContent?.tokenCountMethod).toBe('exact');
+    expect(countTokens).toHaveBeenCalledTimes(2);
+    expect(sent).toHaveLength(0);
+  });
+
   it('the counted tokens are in the preflight comparison: an attachment fills a small window', async () => {
     mocks.resolveModel.mockResolvedValue({ ...resolved(true), inputTokenLimit: 2_000 });
     const { ctx, sent } = buildCtx();
@@ -508,6 +530,14 @@ describe('ask attachments: the count Gemini gives', () => {
     const err = await countAttachmentTokens(nan, 'm', parts).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(AttachmentTokensUncountedError);
     expect((err as AttachmentTokensUncountedError).retryable).toBe(true);
+    for (const bad of [0, 1.5, -1]) {
+      const client = {
+        models: { countTokens: vi.fn(async () => ({ totalTokens: bad })) },
+      } as unknown as Parameters<typeof countAttachmentTokens>[0];
+      await expect(countAttachmentTokens(client, 'm', parts)).rejects.toBeInstanceOf(
+        AttachmentTokensUncountedError,
+      );
+    }
     const controller = new AbortController();
     const reason = new Error('timed out');
     const aborting = {

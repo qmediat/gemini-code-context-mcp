@@ -132,6 +132,10 @@ export interface PreflightInput {
   filesHash: string;
   /** Optional override of the heuristic-vs-exact cutoff. */
   preflightMode?: 'heuristic' | 'exact' | 'auto';
+  /** Tokens the request carries beyond the files and the prompt (attachments, counted by Gemini): they weigh on
+   * the auto decision — a workspace well under the cliff alone may be near it with them — but not on the count
+   * returned, which the caller adds them to. */
+  extraTokens?: number;
   /** The model's advertised input token limit. The cutoff fraction is
    * applied to this. */
   inputTokenLimit: number;
@@ -247,7 +251,8 @@ export async function countForPreflight(
   // Auto-tier decision: if the heuristic count is well under the cliff,
   // skip the API call. The cutoff fraction (0.5) ensures we never trust
   // the heuristic near the threshold.
-  if (mode === 'auto' && heuristicCount < input.inputTokenLimit * HEURISTIC_CUTOFF_FRACTION) {
+  const projected = heuristicCount + (input.extraTokens ?? 0);
+  if (mode === 'auto' && projected < input.inputTokenLimit * HEURISTIC_CUTOFF_FRACTION) {
     return {
       effectiveTokens: heuristicCount + SYSTEM_INSTRUCTION_RESERVE,
       method: 'heuristic',
