@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-10-01
+
+Second of the two PRs that replace #91 (`docs/DESIGN-attachments.md` holds the model this code keeps).
+
+### Added
+
+- `ask` takes `attachments`: up to 8 image or PDF files (png, jpg, jpeg, webp, pdf; 10 MB each, 14 MB together —
+  this server's cap, under every figure Google publishes; base64 adds a third), sent as `inlineData` parts before the
+  question in the user turn, with or without a Context Cache (a cache hit without attachments still sends the bare
+  prompt). They belong to one question, never to the workspace cache. A path must be inside the workspace (the same
+  realpath jail as `ask_agentic`, its secret rules included), a symlink is refused, every file is checked (type, size,
+  readability) by `stat` before any is read, read through an O_NOFOLLOW descriptor whose device and inode must be the
+  ones recorded at inspection (a file swapped, replaced, deleted or grown in between is refused), and its first bytes
+  must match the declared type. Their tokens are what Gemini counts: one free `countTokens` call on the parts, whose
+  total enters the size preflight, the budget reservation and the TPM throttle (measured 2026-10-01: a 1×1 PNG is
+  1090 tokens on gemini-3-flash and 259 on 2.5-flash-lite, so no local figure would do); a count that cannot be
+  obtained refuses the call (`ATTACHMENT_TOKENS_UNCOUNTED`, retryable). Inspection, read and count happen before the
+  preflight and every reservation, so a bad file costs nothing: a model without vision is `ATTACHMENTS_UNSUPPORTED`,
+  a bad file `ATTACHMENT_INVALID` (`retryable: false`), a request whose conservative size (the attachments encoded, the
+  workspace bodies with their markers, the prompt, the system instruction, the JSON framing) would cross Google's
+  20 MB inline limit `REQUEST_TOO_LARGE`, the `ask_agentic` fallback cannot carry them
+  and says so.
+  `structuredContent.attachments` lists what was sent and `attachmentTokens` what Gemini counted. The `latest-vision`
+  alias finally has an input to see.
+
+### Changed
+
+- The Flash-Lite models count as vision-capable (Google lists image and PDF input on them; `countTokens` on
+  `gemini-2.5-flash-lite` counted an inline PNG and PDF on 2026-10-01), so `attachments` work on a Flash-Lite model
+  named explicitly or through `latest-lite` (`latest-vision` keeps resolving among the reasoning and fast tiers).
+
 ## [1.19.0] - 2026-10-01
 
 From the 2026-10-01 comparison with Google's own tools and the community (`docs/COMPETITION-2026-10-01.md`).

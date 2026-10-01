@@ -116,6 +116,8 @@ export interface PreCallEstimateInputs {
   workspaceBytes: number;
   /** Length of the user prompt in chars — tokenised at ~4 bytes/token. */
   promptChars: number;
+  /** Input tokens beyond the workspace and the prompt (the attachments), counted by Gemini. */
+  extraInputTokens?: number | undefined;
   /** Upper bound on output tokens (tool-specific default). */
   expectedOutputTokens: number;
   /** Thinking budget, passed through as extra output tokens. */
@@ -137,7 +139,7 @@ export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   return estimateCostUsd({
     model: input.model,
     serviceTier: input.serviceTier,
-    uncachedInputTokens: workspaceTokens + promptTokens,
+    uncachedInputTokens: workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0),
     cachedInputTokens: 0,
     outputTokens: Math.max(0, input.expectedOutputTokens),
     ...(input.thinkingTokens !== undefined ? { thinkingTokens: input.thinkingTokens } : {}),
