@@ -43,7 +43,7 @@ import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/c
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
-import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import {
   SERVICE_TIER_DESCRIPTION,
@@ -257,6 +257,70 @@ async function prepareAttachments(
   return { attached, parts, bytes, tokens };
 }
 
+type ResolvedAskModel = Awaited<ReturnType<typeof resolveModel>>;
+
+/** The attachments of one call, or the refusal that ends it: a model without vision, a bad file (never retryable),
+ * a count Gemini could not give. Nothing has been scanned or reserved yet. */
+async function attachmentsOrRefusal(
+  client: Parameters<typeof countAttachmentTokens>[0],
+  paths: readonly string[],
+  resolved: ResolvedAskModel,
+  serviceTier: 'standard' | 'flex',
+  workspaceRoot: string,
+  signal: AbortSignal,
+): Promise<{ prepared: PreparedAttachments } | { refusal: TextToolResult }> {
+  const meta = { serviceTier, resolvedModel: resolved.resolved };
+  if (paths.length > 0 && !resolved.capabilities.supportsVision) {
+    return {
+      refusal: errorResult(
+        `ask: ${paths.length} attachment(s) given, but ${safeForLog(resolved.resolved)} does not support vision — use \`latest-vision\` or a model that lists it`,
+        { errorCode: 'ATTACHMENTS_UNSUPPORTED', retryable: false, ...meta },
+      ),
+    };
+  }
+  try {
+    return {
+      prepared: await prepareAttachments(client, paths, workspaceRoot, resolved.resolved, signal),
+    };
+  } catch (err) {
+    if (!(err instanceof AttachmentError) && !(err instanceof AttachmentTokensUncountedError))
+      throw err;
+    return {
+      refusal: errorResult(`ask: ${err.message}`, {
+        errorCode: err.code,
+        retryable: err.retryable,
+        ...meta,
+      }),
+    };
+  }
+}
+
+/** Google's inline request limit holds whatever the caching mode (an explicit cache may not be built and the call
+ * then runs inline): the refusal, before any reservation, when the encoded attachments plus the workspace and the
+ * prompt would cross it; nothing otherwise. */
+function inlineRequestRefusal(
+  prepared: PreparedAttachments,
+  workspaceBytes: number,
+  prompt: string,
+  serviceTier: 'standard' | 'flex',
+): TextToolResult | undefined {
+  if (prepared.attached.length === 0) return undefined;
+  const requestBytes = inlineRequestBytes(
+    prepared.bytes,
+    workspaceBytes + Buffer.byteLength(prompt, 'utf8'),
+  );
+  if (requestBytes <= INLINE_REQUEST_LIMIT_BYTES) return undefined;
+  return errorResult(
+    `ask: the inline request would carry ${requestBytes} bytes (the attachments base64-encoded, the workspace and the prompt), above Google's ${INLINE_REQUEST_LIMIT_BYTES}-byte limit for inline data; use fewer or smaller attachments, or narrow the workspace with includeGlobs / excludeGlobs`,
+    {
+      errorCode: 'REQUEST_TOO_LARGE',
+      retryable: false,
+      serviceTier,
+      ...attachmentMetadata(prepared),
+    },
+  );
+}
+
 /** `structuredContent` fields of a call with attachments; nothing on a call without. */
 function attachmentMetadata(prepared: PreparedAttachments): Record<string, unknown> {
   if (prepared.attached.length === 0) return {};
@@ -349,39 +413,18 @@ async function executeAskBody(
       });
     }
 
-    // v1.20.0 — attachments ride with the prompt as inline parts; the model must see images. Inspected, read and
-    // counted here — before the scan, the preflight, the budget reservation and the throttle: a bad file costs nothing.
-    const attachmentPaths = input.attachments ?? [];
-    if (attachmentPaths.length > 0 && !resolved.capabilities.supportsVision) {
-      return errorResult(
-        `ask: ${attachmentPaths.length} attachment(s) given, but ${safeForLog(resolved.resolved)} does not support vision — use \`latest-vision\` or a model that lists it`,
-        {
-          errorCode: 'ATTACHMENTS_UNSUPPORTED',
-          retryable: false,
-          serviceTier,
-          resolvedModel: resolved.resolved,
-        },
-      );
-    }
-    let attachments: PreparedAttachments;
-    try {
-      attachments = await prepareAttachments(
-        ctx.client,
-        attachmentPaths,
-        workspaceRoot,
-        resolved.resolved,
-        abortSignal,
-      );
-    } catch (err) {
-      if (!(err instanceof AttachmentError) && !(err instanceof AttachmentTokensUncountedError))
-        throw err;
-      return errorResult(`ask: ${err.message}`, {
-        errorCode: err.code,
-        retryable: err instanceof AttachmentTokensUncountedError,
-        serviceTier,
-        resolvedModel: resolved.resolved,
-      });
-    }
+    // Attachments ride with the prompt as inline parts. Inspected, read and counted here — before the scan, the
+    // preflight, the budget reservation and the throttle: a bad file costs nothing.
+    const attachmentsOutcome = await attachmentsOrRefusal(
+      ctx.client,
+      input.attachments ?? [],
+      resolved,
+      serviceTier,
+      workspaceRoot,
+      abortSignal,
+    );
+    if ('refusal' in attachmentsOutcome) return attachmentsOutcome.refusal;
+    const attachments = attachmentsOutcome.prepared;
     const attachmentTokens = attachments.tokens;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
@@ -516,23 +559,13 @@ async function executeAskBody(
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
     const estimatedInputTokens =
       Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4) + attachmentTokens;
-    // Google's inline request limit holds whatever the caching mode (an explicit cache may not be built and the
-    // call then runs inline): refused here, before any reservation, by name.
-    const requestBytes = inlineRequestBytes(
-      attachments.bytes,
-      workspaceBytes + Buffer.byteLength(input.prompt, 'utf8'),
+    const inlineRefusal = inlineRequestRefusal(
+      attachments,
+      workspaceBytes,
+      input.prompt,
+      serviceTier,
     );
-    if (attachments.attached.length > 0 && requestBytes > INLINE_REQUEST_LIMIT_BYTES) {
-      return errorResult(
-        `ask: the inline request would carry ${requestBytes} bytes (the attachments base64-encoded, the workspace and the prompt), above Google's ${INLINE_REQUEST_LIMIT_BYTES}-byte limit for inline data; use fewer or smaller attachments, or narrow the workspace with includeGlobs / excludeGlobs`,
-        {
-          errorCode: 'REQUEST_TOO_LARGE',
-          retryable: false,
-          serviceTier,
-          ...attachmentMetadata(attachments),
-        },
-      );
-    }
+    if (inlineRefusal !== undefined) return inlineRefusal;
 
     // v1.5.0 preflight (rebuilt in v1.10.0 on top of `countTokens`) — refuse
     // immediately if the estimated input doesn't fit under the model's

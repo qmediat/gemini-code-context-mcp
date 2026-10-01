@@ -34,8 +34,8 @@ Second of the two PRs that replace #91 (`docs/DESIGN-attachments.md` holds the m
 ### Changed
 
 - The Flash-Lite models count as vision-capable (Google lists image and PDF input on them; `countTokens` on
-  `gemini-2.5-flash-lite` counted an inline PNG and PDF on 2026-10-01), so `latest-vision` may resolve to one and
-  `attachments` work there.
+  `gemini-2.5-flash-lite` counted an inline PNG and PDF on 2026-10-01), so `attachments` work on a Flash-Lite model
+  named explicitly or through `latest-lite` (`latest-vision` keeps resolving among the reasoning and fast tiers).
 
 ## [1.19.0] - 2026-10-01
 
