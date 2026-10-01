@@ -252,10 +252,10 @@ async function resolveCodeModel(
   try {
     const resolved = await resolveModel(requested, client, { requiredCategory: CODE_CATEGORY });
     if (!replaceable || resolved.capabilities.supportsThinking) return { resolved };
-    why = `resolves to ${resolved.resolved}, which does not support thinking`;
+    why = `resolves to ${safeForLog(resolved.resolved)}, which does not support thinking`;
   } catch (err) {
     if (!replaceable || !(err instanceof ModelCategoryMismatchError)) throw err;
-    why = `is '${err.actualCategory}', not a reasoning model`;
+    why = `is '${safeForLog(err.actualCategory)}', not a reasoning model`;
   }
   logger.warn(
     `code: the configured default model ${safeForLog(requested)} ${why} — using ${CODE_FALLBACK_MODEL} for this call (set GEMINI_CODE_CONTEXT_DEFAULT_MODEL to a thinking pro alias, or pass model per call)`,
@@ -275,7 +275,7 @@ async function executeCodeBody(
   // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile, then the alias — loadConfig always
   // sets it), as ask and ask_agentic read it. `resolveCodeModel` keeps `code` on a thinking reasoning model when the
   // configured default is not one, and the response names the replaced default.
-  const modelRequest = input.model ?? ctx.config.defaultModel;
+  const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL; // the last ?? as ask_agentic has it
   const expectEdits = input.expectEdits ?? true;
   const codeExecution = input.codeExecution ?? false;
 
@@ -330,7 +330,7 @@ async function executeCodeBody(
     // (which may share `pro` tokens with text models in Google's registry)
     // from reaching `generateContent` with a code-review prompt — the
     // primary motivation for the v1.4.0 taxonomy work.
-    const choice = await resolveCodeModel(modelRequest, input.model === undefined, ctx.client);
+    const choice = await resolveCodeModel(modelRequest, input.model == null, ctx.client);
     const resolved = choice.resolved;
     if (choice.replacedDefault !== undefined) {
       emitter.emit(
