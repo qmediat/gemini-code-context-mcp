@@ -74,9 +74,10 @@ export const codeInputSchema = z
     workspace: z.string().optional().describe('Workspace path (default: cwd).'),
     model: z
       .string()
+      .min(1)
       .optional()
       .describe(
-        "Model alias or literal ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile); a configured default that cannot reason (a flash/lite tier) is replaced by 'latest-pro-thinking' for this tool, a model named here never is.",
+        "Model alias or literal ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile); a configured default that resolves but cannot reason or think (a flash/lite tier) is replaced by 'latest-pro-thinking' for this tool and the response says so (configuredModelReplaced); a model named here is never replaced.",
       ),
     thinkingBudget: z
       .number()
@@ -228,28 +229,41 @@ export const codeTool: ToolDefinition<CodeInput> = {
 const CODE_FALLBACK_MODEL = 'latest-pro-thinking';
 const CODE_CATEGORY: readonly ['text-reasoning'] = ['text-reasoning'];
 
+interface CodeModelChoice {
+  resolved: ResolvedModel;
+  /** The configured default this call did not use, when `code` fell back to the alias; absent otherwise. */
+  replacedDefault?: string;
+}
+
 /**
- * `code` needs a reasoning model. A model the caller named is resolved as asked and a category mismatch is the
- * caller's error, as before. The CONFIGURED default (`fromConfig`) is honoured when it can reason; when it cannot
- * (a flash or lite alias or ID set for cheaper `ask` calls), `code` falls back to the alias and says so once per
- * call — a default meant for Q&A must not make every coding call fail.
+ * `code` needs a reasoning model that thinks (it always sends a thinking budget or level). A model the caller named is
+ * resolved as asked and a category mismatch is the caller's error, as before. The CONFIGURED default (`fromConfig`) is
+ * honoured when it resolves to such a model; when it resolves but cannot (a flash or lite alias or ID set for cheaper
+ * `ask` calls, or a model without thinking), `code` uses the alias instead and says so — in the log and in the response
+ * (`configuredModelReplaced`). A configured default that does not resolve at all fails the call, as it fails `ask`.
  */
 async function resolveCodeModel(
   requested: string,
   fromConfig: boolean,
   client: Parameters<typeof resolveModel>[1],
-): Promise<ResolvedModel> {
+): Promise<CodeModelChoice> {
+  const replaceable = fromConfig && requested !== CODE_FALLBACK_MODEL;
+  let why: string;
   try {
-    return await resolveModel(requested, client, { requiredCategory: CODE_CATEGORY });
+    const resolved = await resolveModel(requested, client, { requiredCategory: CODE_CATEGORY });
+    if (!replaceable || resolved.capabilities.supportsThinking) return { resolved };
+    why = `resolves to ${resolved.resolved}, which does not support thinking`;
   } catch (err) {
-    const fallbackApplies =
-      fromConfig && requested !== CODE_FALLBACK_MODEL && err instanceof ModelCategoryMismatchError;
-    if (!fallbackApplies) throw err;
-    logger.warn(
-      `code: the configured default model ${safeForLog(requested)} is '${err.actualCategory}', not a reasoning model — using ${CODE_FALLBACK_MODEL} for this call (set GEMINI_CODE_CONTEXT_DEFAULT_MODEL to a pro alias, or pass model per call)`,
-    );
-    return resolveModel(CODE_FALLBACK_MODEL, client, { requiredCategory: CODE_CATEGORY });
+    if (!replaceable || !(err instanceof ModelCategoryMismatchError)) throw err;
+    why = `is '${err.actualCategory}', not a reasoning model`;
   }
+  logger.warn(
+    `code: the configured default model ${safeForLog(requested)} ${why} — using ${CODE_FALLBACK_MODEL} for this call (set GEMINI_CODE_CONTEXT_DEFAULT_MODEL to a thinking pro alias, or pass model per call)`,
+  );
+  const resolved = await resolveModel(CODE_FALLBACK_MODEL, client, {
+    requiredCategory: CODE_CATEGORY,
+  });
+  return { resolved, replacedDefault: requested };
 }
 
 async function executeCodeBody(
@@ -258,10 +272,10 @@ async function executeCodeBody(
   workspaceRoot: string,
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
-  // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile), as ask and ask_agentic read it;
-  // the alias is the last resort for a context built without one. `resolveCodeModel` keeps `code` on a reasoning
-  // model when the configured default is not one.
-  const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL;
+  // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile, then the alias — loadConfig always
+  // sets it), as ask and ask_agentic read it. `resolveCodeModel` keeps `code` on a thinking reasoning model when the
+  // configured default is not one, and the response names the replaced default.
+  const modelRequest = input.model ?? ctx.config.defaultModel;
   const expectEdits = input.expectEdits ?? true;
   const codeExecution = input.codeExecution ?? false;
 
@@ -316,7 +330,13 @@ async function executeCodeBody(
     // (which may share `pro` tokens with text models in Google's registry)
     // from reaching `generateContent` with a code-review prompt — the
     // primary motivation for the v1.4.0 taxonomy work.
-    const resolved = await resolveCodeModel(modelRequest, input.model === undefined, ctx.client);
+    const choice = await resolveCodeModel(modelRequest, input.model === undefined, ctx.client);
+    const resolved = choice.resolved;
+    if (choice.replacedDefault !== undefined) {
+      emitter.emit(
+        `configured default model '${choice.replacedDefault}' replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
+      );
+    }
     resolvedModelKey = resolved.resolved;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
@@ -846,6 +866,9 @@ async function executeCodeBody(
     const structured: Record<string, unknown> = {
       resolvedModel: resolved.resolved,
       requestedModel: resolved.requested,
+      // The configured default this call did not use (null when the configured default or a per-call model was used):
+      // an audit can tell a fallback from a caller's choice.
+      configuredModelReplaced: choice.replacedDefault ?? null,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,
       contextWindow: resolved.inputTokenLimit,

@@ -175,7 +175,7 @@ Every env var, auth tier and per-call override is listed in [`docs/configuration
 | `GEMINI_API_KEY` | — | Fallback (Tier 3; emits a warning) |
 | `GEMINI_USE_VERTEX` + `GOOGLE_CLOUD_PROJECT` | — | Enable Vertex AI backend |
 | `GEMINI_DAILY_BUDGET_USD` | unlimited | Hard cap on daily spend; honoured by `ask`, `code`, and `ask_agentic` (per-iteration) |
-| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` | Alias or literal ID, read by `ask`, `ask_agentic` and `code` (a per-call `model` wins); the default is the thinking tier, so budgets should assume it |
+| `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` | `latest-pro-thinking` | Alias or literal ID, read by `ask`, `ask_agentic` and `code` (a per-call `model` wins). `code` needs a thinking reasoning model: a default that resolves to anything else is replaced by `latest-pro-thinking` for that tool and the response says so (`configuredModelReplaced`). The default is the thinking tier, so budgets should assume it |
 | `GEMINI_CODE_CONTEXT_CACHING_MODE` *(v1.14.0+)* | `implicit` | `implicit` (inline, Gemini's automatic prefix cache) or `explicit` (Files API + Context Cache) for every `ask` / `code` call; per-call `cachingMode` wins |
 | `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` | `3600` | Context Cache TTL (explicit mode) |
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |

@@ -10,7 +10,7 @@
 import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
-import { codeTool } from '../../src/tools/code.tool.js';
+import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
 
@@ -356,15 +356,15 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
 });
 
 describe('code.tool.ts model default (1.18.0): the configured default, like ask and ask_agentic', () => {
-  const reasoning = (requested: string) => ({
+  const reasoning = (requested: string, supportsThinking = true) => ({
     requested,
-    resolved: 'gemini-3-pro-preview',
+    resolved: supportsThinking ? 'gemini-3-pro-preview' : 'gemini-3-pro-nothink',
     inputTokenLimit: 1_000_000,
     outputTokenLimit: 65_536,
     fallbackApplied: false,
     category: 'text-reasoning' as const,
     capabilities: {
-      supportsThinking: true,
+      supportsThinking,
       supportsCaching: true,
       supportsVision: false,
       supportsCodeExecution: true,
@@ -389,17 +389,28 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
     });
     mocks.resolveModel.mockImplementation(async (requested: string) => {
       if (requested === 'latest-flash') throw mismatch('gemini-3-flash-preview');
-      return reasoning(requested);
+      return reasoning(requested, requested !== 'latest-pro-nothink');
     });
+    // this suite's own context: nothing inherited from the sibling suites' beforeEach
+    mocks.prepareContext.mockResolvedValue({
+      cacheId: null,
+      inlineContents: [],
+      reused: false,
+      rebuilt: false,
+      inlineOnly: true,
+      uploaded: { failedCount: 0, failures: [] },
+    });
+    mocks.isStaleCacheError.mockReturnValue(false);
   });
 
   it('a call without `model` asks for ctx.config.defaultModel (GEMINI_CODE_CONTEXT_DEFAULT_MODEL / the profile)', async () => {
     const { ctx } = buildCtx({ defaultModel: 'latest-pro' });
-    await codeTool.execute({ task: 'x' }, ctx);
+    const result = await codeTool.execute({ task: 'x' }, ctx);
     expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual(['latest-pro']);
+    expect(result.structuredContent?.configuredModelReplaced).toBeNull();
   });
 
-  it('a configured default that cannot reason falls back to latest-pro-thinking for this tool', async () => {
+  it('a configured default that cannot reason falls back to latest-pro-thinking, and the response says which default was replaced', async () => {
     const { ctx } = buildCtx({ defaultModel: 'latest-flash' });
     const result = await codeTool.execute({ task: 'x' }, ctx);
     expect(result.isError).not.toBe(true);
@@ -407,6 +418,22 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
       'latest-flash',
       'latest-pro-thinking',
     ]);
+    expect(result.structuredContent?.configuredModelReplaced).toBe('latest-flash');
+    expect(result.structuredContent?.requestedModel).toBe('latest-pro-thinking');
+  });
+
+  it('a configured default that reasons but does not think is replaced too (code always sends a thinking budget)', async () => {
+    const { ctx } = buildCtx({ defaultModel: 'latest-pro-nothink' });
+    const result = await codeTool.execute({ task: 'x' }, ctx);
+    expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual([
+      'latest-pro-nothink',
+      'latest-pro-thinking',
+    ]);
+    expect(result.structuredContent?.configuredModelReplaced).toBe('latest-pro-nothink');
+  });
+
+  it('an empty per-call model is a schema error, not the configured default', () => {
+    expect(codeInputSchema.safeParse({ task: 'x', model: '' }).success).toBe(false);
   });
 
   it('a per-call `model` wins over the configured default and never falls back', async () => {

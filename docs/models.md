@@ -80,7 +80,8 @@ falling to a different category.
 ### Code review (the primary use case)
 
 ```jsonc
-// Default — no `model` needed; code tool uses `latest-pro-thinking`.
+// Default — no `model` needed; code uses the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile,
+// then `latest-pro-thinking`), replaced by `latest-pro-thinking` when that default cannot reason or think.
 { "tool": "code", "task": "Review my PR for memory safety issues" }
 ```
 
