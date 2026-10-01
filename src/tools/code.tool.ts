@@ -15,7 +15,6 @@ import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
-import type { ResolvedModel } from '../types.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
@@ -23,6 +22,7 @@ import {
   WorkspaceValidationError,
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
+import type { ResolvedModel } from '../types.js';
 import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';

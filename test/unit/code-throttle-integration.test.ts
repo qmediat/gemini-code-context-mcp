@@ -403,7 +403,10 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
     const { ctx } = buildCtx({ defaultModel: 'latest-flash' });
     const result = await codeTool.execute({ task: 'x' }, ctx);
     expect(result.isError).not.toBe(true);
-    expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual(['latest-flash', 'latest-pro-thinking']);
+    expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual([
+      'latest-flash',
+      'latest-pro-thinking',
+    ]);
   });
 
   it('a per-call `model` wins over the configured default and never falls back', async () => {
@@ -412,6 +415,9 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
     expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual(['latest-pro-thinking']);
     const named = await codeTool.execute({ task: 'x', model: 'latest-flash' }, ctx);
     expect(named.isError).toBe(true);
-    expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual(['latest-pro-thinking', 'latest-flash']);
+    expect(mocks.resolveModel.mock.calls.map((c) => c[0])).toEqual([
+      'latest-pro-thinking',
+      'latest-flash',
+    ]);
   });
 });
