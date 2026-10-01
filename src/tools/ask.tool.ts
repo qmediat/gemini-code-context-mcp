@@ -9,8 +9,27 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
+import type {
+  Content,
+  GenerateContentConfig,
+  Part,
+  ThinkingConfig,
+  ThinkingLevel,
+} from '@google/genai';
 import { z } from 'zod';
+import {
+  type Attachment,
+  AttachmentError,
+  AttachmentTokensUncountedError,
+  INLINE_REQUEST_LIMIT_BYTES,
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENTS_TOTAL_BYTES,
+  MAX_ATTACHMENT_BYTES,
+  countAttachmentTokens,
+  inlineRequestBytes,
+  inspectAttachments,
+  readAttachments,
+} from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -161,6 +180,13 @@ export const askInputSchema = z
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
     serviceTier: z.enum(['standard', 'flex']).optional().describe(SERVICE_TIER_DESCRIPTION),
+    attachments: z
+      .array(z.string().min(1))
+      .max(MAX_ATTACHMENTS)
+      .optional()
+      .describe(
+        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline before the question — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply, the first bytes must match the type). They belong to THIS question only, never to the workspace cache. Their tokens are counted by Gemini (one free countTokens call) and enter the size preflight, the budget reservation and the TPM throttle; a count that cannot be obtained refuses the call (ATTACHMENT_TOKENS_UNCOUNTED, retryable). The model must support vision (ATTACHMENTS_UNSUPPORTED otherwise); a bad file is ATTACHMENT_INVALID, never retryable, and costs nothing. Not available with the ask_agentic fallback.`,
+      ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
       .optional()
@@ -206,6 +232,43 @@ export const askTool: ToolDefinition<AskInput> = {
     return executeAskBody(input, ctx, workspaceRoot, model, started);
   },
 };
+
+interface PreparedAttachments {
+  readonly attached: Attachment[];
+  readonly parts: Part[];
+  /** Raw bytes read. */
+  readonly bytes: number;
+  /** What Gemini counted for the parts. */
+  readonly tokens: number;
+}
+
+/** The attachments of one call: inspected, read and counted by Gemini, in that order — a refused file is never read,
+ * a file that fails to read is never counted, and nothing has been reserved yet. */
+async function prepareAttachments(
+  client: Parameters<typeof countAttachmentTokens>[0],
+  paths: readonly string[],
+  workspaceRoot: string,
+  model: string,
+  signal: AbortSignal,
+): Promise<PreparedAttachments> {
+  const attached = await inspectAttachments(paths, workspaceRoot);
+  const { parts, bytes } = await readAttachments(attached, signal);
+  const tokens = await countAttachmentTokens(client, model, parts, signal);
+  return { attached, parts, bytes, tokens };
+}
+
+/** `structuredContent` fields of a call with attachments; nothing on a call without. */
+function attachmentMetadata(prepared: PreparedAttachments): Record<string, unknown> {
+  if (prepared.attached.length === 0) return {};
+  return {
+    attachments: prepared.attached.map((a) => ({
+      path: a.path,
+      mimeType: a.mimeType,
+      bytes: a.bytes,
+    })),
+    attachmentTokens: prepared.tokens,
+  };
+}
 
 async function executeAskBody(
   input: AskInput,
@@ -285,6 +348,41 @@ async function executeAskBody(
         resolvedModel: resolved.resolved,
       });
     }
+
+    // v1.20.0 — attachments ride with the prompt as inline parts; the model must see images. Inspected, read and
+    // counted here — before the scan, the preflight, the budget reservation and the throttle: a bad file costs nothing.
+    const attachmentPaths = input.attachments ?? [];
+    if (attachmentPaths.length > 0 && !resolved.capabilities.supportsVision) {
+      return errorResult(
+        `ask: ${attachmentPaths.length} attachment(s) given, but ${safeForLog(resolved.resolved)} does not support vision — use \`latest-vision\` or a model that lists it`,
+        {
+          errorCode: 'ATTACHMENTS_UNSUPPORTED',
+          retryable: false,
+          serviceTier,
+          resolvedModel: resolved.resolved,
+        },
+      );
+    }
+    let attachments: PreparedAttachments;
+    try {
+      attachments = await prepareAttachments(
+        ctx.client,
+        attachmentPaths,
+        workspaceRoot,
+        resolved.resolved,
+        abortSignal,
+      );
+    } catch (err) {
+      if (!(err instanceof AttachmentError) && !(err instanceof AttachmentTokensUncountedError))
+        throw err;
+      return errorResult(`ask: ${err.message}`, {
+        errorCode: err.code,
+        retryable: err instanceof AttachmentTokensUncountedError,
+        serviceTier,
+        resolvedModel: resolved.resolved,
+      });
+    }
+    const attachmentTokens = attachments.tokens;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — build the scan memo from previously-stored file rows so the
@@ -416,7 +514,25 @@ async function executeAskBody(
     // Tier 2 = real `countTokens` call when near the cliff). Closes T17
     // (`bytes/4` undercount on dense Unicode). See `src/gemini/token-counter.ts`.
     const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-    const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4);
+    const estimatedInputTokens =
+      Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4) + attachmentTokens;
+    // Google's inline request limit holds whatever the caching mode (an explicit cache may not be built and the
+    // call then runs inline): refused here, before any reservation, by name.
+    const requestBytes = inlineRequestBytes(
+      attachments.bytes,
+      workspaceBytes + Buffer.byteLength(input.prompt, 'utf8'),
+    );
+    if (attachments.attached.length > 0 && requestBytes > INLINE_REQUEST_LIMIT_BYTES) {
+      return errorResult(
+        `ask: the inline request would carry ${requestBytes} bytes (the attachments base64-encoded, the workspace and the prompt), above Google's ${INLINE_REQUEST_LIMIT_BYTES}-byte limit for inline data; use fewer or smaller attachments, or narrow the workspace with includeGlobs / excludeGlobs`,
+        {
+          errorCode: 'REQUEST_TOO_LARGE',
+          retryable: false,
+          serviceTier,
+          ...attachmentMetadata(attachments),
+        },
+      );
+    }
 
     // v1.5.0 preflight (rebuilt in v1.10.0 on top of `countTokens`) — refuse
     // immediately if the estimated input doesn't fit under the model's
@@ -460,6 +576,8 @@ async function executeAskBody(
         // maps it to `errorCode: 'TIMEOUT'` immediately.
         signal: abortSignal,
       });
+      // the attachments' tokens, counted by Gemini, join the count whichever way it was made: the window must hold them
+      preflight = { ...preflight, effectiveTokens: preflight.effectiveTokens + attachmentTokens };
       const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
       if (preflight.effectiveTokens > threshold) {
         const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
@@ -472,6 +590,20 @@ async function executeAskBody(
         // workspace) and re-translates `timeoutMs` to `iterationTimeoutMs`
         // (per-iteration cap; total wall-clock can be N × that). Cost +
         // timing shape genuinely changes — opt-in is the right default.
+        if (
+          input.onWorkspaceTooLarge === 'fallback-to-agentic' &&
+          attachments.attached.length > 0
+        ) {
+          return errorResult(
+            'ask: the workspace is too large for the eager path and `attachments` cannot follow the ask_agentic fallback (it sends no inline parts); drop the attachments or narrow the workspace',
+            {
+              errorCode: 'WORKSPACE_TOO_LARGE',
+              retryable: false,
+              serviceTier,
+              ...attachmentMetadata(attachments),
+            },
+          );
+        }
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
           if (serviceTier === 'flex') {
             const note =
@@ -637,6 +769,7 @@ async function executeAskBody(
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
             serviceTier,
+            ...attachmentMetadata(attachments),
             retryable: false,
             estimatedInputTokens: preflight.effectiveTokens,
             tokenCountMethod: preflight.method,
@@ -665,6 +798,7 @@ async function executeAskBody(
       const estimateUsd = estimatePreCallCostUsd({
         model: resolved.resolved,
         serviceTier,
+        extraInputTokens: attachmentTokens,
         workspaceBytes,
         promptChars: input.prompt.length,
         // Budget reservation uses the effective cap (explicit-user-cap
@@ -817,11 +951,18 @@ async function executeAskBody(
             ...tierField,
           };
     };
+    // The user turn: the attachments first, the question last; with a cache the turn still carries the parts.
+    const userTurn: Content = {
+      role: 'user',
+      parts: [...attachments.parts, { text: input.prompt }],
+    };
     const buildContents = (
       cacheId: string | null,
       inline: typeof ctxPrep.inlineContents,
-    ): string | Content[] =>
-      cacheId ? input.prompt : [...inline, { role: 'user', parts: [{ text: input.prompt }] }];
+    ): string | Content[] => {
+      if (cacheId) return attachments.parts.length === 0 ? input.prompt : [userTurn];
+      return [...inline, userTurn];
+    };
 
     // Track the prepared-context used for the FINAL successful call. Starts
     // pointing at the initial ctxPrep; retry branch below reassigns to the
@@ -1077,6 +1218,7 @@ async function executeAskBody(
       resolvedModel: resolved.resolved,
       requestedModel: resolved.requested,
       serviceTier,
+      ...attachmentMetadata(attachments),
       fallbackApplied: resolved.fallbackApplied,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,

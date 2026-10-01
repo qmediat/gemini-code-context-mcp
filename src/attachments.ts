@@ -1,0 +1,292 @@
+/** `ask` attachments: local image and PDF files sent inline with one question. The threat model, the caps and the
+ * token rule are in `docs/DESIGN-attachments.md`; this module keeps them. */
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, stat } from 'node:fs/promises';
+import { extname, resolve } from 'node:path';
+import type { GoogleGenAI, Part } from '@google/genai';
+import {
+  SandboxError,
+  resolveInsideWorkspace,
+  resolveWorkspaceRoot,
+} from './tools/agentic/sandbox.js';
+
+export type AttachmentMimeType = 'image/png' | 'image/jpeg' | 'image/webp' | 'application/pdf';
+
+/** What Gemini accepts inline that a code question may need: screenshots, diagrams, a PDF spec. */
+const MIME_BY_EXTENSION: Readonly<Record<string, AttachmentMimeType>> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
+};
+
+/** This server's cap on the raw bytes of one call's attachments: under every figure Google publishes (100 MB per
+ * request, 50 MB for PDFs, 20 MB including text for images), with base64 adding a third (14 MB ≈ 18.7 MB encoded)
+ * and the workspace text travelling in the same request in implicit caching mode. */
+export const MAX_ATTACHMENTS_TOTAL_BYTES = 14 * 1024 * 1024;
+/** One attachment: well under the request limit, so several fit. */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+export const MAX_ATTACHMENTS = 8;
+/** Google's limit on one inline request — files, prompt and system instruction together; an attachment travels
+ * base64-encoded, so 14 MB raw beside an inline workspace can cross it. Checked by the tool before any reservation. */
+export const INLINE_REQUEST_LIMIT_BYTES = 20_000_000;
+
+/** The bytes an inline request carries for `rawBytes` of attachments beside `textBytes` of workspace and prompt. */
+export function inlineRequestBytes(rawBytes: number, textBytes: number): number {
+  return Math.ceil(rawBytes / 3) * 4 + textBytes;
+}
+
+const SUPPORTED_ATTACHMENT_EXTENSIONS: readonly string[] = Object.keys(MIME_BY_EXTENSION);
+
+/** What inspection established about one file. */
+export interface Attachment {
+  /** The canonical path inside the workspace at inspection. */
+  readonly path: string;
+  /** The file's identity at inspection: the read accepts only this device and inode behind the descriptor. */
+  readonly dev: number;
+  readonly ino: number;
+  readonly mimeType: AttachmentMimeType;
+  readonly bytes: number;
+}
+
+/** The inline parts, read once, bounded. Tokens are not a field: Gemini counts the assembled parts. */
+export interface ReadAttachments {
+  readonly parts: Part[];
+  readonly bytes: number;
+}
+
+/** A refused attachment: `ATTACHMENT_INVALID`, never retryable, raised before any reservation. */
+export class AttachmentError extends Error {
+  readonly code = 'ATTACHMENT_INVALID';
+  constructor(message: string) {
+    super(message);
+    this.name = 'AttachmentError';
+  }
+}
+
+/** Gemini could not count the parts: `ATTACHMENT_TOKENS_UNCOUNTED`, retryable — no local estimate stands in. */
+export class AttachmentTokensUncountedError extends Error {
+  readonly code = 'ATTACHMENT_TOKENS_UNCOUNTED';
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'AttachmentTokensUncountedError';
+  }
+}
+
+function mimeTypeOf(path: string): AttachmentMimeType {
+  const mime = MIME_BY_EXTENSION[extname(path).toLowerCase()];
+  if (mime === undefined) {
+    throw new AttachmentError(
+      `attachment ${path}: unsupported type (one of ${SUPPORTED_ATTACHMENT_EXTENSIONS.join(', ')})`,
+    );
+  }
+  return mime;
+}
+
+/** The first bytes a file of the declared type starts with. WebP is `RIFF????WEBP`. */
+function hasMagic(mimeType: AttachmentMimeType, data: Buffer): boolean {
+  switch (mimeType) {
+    case 'image/png':
+      return data
+        .subarray(0, 8)
+        .equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    case 'image/jpeg':
+      return data.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]));
+    case 'image/webp':
+      return (
+        data.subarray(0, 4).toString('latin1') === 'RIFF' &&
+        data.subarray(8, 12).toString('latin1') === 'WEBP'
+      );
+    case 'application/pdf':
+      return data.subarray(0, 5).toString('latin1') === '%PDF-';
+  }
+}
+
+function describe(err: unknown): string {
+  if (err instanceof SandboxError) return `${err.code}: ${err.message}`;
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Validates the list (count, place, type, size, readability) by `stat` before anything is read. A path must
+ * resolve inside the workspace (symlinks followed, as `ask_agentic`'s jail does), the leaf must not itself be a
+ * symlink, and the sandbox's secret rules apply — a diagram.pdf pointing at a credentials file is refused by name. */
+export async function inspectAttachments(
+  paths: readonly string[],
+  workspaceRoot: string,
+): Promise<Attachment[]> {
+  if (paths.length > MAX_ATTACHMENTS) {
+    throw new AttachmentError(`${paths.length} attachments; at most ${MAX_ATTACHMENTS} per call`);
+  }
+  if (paths.length === 0) return [];
+  const root = await resolveWorkspaceRoot(workspaceRoot); // canonical, as the jail compares
+  const out: Attachment[] = [];
+  let total = 0;
+  for (const raw of paths) {
+    const path = await insideWorkspace(root, raw);
+    const mimeType = mimeTypeOf(path);
+    const { bytes, dev, ino } = await identityOf(path);
+    if (bytes > MAX_ATTACHMENT_BYTES) {
+      throw new AttachmentError(
+        `attachment ${path}: ${bytes} bytes, above ${MAX_ATTACHMENT_BYTES}`,
+      );
+    }
+    total += bytes;
+    out.push({ path, dev, ino, mimeType, bytes });
+  }
+  if (total > MAX_ATTACHMENTS_TOTAL_BYTES) {
+    throw new AttachmentError(
+      `attachments total ${total} bytes, above this server's cap ${MAX_ATTACHMENTS_TOTAL_BYTES}`,
+    );
+  }
+  return out;
+}
+
+/** The canonical path inside the workspace, or an AttachmentError naming why not. */
+async function insideWorkspace(workspaceRoot: string, raw: string): Promise<string> {
+  try {
+    // the leaf as the caller named it: a symlink is refused before anything is resolved through it
+    const named = await lstat(resolve(workspaceRoot, raw)).catch(() => undefined);
+    if (named?.isSymbolicLink())
+      throw new AttachmentError(`attachment ${raw}: a symlink is not accepted`);
+    const { absolutePath } = await resolveInsideWorkspace(workspaceRoot, raw);
+    return absolutePath;
+  } catch (err) {
+    if (err instanceof AttachmentError) throw err;
+    throw new AttachmentError(`attachment ${raw}: ${describe(err)}`);
+  }
+}
+
+async function identityOf(path: string): Promise<{ bytes: number; dev: number; ino: number }> {
+  try {
+    const info = await stat(path);
+    if (!info.isFile()) throw new AttachmentError(`attachment ${path}: not a regular file`);
+    if (info.size === 0) throw new AttachmentError(`attachment ${path}: empty file`);
+    return { bytes: info.size, dev: info.dev, ino: info.ino };
+  } catch (err) {
+    if (err instanceof AttachmentError) throw err;
+    throw new AttachmentError(`attachment ${path}: ${describe(err)}`);
+  }
+}
+
+/** The inline parts, in the order given; read only after every file passed inspection. The read opens the
+ * inspected path with O_NOFOLLOW, accepts only the inspected device and inode behind the descriptor, measures through
+ * it, reads the size plus one byte in chunks (a timeout ends it) so a file that grew is caught without being
+ * materialised, checks the first bytes against the declared type, and re-checks the total. */
+export async function readAttachments(
+  attachments: readonly Attachment[],
+  signal?: AbortSignal,
+): Promise<ReadAttachments> {
+  const parts: Part[] = [];
+  let bytes = 0;
+  for (const a of attachments) {
+    const data = await readAttachment(a, MAX_ATTACHMENTS_TOTAL_BYTES - bytes, signal);
+    if (!hasMagic(a.mimeType, data)) {
+      throw new AttachmentError(`attachment ${a.path}: the content is not ${a.mimeType}`);
+    }
+    bytes += data.length;
+    parts.push({ inlineData: { mimeType: a.mimeType, data: data.toString('base64') } });
+  }
+  return { parts, bytes };
+}
+
+type FileHandle = Awaited<ReturnType<typeof open>>;
+
+async function readAttachment(
+  a: Attachment,
+  roomLeft: number,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(a.path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); // a symlink leaf fails to open
+    const info = await handle.stat();
+    if (!info.isFile())
+      throw new AttachmentError(`attachment ${a.path}: not a regular file at read`);
+    if (info.dev !== a.dev || info.ino !== a.ino) {
+      throw new AttachmentError(`attachment ${a.path}: the opened file is not the one inspected`);
+    }
+    if (info.size > MAX_ATTACHMENT_BYTES) {
+      throw new AttachmentError(
+        `attachment ${a.path}: ${info.size} bytes at read, above ${MAX_ATTACHMENT_BYTES}`,
+      );
+    }
+    if (info.size > roomLeft) {
+      throw new AttachmentError(
+        `attachment ${a.path}: ${info.size} bytes at read would take the attachments above this server's cap ${MAX_ATTACHMENTS_TOTAL_BYTES}`,
+      );
+    }
+    return await readExactly(handle, info.size, a.path, signal);
+  } catch (err) {
+    if (err instanceof AttachmentError) throw err;
+    if (signal?.aborted && err === signal.reason) throw err; // a timeout or cancellation keeps its identity
+    throw new AttachmentError(`attachment ${a.path}: ${describe(err)}`);
+  } finally {
+    await handle?.close();
+  }
+}
+
+/** Reads `size` bytes and one more, a chunk at a time so a timeout or cancellation ends it: a file that has more than
+ * `size` bytes grew after it was measured. */
+const READ_CHUNK = 1024 * 1024;
+async function readExactly(
+  handle: FileHandle,
+  size: number,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  const buffer = Buffer.alloc(size + 1);
+  let read = 0;
+  for (;;) {
+    if (signal?.aborted) {
+      throw signal.reason instanceof Error
+        ? signal.reason
+        : new AttachmentError(`attachment ${path}: read aborted`);
+    }
+    const { bytesRead } = await handle.read(
+      buffer,
+      read,
+      Math.min(READ_CHUNK, buffer.length - read),
+      read,
+    );
+    if (bytesRead === 0) break;
+    read += bytesRead;
+    if (read > size) throw new AttachmentError(`attachment ${path}: grew while being read`);
+  }
+  return buffer.subarray(0, read);
+}
+
+/** The tokens Gemini counts for the parts (one free `countTokens` call; measured on 2026-10-01: a 1×1 PNG is 1090
+ * tokens on gemini-3-flash and 259 on 2.5-flash-lite — no local figure is right for every model). A cancellation keeps
+ * its identity so the caller maps it to TIMEOUT; any other failure, and a malformed count, is uncounted. */
+export async function countAttachmentTokens(
+  client: GoogleGenAI,
+  model: string,
+  parts: readonly Part[],
+  signal?: AbortSignal,
+): Promise<number> {
+  if (parts.length === 0) return 0;
+  let total: unknown;
+  try {
+    const response = await client.models.countTokens({
+      model,
+      contents: [{ role: 'user', parts: [...parts] }],
+      ...(signal !== undefined ? { config: { abortSignal: signal } } : {}),
+    });
+    total = response.totalTokens;
+  } catch (err) {
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : err;
+    throw new AttachmentTokensUncountedError(
+      `countTokens failed for the attachments: ${describe(err)}`,
+      {
+        cause: err,
+      },
+    );
+  }
+  if (typeof total !== 'number' || !Number.isFinite(total) || total < 0) {
+    throw new AttachmentTokensUncountedError(
+      `countTokens returned no usable total for the attachments (${String(total)})`,
+    );
+  }
+  return total;
+}

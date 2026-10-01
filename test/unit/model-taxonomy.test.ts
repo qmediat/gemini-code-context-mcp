@@ -165,9 +165,9 @@ describe('extractCapabilityFlags', () => {
     });
   });
 
-  it('lite-tier has vision disabled (Google does not advertise vision on *-lite)', () => {
+  it('lite-tier has vision enabled (Google lists image and PDF input on Flash-Lite)', () => {
     const flags = extractCapabilityFlags('gemini-3-flash-lite', { supportsThinking: false });
-    expect(flags.supportsVision).toBe(false);
+    expect(flags.supportsVision).toBe(true);
     expect(flags.supportsCodeExecution).toBe(true);
     expect(flags.costTier).toBe('budget');
   });

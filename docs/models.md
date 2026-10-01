@@ -69,7 +69,7 @@ Orthogonal to category — multiple can apply to a single model:
 | `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | The default for every tool when `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` is unset; preferred for deep work |
 | `latest-flash` | `text-fast` | — | Faster + cheaper than pro; no deep thinking |
 | `latest-lite` | `text-lite` | — | Cheapest tier; limited capabilities |
-| `latest-vision` | `text-reasoning` or `text-fast` | `supportsVision=true` | Screenshot analysis, image Q&A |
+| `latest-vision` | `text-reasoning` or `text-fast` | `supportsVision=true` | Screenshot analysis, image Q&A — give the images with `ask`'s `attachments` *(v1.20.0+)* |
 
 Aliases **never** cross category boundaries. If your API key has no model in
 the required category, the resolver throws a clear error rather than silently
