@@ -299,6 +299,7 @@ async function executeCodeBody(
   // Canonical resolved-model string for retry-hint seeding (T22a).
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
+  let modelAudit: Record<string, unknown> = {};
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
   // See ask.tool.ts for rationale; same shape here.
@@ -332,9 +333,15 @@ async function executeCodeBody(
     // primary motivation for the v1.4.0 taxonomy work.
     const choice = await resolveCodeModel(modelRequest, input.model == null, ctx.client);
     const resolved = choice.resolved;
+    // The same two fields on every result after this point, error results included: an audit of a failed call
+    // can still tell a fallback from a caller's choice.
+    modelAudit = {
+      resolvedModel: resolved.resolved,
+      configuredModelReplaced: choice.replacedDefault ?? null,
+    };
     if (choice.replacedDefault !== undefined) {
       emitter.emit(
-        `configured default model '${choice.replacedDefault}' replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
+        `configured default model ${safeForLog(choice.replacedDefault)} replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
       );
     }
     resolvedModelKey = resolved.resolved;
@@ -471,7 +478,7 @@ async function executeCodeBody(
             contextWindowTokens: contextWindow,
             thresholdTokens: threshold,
             guardRatio: ctx.config.workspaceGuardRatio,
-            resolvedModel: resolved.resolved,
+            ...modelAudit,
             filesIndexed: scan.files.length,
           },
         );
@@ -505,7 +512,7 @@ async function executeCodeBody(
         const spentUsd = reserve.spentMicros / 1_000_000;
         return errorResult(
           `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false },
+          { errorCode: 'BUDGET_REJECT', retryable: false, ...modelAudit },
         );
       }
       reservationId = reserve.id;
@@ -864,11 +871,8 @@ async function executeCodeBody(
     }
 
     const structured: Record<string, unknown> = {
-      resolvedModel: resolved.resolved,
+      ...modelAudit,
       requestedModel: resolved.requested,
-      // The configured default this call did not use (null when the configured default or a per-call model was used):
-      // an audit can tell a fallback from a caller's choice.
-      configuredModelReplaced: choice.replacedDefault ?? null,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,
       contextWindow: resolved.inputTokenLimit,
@@ -963,12 +967,14 @@ async function executeCodeBody(
         timeoutMs: ms,
         stallMs,
         retryable: true,
+        ...modelAudit,
       });
     }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
       errorCode: 'UNKNOWN',
       ...(httpStatus !== undefined ? { httpStatus } : {}),
+      ...modelAudit,
     });
   } finally {
     timeoutController.dispose();

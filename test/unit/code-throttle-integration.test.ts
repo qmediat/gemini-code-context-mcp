@@ -432,6 +432,18 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
     expect(result.structuredContent?.configuredModelReplaced).toBe('latest-pro-nothink');
   });
 
+  it('an error result after model resolution carries the same audit fields (a failed call still tells a fallback from a choice)', async () => {
+    const { ctx } = buildCtx({
+      defaultModel: 'latest-flash',
+      generateContent: vi.fn().mockRejectedValue(new Error('boom')),
+    });
+    const result = await codeTool.execute({ task: 'x' }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    expect(result.structuredContent?.configuredModelReplaced).toBe('latest-flash');
+    expect(result.structuredContent?.resolvedModel).toBe('gemini-3-pro-preview');
+  });
+
   it('an empty per-call model is a schema error, not the configured default', () => {
     expect(codeInputSchema.safeParse({ task: 'x', model: '' }).success).toBe(false);
   });
