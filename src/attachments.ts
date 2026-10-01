@@ -30,6 +30,9 @@ export const SUPPORTED_ATTACHMENT_EXTENSIONS: readonly string[] = Object.keys(MI
 export interface Attachment {
   /** The canonical path inside the workspace at inspection time. */
   readonly path: string;
+  /** The file's identity at inspection (device and inode): the read opens the path and accepts only this file. */
+  readonly dev: number;
+  readonly ino: number;
   /** The canonical workspace root the path was checked against; the read checks again. */
   readonly root: string;
   readonly mimeType: string;
@@ -43,13 +46,26 @@ export const MAX_TILES_PER_IMAGE = 24;
 /** Gemini reads at most this many pages of a PDF. */
 export const MAX_PDF_PAGES = 1000;
 
-/** The page objects of a PDF (`/Type /Page`, not `/Pages`); a PDF that keeps them in compressed object streams shows
- * none and is taken as Gemini's maximum — an upper bound, never an undercount. */
+/** The page count of a PDF as an upper bound, from what its bytes show in clear:
+ *  1. the largest `/Count N` of a `/Pages` node — the root node's count covers every leaf page, compressed or not,
+ *     and an intermediate node's count is smaller, so the largest `/Count` seen is the total;
+ *  2. no `/Count` in clear but an object stream (`/ObjStm`) — pages may hide in it: Gemini's maximum;
+ *  3. neither — every object is in clear: the `/Type /Page` objects (none at all: Gemini's maximum).
+ * Never an undercount: a PDF that hides its page tree is over-reserved and settled by the ledger. */
+const PDF_PAGES_COUNT =
+  /\/Type\s*\/Pages\b[^>]*?\/Count\s+(\d+)|\/Count\s+(\d+)[^>]*?\/Type\s*\/Pages\b/g;
 const PDF_PAGE_OBJECT = /\/Type\s*\/Page(?![s\w])/g;
+const PDF_OBJECT_STREAM = /\/Type\s*\/ObjStm\b/;
 
 export function pdfPageCount(data: Buffer): number {
-  const found = data.toString('latin1').match(PDF_PAGE_OBJECT)?.length ?? 0;
-  return found === 0 ? MAX_PDF_PAGES : Math.min(MAX_PDF_PAGES, found);
+  const text = data.toString('latin1');
+  let counted = 0;
+  for (const m of text.matchAll(PDF_PAGES_COUNT))
+    counted = Math.max(counted, Number(m[1] ?? m[2] ?? 0));
+  const visible = text.match(PDF_PAGE_OBJECT)?.length ?? 0;
+  if (counted > 0) return Math.min(MAX_PDF_PAGES, Math.max(counted, visible));
+  if (PDF_OBJECT_STREAM.test(text) || visible === 0) return MAX_PDF_PAGES;
+  return Math.min(MAX_PDF_PAGES, visible);
 }
 
 /** An UPPER-BOUND token estimate of one attachment from its bytes: an image as the most tiles Gemini makes of a 10 MB
@@ -98,14 +114,14 @@ export async function inspectAttachments(
   for (const raw of paths) {
     const path = await insideWorkspace(root, raw);
     const mimeType = mimeTypeOf(path);
-    const bytes = await sizeOf(path);
+    const { bytes, dev, ino } = await identityOf(path);
     if (bytes > MAX_ATTACHMENT_BYTES) {
       throw new AttachmentError(
         `attachment ${path}: ${bytes} bytes, above ${MAX_ATTACHMENT_BYTES}`,
       );
     }
     total += bytes;
-    out.push({ path, root, mimeType, bytes });
+    out.push({ path, root, dev, ino, mimeType, bytes });
   }
   if (total > MAX_ATTACHMENTS_TOTAL_BYTES) {
     throw new AttachmentError(
@@ -136,12 +152,12 @@ async function insideWorkspace(workspaceRoot: string, raw: string): Promise<stri
   }
 }
 
-async function sizeOf(path: string): Promise<number> {
+async function identityOf(path: string): Promise<{ bytes: number; dev: number; ino: number }> {
   try {
     const info = await stat(path);
     if (!info.isFile()) throw new AttachmentError(`attachment ${path}: not a regular file`);
     if (info.size === 0) throw new AttachmentError(`attachment ${path}: empty file`);
-    return info.size;
+    return { bytes: info.size, dev: info.dev, ino: info.ino };
   } catch (err) {
     if (err instanceof AttachmentError) throw err;
     throw new AttachmentError(
@@ -182,15 +198,11 @@ async function readAttachment(
     const info = await handle.stat();
     if (!info.isFile())
       throw new AttachmentError(`attachment ${a.path}: not a regular file at read`);
-    // The file behind the descriptor must be the one the path names inside the workspace NOW: the path is resolved
-    // again (a parent swapped for a symlink resolves elsewhere and is refused) and its inode compared with the
-    // descriptor's — a swap of any component between that check and the open cannot change what was opened.
-    const { absolutePath } = await resolveInsideWorkspace(a.root, a.path);
-    const named = await lstat(absolutePath);
-    if (absolutePath !== a.path || named.dev !== info.dev || named.ino !== info.ino) {
-      throw new AttachmentError(
-        `attachment ${a.path}: is not the workspace file it was when inspected`,
-      );
+    // The opened file must be the file inspected: its device and inode, recorded at inspection inside the workspace,
+    // are compared with the descriptor's. A path component swapped before, during or after the open yields another
+    // inode and is refused; no second walk of the path is involved, so there is nothing to toggle.
+    if (info.dev !== a.dev || info.ino !== a.ino) {
+      throw new AttachmentError(`attachment ${a.path}: the opened file is not the one inspected`);
     }
     if (info.size > MAX_ATTACHMENT_BYTES) {
       throw new AttachmentError(

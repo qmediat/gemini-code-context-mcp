@@ -391,6 +391,27 @@ describe('attachments between inspection and read (1.19.0)', () => {
     );
     expect(pdfPageCount(threePages)).toBe(3);
     expect(pdfPageCount(Buffer.from('%PDF-1.5 objects in a compressed stream'))).toBe(1000);
+    expect(
+      pdfPageCount(
+        Buffer.from(
+          '%PDF-1.7\n1 0 obj << /Type /Pages /Count 7 /Kids [] >> endobj\n2 0 obj << /Type /Page >> endobj',
+        ),
+      ),
+    ).toBe(7); // the page tree's count covers the pages in object streams
+    expect(
+      pdfPageCount(
+        Buffer.from(
+          '%PDF-1.7\n5 0 obj << /Type /ObjStm /N 3 >> stream … 9 0 obj << /Type /Page >> endobj',
+        ),
+      ),
+    ).toBe(1000); // one visible page and an object stream that may hold the rest
+    expect(
+      pdfPageCount(
+        Buffer.from(
+          '%PDF-1.4 << /Count 2 /Type /Pages >> << /Type /Page >> << /Type /Page >> << /Type /Page >>',
+        ),
+      ),
+    ).toBe(3); // never below the visible pages
     expect(attachmentTokens('application/pdf', threePages)).toBe(3 * 258);
     expect(attachmentTokens('image/png', PNG)).toBe(24 * 258);
     const base = {

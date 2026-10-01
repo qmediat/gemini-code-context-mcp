@@ -24,9 +24,9 @@ From the 2026-10-01 comparison with Google's own tools and the community (`docs/
   258 per image; a PDF's page count × 258, from the page tree's `/Count` in the bytes, or Gemini's 1000-page maximum
   when the tree sits in compressed object streams); the ledger records what Gemini billed. The bytes are read right
   after the model is resolved — before the preflight and every reservation, so a refused file costs nothing — through an
-  O_NOFOLLOW descriptor whose inode is compared with the re-resolved workspace path, measured through it and read in
-  chunks (stopped by `timeoutMs`) to the size plus one byte, so a file swapped for a symlink (leaf or parent) or grown
-  between inspection and read is refused (`ATTACHMENT_INVALID`).
+  O_NOFOLLOW descriptor whose device and inode must be the ones recorded at inspection (no second walk of the path:
+  nothing to toggle), measured through it and read in chunks (stopped by `timeoutMs`) to the size plus one byte, so a
+  file swapped for a symlink (leaf or parent) or grown between inspection and read is refused (`ATTACHMENT_INVALID`).
   `structuredContent.attachments` lists what was sent. The `latest-vision` alias finally has an input to see; the
   Flash-Lite models count as vision-capable now (Google lists image and PDF input on them).
 - `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`
