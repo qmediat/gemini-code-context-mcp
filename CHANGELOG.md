@@ -19,8 +19,9 @@ From the 2026-10-01 comparison with Google's own tools and the community (`docs/
   under load (429/503) is NOT retried by this server — the network retry covers connection failures only; the result
   says `RATE_LIMIT` / `OVERLOADED`, `retryable: true` with Google's retry hint when it sent one (a 429/503 on the
   stale-cache retry is reported as itself), and the client retries; a flex request is sent exactly once — the server's
-  own network retry is off for it, every send being billed. Reported as `serviceTier` on every result, errors and
-  timeouts included (the requested tier before the model is resolved); a failure before any response (a reset, the
+  own network retry is off for it, every send being billed. Reported as `serviceTier` on every result of a call that reached model resolution, errors and
+  timeouts included (the requested tier until the model is resolved; the earliest validation errors — workspace,
+  thinking budget — carry no tier); a failure before any response (a reset, the
   300 s header wait on a queued flex request) is `NETWORK_ERROR`, `retryable: true`; the `ask_agentic` fallback runs standard and says so (progress line, warning,
   `serviceTierDowngraded`). Not available on the Vertex AI backend (the SDK sends no tier there, js-genai#1468): a
   per-call `flex` is refused by name, a default of `flex` runs standard with a startup warning. Registered follow-ups:
