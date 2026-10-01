@@ -5,7 +5,7 @@ This guide takes you from zero to a working Gemini-powered Claude Code session i
 ## Prerequisites
 
 - **Node.js ≥ 22** (`node --version`)
-- A Gemini API key — grab one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) (free tier works for the 1M-token context; 2M requires paid tier)
+- A Gemini API key — grab one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) (the free tier works; the models your key lists decide the alias resolution)
 - Any MCP host: **Claude Code**, **Claude Desktop**, **Cursor**, **Cline**, **Continue.dev**, or the **MCP Inspector** for testing
 
 ## 1. Secure setup (recommended)
@@ -20,7 +20,7 @@ You'll be asked to:
 
 1. Pick an auth method (**API key** or **Vertex AI**)
 2. Paste the key (hidden input, never echoed)
-3. Set a default model (just press enter for `latest-pro`)
+3. Set a default model (just press enter for `latest-pro-thinking`)
 4. Set a daily budget cap in USD (recommended)
 
 Credentials land in `~/.config/qmediat/credentials` with `chmod 0600`. The server reads them at startup; your MCP host config only references the profile name.
@@ -29,7 +29,13 @@ Credentials land in `~/.config/qmediat/credentials` with `chmod 0600`. The serve
 
 ### Claude Code
 
-Edit `~/.claude.json` and add:
+One command:
+
+```bash
+claude mcp add --scope user gemini-code-context -e GEMINI_CREDENTIALS_PROFILE=default -- npx -y @qmediat.io/gemini-code-context-mcp
+```
+
+or edit `~/.claude.json` and add:
 
 ```json
 {
@@ -70,6 +76,6 @@ Check what you've spent and how much context is cached:
 ## Next steps
 
 - **Configuration reference** — all env vars and their defaults: [configuration.md](configuration.md)
-- **How caching works** — the 45s → 2s story: [how-caching-works.md](how-caching-works.md)
+- **How caching works** — the two caching modes and what was measured: [how-caching-works.md](how-caching-works.md)
 - **Security model** — threat model + incident response: [security.md](security.md)
 - **Cost model** — what you actually pay for and how to control it: [cost-model.md](cost-model.md)

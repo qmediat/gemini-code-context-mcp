@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.qmediat/gemini-code-context-mcp",
-  "description": "Gemini 2M context cache for Claude Code — persistent; repeat queries ~8x faster, ~4x cheaper.",
+  "description": "Long-context codebase Q&A for Claude Code through Gemini (1M-token window): one workspace scan, implicit caching by default, explicit Context Cache on request, agentic file access for larger repos.",
   "repository": {
     "url": "https://github.com/qmediat/gemini-code-context-mcp",
     "source": "github"
   },
-  "version": "1.17.0",
+  "version": "1.17.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@qmediat.io/gemini-code-context-mcp",
-      "version": "1.17.0",
+      "version": "1.17.1",
       "transport": {
         "type": "stdio"
       },
@@ -53,14 +53,21 @@
         },
         {
           "name": "GEMINI_CODE_CONTEXT_DEFAULT_MODEL",
-          "description": "Model alias (`latest-pro`, `latest-pro-thinking`, `latest-flash`, `latest-lite`, `latest-vision`) or literal model ID. Default: `latest-pro`.",
+          "description": "Model alias (`latest-pro-thinking`, `latest-pro`, `latest-flash`, `latest-lite`, `latest-vision`) or literal model ID. Default: `latest-pro-thinking` (the thinking tier).",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        },
+        {
+          "name": "GEMINI_CODE_CONTEXT_CACHING_MODE",
+          "description": "`implicit` (default since v1.14.0: the workspace text is sent inline, Gemini's automatic prefix cache decides any discount) or `explicit` (Files API upload + Context Cache with Google's cached-input price). Per-call `cachingMode` wins.",
           "isRequired": false,
           "format": "string",
           "isSecret": false
         },
         {
           "name": "GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS",
-          "description": "Context Cache TTL in seconds. Default: 3600 (1 hour). Hot workspaces (<10 min since last use) auto-refresh via background watcher.",
+          "description": "Context Cache TTL in seconds in explicit caching mode. Default: 3600 (1 hour). Hot workspaces (<10 min since last use) auto-refresh via background watcher.",
           "isRequired": false,
           "format": "string",
           "isSecret": false

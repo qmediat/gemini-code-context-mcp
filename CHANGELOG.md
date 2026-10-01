@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-10-01
+
 ### Changed
 
-- `package.json` names the `bin` path as `dist/index.js` — the form npm publishes, so a publish prints no auto-correction.
+- Every public claim brought to what the code does (audit of the npm page, 2026-10-01): the context window is 1M tokens, not 2M; the default caching mode is `implicit` (since v1.14.0) and the README, the caching page, the `ask` description and the MCP registry manifest say so, with the explicit Context Cache as the documented option (`GEMINI_CODE_CONTEXT_CACHING_MODE`, `cachingMode`); the default model is `latest-pro-thinking` everywhere (`--help`, the `init` prompt, README, `server.json`, getting-started); one measurement with its date and mode replaces the five repeat-query figures; the cost-model numbers are labelled as explicit-mode measurements and the estimator's 25 % fallback is named; the secret denylist is listed as the exact basenames the sandbox checks; the no-progress threshold is 5; per-tool parameters are listed; the comparison with `gemini-mcp-tool` is re-measured on 2026-10-01 (its 1.1.8 release and answered issues) and the dead-dependency row is gone; the release-cadence and "production-deployed / daily" sentences are gone; the 48-hour SLA is an aim; one contact domain.
+- README: a `claude mcp add` one-liner, a supported-platforms note (`better-sqlite3` prebuilt bindings), absolute links to the docs so the npm page renders them; `docs/configuration.md` documents `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` and `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`; `docs/getting-started.md` has the one-liner.
+- `package.json` description and keywords describe 1.17 (no `2m-context`, no `files-api`); names the `bin` path as `dist/index.js` — the form npm publishes, so a publish prints no auto-correction.
 
 ## [1.17.0] - 2026-09-29
 

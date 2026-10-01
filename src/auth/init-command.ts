@@ -244,7 +244,7 @@ export async function runInit(): Promise<void> {
       data.vertexLocation = location;
     }
 
-    const modelInput = (await rl.question('Default model [latest-pro]: ')).trim();
+    const modelInput = (await rl.question('Default model [latest-pro-thinking]: ')).trim();
     if (modelInput.length > 0) data.defaultModel = modelInput;
 
     const budgetInput = (await rl.question('Daily budget cap in USD (blank = no cap) []: ')).trim();

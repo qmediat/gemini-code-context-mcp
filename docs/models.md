@@ -66,7 +66,7 @@ Orthogonal to category — multiple can apply to a single model:
 | Alias | Category set | Extra filter | Notes |
 |---|---|---|---|
 | `latest-pro` | `text-reasoning` | — | Newest pro-tier text model |
-| `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | Default for `code`; preferred for deep work |
+| `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | Default for every tool (`GEMINI_CODE_CONTEXT_DEFAULT_MODEL` unset); preferred for deep work |
 | `latest-flash` | `text-fast` | — | Faster + cheaper than pro; no deep thinking |
 | `latest-lite` | `text-lite` | — | Cheapest tier; limited capabilities |
 | `latest-vision` | `text-reasoning` or `text-fast` | `supportsVision=true` | Screenshot analysis, image Q&A |

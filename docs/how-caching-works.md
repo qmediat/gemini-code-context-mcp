@@ -1,6 +1,9 @@
-# How caching works (the 45 s → 2 s story)
+# How caching works
 
-Gemini's 2M-token context window is useless if you re-send the whole codebase on every prompt. This server solves that by keeping a **persistent context cache** per workspace.
+Gemini's 1M-token context window is useless if you re-read the whole codebase yourself on every prompt. This server scans a workspace once and reuses the scan; what happens on Google's side depends on the caching mode (`cachingMode` per call, `GEMINI_CODE_CONTEXT_CACHING_MODE` for every call):
+
+- **`implicit`** — the default since v1.14.0: the workspace text is sent inline with each question, nothing is uploaded or stored between calls, and Gemini's automatic prefix cache may bill the repeated prefix at the cached-input price — no guarantee.
+- **`explicit`** — the path described below: a Files API upload and a **persistent Context Cache** per workspace, rebuilt when a file changes, with Google's cached-input price on every repeat question. The figures in this page were measured in this mode (2026-04-22: first call 125 s, repeat ~14 s on a 670 k-token workspace).
 
 ## The problem
 
@@ -34,12 +37,12 @@ Do that ten times in an afternoon and you've burned $20 in input tokens alone.
 │    ttl: 1h                │        │    contents: prompt      │
 │  ) → cache_id             │        │  )                       │
 │                           │        │                          │
-│  generateContent(         │        │  response in ~2 s,       │
+│  generateContent(         │        │  response without the    │
 │    cachedContent: ID,     │        │  input tokens billed at  │
-│    contents: prompt       │        │  ~25 % of input rate     │
+│    contents: prompt       │        │  upload and cache build  │
 │  )                        │        │                          │
 └──────────────────────────┘        └──────────────────────────┘
-  ~35–45 s, full input price          ~2–3 s, cached-token price
+  full input price (125 s measured)    cached-token price (~14 s measured)
 ```
 
 On repeat queries against the same files, the 45-second upload-and-understand phase is replaced by a reference to the existing cache (`cachedContent: cachedContents/abc123`). Gemini doesn't re-tokenize the codebase — it already has it indexed.

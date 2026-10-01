@@ -79,7 +79,7 @@ Then update `~/.claude.json` with the `npx` command from the TL;DR above.
 
 ### The server starts but `ask` fails with "No models available"
 
-Your API key's tier doesn't reach any Gemini model. Check [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Paid tier gets 2M context + access to `-pro` and `-pro-thinking` models.
+Your API key's tier doesn't reach any Gemini model. Check [aistudio.google.com/apikey](https://aistudio.google.com/apikey). Paid tier gets the 1M-token context + access to `-pro` and `-pro-thinking` models.
 
 ### "Daily budget cap reached"
 
