@@ -75,11 +75,20 @@ function pricingFor(model: string): PricingEntry {
 }
 
 export interface CostInputs {
+  /** The service tier the call runs on; flex halves the price. */
+  serviceTier?: 'standard' | 'flex' | undefined;
   model: string;
   uncachedInputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
   thinkingTokens?: number;
+}
+
+/** Google's flex tier is billed at half the standard price for the same model. */
+export const FLEX_PRICE_FACTOR = 0.5;
+
+function tierFactor(tier: 'standard' | 'flex' | undefined): number {
+  return tier === 'flex' ? FLEX_PRICE_FACTOR : 1;
 }
 
 /** Estimated cost in USD (float). Multiply by 1e6 for micros before storing. */
@@ -93,7 +102,7 @@ export function estimateCostUsd(input: CostInputs): number {
   const thinking = input.thinkingTokens
     ? (input.thinkingTokens / 1_000_000) * p.outputPerMillion
     : 0;
-  return uncached + cached + output + thinking;
+  return (uncached + cached + output + thinking) * tierFactor(input.serviceTier);
 }
 
 export function toMicrosUsd(dollars: number): number {
@@ -101,6 +110,7 @@ export function toMicrosUsd(dollars: number): number {
 }
 
 export interface PreCallEstimateInputs {
+  serviceTier?: 'standard' | 'flex' | undefined;
   model: string;
   /** Sum of file sizes in bytes — the workspace content that will be sent. */
   workspaceBytes: number;
@@ -126,6 +136,7 @@ export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   const promptTokens = Math.ceil(Math.max(0, input.promptChars) / 4);
   return estimateCostUsd({
     model: input.model,
+    serviceTier: input.serviceTier,
     uncachedInputTokens: workspaceTokens + promptTokens,
     cachedInputTokens: 0,
     outputTokens: Math.max(0, input.expectedOutputTokens),

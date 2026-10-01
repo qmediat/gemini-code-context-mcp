@@ -26,6 +26,15 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import {
+  SERVICE_TIER_DESCRIPTION,
+  ServiceTierError,
+  networkAttempts,
+  resolveServiceTier,
+  serviceTierConfig,
+  statusOf,
+  tierErrorMeta,
+} from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
@@ -151,6 +160,7 @@ export const askInputSchema = z
       .describe(
         "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
       ),
+    serviceTier: z.enum(['standard', 'flex']).optional().describe(SERVICE_TIER_DESCRIPTION),
     cachingMode: z
       .enum(['explicit', 'implicit'])
       .optional()
@@ -213,6 +223,12 @@ async function executeAskBody(
   // `reserve` used. `model` at the top of execute is the request alias
   // ("latest-pro-thinking") — different key, different bucket.
   let resolvedModelKey: string | null = null;
+  // once a stream opened, a later transport failure is mid-stream: billed work, not to be re-sent
+  let streamOpened = false;
+  // the tier this call runs on once resolved (Vertex may force standard); before that, the requested one is reported
+  let serviceTier: 'standard' | 'flex' | undefined;
+  const reportedTier = (): 'standard' | 'flex' =>
+    serviceTier ?? input.serviceTier ?? ctx.config.serviceTier;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // Composite timeout controller — wall-clock-bound (`timeoutMs`) AND/OR
   // heartbeat-aware stall watchdog (`stallMs`, v1.12.0). Set up before any
@@ -254,6 +270,21 @@ async function executeAskBody(
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
     resolvedModelKey = resolved.resolved;
+    try {
+      serviceTier = resolveServiceTier(
+        input.serviceTier,
+        ctx.config.serviceTier,
+        ctx.config.vertex,
+      );
+    } catch (err) {
+      if (!(err instanceof ServiceTierError)) throw err;
+      return errorResult(`ask: ${err.message}`, {
+        errorCode: err.code,
+        retryable: false,
+        serviceTier: 'flex',
+        resolvedModel: resolved.resolved,
+      });
+    }
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — build the scan memo from previously-stored file rows so the
@@ -442,6 +473,12 @@ async function executeAskBody(
         // (per-iteration cap; total wall-clock can be N × that). Cost +
         // timing shape genuinely changes — opt-in is the right default.
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
+          if (serviceTier === 'flex') {
+            const note =
+              'ask: the ask_agentic fallback has no service tier — this call runs standard, not flex';
+            emitter.emit(note);
+            logger.warn(note);
+          }
           logger.warn(
             `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
           );
@@ -535,6 +572,8 @@ async function executeAskBody(
 
           const wrappedStructured: Record<string, unknown> = {
             fallbackApplied: 'ask_agentic',
+            serviceTier: 'standard', // ask_agentic has no tier: the fallback runs standard whatever was asked
+            ...(serviceTier === 'flex' ? { serviceTierDowngraded: 'flex' } : {}),
             fallbackReason: 'WORKSPACE_TOO_LARGE',
             preflightEstimate: {
               tokens: preflight.effectiveTokens,
@@ -597,6 +636,7 @@ async function executeAskBody(
           `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload). Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
+            serviceTier,
             retryable: false,
             estimatedInputTokens: preflight.effectiveTokens,
             tokenCountMethod: preflight.method,
@@ -624,6 +664,7 @@ async function executeAskBody(
     if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
       const estimateUsd = estimatePreCallCostUsd({
         model: resolved.resolved,
+        serviceTier,
         workspaceBytes,
         promptChars: input.prompt.length,
         // Budget reservation uses the effective cap (explicit-user-cap
@@ -645,7 +686,7 @@ async function executeAskBody(
         const spentUsd = reserve.spentMicros / 1_000_000;
         return errorResult(
           `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false },
+          { errorCode: 'BUDGET_REJECT', retryable: false, serviceTier },
         );
       }
       reservationId = reserve.id;
@@ -763,15 +804,17 @@ async function executeAskBody(
       : effectiveThinkingBudget === null
         ? { includeThoughts: true }
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
+    const tierField = serviceTierConfig(serviceTier);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
       return cacheId
-        ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField }
+        ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField, ...tierField }
         : {
             systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
             thinkingConfig,
             ...maxOutputField,
+            ...tierField,
           };
     };
     const buildContents = (
@@ -803,6 +846,7 @@ async function executeAskBody(
             config: { ...buildConfig(activePrep.cacheId), abortSignal },
           }),
         {
+          attempts: networkAttempts(serviceTier), // a flex request is never re-sent
           signal: abortSignal,
           onRetry: (attempt, retryErr) => {
             logger.warn(
@@ -813,6 +857,7 @@ async function executeAskBody(
           },
         },
       );
+      streamOpened = true;
       response = await collectStream(stream, {
         signal: abortSignal,
         onThoughtChunk: (text) => {
@@ -885,6 +930,7 @@ async function executeAskBody(
                 config: { ...buildConfig(rebuilt.cacheId), abortSignal },
               }),
             {
+              attempts: networkAttempts(serviceTier),
               signal: abortSignal,
               onRetry: (attempt, retryErr) => {
                 logger.warn(
@@ -895,6 +941,7 @@ async function executeAskBody(
               },
             },
           );
+          streamOpened = true;
           response = await collectStream(retryStream, {
             signal: abortSignal,
             onThoughtChunk: (text) => {
@@ -916,6 +963,9 @@ async function executeAskBody(
           // Otherwise preserve the ORIGINAL stale-cache error as `cause` so
           // ops can root-cause diagnostics across both the first 404 and any
           // rebuild-time failure.
+          // an HTTP error on the retry (a 429/503) IS the error: thrown as the SDK made it, so its status and the
+          // throttle's retry hint are read as usual; only a status-less failure is wrapped over the stale 404
+          if (statusOf(retryErr) !== undefined) throw retryErr;
           throw new Error(
             `ask retry after stale cache failed: ${
               retryErr instanceof Error ? retryErr.message : String(retryErr)
@@ -960,6 +1010,7 @@ async function executeAskBody(
 
     const cost = estimateCostUsd({
       model: resolved.resolved,
+      serviceTier,
       uncachedInputTokens: uncached,
       cachedInputTokens: cached,
       outputTokens: output,
@@ -1025,6 +1076,7 @@ async function executeAskBody(
     const metadata: Record<string, unknown> = {
       resolvedModel: resolved.resolved,
       requestedModel: resolved.requested,
+      serviceTier,
       fallbackApplied: resolved.fallbackApplied,
       modelCategory: resolved.category,
       modelCostTier: resolved.capabilities.costTier,
@@ -1133,11 +1185,13 @@ async function executeAskBody(
         timeoutMs: ms,
         stallMs,
         retryable: true,
+        serviceTier: reportedTier(),
       });
     }
-    const httpStatus = (err as { status?: number }).status;
+    const httpStatus = statusOf(err);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      errorCode: 'UNKNOWN',
+      ...tierErrorMeta(err, streamOpened),
+      serviceTier: reportedTier(),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {

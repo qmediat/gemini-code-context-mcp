@@ -190,9 +190,10 @@ describe('ask — mid-stream failure semantics (T20 review CRITICAL fix)', () =>
     const result = await askTool.execute({ prompt: 'hi' }, ctx);
     // Stream opens exactly ONCE — the mid-stream failure is terminal.
     expect(openCount).toBe(1);
-    // Surfaces as a regular failure (UNKNOWN errorCode + the SDK error message).
+    // Surfaces as a transport failure that must NOT be retried: the stream had opened, the work is billed.
     expect(result.isError).toBe(true);
-    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    expect(result.structuredContent?.errorCode).toBe('NETWORK_ERROR');
+    expect(result.structuredContent?.retryable).toBe(false);
   });
 
   it('PRE-stream transient error IS retried (withNetworkRetry path)', async () => {

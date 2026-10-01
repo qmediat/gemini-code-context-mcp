@@ -666,3 +666,24 @@ The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to s
 **Blocked on:** Need for a destructive migration. The `addColumnIfMissing` idempotent pattern is sufficient until a column needs to disappear or change shape.
 
 ---
+
+## DEF-FLEX-01 — raise the fetch headers timeout for flex-tier calls (2026-10-01, cross-review of 1.19.0)
+
+Google advises client timeouts of 10 minutes or more on the flex tier (1–15 min latency). Node's `fetch` (undici)
+waits at most 300 s for the response headers by default; a queued flex stream past that aborts as `fetch failed`.
+1.19.0 sends a flex request once (no re-send), so the call fails as `NETWORK_ERROR` (retryable) instead of being
+billed three times — but it still fails, and Google quotes 1–15 min of queue on flex. Not reproduced live. Fix: an undici
+`Agent` with `headersTimeout` ≥ 15 min set as the SDK's dispatcher when the tier is flex (`httpOptions` or
+`setGlobalDispatcher`), with a test on a slow fake server. Owner @qmt, the next release after 1.19.0.
+
+## DEF-FLEX-02 — record the service tier on usage rows (2026-10-01, cross-review of 1.19.0)
+
+`insertUsageMetric` rows carry the halved cost of a flex call but not the tier, so `status` and an audit cannot tell
+a flex call from a cheap standard one. Fix: a `serviceTier` column (migration), written by ask/code, shown by `status`.
+Owner @qmt, the next release after 1.19.0.
+
+## DEF-FLEX-03 — ask_agentic reports a 429/503 as UNKNOWN (2026-10-01, round 2 of #92)
+
+`ask_agentic` maps a Google 429/503 to `errorCode: 'UNKNOWN'`, `retryable: false` and reads `.status` unguarded,
+while ask/code report `RATE_LIMIT` / `OVERLOADED` through `tierErrorMeta` / `statusOf` since 1.19.0. Fix: the same
+mapping in the agentic loop's error path (another code area — its own PR). Owner @qmt.

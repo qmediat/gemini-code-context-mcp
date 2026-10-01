@@ -67,6 +67,8 @@ function buildCtx(): ToolContext {
     config: {
       auth,
       defaultModel: 'latest-pro-thinking',
+      serviceTier: 'standard',
+      vertex: false,
       dailyBudgetUsd: 50,
       maxFilesPerWorkspace: 200,
       maxFileSizeBytes: 1_000_000,

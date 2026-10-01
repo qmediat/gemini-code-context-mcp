@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-10-01
+
+From the 2026-10-01 comparison with Google's own tools and the community (`docs/COMPETITION-2026-10-01.md`).
+
+### Added
+
+- `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`
+  (trimmed, case-insensitive; an invalid value warns on stderr and is standard): `flex` is Google's half-price tier
+  (longer latency). The cost estimate, the usage ledger and the daily budget use the flex price. A request flex refuses
+  under load (429/503) is NOT retried by this server — the network retry covers connection failures only; the result
+  says `RATE_LIMIT` / `OVERLOADED`, `retryable: true` with Google's retry hint when it sent one (a 429/503 on the
+  stale-cache retry is reported as itself), and the client retries; a flex request is sent exactly once — the server's
+  own network retry is off for it, every send being billed. Reported as `serviceTier` on every result of a call that reached model resolution, errors and
+  timeouts included (the requested tier until the model is resolved; the earliest validation errors — workspace,
+  thinking budget — carry no tier); a failure before any response (a reset, the
+  300 s header wait on a queued flex request) is `NETWORK_ERROR`, `retryable: true`; the `ask_agentic` fallback runs standard and says so (progress line, warning,
+  `serviceTierDowngraded`). Not available on the Vertex AI backend (the SDK sends no tier there, js-genai#1468): a
+  per-call `flex` is refused by name, a default of `flex` runs standard with a startup warning. Registered follow-ups:
+  DEF-FLEX-01 (the fetch headers timeout on flex), DEF-FLEX-02 (the usage rows do not record the tier yet).
+
 ## [1.18.0] - 2026-10-01
 
 ### Fixed
