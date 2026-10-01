@@ -9,16 +9,22 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import {
-  type Content,
-  type GenerateContentConfig,
-  type Part,
-  ServiceTier,
-  type ThinkingConfig,
-  type ThinkingLevel,
+import type {
+  Content,
+  GenerateContentConfig,
+  Part,
+  ThinkingConfig,
+  ThinkingLevel,
 } from '@google/genai';
 import { z } from 'zod';
-import { attachmentParts, inspectAttachments } from '../attachments.js';
+import {
+  AttachmentError,
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENTS_TOTAL_BYTES,
+  MAX_ATTACHMENT_BYTES,
+  attachmentParts,
+  inspectAttachments,
+} from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -34,6 +40,7 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import { resolveServiceTier, serviceTierConfig, tierErrorCode } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
@@ -161,16 +168,16 @@ export const askInputSchema = z
       ),
     attachments: z
       .array(z.string().min(1))
-      .max(8)
+      .max(MAX_ATTACHMENTS)
       .optional()
       .describe(
-        'Local image or PDF files (png, jpg, jpeg, webp, gif, pdf; up to 8, 10 MB each, 20 MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are absolute or relative to the workspace. They are part of THIS question only, never of the workspace cache. The model must support vision (`latest-vision`, or a pro/flash model that lists vision); a model without it is refused by name. Not available with the ask_agentic fallback.',
+        `Local image or PDF files (png, jpg, jpeg, webp, pdf; up to ${MAX_ATTACHMENTS}, ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB each, ${MAX_ATTACHMENTS_TOTAL_BYTES / 1024 / 1024} MB together) sent inline with the prompt — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply). They are part of THIS question only, never of the workspace cache, and their tokens are NOT counted by the size preflight, the budget reservation or the TPM throttle (an image is about 258 tokens, a PDF page as much). The model must support vision; a model without it is refused by name. Not available with the ask_agentic fallback.`,
       ),
     serviceTier: z
       .enum(['standard', 'flex'])
       .optional()
       .describe(
-        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency, requests may be refused under load with 429 — the usual retry applies); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`.",
+        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry — the result says RATE_LIMITED / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price.",
       ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
@@ -284,9 +291,17 @@ async function executeAskBody(
         { errorCode: 'ATTACHMENTS_UNSUPPORTED', resolvedModel: resolved.resolved },
       );
     }
-    const attached = await inspectAttachments(attachmentPaths, workspaceRoot);
-    const extraParts: Part[] = await attachmentParts(attached);
-    const serviceTier = input.serviceTier ?? ctx.config.serviceTier;
+    let attached: Awaited<ReturnType<typeof inspectAttachments>>;
+    try {
+      attached = await inspectAttachments(attachmentPaths, workspaceRoot);
+    } catch (err) {
+      if (!(err instanceof AttachmentError)) throw err;
+      return errorResult(`ask: ${err.message}`, {
+        errorCode: 'ATTACHMENT_INVALID',
+        retryable: false,
+      });
+    }
+    const serviceTier = resolveServiceTier(input.serviceTier, ctx.config.serviceTier);
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — build the scan memo from previously-stored file rows so the
@@ -574,6 +589,7 @@ async function executeAskBody(
 
           const wrappedStructured: Record<string, unknown> = {
             fallbackApplied: 'ask_agentic',
+            serviceTier: 'standard', // ask_agentic has no tier: the fallback runs standard whatever was asked
             fallbackReason: 'WORKSPACE_TOO_LARGE',
             preflightEstimate: {
               tokens: preflight.effectiveTokens,
@@ -663,6 +679,7 @@ async function executeAskBody(
     if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
       const estimateUsd = estimatePreCallCostUsd({
         model: resolved.resolved,
+        serviceTier,
         workspaceBytes,
         promptChars: input.prompt.length,
         // Budget reservation uses the effective cap (explicit-user-cap
@@ -802,7 +819,9 @@ async function executeAskBody(
       : effectiveThinkingBudget === null
         ? { includeThoughts: true }
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
-    const tierField = serviceTier === 'flex' ? { serviceTier: ServiceTier.FLEX } : {};
+    const tierField = serviceTierConfig(serviceTier);
+    // the bytes are read only now — after the size preflight and the budget reservation refused nothing
+    const extraParts: Part[] = await attachmentParts(attached);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
@@ -1005,6 +1024,7 @@ async function executeAskBody(
 
     const cost = estimateCostUsd({
       model: resolved.resolved,
+      serviceTier,
       uncachedInputTokens: uncached,
       cachedInputTokens: cached,
       outputTokens: output,
@@ -1184,7 +1204,8 @@ async function executeAskBody(
     }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      errorCode: 'UNKNOWN',
+      ...tierErrorCode(httpStatus),
+      serviceTier: resolveServiceTier(input.serviceTier, ctx.config.serviceTier),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {

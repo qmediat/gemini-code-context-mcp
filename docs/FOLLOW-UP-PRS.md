@@ -666,3 +666,11 @@ The full v1.6/v1.7 plan recommended converting BOTH the loop AND the rescue to s
 **Blocked on:** Need for a destructive migration. The `addColumnIfMissing` idempotent pattern is sufficient until a column needs to disappear or change shape.
 
 ---
+
+## DEF-FLEX-01 — raise the fetch headers timeout for flex-tier calls (2026-10-01, cross-review of 1.19.0)
+
+Google advises client timeouts of 10 minutes or more on the flex tier (1–15 min latency). Node's `fetch` (undici)
+waits at most 300 s for the response headers by default; a queued flex stream past that aborts as `fetch failed`,
+which `withNetworkRetry` treats as transient and re-sends up to three times. Not reproduced live. Fix: an undici
+`Agent` with `headersTimeout` ≥ 15 min set as the SDK's dispatcher when the tier is flex (`httpOptions` or
+`setGlobalDispatcher`), with a test on a slow fake server. Owner @qmt, the next release after 1.19.0.

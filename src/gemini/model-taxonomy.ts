@@ -188,14 +188,13 @@ export function extractCapabilityFlags(
   const category = categorizeModel(modelId);
   return {
     supportsThinking: sdkMetadata.supportsThinking,
-    // Most current Gemini text models accept image input (multimodal by
-    // default). Only *-lite variants and embedding models don't. Heuristic
-    // matches Google's documented vision support table as of 2026-04.
+    // Every current Gemini text model accepts image input — the Flash-Lite
+    // models included (Google lists image and PDF input on them); only the
+    // embedding and media-generation categories do not.
     supportsVision:
       category !== 'embedding' &&
       category !== 'audio-generation' &&
-      category !== 'video-generation' &&
-      !/-lite(?:-|$)/i.test(modelId),
+      category !== 'video-generation',
     // Code execution is an explicit tool flag on generateContent; all
     // current Gemini 2.5+/3.x text models support it. Exclude image /
     // audio / video variants and embeddings.

@@ -2,7 +2,7 @@
  * v1.19.0 — `ask` attachments (inline image/PDF parts) and the service tier, on the same harness as the throttle
  * suite: the workspace, the model and the context are mocked; `generateContentStream` records what would be sent.
  */
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -34,7 +34,8 @@ vi.mock('../../src/cache/cache-manager.js', () => ({
   markCacheStale: mocks.markCacheStale,
 }));
 
-const dir = mkdtempSync(join(tmpdir(), 'gcc-attach-'));
+const dir = realpathSync(mkdtempSync(join(tmpdir(), 'gcc-attach-')));
+const outside = realpathSync(mkdtempSync(join(tmpdir(), 'gcc-outside-')));
 const PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
   'base64',
@@ -43,6 +44,13 @@ const shot = join(dir, 'shot.png');
 writeFileSync(shot, PNG);
 const notes = join(dir, 'notes.txt');
 writeFileSync(notes, 'x');
+const secret = join(outside, 'secret.png');
+writeFileSync(secret, PNG);
+const link = join(dir, 'link.png');
+symlinkSync(secret, link);
+const big = join(dir, 'big.png');
+writeFileSync(big, PNG);
+truncateSync(big, 10 * 1024 * 1024 + 1);
 
 interface Sent {
   contents: unknown;
@@ -178,6 +186,69 @@ describe('ask attachments and service tier (1.19.0)', () => {
     ]);
   });
 
+  it('without attachments a cache hit still sends the bare prompt string (the cached path is unchanged)', async () => {
+    mocks.prepareContext.mockResolvedValue({
+      cacheId: 'cachedContents/abc',
+      inlineContents: [],
+      reused: true,
+      rebuilt: false,
+      inlineOnly: false,
+      uploaded: { failedCount: 0, failures: [] },
+    });
+    const { ctx, sent } = buildCtx();
+    await askTool.execute({ prompt: 'q', workspace: dir }, ctx);
+    expect(sentAt(sent, 0).contents).toBe('q');
+  });
+
+  it('a file outside the workspace, a symlink to one and a file over the per-file cap are refused with ATTACHMENT_INVALID', async () => {
+    const { ctx, sent } = buildCtx();
+    const cases: Array<[string, RegExp]> = [
+      [secret, /escapes workspace root|outside/],
+      [link, /symlink/],
+      [big, /above 10485760/],
+    ];
+    for (const [path, why] of cases) {
+      const result = await askTool.execute(
+        { prompt: 'q', workspace: dir, attachments: [path] },
+        ctx,
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent?.errorCode).toBe('ATTACHMENT_INVALID');
+      expect(result.structuredContent?.retryable).toBe(false);
+      expect(String(result.content[0]?.text)).toMatch(why);
+    }
+    expect(sent).toHaveLength(0);
+  });
+
+  it('the ask_agentic fallback refuses attachments with a reason instead of dropping them', async () => {
+    mocks.scanWorkspace.mockResolvedValue({
+      workspaceRoot: dir,
+      filesHash: 'big',
+      files: Array.from({ length: 50 }, (_, i) => ({
+        path: `f${i}.ts`,
+        size: 400_000,
+        hash: `h${i}`,
+      })),
+      skippedTooLarge: 0,
+      truncated: false,
+    });
+    mocks.resolveModel.mockResolvedValue({ ...resolved(true), inputTokenLimit: 10_000 });
+    const { ctx, sent } = buildCtx();
+    const result = await askTool.execute(
+      {
+        prompt: 'q',
+        workspace: dir,
+        attachments: [shot],
+        onWorkspaceTooLarge: 'fallback-to-agentic',
+      },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.errorCode).toBe('WORKSPACE_TOO_LARGE');
+    expect(String(result.content[0]?.text)).toMatch(/attachments/);
+    expect(sent).toHaveLength(0);
+  });
+
   it('with a cache the prompt is no longer a bare string when attachments are given', async () => {
     mocks.prepareContext.mockResolvedValue({
       cacheId: 'cachedContents/abc',
@@ -207,6 +278,7 @@ describe('ask attachments and service tier (1.19.0)', () => {
     const bad = await askTool.execute({ prompt: 'q', workspace: dir, attachments: [notes] }, ctx);
     expect(bad.isError).toBe(true);
     expect(String(bad.content[0]?.text)).toMatch(/unsupported type/);
+    expect(bad.structuredContent?.errorCode).toBe('ATTACHMENT_INVALID');
     const missing = await askTool.execute(
       { prompt: 'q', workspace: dir, attachments: ['nope.png'] },
       ctx,

@@ -228,10 +228,12 @@ export function loadConfig(): Config {
 /** `GEMINI_CODE_CONTEXT_SERVICE_TIER`: `standard` (default) or `flex`; anything else warns and is standard. */
 function readServiceTierEnv(): 'standard' | 'flex' {
   const raw = process.env.GEMINI_CODE_CONTEXT_SERVICE_TIER;
-  if (raw === undefined || raw === '') return 'standard';
-  if (raw === 'standard' || raw === 'flex') return raw;
+  if (raw === undefined) return 'standard';
+  const v = raw.trim().toLowerCase();
+  if (v === '') return 'standard';
+  if (v === 'standard' || v === 'flex') return v;
   console.error(
-    `[gemini-code-context] GEMINI_CODE_CONTEXT_SERVICE_TIER=${safeForLog(raw)} is not 'standard' or 'flex'; using standard`,
+    `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_SERVICE_TIER=${safeForLog(raw)} is not 'standard' or 'flex'; using standard`,
   );
   return 'standard';
 }

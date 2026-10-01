@@ -10,13 +10,7 @@
 
 import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import {
-  type Content,
-  type GenerateContentConfig,
-  ServiceTier,
-  type ThinkingConfig,
-  type ThinkingLevel,
-} from '@google/genai';
+import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
@@ -34,6 +28,7 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import { resolveServiceTier, serviceTierConfig, tierErrorCode } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
@@ -150,7 +145,7 @@ export const codeInputSchema = z
       .enum(['standard', 'flex'])
       .optional()
       .describe(
-        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency, may be refused under load with 429 — the usual retry applies); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`.",
+        "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry — the result says RATE_LIMITED / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price.",
       ),
     cachingMode: z
       .enum(['explicit', 'implicit'])
@@ -345,12 +340,13 @@ async function executeCodeBody(
     // primary motivation for the v1.4.0 taxonomy work.
     const choice = await resolveCodeModel(modelRequest, input.model == null, ctx.client);
     const resolved = choice.resolved;
-    // The same two fields on every result after this point, error results included: an audit of a failed call
+    // The same fields on every result after this point, error results included: an audit of a failed call
     // can still tell a fallback from a caller's choice.
+    const serviceTier = resolveServiceTier(input.serviceTier, ctx.config.serviceTier);
     modelAudit = {
       resolvedModel: resolved.resolved,
       configuredModelReplaced: choice.replacedDefault ?? null,
-      serviceTier: input.serviceTier ?? ctx.config.serviceTier,
+      serviceTier,
     };
     if (choice.replacedDefault !== undefined) {
       emitter.emit(
@@ -508,6 +504,7 @@ async function executeCodeBody(
     if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
       const estimateUsd = estimatePreCallCostUsd({
         model: resolved.resolved,
+        serviceTier,
         workspaceBytes,
         promptChars: input.task.length,
         expectedOutputTokens: effectiveOutputCap,
@@ -626,8 +623,7 @@ async function executeCodeBody(
         'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
       );
     }
-    const serviceTier = input.serviceTier ?? ctx.config.serviceTier;
-    const tierField = serviceTier === 'flex' ? { serviceTier: ServiceTier.FLEX } : {};
+    const tierField = serviceTierConfig(serviceTier);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
       const maxOutputField =
         wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
@@ -824,6 +820,7 @@ async function executeCodeBody(
 
     const cost = estimateCostUsd({
       model: resolved.resolved,
+      serviceTier,
       uncachedInputTokens: uncached,
       cachedInputTokens: cached,
       outputTokens: output,
@@ -989,7 +986,7 @@ async function executeCodeBody(
     }
     const httpStatus = (err as { status?: number }).status;
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      errorCode: 'UNKNOWN',
+      ...tierErrorCode(httpStatus),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       ...modelAudit,
     });

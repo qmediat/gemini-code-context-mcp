@@ -13,15 +13,24 @@ From the 2026-10-01 comparison with Google's own tools and the community (`docs/
 
 ### Added
 
-- `ask` takes `attachments`: up to 8 local image or PDF files (png, jpg, jpeg, webp, gif, pdf; 10 MB each, 20 MB
-  together — Gemini's inline limit), sent as `inlineData` parts before the question in the user turn, with or without
-  a Context Cache. They belong to one question, never to the workspace cache. Every file is checked (type, size,
-  readability) before any is read; a model without vision is refused by name (`ATTACHMENTS_UNSUPPORTED`); the
-  `ask_agentic` fallback cannot carry them and says so. `structuredContent.attachments` lists what was sent. The
-  `latest-vision` alias finally has an input to see.
-- `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`:
-  `flex` is Google's half-price tier (longer latency, may be refused under load with 429 — the usual retry applies).
-  Reported as `serviceTier` in `structuredContent`.
+- `ask` takes `attachments`: up to 8 image or PDF files (png, jpg, jpeg, webp, pdf; 10 MB each, 20 MB together —
+  this server's cap, under every figure Google publishes; base64 adds a third), sent as `inlineData` parts before the
+  question in the user turn, with or without a Context Cache (a cache hit without attachments still sends the bare
+  prompt). They belong to one question, never to the workspace cache. A path must be inside the workspace (the same
+  realpath jail as `ask_agentic`, its secret rules included), a symlink is refused, every file is checked (type, size,
+  readability) by `stat` before any is read and re-checked at read; the bytes are read only after the size preflight
+  and the budget reservation passed. A model without vision is refused by name (`ATTACHMENTS_UNSUPPORTED`), a bad
+  file is `ATTACHMENT_INVALID` (`retryable: false`), the `ask_agentic` fallback cannot carry them and says so.
+  Attachment tokens are NOT counted by the preflight, the budget or the throttle — stated in the parameter text.
+  `structuredContent.attachments` lists what was sent. The `latest-vision` alias finally has an input to see; the
+  Flash-Lite models count as vision-capable now (Google lists image and PDF input on them).
+- `serviceTier` on `ask` and `code` (`standard` | `flex`), with the operator default `GEMINI_CODE_CONTEXT_SERVICE_TIER`
+  (trimmed, case-insensitive; an invalid value warns on stderr and is standard): `flex` is Google's half-price tier
+  (longer latency). The cost estimate, the usage ledger and the daily budget use the flex price. A request flex refuses
+  under load (429/503) is NOT retried by this server — the network retry covers connection failures only; the result
+  says `RATE_LIMITED` / `OVERLOADED`, `retryable: true`, and the client retries. Reported as `serviceTier` on every
+  result, errors included; the `ask_agentic` fallback runs standard and reports it.
+
 
 ## [1.18.0] - 2026-10-01
 
