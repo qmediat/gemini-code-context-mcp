@@ -79,7 +79,7 @@ export const askAgenticInputSchema = z
       .string()
       .optional()
       .describe(
-        "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash') or literal model ID. Defaults to `latest-pro-thinking`.",
+        "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash') or literal model ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile, then `latest-pro-thinking`).",
       ),
     includeGlobs: z
       .array(z.string())

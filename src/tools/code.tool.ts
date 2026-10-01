@@ -13,7 +13,9 @@ import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
+import type { ResolvedModel } from '../types.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
@@ -74,7 +76,7 @@ export const codeInputSchema = z
       .string()
       .optional()
       .describe(
-        "Model alias or literal ID. Defaults to 'latest-pro-thinking' for strongest coding performance.",
+        "Model alias or literal ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile); a configured default that cannot reason (a flash/lite tier) is replaced by 'latest-pro-thinking' for this tool, a model named here never is.",
       ),
     thinkingBudget: z
       .number()
@@ -223,6 +225,33 @@ export const codeTool: ToolDefinition<CodeInput> = {
   },
 };
 
+const CODE_FALLBACK_MODEL = 'latest-pro-thinking';
+const CODE_CATEGORY: readonly ['text-reasoning'] = ['text-reasoning'];
+
+/**
+ * `code` needs a reasoning model. A model the caller named is resolved as asked and a category mismatch is the
+ * caller's error, as before. The CONFIGURED default (`fromConfig`) is honoured when it can reason; when it cannot
+ * (a flash or lite alias or ID set for cheaper `ask` calls), `code` falls back to the alias and says so once per
+ * call — a default meant for Q&A must not make every coding call fail.
+ */
+async function resolveCodeModel(
+  requested: string,
+  fromConfig: boolean,
+  client: Parameters<typeof resolveModel>[1],
+): Promise<ResolvedModel> {
+  try {
+    return await resolveModel(requested, client, { requiredCategory: CODE_CATEGORY });
+  } catch (err) {
+    const fallbackApplies =
+      fromConfig && requested !== CODE_FALLBACK_MODEL && err instanceof ModelCategoryMismatchError;
+    if (!fallbackApplies) throw err;
+    logger.warn(
+      `code: the configured default model ${safeForLog(requested)} is '${err.actualCategory}', not a reasoning model — using ${CODE_FALLBACK_MODEL} for this call (set GEMINI_CODE_CONTEXT_DEFAULT_MODEL to a pro alias, or pass model per call)`,
+    );
+    return resolveModel(CODE_FALLBACK_MODEL, client, { requiredCategory: CODE_CATEGORY });
+  }
+}
+
 async function executeCodeBody(
   input: CodeInput,
   ctx: Parameters<typeof codeTool.execute>[1],
@@ -230,8 +259,9 @@ async function executeCodeBody(
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
   // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile), as ask and ask_agentic read it;
-  // the alias is the last resort for a context built without one.
-  const modelRequest = input.model ?? ctx.config.defaultModel ?? 'latest-pro-thinking';
+  // the alias is the last resort for a context built without one. `resolveCodeModel` keeps `code` on a reasoning
+  // model when the configured default is not one.
+  const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL;
   const expectEdits = input.expectEdits ?? true;
   const codeExecution = input.codeExecution ?? false;
 
@@ -286,9 +316,7 @@ async function executeCodeBody(
     // (which may share `pro` tokens with text models in Google's registry)
     // from reaching `generateContent` with a code-review prompt — the
     // primary motivation for the v1.4.0 taxonomy work.
-    const resolved = await resolveModel(modelRequest, ctx.client, {
-      requiredCategory: ['text-reasoning'],
-    });
+    const resolved = await resolveCodeModel(modelRequest, input.model === undefined, ctx.client);
     resolvedModelKey = resolved.resolved;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
