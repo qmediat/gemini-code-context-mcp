@@ -73,7 +73,8 @@ export interface Config {
    * and falls back to standard.
    */
   serviceTier: 'standard' | 'flex';
-  /** `GEMINI_USE_VERTEX=true`: the Vertex AI backend, where the flex tier is not available through this SDK. */
+  /** The calls go to Vertex AI (the resolved auth profile is of kind `vertex`), where the flex tier is not available
+   * through this SDK. */
   vertex: boolean;
   /**
    * Client-side TPM (tokens-per-minute) throttle ceiling, per resolved model.
@@ -224,9 +225,16 @@ export function loadConfig(): Config {
     forceMaxOutputTokens: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT'),
     forceRescan: readBoolEnv('GEMINI_CODE_CONTEXT_FORCE_RESCAN'),
     cachingMode: readCachingModeEnv(),
-    serviceTier: readServiceTierEnv(process.env.GEMINI_USE_VERTEX === 'true'),
-    vertex: process.env.GEMINI_USE_VERTEX === 'true',
+    serviceTier: readServiceTierEnv(isVertexAuth(auth)),
+    vertex: isVertexAuth(auth),
   };
+}
+
+/** Whether the calls go to Vertex AI — from the auth that was resolved (the env profile or a credentials-file
+ * profile of kind `vertex`), never from `GEMINI_USE_VERTEX` alone: that variable without a project falls back to the
+ * API key, and a file profile needs no variable at all. */
+export function isVertexAuth(auth: Pick<ResolvedAuth, 'profile'>): boolean {
+  return auth.profile.kind === 'vertex';
 }
 
 /** `GEMINI_CODE_CONTEXT_SERVICE_TIER`: `standard` (default) or `flex`; anything else warns and is standard. */

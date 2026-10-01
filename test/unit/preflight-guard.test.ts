@@ -93,6 +93,8 @@ function buildCtx(opts: {
       // tool's `requestedCachingMode` resolves through `ctx.config.cachingMode`
       // when the per-call field is unset (matches loadConfig() production).
       cachingMode: opts.cachingMode ?? 'implicit',
+      serviceTier: 'standard',
+      vertex: false,
     } as ToolContext['config'],
     client: {
       models: {

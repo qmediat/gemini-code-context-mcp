@@ -6,8 +6,9 @@
 import { mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readServiceTierEnv } from '../../src/config.js';
+import { isVertexAuth, readServiceTierEnv } from '../../src/config.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -232,7 +233,8 @@ describe('service tier (1.19.0)', () => {
     });
     expect(
       tierErrorMeta(
-        Object.assign(new Error('{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}'), {
+        new ApiError({
+          message: '{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}',
           status: 429,
         }),
       ),
@@ -341,6 +343,21 @@ describe('service tier (1.19.0)', () => {
     } finally {
       set(saved);
     }
+  });
+
+  it('the backend is the resolved auth profile, not GEMINI_USE_VERTEX: a credentials-file Vertex profile counts', () => {
+    expect(
+      isVertexAuth({ profile: { kind: 'vertex', project: 'p', location: 'us-central1' } as never }),
+    ).toBe(true);
+    expect(isVertexAuth({ profile: { kind: 'api-key', apiKey: 'x' } as never })).toBe(false);
+  });
+
+  it("the retry hint is read only from the SDK's own 429, never from a look-alike error", () => {
+    const lookAlike = Object.assign(
+      new Error('{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}'),
+      { status: 429 },
+    );
+    expect(tierErrorMeta(lookAlike)).toEqual({ errorCode: 'RATE_LIMIT', retryable: true });
   });
 
   it('code on the cached path sends the tier, and its usage row is written at the flex price', async () => {

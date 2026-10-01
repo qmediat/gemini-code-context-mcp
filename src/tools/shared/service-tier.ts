@@ -6,7 +6,7 @@
  * SDK does not send), so flex there would be billed standard while this server charged half: a per-call `flex` on
  * Vertex is refused, an operator default of `flex` on Vertex runs standard with a startup warning. */
 import { type GenerateContentConfig, ServiceTier } from '@google/genai';
-import { parseRetryDelayMs } from './throttle.js';
+import { isGemini429, parseRetryDelayMs } from './throttle.js';
 
 export type ServiceTierName = 'standard' | 'flex';
 
@@ -69,7 +69,7 @@ export interface TierErrorMeta {
 export function tierErrorMeta(err: unknown): TierErrorMeta {
   const status = statusOf(err);
   if (status === 429) {
-    const hint = err instanceof Error ? parseRetryDelayMs(err.message) : null;
+    const hint = isGemini429(err) ? parseRetryDelayMs(err.message) : null; // the hint only from the SDK's own 429
     return {
       errorCode: 'RATE_LIMIT',
       retryable: true,

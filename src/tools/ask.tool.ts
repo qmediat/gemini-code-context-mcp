@@ -223,6 +223,10 @@ async function executeAskBody(
   // `reserve` used. `model` at the top of execute is the request alias
   // ("latest-pro-thinking") — different key, different bucket.
   let resolvedModelKey: string | null = null;
+  // the tier this call runs on once resolved (Vertex may force standard); before that, the requested one is reported
+  let serviceTier: 'standard' | 'flex' | undefined;
+  const reportedTier = (): 'standard' | 'flex' =>
+    serviceTier ?? input.serviceTier ?? ctx.config.serviceTier;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // Composite timeout controller — wall-clock-bound (`timeoutMs`) AND/OR
   // heartbeat-aware stall watchdog (`stallMs`, v1.12.0). Set up before any
@@ -264,7 +268,6 @@ async function executeAskBody(
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
     resolvedModelKey = resolved.resolved;
-    let serviceTier: 'standard' | 'flex';
     try {
       serviceTier = resolveServiceTier(
         input.serviceTier,
@@ -1177,13 +1180,13 @@ async function executeAskBody(
         timeoutMs: ms,
         stallMs,
         retryable: true,
-        serviceTier: input.serviceTier ?? ctx.config.serviceTier,
+        serviceTier: reportedTier(),
       });
     }
     const httpStatus = statusOf(err);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
       ...tierErrorMeta(err),
-      serviceTier: input.serviceTier ?? ctx.config.serviceTier,
+      serviceTier: reportedTier(),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
     });
   } finally {
