@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.qmediat/gemini-code-context-mcp",
-  "description": "Long-context codebase Q&A for Claude Code through Gemini (1M-token window): one workspace scan, implicit caching by default, explicit Context Cache on request, agentic file access for larger repos.",
+  "description": "Codebase Q&A for Claude Code through Gemini's 1M-token window, with workspace scans and caching.",
   "repository": {
     "url": "https://github.com/qmediat/gemini-code-context-mcp",
     "source": "github"
