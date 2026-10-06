@@ -38,7 +38,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file in it was refused, so an agent spent iterations on it; it is now excluded as a directory too, in the scan,
   the listing, the search and the sandbox alike.
 - `read_file` refuses a named pipe, socket or device even when its name carries a source extension (`pipe.ts`):
-  reading one could block the agentic loop forever (the scan and `find_files` / `grep` already skipped them).
+  reading one could block the agentic loop forever (the scan and `find_files` / `grep` already skipped them); the
+  `#!` probe never reads one either (a read would consume bytes another process queued).
+- `read_file` refuses every file a rule excludes — a caller's `excludeGlobs` or a default exclude — with the generic
+  `EXCLUDED_FILE`, as the tool's schema promises; a non-source file under an excluded directory (`internal/notes`)
+  came back as `NON_SOURCE_FILE` with its path.
 - `server.json` `description` within the registry's 100-character limit (the registry refused the longer one).
 
 ### Security

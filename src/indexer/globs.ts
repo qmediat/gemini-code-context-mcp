@@ -271,9 +271,6 @@ export const DEFAULT_EXCLUDE_EXTENSIONS: readonly string[] = ['.tsbuildinfo'];
 export const DEFAULT_EXCLUDE_FILE_NAMES_LOWER: ReadonlySet<string> = new Set(
   DEFAULT_EXCLUDE_FILE_NAMES.map((s) => s.toLowerCase()),
 );
-export const DEFAULT_EXCLUDE_DIRS_LOWER: ReadonlySet<string> = new Set(
-  DEFAULT_EXCLUDE_DIRS.map((s) => s.toLowerCase()),
-);
 
 export interface MatchConfig {
   includeExtensions: readonly string[];

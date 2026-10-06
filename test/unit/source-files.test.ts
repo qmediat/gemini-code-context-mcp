@@ -9,7 +9,17 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import {
+  constants,
+  chmodSync,
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -256,6 +266,18 @@ describe('the ask_agentic tools', () => {
     expect(error.message).not.toContain('script/build');
   });
 
+  it('refuse any file under a caller-excluded directory with the generic message, extension or not', async () => {
+    const root = await agenticRepo();
+    put(root, 'internal/notes', 'plain text, no #!\n');
+    put(root, 'internal/diagram.png', 'png');
+    const own = defaultMatchConfig({ excludeGlobs: ['internal'] });
+    for (const rel of ['internal/notes', 'internal/diagram.png']) {
+      const error = await readFileExecutor(root, rel, undefined, undefined, own).catch((e) => e);
+      expect(error).toMatchObject({ code: 'EXCLUDED_FILE' });
+      expect(error.message).not.toContain('internal');
+    }
+  });
+
   it('read and list a #! script named like an excluded directory', async () => {
     const root = await agenticRepo();
     put(root, 'script/build', '#!/bin/sh\nbuild_main\n', true);
@@ -291,6 +313,14 @@ describe('the ask_agentic tools', () => {
       expect(await startsWithShebang(join(root, 'tool/bin/pipe'))).toBe(false);
       expect(warn).not.toHaveBeenCalled(); // a pipe is "not a script", not an error
       warn.mockRestore();
+      // A pipe holding `#!` is neither taken for a script nor read: the bytes stay queued for their reader.
+      const queued = join(root, 'tool/bin/queued');
+      execFileSync('mkfifo', [queued]);
+      const fd = openSync(queued, constants.O_RDWR | constants.O_NONBLOCK);
+      writeSync(fd, '#!');
+      expect(await startsWithShebang(queued)).toBe(false);
+      expect(readSync(fd, Buffer.alloc(2), 0, 2, null)).toBe(2);
+      closeSync(fd);
       await expect(readFileExecutor(root, 'tool/bin/pipe')).rejects.toMatchObject({
         code: 'NON_SOURCE_FILE',
       });

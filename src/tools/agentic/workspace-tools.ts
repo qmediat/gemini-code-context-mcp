@@ -22,13 +22,8 @@
 import type { Dirent } from 'node:fs';
 import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import {
-  type MatchConfig,
-  defaultMatchConfig,
-  isPathExcluded,
-  matchesAnyIncludeExtension,
-} from '../../indexer/globs.js';
-import { isExtensionless, isSourceFile, startsWithShebang } from '../../indexer/source-files.js';
+import { type MatchConfig, defaultMatchConfig, isPathExcluded } from '../../indexer/globs.js';
+import { isSourceFile } from '../../indexer/source-files.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
 
 /**
@@ -413,30 +408,21 @@ export async function readFileExecutor(
   // can still distinguish "explicitly excluded by your config" from
   // "default-rejected source-set membership".
   if (!(await isSourceFile(target.absolutePath, target.relpath, config))) {
-    // Discriminate the two failure modes via the shared helper (v1.9.0
-    // Phase 1.1, /6step Finding #3): if NO include-extension matches, the
-    // file is structurally non-source — keep the path in the message
-    // because the model needs to know which file it asked for is
-    // "wrong-tool" territory (binary, image, etc.) and the path is purely
-    // utility, not privacy-bearing. If an include-extension DOES match,
-    // the file is excluded by some other rule (filename / extension
-    // exclude / dir-prefix exclude) — emit a generic message with NO path
-    // (Finding #2) so the error string can't be used as an existence
-    // oracle for paths the user explicitly excluded. The third
-    // `SandboxError` argument (`relPath`) is preserved either way for
-    // internal logging via `requestedPath`.
-    // A `#!` script is source by content, not extension: when it is refused, a rule excluded it (a caller's
-    // `excludeGlobs` naming `build` hides `script/build`) — the generic message, as for a source extension.
-    const sourceByContent =
-      isExtensionless(target.relpath) && (await startsWithShebang(target.absolutePath));
-    if (!matchesAnyIncludeExtension(target.relpath, config) && !sourceByContent) {
-      throw new SandboxError(
-        'NON_SOURCE_FILE',
-        `file extension not in allowed source set, and not a readable #! script: ${target.relpath}`,
-        relPath,
-      );
+    // Two failure modes. A file a rule excludes (a caller's `excludeGlobs`, a default exclude: directory, filename
+    // or extension) gets a generic message with NO path (v1.9.0 Finding #2) — whatever its extension — so the error
+    // string can't be used as an existence oracle for paths the user explicitly excluded. Any other refused file is
+    // structurally non-source (binary, image, a file without `#!`): the path stays in the message, the model needs
+    // to know which file it asked for is "wrong-tool" territory. The third `SandboxError` argument (`relPath`) is
+    // kept either way for internal logging via `requestedPath`.
+    const fileName = target.relpath.slice(target.relpath.lastIndexOf('/') + 1);
+    if (isFileExcludedByConfig(target.relpath, fileName, config)) {
+      throw new SandboxError('EXCLUDED_FILE', 'file is excluded by configured policy', relPath);
     }
-    throw new SandboxError('EXCLUDED_FILE', 'file is excluded by configured policy', relPath);
+    throw new SandboxError(
+      'NON_SOURCE_FILE',
+      `file extension not in allowed source set, and not a readable #! script: ${target.relpath}`,
+      relPath,
+    );
   }
 
   // Stat first so we never allocate a >200MB Buffer for a minified bundle.

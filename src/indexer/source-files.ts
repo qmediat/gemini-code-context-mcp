@@ -37,6 +37,9 @@ export async function startsWithShebang(absolutePath: string): Promise<boolean> 
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(absolutePath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    // Never read a pipe, socket or device: a read consumes what another process queued there (and a pipe holding
+    // `#!` would pass for a script). fstat on the open handle, so nothing can be swapped in between.
+    if (!(await handle.stat()).isFile()) return false;
     const buf = Buffer.alloc(2);
     const { bytesRead } = await handle.read(buf, 0, 2, null); // from the start; a pipe has no position
     return bytesRead === 2 && buf[0] === 0x23 && buf[1] === 0x21;
