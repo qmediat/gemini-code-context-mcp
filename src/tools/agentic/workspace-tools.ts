@@ -440,10 +440,18 @@ export async function readFileExecutor(
   // metadata-only response so the model can skip them instead of DOSing
   // the process. Reported in PR #24 review by GPT.
   let totalBytes: number;
+  let regularFile: boolean;
   try {
-    totalBytes = (await stat(target.absolutePath)).size;
+    const st = await stat(target.absolutePath);
+    totalBytes = st.size;
+    regularFile = st.isFile();
   } catch (err) {
     throw new SandboxError('NOT_FOUND', `stat failed: ${String(err)}`, relPath);
+  }
+  // A named pipe, socket or device with a source extension (`pipe.ts`) passes the source rule; reading it could
+  // block forever. The scan and find/grep skip such entries by their dirent type; read_file has only the path.
+  if (!regularFile) {
+    throw new SandboxError('NON_SOURCE_FILE', `not a regular file: ${target.relpath}`, relPath);
   }
   const HARD_FILE_SIZE_LIMIT = 5 * MAX_READ_BYTES; // 1MB
   if (totalBytes > HARD_FILE_SIZE_LIMIT) {

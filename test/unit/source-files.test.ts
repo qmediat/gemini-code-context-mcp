@@ -82,6 +82,22 @@ describe('the rule for a source file', () => {
     expect(isPathExcluded('wt/.git', config, 'file')).toBe(true);
     const own = defaultMatchConfig({ excludeGlobs: ['deploy'] });
     expect(isPathExcluded('bin/deploy', own, 'file')).toBe(true);
+    expect(isPathExcluded('notes/Documents', config, 'file')).toBe(true);
+  });
+
+  it('lets a caller exclude hide a file named like a default build directory', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-own-'));
+    put(root, 'script/build', '#!/bin/sh\nprivate\n', true);
+    const own = defaultMatchConfig({ excludeGlobs: ['build'] });
+    expect(isPathExcluded('script/build', own, 'file')).toBe(true);
+    expect(await isSourceFile(join(root, 'script/build'), 'script/build', own)).toBe(false);
+    clearHashCache();
+    const result = await scanWorkspace(root, {
+      maxFiles: 1000,
+      maxFileSizeBytes: 100_000,
+      excludeGlobs: ['build'],
+    });
+    expect(result.files.map((f) => f.relpath)).toEqual([]);
   });
 
   it('excludes .NET build output under bin/ at the configuration or the platform level', () => {
@@ -255,13 +271,18 @@ describe('the ask_agentic tools', () => {
   });
 
   it.skipIf(process.platform === 'win32')(
-    'refuse an extensionless named pipe without opening it for a read that would never end',
+    'refuse a named pipe, extensionless or with a source extension, without a read that would never end',
     async () => {
       const root = await agenticRepo();
       execFileSync('mkfifo', [join(root, 'tool/bin/pipe')]);
       expect(await startsWithShebang(join(root, 'tool/bin/pipe'))).toBe(false);
       await expect(readFileExecutor(root, 'tool/bin/pipe')).rejects.toMatchObject({
         code: 'NON_SOURCE_FILE',
+      });
+      execFileSync('mkfifo', [join(root, 'tool/lib/pipe.ts')]);
+      await expect(readFileExecutor(root, 'tool/lib/pipe.ts')).rejects.toMatchObject({
+        code: 'NON_SOURCE_FILE',
+        message: expect.stringContaining('not a regular file'),
       });
     },
     2000,

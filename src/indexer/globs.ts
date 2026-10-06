@@ -94,33 +94,10 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
 ];
 
 /**
- * Path fragments excluded regardless of depth.
- *
- * Matched by `isPathExcluded` (below) against the workspace-relative POSIX path
- * by `pathHitsDir`: a path UNDER the directory (`${dir}/` prefix, `/${dir}/` substring) is excluded whatever it is,
- * and so is a path that NAMES it (exact equality, `/${dir}` suffix) — except a FILE named like one of the default
- * build/cache directories here, which is a file (a `#!` script called `script/build` or `bin/release`).
- * Entries are therefore typically directory *basenames* (`node_modules`,
- * `.ssh`), but multi-segment fragments like `.config/gcloud` also match
- * correctly — the matcher sees the full relative path, not just `dirent.name`.
- *
- * Two classes of entries:
- *   - **Build / cache artefacts** — indexing them wastes tokens on derived output
- *     (no value to Gemini).
- *   - **Secret-bearing directories** (`.ssh`, `.aws`, `.gnupg`, `.kube`, …) — if a
- *     user or prompt-injected agent points `workspace` at `$HOME`, we refuse to
- *     even walk these even if `workspace-validation.ts` is bypassed. Defense in
- *     depth against credential exfiltration through the Files API upload path.
- *
- * Entries here are ALWAYS excluded: `isFileIncluded` checks `isPathExcluded`
- * first, and `defaultMatchConfig` only ever APPENDS extra excludes supplied by
- * the caller. Tool-level `includeGlobs` cannot re-include a directory that is
- * in this list — if a repo has a legitimately-named dir that collides with
- * one of these, the fix is to rename the dir or fork the list, not to try to
- * punch through via `includeGlobs`.
+ * Dependencies, build output, caches and tool state. A FILE named like one of the non-dot entries is a file, not
+ * that directory (`script/build` is a script) — unless a caller's own `excludeGlobs` names it.
  */
-export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
-  // Dependencies / build output
+const BUILD_OUTPUT_DIRS: readonly string[] = [
   'node_modules',
   'dist',
   'build',
@@ -151,12 +128,10 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   'obj',
   '.DS_Store',
   '.terraform',
-  // VCS internals
-  '.git',
-  '.hg',
-  '.svn',
-  '.jj',
-  // Secret-bearing directories — never index, never upload.
+];
+
+/** Secret-bearing directories — never index, never upload; a path that names one is refused whatever it is. */
+const SECRET_DIRS: readonly string[] = [
   '.ssh',
   '.aws',
   '.gnupg',
@@ -170,6 +145,43 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   '.config/gcloud',
   '.config/azure',
   'Keychains', // macOS: `Library/Keychains`
+];
+
+/**
+ * Path fragments excluded regardless of depth.
+ *
+ * Matched by `isPathExcluded` (below) against the workspace-relative POSIX path
+ * by `pathHitsDir`: a path UNDER the directory (`${dir}/` prefix, `/${dir}/` substring) is excluded whatever it is,
+ * and so is a path that NAMES it (exact equality, `/${dir}` suffix) — except a FILE named like one of the default
+ * build/cache directories here, which is a file (a `#!` script called `script/build` or `bin/release`).
+ * Entries are therefore typically directory *basenames* (`node_modules`,
+ * `.ssh`), but multi-segment fragments like `.config/gcloud` also match
+ * correctly — the matcher sees the full relative path, not just `dirent.name`.
+ *
+ * Two classes of entries:
+ *   - **Build / cache artefacts** — indexing them wastes tokens on derived output
+ *     (no value to Gemini).
+ *   - **Secret-bearing directories** (`.ssh`, `.aws`, `.gnupg`, `.kube`, …) — if a
+ *     user or prompt-injected agent points `workspace` at `$HOME`, we refuse to
+ *     even walk these even if `workspace-validation.ts` is bypassed. Defense in
+ *     depth against credential exfiltration through the Files API upload path.
+ *
+ * Entries here are ALWAYS excluded: `isFileIncluded` checks `isPathExcluded`
+ * first, and `defaultMatchConfig` only ever APPENDS extra excludes supplied by
+ * the caller. Tool-level `includeGlobs` cannot re-include a directory that is
+ * in this list — if a repo has a legitimately-named dir that collides with
+ * one of these, the fix is to rename the dir or fork the list, not to try to
+ * punch through via `includeGlobs`.
+ */
+export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
+  ...BUILD_OUTPUT_DIRS,
+  // VCS internals
+  '.git',
+  '.hg',
+  '.svn',
+  '.jj',
+  // Secret-bearing directories — never index, never upload.
+  ...SECRET_DIRS,
   // Home-level user directories — defense in depth. If a caller somehow
   // ends up scanning `$HOME` despite `validateWorkspacePath`'s home-reject
   // (e.g. a symlinked sibling that points back at home, or a future MCP
@@ -276,6 +288,8 @@ export interface MatchConfig {
    */
   excludeExtensions: readonly string[];
   excludeFileNames: readonly string[];
+  /** The directory entries a caller's `excludeGlobs` added, lowercased: they match a file of that name too. */
+  callerExcludeDirsLower: ReadonlySet<string>;
 }
 
 /**
@@ -422,6 +436,7 @@ export function defaultMatchConfig(
     excludeDirs: [...DEFAULT_EXCLUDE_DIRS, ...extraDirs],
     excludeExtensions: [...DEFAULT_EXCLUDE_EXTENSIONS, ...extraExtsExclude],
     excludeFileNames: [...DEFAULT_EXCLUDE_FILE_NAMES, ...extraFileNames],
+    callerExcludeDirsLower: new Set(extraDirs.map((d) => d.toLowerCase())),
   };
 }
 
@@ -435,7 +450,9 @@ export function defaultMatchConfig(
 export function isPathExcluded(relpath: string, config: MatchConfig, kind: PathKind): boolean {
   const relLower = relpath.toLowerCase();
   for (const dir of config.excludeDirs) {
-    if (pathHitsDir(relLower, dir.toLowerCase(), kind)) return true;
+    const dirLower = dir.toLowerCase();
+    if (pathHitsDir(relLower, dirLower, kind, config.callerExcludeDirsLower.has(dirLower)))
+      return true;
   }
   return isDotnetBuildOutput(relLower, kind);
 }
@@ -449,45 +466,33 @@ export type PathKind = 'file' | 'dir';
  * an audit can tell "tried to read secrets" from "tried to read build output".
  */
 export const SECRET_EXCLUDE_DIRS: ReadonlySet<string> = new Set(
-  [
-    '.ssh',
-    '.aws',
-    '.gnupg',
-    '.gpg',
-    '.kube',
-    '.docker',
-    '.1password',
-    '.pki',
-    '.gcloud',
-    '.azure',
-    '.config/gcloud',
-    '.config/azure',
-    'Keychains',
-  ].map((s) => s.toLowerCase()),
+  SECRET_DIRS.map((s) => s.toLowerCase()),
 );
 
 /**
- * The default excluded directories a script could be named after, lowercased: every default entry but the
- * secret-bearing ones and the dot-names (a dotfile is never an extensionless script, and `.git` / `.DS_Store` files
- * stay hidden). A FILE named like one of them is a file — `script/build` is a script, not the `build` directory. A
- * caller's own `excludeGlobs` entry and a secret-bearing name still match a file of that name: they keep something
- * private.
+ * The build/cache directories a script could be named after, lowercased: `BUILD_OUTPUT_DIRS` without the dot-names (a
+ * dotfile is never an extensionless script; `.git` / `.DS_Store` files stay hidden). A FILE named like one of them is
+ * a file — `script/build` is a script, not the `build` directory. Every other entry — VCS, secret-bearing, home-level
+ * and a caller's own `excludeGlobs` — still matches a file of that name.
  */
 const BUILD_DIR_NAMES_LOWER: ReadonlySet<string> = new Set(
-  DEFAULT_EXCLUDE_DIRS.map((d) => d.toLowerCase()).filter(
-    (d) => !SECRET_EXCLUDE_DIRS.has(d) && !d.startsWith('.'),
-  ),
+  BUILD_OUTPUT_DIRS.map((d) => d.toLowerCase()).filter((d) => !d.startsWith('.')),
 );
 
 /**
  * Does a lowercased relative path hit the lowercased directory `dirLower`, at the root or nested? A path under it
  * always does; so does a path that names it (`pkg/node_modules`), so a listing never offers a directory whose every
- * file would be refused — unless the path is a file named like a default build/cache directory (`script/build`).
- * Shared by `isPathExcluded` and the agentic sandbox.
+ * file would be refused — unless the path is a file named like a default build/cache directory (`script/build`)
+ * that no caller exclude names (`callerEntry`). Shared by `isPathExcluded` and the agentic sandbox.
  */
-export function pathHitsDir(relLower: string, dirLower: string, kind: PathKind): boolean {
+export function pathHitsDir(
+  relLower: string,
+  dirLower: string,
+  kind: PathKind,
+  callerEntry = false,
+): boolean {
   if (relLower.startsWith(`${dirLower}/`) || relLower.includes(`/${dirLower}/`)) return true;
-  if (kind === 'file' && BUILD_DIR_NAMES_LOWER.has(dirLower)) return false;
+  if (kind === 'file' && !callerEntry && BUILD_DIR_NAMES_LOWER.has(dirLower)) return false;
   return relLower === dirLower || relLower.endsWith(`/${dirLower}`);
 }
 

@@ -183,8 +183,10 @@ describe('isFileIncluded with excludeExtensions', () => {
     const userConfig = defaultMatchConfig({
       excludeGlobs: ['src/lib/db/migrations/meta'],
     });
-    expect(isPathExcluded('src/lib/db/migrations/meta/0001_snapshot.json', userConfig)).toBe(true);
-    expect(isPathExcluded('src/lib/db/schema.ts', userConfig)).toBe(false);
+    expect(
+      isPathExcluded('src/lib/db/migrations/meta/0001_snapshot.json', userConfig, 'file'),
+    ).toBe(true);
+    expect(isPathExcluded('src/lib/db/schema.ts', userConfig, 'file')).toBe(false);
   });
 });
 

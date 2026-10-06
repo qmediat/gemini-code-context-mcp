@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An excluded directory nested in the tree (`packages/a/node_modules`) was listed by `list_directory` although every
   file in it was refused, so an agent spent iterations on it; it is now excluded as a directory too, in the scan,
   the listing, the search and the sandbox alike.
+- `read_file` refuses a named pipe, socket or device even when its name carries a source extension (`pipe.ts`):
+  reading one could block the agentic loop forever (the scan and `find_files` / `grep` already skipped them).
 - `server.json` `description` within the registry's 100-character limit (the registry refused the longer one).
 
 ### Security

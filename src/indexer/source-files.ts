@@ -1,5 +1,6 @@
 import { constants } from 'node:fs';
 import { open } from 'node:fs/promises';
+import { logger, safeForLog } from '../utils/logger.js';
 import { type MatchConfig, isFileIncluded, isPathExcluded } from './globs.js';
 
 /**
@@ -16,6 +17,15 @@ function baseName(relpath: string): string {
   return relpath.slice(relpath.lastIndexOf('/') + 1);
 }
 
+/** Errors that mean "not a script" (gone, a directory, a pipe or socket with no writer) — every other one is logged. */
+const NOT_A_SCRIPT_ERRORS: ReadonlySet<string> = new Set([
+  'ENOENT',
+  'ENOTDIR',
+  'EISDIR',
+  'EAGAIN',
+  'ENXIO',
+]);
+
 /**
  * Whether the file starts with `#!`. False for a file that is not a readable `#!` script — no `#!`, unreadable,
  * a directory, a named pipe — and the caller then treats it as not source. `O_NONBLOCK` keeps a named pipe from
@@ -28,7 +38,13 @@ export async function startsWithShebang(absolutePath: string): Promise<boolean> 
     const buf = Buffer.alloc(2);
     const { bytesRead } = await handle.read(buf, 0, 2, 0);
     return bytesRead === 2 && buf[0] === 0x23 && buf[1] === 0x21;
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== undefined && !NOT_A_SCRIPT_ERRORS.has(code)) {
+      logger.warn(
+        `not indexed, cannot read the first bytes (${code}): ${safeForLog(absolutePath)}`,
+      );
+    }
     return false;
   } finally {
     await handle?.close();
