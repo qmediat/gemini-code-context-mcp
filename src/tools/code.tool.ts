@@ -945,6 +945,9 @@ async function executeCodeBody(
       workspaceTruncated: scan.truncated,
       maxFilesCap: ctx.config.maxFilesPerWorkspace,
       filesIndexed: scan.files.length,
+      excludedDirs: scan.excludedDirs,
+      excludedDirsTotal: scan.excludedDirsTotal,
+      filesSkippedNonSource: scan.skippedNonSource,
       filesUploadFailed: activePrep.uploaded.failedCount,
       ...(activePrep.uploaded.failedCount > 0
         ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }

@@ -22,13 +22,8 @@
 import type { Dirent } from 'node:fs';
 import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { join } from 'node:path';
-import {
-  type MatchConfig,
-  defaultMatchConfig,
-  isFileIncluded,
-  isPathExcluded,
-  matchesAnyIncludeExtension,
-} from '../../indexer/globs.js';
+import { type MatchConfig, defaultMatchConfig, isPathExcluded } from '../../indexer/globs.js';
+import { isSourceFile } from '../../indexer/source-files.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
 
 /**
@@ -61,7 +56,7 @@ function resolveMatchConfig(matchConfig: MatchConfig | undefined): MatchConfig {
  * true, which is correct for indexing but wrong for listing.
  */
 function isFileExcludedByConfig(relpath: string, basename: string, config: MatchConfig): boolean {
-  if (isPathExcluded(relpath, config)) return true;
+  if (isPathExcluded(relpath, config, 'file')) return true;
   const lowerBase = basename.toLowerCase();
   for (const name of config.excludeFileNames) {
     if (lowerBase === name.toLowerCase()) return true;
@@ -198,7 +193,7 @@ export async function listDirectoryExecutor(
   // Generic message — no path interpolation — to avoid the same
   // existence-leak via error string (see Finding #2 for the file-level
   // analogue).
-  if (target.relpath && isPathExcluded(target.relpath, config)) {
+  if (target.relpath && isPathExcluded(target.relpath, config, target.kind)) {
     throw new SandboxError('EXCLUDED_DIR', 'directory is excluded by configured policy', relPath);
   }
 
@@ -239,7 +234,7 @@ export async function listDirectoryExecutor(
     // Skip excluded directories (user never gets to recurse into them).
     // Defaults (`node_modules`, `.git`, …) are merged into `config.excludeDirs`
     // by `defaultMatchConfig`; user `excludeGlobs` (dir-shaped) add to it.
-    if (isDir && isPathExcluded(childRel, config)) continue;
+    if (isDir && isPathExcluded(childRel, config, 'dir')) continue;
     // Skip files the user's excludes filter out — exclude-side ONLY.
     // Deliberately NOT requiring include-extension match: `list_directory`
     // is a navigation aid, not a content-access gate, so a `LICENSE` /
@@ -335,7 +330,7 @@ export async function findFilesExecutor(
         // Honour user `excludeGlobs` dir entries in addition to defaults
         // — `isPathExcluded` checks the full nested path, so multi-segment
         // globs like `src/vendor` work even when we hit them mid-walk.
-        if (isPathExcluded(childRel, config)) continue;
+        if (isPathExcluded(childRel, config, 'dir')) continue;
         await walk(join(currentAbs, entry.name), childRel, depth + 1);
         continue;
       }
@@ -343,9 +338,9 @@ export async function findFilesExecutor(
 
       // Unified filter: covers default filename / extension excludes,
       // user `excludeGlobs` filename / extension entries, AND requires
-      // an include-extension match (default + user). Same predicate the
-      // eager scanner uses — no agentic / eager divergence.
-      if (!isFileIncluded(childRel, config)) continue;
+      // an include-extension match (default + user) or a `#!` script.
+      // Same predicate the eager scanner uses — no agentic / eager divergence.
+      if (!(await isSourceFile(join(currentAbs, entry.name), childRel, config))) continue;
 
       if (!regex.test(childRel)) continue;
       totalMatches += 1;
@@ -412,27 +407,22 @@ export async function readFileExecutor(
   // the more specific "extension not allowed at all" sub-case so callers
   // can still distinguish "explicitly excluded by your config" from
   // "default-rejected source-set membership".
-  if (!isFileIncluded(target.relpath, config)) {
-    // Discriminate the two failure modes via the shared helper (v1.9.0
-    // Phase 1.1, /6step Finding #3): if NO include-extension matches, the
-    // file is structurally non-source — keep the path in the message
-    // because the model needs to know which file it asked for is
-    // "wrong-tool" territory (binary, image, etc.) and the path is purely
-    // utility, not privacy-bearing. If an include-extension DOES match,
-    // the file is excluded by some other rule (filename / extension
-    // exclude / dir-prefix exclude) — emit a generic message with NO path
-    // (Finding #2) so the error string can't be used as an existence
-    // oracle for paths the user explicitly excluded. The third
-    // `SandboxError` argument (`relPath`) is preserved either way for
-    // internal logging via `requestedPath`.
-    if (!matchesAnyIncludeExtension(target.relpath, config)) {
-      throw new SandboxError(
-        'NON_SOURCE_FILE',
-        `file extension not in allowed source set: ${target.relpath}`,
-        relPath,
-      );
+  if (!(await isSourceFile(target.absolutePath, target.relpath, config))) {
+    // Two failure modes. A file a rule excludes (a caller's `excludeGlobs`, a default exclude: directory, filename
+    // or extension) gets a generic message with NO path (v1.9.0 Finding #2) — whatever its extension — so the error
+    // string can't be used as an existence oracle for paths the user explicitly excluded. Any other refused file is
+    // structurally non-source (binary, image, a file without `#!`): the path stays in the message, the model needs
+    // to know which file it asked for is "wrong-tool" territory. The third `SandboxError` argument (`relPath`) is
+    // kept either way for internal logging via `requestedPath`.
+    const fileName = target.relpath.slice(target.relpath.lastIndexOf('/') + 1);
+    if (isFileExcludedByConfig(target.relpath, fileName, config)) {
+      throw new SandboxError('EXCLUDED_FILE', 'file is excluded by configured policy', relPath);
     }
-    throw new SandboxError('EXCLUDED_FILE', 'file is excluded by configured policy', relPath);
+    throw new SandboxError(
+      'NON_SOURCE_FILE',
+      `file extension not in allowed source set, and not a readable #! script: ${target.relpath}`,
+      relPath,
+    );
   }
 
   // Stat first so we never allocate a >200MB Buffer for a minified bundle.
@@ -440,10 +430,18 @@ export async function readFileExecutor(
   // metadata-only response so the model can skip them instead of DOSing
   // the process. Reported in PR #24 review by GPT.
   let totalBytes: number;
+  let regularFile: boolean;
   try {
-    totalBytes = (await stat(target.absolutePath)).size;
+    const st = await stat(target.absolutePath);
+    totalBytes = st.size;
+    regularFile = st.isFile();
   } catch (err) {
     throw new SandboxError('NOT_FOUND', `stat failed: ${String(err)}`, relPath);
+  }
+  // A named pipe, socket or device with a source extension (`pipe.ts`) passes the source rule; reading it could
+  // block forever. The scan and find/grep skip such entries by their dirent type; read_file has only the path.
+  if (!regularFile) {
+    throw new SandboxError('NON_SOURCE_FILE', `not a regular file: ${target.relpath}`, relPath);
   }
   const HARD_FILE_SIZE_LIMIT = 5 * MAX_READ_BYTES; // 1MB
   if (totalBytes > HARD_FILE_SIZE_LIMIT) {
@@ -601,7 +599,7 @@ export async function grepExecutor(
     // excludes but NOT in DEFAULT_EXCLUDE_DIRS) succeeds-with-zero-results
     // when the dir exists vs throws NOT_FOUND when it doesn't — same
     // existence-probe oracle. Generic message, no path leak.
-    if (resolved.relpath && isPathExcluded(resolved.relpath, config)) {
+    if (resolved.relpath && isPathExcluded(resolved.relpath, config, resolved.kind)) {
       throw new SandboxError(
         'EXCLUDED_DIR',
         'pathPrefix is excluded by configured policy',
@@ -661,16 +659,16 @@ export async function grepExecutor(
         // they explicitly excluded — and grep returns matched LINES, so
         // a regex like `password|secret|api_key` could leak content from
         // an excluded `internal-config/` dir straight into the model.
-        if (isPathExcluded(childRel, config)) continue;
+        if (isPathExcluded(childRel, config, 'dir')) continue;
         await walk(join(currentAbs, entry.name), childRel, depth + 1);
         continue;
       }
       if (!entry.isFile()) continue;
 
       // Unified filter — same predicate as `findFilesExecutor` and the
-      // eager scanner. Honours default + user excludes; requires include
-      // extension. v1.9.0 closes the agentic / eager divergence.
-      if (!isFileIncluded(childRel, config)) continue;
+      // eager scanner. Honours default + user excludes; requires an include
+      // extension or a `#!` script. v1.9.0 closes the agentic / eager divergence.
+      if (!(await isSourceFile(join(currentAbs, entry.name), childRel, config))) continue;
 
       // Read full file (bounded by MAX_READ_BYTES via soft stat check).
       const absFile = join(currentAbs, entry.name);

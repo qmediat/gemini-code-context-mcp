@@ -90,6 +90,9 @@ beforeEach(() => {
     filesHash: 'abc',
     files: [{ relpath: 'a.ts', size: 100, contentHash: 'h', absolutePath: '/fake/a.ts' }],
     skippedTooLarge: 0,
+    excludedDirs: [],
+    excludedDirsTotal: 0,
+    skippedNonSource: 0,
     truncated: false,
   });
   mocks.resolveModel.mockResolvedValue({

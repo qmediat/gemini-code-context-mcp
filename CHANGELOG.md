@@ -9,14 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ask` and `code` report what the scan left out: `excludedDirs` (the excluded directories met, the first 50),
+  `excludedDirsTotal` (all of them — more than the list holds means it was cut) and `filesSkippedNonSource`, so a
+  caller can tell "not in the workspace" from "not indexed".
 - `.github/workflows/mcp-registry.yml` keeps the official MCP Registry in step with the releases: every run (at a
   release, at the end of the Release workflow, daily, by hand) publishes each of the last 10 releases that npm
   serves and the registry lacks, oldest first — the `server.json` of its tag with the default branch's description
   (GitHub Actions OIDC, no secret; `mcp-publisher` pinned by version and sha256). The registry listed an old version
   of this server; the next run lists the missing ones.
 
+### Changed
+
+- `bin/` is no longer an always-excluded directory. It holds source in Node, Ruby, Python and shell-tool repos
+  (CLIs, scripts) and was invisible to `ask`, `code` and every `ask_agentic` tool, with no way to include it. .NET's
+  build output stays out: `Debug` / `Release` directly under a `bin/` or one platform level below it (`bin/x64/Debug`)
+  is excluded (its `.json` / `.xml` copies would pass the extension filter); Java's `bin/` holds `.class` files, which
+  the extension filter drops.
+- An extensionless file that starts with `#!` is a script and counts as source — indexed by the scan, readable,
+  findable and searchable by the agentic tools — unless it sits under an excluded directory or is excluded by name.
+  A script named like a default build directory (`script/build`, `bin/release`) is a file, not that directory; a
+  secret-bearing name (`.aws`), a dot-name (`.git`) and a caller's own `excludeGlobs` entry still match a file of that
+  name, and `read_file` refuses such a script with the generic `EXCLUDED_FILE` (no path), like any excluded source
+  file. `read_file` refuses any other extensionless file as "not a readable #! script".
+
 ### Fixed
 
+- An excluded directory nested in the tree (`packages/a/node_modules`) was listed by `list_directory` although every
+  file in it was refused, so an agent spent iterations on it; it is now excluded as a directory too, in the scan,
+  the listing, the search and the sandbox alike.
+- `read_file` refuses a named pipe, socket or device even when its name carries a source extension (`pipe.ts`):
+  reading one could block the agentic loop forever (the scan and `find_files` / `grep` already skipped them); the
+  `#!` probe never reads one either (a read would consume bytes another process queued).
+- `read_file` refuses every file a rule excludes — a caller's `excludeGlobs` or a default exclude — with the generic
+  `EXCLUDED_FILE`, as the tool's schema promises; a non-source file under an excluded directory (`internal/notes`)
+  came back as `NON_SOURCE_FILE` with its path.
 - `server.json` `description` within the registry's 100-character limit (the registry refused the longer one).
 
 ### Security

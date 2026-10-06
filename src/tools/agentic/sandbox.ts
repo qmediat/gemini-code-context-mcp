@@ -21,9 +21,16 @@
  * unsafe. This module implements `realpath + root jail` per that feedback.
  */
 
-import { realpath } from 'node:fs/promises';
+import { realpath, stat } from 'node:fs/promises';
 import { basename, sep as pathSep, relative, resolve } from 'node:path';
-import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILE_NAMES_LOWER } from '../../indexer/globs.js';
+import {
+  DEFAULT_EXCLUDE_DIRS,
+  DEFAULT_EXCLUDE_FILE_NAMES_LOWER,
+  type PathKind,
+  SECRET_EXCLUDE_DIRS,
+  isDotnetBuildOutput,
+  pathHitsDir,
+} from '../../indexer/globs.js';
 
 /** Filename-basename entries that NEVER leak through `read_file`. Even when
  * the path resolves safely under the workspace root, any of these basenames
@@ -113,34 +120,6 @@ export type SandboxErrorCode =
   | 'NOT_INSIDE_ROOT'
   | 'INVALID_INPUT';
 
-/**
- * Directories that carry sensitive material and should trip the
- * `SECRET_DENYLIST` error code (not the generic `EXCLUDED_DIR`). The
- * distinction matters for observability: a downstream audit log tracing
- * "model tried to read secrets" vs. "model tried to read a generated
- * dist file" can filter on the error code. Functionally both are
- * rejected, so security posture is identical.
- *
- * Introduced in PR #24 round-3 self-review finding #7.
- */
-const SECRET_EXCLUDE_DIRS: ReadonlySet<string> = new Set(
-  [
-    '.ssh',
-    '.aws',
-    '.gnupg',
-    '.gpg',
-    '.kube',
-    '.docker',
-    '.1password',
-    '.pki',
-    '.gcloud',
-    '.azure',
-    '.config/gcloud',
-    '.config/azure',
-    'Keychains',
-  ].map((s) => s.toLowerCase()),
-);
-
 // ---------------------------------------------------------------------------
 // Path-compare helpers (declared at the top of the file so no function is
 // referenced before its declaration in source order — a defensive tidy-up
@@ -209,7 +188,7 @@ export async function resolveWorkspaceRoot(rootInput: string): Promise<string> {
 export async function resolveInsideWorkspace(
   workspaceRoot: string,
   relOrAbs: string,
-): Promise<{ absolutePath: string; relpath: string }> {
+): Promise<ResolvedPath> {
   if (typeof relOrAbs !== 'string' || relOrAbs.length === 0) {
     throw new SandboxError('PATH_TRAVERSAL', 'path argument is empty', relOrAbs);
   }
@@ -315,22 +294,21 @@ export async function resolveInsideWorkspace(
   // tried to exfiltrate" from "this dir is just boring build output" in
   // observability. Functionally both are blocked.
   const relLower = rel.toLowerCase();
+  const kind = await kindOf(resolved, relOrAbs);
   for (const dir of DEFAULT_EXCLUDE_DIRS) {
     const dirLower = dir.toLowerCase();
-    const isHit =
-      relLower === dirLower ||
-      relLower.startsWith(`${dirLower}/`) ||
-      relLower.includes(`/${dirLower}/`);
-    if (!isHit) continue;
+    if (!pathHitsDir(relLower, dirLower, kind)) continue;
     const code: SandboxErrorCode = SECRET_EXCLUDE_DIRS.has(dirLower)
       ? 'SECRET_DENYLIST'
       : 'EXCLUDED_DIR';
     const detail =
       code === 'SECRET_DENYLIST'
         ? `path is inside a secret-bearing directory: ${dir}`
-        : relLower === dirLower
-          ? `path is an excluded directory: ${dir}`
-          : `path is inside excluded directory: ${dir}`;
+        : !(relLower === dirLower || relLower.endsWith(`/${dirLower}`))
+          ? `path is inside excluded directory: ${dir}`
+          : kind === 'dir'
+            ? `path is an excluded directory: ${dir}`
+            : `path is a file named like an excluded directory: ${dir}`;
     throw new SandboxError(code, detail, relOrAbs);
   }
   // And one more pass over DEFAULT_EXCLUDE_FILE_NAMES — lockfiles,
@@ -349,5 +327,27 @@ export async function resolveInsideWorkspace(
     );
   }
 
-  return { absolutePath: resolved, relpath: rel };
+  if (isDotnetBuildOutput(relLower, kind)) {
+    throw new SandboxError(
+      'EXCLUDED_DIR',
+      'path is .NET build output (bin/…/Debug or Release)',
+      relOrAbs,
+    );
+  }
+  return { absolutePath: resolved, relpath: rel, kind };
+}
+
+/** A path inside the workspace, resolved: what it is decides whether it can be an excluded directory itself. */
+export interface ResolvedPath {
+  absolutePath: string;
+  relpath: string;
+  kind: PathKind;
+}
+
+async function kindOf(resolved: string, relOrAbs: string): Promise<PathKind> {
+  try {
+    return (await stat(resolved)).isDirectory() ? 'dir' : 'file';
+  } catch {
+    throw new SandboxError('NOT_FOUND', `path does not exist: ${relOrAbs}`, relOrAbs);
+  }
 }
