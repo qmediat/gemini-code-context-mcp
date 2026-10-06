@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-10-06
+
 ### Added
 
 - `ask` and `code` report what the scan left out: `excludedDirs` (the excluded directories met, the first 50),
@@ -1640,5 +1642,6 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.17.0...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.21.0...HEAD
+[1.21.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.20.0...v1.21.0
 [1.0.0]: https://github.com/qmediat/gemini-code-context-mcp/releases/tag/v1.0.0
