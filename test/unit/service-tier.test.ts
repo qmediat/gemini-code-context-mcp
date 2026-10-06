@@ -154,6 +154,8 @@ beforeEach(() => {
       },
     ],
     skippedTooLarge: 0,
+    excludedDirs: [],
+    skippedNonSource: 0,
     truncated: false,
   });
   mocks.resolveModel.mockResolvedValue(resolved);

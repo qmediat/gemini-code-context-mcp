@@ -23,7 +23,11 @@
 
 import { realpath } from 'node:fs/promises';
 import { basename, sep as pathSep, relative, resolve } from 'node:path';
-import { DEFAULT_EXCLUDE_DIRS, DEFAULT_EXCLUDE_FILE_NAMES_LOWER } from '../../indexer/globs.js';
+import {
+  DEFAULT_EXCLUDE_DIRS,
+  DEFAULT_EXCLUDE_FILE_NAMES_LOWER,
+  pathHitsDir,
+} from '../../indexer/globs.js';
 
 /** Filename-basename entries that NEVER leak through `read_file`. Even when
  * the path resolves safely under the workspace root, any of these basenames
@@ -317,18 +321,14 @@ export async function resolveInsideWorkspace(
   const relLower = rel.toLowerCase();
   for (const dir of DEFAULT_EXCLUDE_DIRS) {
     const dirLower = dir.toLowerCase();
-    const isHit =
-      relLower === dirLower ||
-      relLower.startsWith(`${dirLower}/`) ||
-      relLower.includes(`/${dirLower}/`);
-    if (!isHit) continue;
+    if (!pathHitsDir(relLower, dirLower)) continue;
     const code: SandboxErrorCode = SECRET_EXCLUDE_DIRS.has(dirLower)
       ? 'SECRET_DENYLIST'
       : 'EXCLUDED_DIR';
     const detail =
       code === 'SECRET_DENYLIST'
         ? `path is inside a secret-bearing directory: ${dir}`
-        : relLower === dirLower
+        : relLower === dirLower || relLower.endsWith(`/${dirLower}`)
           ? `path is an excluded directory: ${dir}`
           : `path is inside excluded directory: ${dir}`;
     throw new SandboxError(code, detail, relOrAbs);

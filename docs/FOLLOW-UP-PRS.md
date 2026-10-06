@@ -687,3 +687,12 @@ Owner @qmt, the next release after 1.19.0.
 `ask_agentic` maps a Google 429/503 to `errorCode: 'UNKNOWN'`, `retryable: false` and reads `.status` unguarded,
 while ask/code report `RATE_LIMIT` / `OVERLOADED` through `tierErrorMeta` / `statusOf` since 1.19.0. Fix: the same
 mapping in the agentic loop's error path (another code area — its own PR). Owner @qmt.
+
+## DEF-SCAN-01 — let a caller re-include a default-excluded build directory (2026-10-06, the bin/ fix)
+
+`DEFAULT_EXCLUDE_DIRS` is unconditional: `includeGlobs` cannot re-include `build/`, `out/`, `target/` or `vendor/`,
+which some repos use for source (a `build/` of Gradle scripts, a Go `vendor/` the caller wants read). The bin/ fix
+removed the worst case; the general one needs a design, because the same list carries the secret-bearing directories
+and the sandbox reads it: a per-call override must split the build/cache entries (overridable) from the secret ones
+(never), keep the sandbox and the scan on one rule, and appear in the cache signature so an override never serves a
+cache built without it. A design note with a threat model first (`docs/DESIGN-*.md`), its own PR. Owner @qmt.

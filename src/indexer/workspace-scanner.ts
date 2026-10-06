@@ -14,8 +14,9 @@ import { readdir, stat } from 'node:fs/promises';
 import { join, sep as pathSep, relative } from 'node:path';
 import type { FileRow } from '../types.js';
 import { runPool } from '../utils/run-pool.js';
-import { type MatchConfig, defaultMatchConfig, isFileIncluded, isPathExcluded } from './globs.js';
+import { type MatchConfig, defaultMatchConfig, isPathExcluded } from './globs.js';
 import { hashFile, mergeHashes } from './hasher.js';
+import { isSourceFile } from './source-files.js';
 
 /**
  * v1.13.0+: build the per-file fingerprint map the scanner consults to skip
@@ -119,14 +120,30 @@ export interface ScanResult {
    * touching every file).
    */
   memoHitCount: number;
+  /**
+   * v1.21.0+: what the scan left out, so a caller can tell "the code is not there" from "the code was not indexed":
+   * the excluded directories it met (relative paths, sorted, at most `EXCLUDED_DIRS_REPORTED`) and the count of
+   * files that are neither source by extension nor a `#!` script.
+   */
+  excludedDirs: string[];
+  skippedNonSource: number;
+}
+
+/** How many excluded directories a scan names; the count of the rest is not kept. */
+export const EXCLUDED_DIRS_REPORTED = 50;
+
+interface WalkState {
+  acc: string[];
+  seen: Set<string>;
+  excludedDirs: string[];
+  skippedNonSource: number;
 }
 
 async function walk(
   root: string,
   currentDir: string,
   config: MatchConfig,
-  acc: string[],
-  seen: Set<string>,
+  state: WalkState,
 ): Promise<void> {
   const entries = await readdir(currentDir, { withFileTypes: true });
   for (const entry of entries) {
@@ -134,16 +151,22 @@ async function walk(
     const rel = toPosix(relative(root, absolutePath));
 
     if (entry.isDirectory()) {
-      if (isPathExcluded(rel, config)) continue;
-      await walk(root, absolutePath, config, acc, seen);
+      if (isPathExcluded(rel, config)) {
+        if (state.excludedDirs.length < EXCLUDED_DIRS_REPORTED) state.excludedDirs.push(rel);
+        continue;
+      }
+      await walk(root, absolutePath, config, state);
       continue;
     }
 
     if (entry.isFile()) {
-      if (!isFileIncluded(rel, config)) continue;
-      if (seen.has(rel)) continue;
-      seen.add(rel);
-      acc.push(absolutePath);
+      if (!(await isSourceFile(absolutePath, rel, config))) {
+        state.skippedNonSource += 1;
+        continue;
+      }
+      if (state.seen.has(rel)) continue;
+      state.seen.add(rel);
+      state.acc.push(absolutePath);
     }
   }
 }
@@ -157,8 +180,9 @@ export async function scanWorkspace(
   if (options.excludeGlobs !== undefined) matchOpts.excludeGlobs = options.excludeGlobs;
   const config = defaultMatchConfig(matchOpts);
 
-  const absolutes: string[] = [];
-  await walk(workspaceRoot, workspaceRoot, config, absolutes, new Set());
+  const state: WalkState = { acc: [], seen: new Set(), excludedDirs: [], skippedNonSource: 0 };
+  await walk(workspaceRoot, workspaceRoot, config, state);
+  const absolutes = state.acc;
   absolutes.sort();
 
   const truncated = absolutes.length > options.maxFiles;
@@ -228,5 +252,7 @@ export async function scanWorkspace(
     skippedTooLarge,
     truncated,
     memoHitCount,
+    excludedDirs: state.excludedDirs.sort(),
+    skippedNonSource: state.skippedNonSource,
   };
 }

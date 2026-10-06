@@ -107,6 +107,8 @@ describe('prepareContext', () => {
       files: scanned,
       filesHash: 'fh-1',
       skippedTooLarge: 0,
+      excludedDirs: [],
+      skippedNonSource: 0,
       truncated: false,
       memoHitCount: 0,
     };

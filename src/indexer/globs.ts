@@ -97,7 +97,7 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
  * Path fragments excluded regardless of depth.
  *
  * Matched by `isPathExcluded` (below) against the workspace-relative POSIX path
- * in three modes: exact equality, `${dir}/` prefix, and `/${dir}/` substring.
+ * in four modes: exact equality, `${dir}/` prefix, `/${dir}/` substring and `/${dir}` suffix.
  * Entries are therefore typically directory *basenames* (`node_modules`,
  * `.ssh`), but multi-segment fragments like `.config/gcloud` also match
  * correctly — the matcher sees the full relative path, not just `dirent.name`.
@@ -144,7 +144,11 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   '.gradle',
   '.idea',
   '.vscode',
-  'bin',
+  // `bin/` itself is NOT here: in Node, Ruby, Python and shell-tool repos it holds source (CLIs, scripts). .NET writes
+  // its build output to `bin/Debug` and `bin/Release` — with `.json` and `.xml` copies the extension filter would keep —
+  // so those two are excluded; Java's `bin/` holds `.class` files, which the extension filter drops.
+  'bin/Debug',
+  'bin/Release',
   'obj',
   '.DS_Store',
   '.terraform',
@@ -432,12 +436,23 @@ export function defaultMatchConfig(
 export function isPathExcluded(relpath: string, config: MatchConfig): boolean {
   const relLower = relpath.toLowerCase();
   for (const dir of config.excludeDirs) {
-    const dirLower = dir.toLowerCase();
-    if (relLower === dirLower) return true;
-    if (relLower.startsWith(`${dirLower}/`)) return true;
-    if (relLower.includes(`/${dirLower}/`)) return true;
+    if (pathHitsDir(relLower, dir.toLowerCase())) return true;
   }
   return false;
+}
+
+/**
+ * Does a lowercased relative path sit in, or name, the lowercased directory `dirLower` — at the root or nested? The
+ * directory itself counts too (`pkg/node_modules`), so a listing never offers a directory whose every file would be
+ * refused. Shared by `isPathExcluded` and the agentic sandbox.
+ */
+export function pathHitsDir(relLower: string, dirLower: string): boolean {
+  return (
+    relLower === dirLower ||
+    relLower.startsWith(`${dirLower}/`) ||
+    relLower.includes(`/${dirLower}/`) ||
+    relLower.endsWith(`/${dirLower}`)
+  );
 }
 
 /**

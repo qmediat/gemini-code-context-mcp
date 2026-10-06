@@ -25,10 +25,10 @@ import { join } from 'node:path';
 import {
   type MatchConfig,
   defaultMatchConfig,
-  isFileIncluded,
   isPathExcluded,
   matchesAnyIncludeExtension,
 } from '../../indexer/globs.js';
+import { isSourceFile } from '../../indexer/source-files.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
 
 /**
@@ -343,9 +343,9 @@ export async function findFilesExecutor(
 
       // Unified filter: covers default filename / extension excludes,
       // user `excludeGlobs` filename / extension entries, AND requires
-      // an include-extension match (default + user). Same predicate the
-      // eager scanner uses — no agentic / eager divergence.
-      if (!isFileIncluded(childRel, config)) continue;
+      // an include-extension match (default + user) or a `#!` script.
+      // Same predicate the eager scanner uses — no agentic / eager divergence.
+      if (!(await isSourceFile(join(currentAbs, entry.name), childRel, config))) continue;
 
       if (!regex.test(childRel)) continue;
       totalMatches += 1;
@@ -412,7 +412,7 @@ export async function readFileExecutor(
   // the more specific "extension not allowed at all" sub-case so callers
   // can still distinguish "explicitly excluded by your config" from
   // "default-rejected source-set membership".
-  if (!isFileIncluded(target.relpath, config)) {
+  if (!(await isSourceFile(target.absolutePath, target.relpath, config))) {
     // Discriminate the two failure modes via the shared helper (v1.9.0
     // Phase 1.1, /6step Finding #3): if NO include-extension matches, the
     // file is structurally non-source — keep the path in the message
@@ -428,7 +428,7 @@ export async function readFileExecutor(
     if (!matchesAnyIncludeExtension(target.relpath, config)) {
       throw new SandboxError(
         'NON_SOURCE_FILE',
-        `file extension not in allowed source set: ${target.relpath}`,
+        `file extension not in allowed source set (and no #! line): ${target.relpath}`,
         relPath,
       );
     }
@@ -668,9 +668,9 @@ export async function grepExecutor(
       if (!entry.isFile()) continue;
 
       // Unified filter — same predicate as `findFilesExecutor` and the
-      // eager scanner. Honours default + user excludes; requires include
-      // extension. v1.9.0 closes the agentic / eager divergence.
-      if (!isFileIncluded(childRel, config)) continue;
+      // eager scanner. Honours default + user excludes; requires an include
+      // extension or a `#!` script. v1.9.0 closes the agentic / eager divergence.
+      if (!(await isSourceFile(join(currentAbs, entry.name), childRel, config))) continue;
 
       // Read full file (bounded by MAX_READ_BYTES via soft stat check).
       const absFile = join(currentAbs, entry.name);

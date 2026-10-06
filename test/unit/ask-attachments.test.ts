@@ -202,6 +202,8 @@ function scanOf(size = 100): ScanResult {
       },
     ],
     skippedTooLarge: 0,
+    excludedDirs: [],
+    skippedNonSource: 0,
     truncated: false,
     memoHitCount: 0,
   };

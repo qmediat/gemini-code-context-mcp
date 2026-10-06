@@ -161,6 +161,8 @@ function mockScanOfBytes(totalBytes: number): void {
       { relpath: 'big.ts', size: totalBytes, contentHash: 'h1', absolutePath: '/fake/big.ts' },
     ],
     skippedTooLarge: 0,
+    excludedDirs: [],
+    skippedNonSource: 0,
     truncated: false,
   });
 }

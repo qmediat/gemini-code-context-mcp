@@ -141,6 +141,8 @@ describe('code.tool.ts throttle call sequence (T22b regression)', () => {
       filesHash: 'abc',
       files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
       skippedTooLarge: 0,
+      excludedDirs: [],
+      skippedNonSource: 0,
       truncated: false,
     });
     mocks.resolveModel.mockResolvedValue({
@@ -282,6 +284,8 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
       filesHash: 'abc',
       files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
       skippedTooLarge: 0,
+      excludedDirs: [],
+      skippedNonSource: 0,
       truncated: false,
     });
     mocks.resolveModel.mockResolvedValue({
@@ -385,6 +389,8 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
       filesHash: 'abc',
       files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
       skippedTooLarge: 0,
+      excludedDirs: [],
+      skippedNonSource: 0,
       truncated: false,
     });
     mocks.resolveModel.mockImplementation(async (requested: string) => {

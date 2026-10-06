@@ -9,14 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ask` reports what the scan left out: `excludedDirs` (the excluded directories met, at most 50) and
+  `filesSkippedNonSource`, so a caller can tell "not in the workspace" from "not indexed".
 - `.github/workflows/mcp-registry.yml` keeps the official MCP Registry in step with the releases: every run (at a
   release, at the end of the Release workflow, daily, by hand) publishes each of the last 10 releases that npm
   serves and the registry lacks, oldest first — the `server.json` of its tag with the default branch's description
   (GitHub Actions OIDC, no secret; `mcp-publisher` pinned by version and sha256). The registry listed an old version
   of this server; the next run lists the missing ones.
 
+### Changed
+
+- `bin/` is no longer an always-excluded directory. It holds source in Node, Ruby, Python and shell-tool repos
+  (CLIs, scripts) and was invisible to `ask`, `code` and every `ask_agentic` tool, with no way to include it. .NET's
+  build output stays out: `bin/Debug` and `bin/Release` are excluded (their `.json` / `.xml` copies would pass the
+  extension filter); Java's `bin/` holds `.class` files, which the extension filter drops.
+- An extensionless file that starts with `#!` is a script and counts as source — indexed by the scan, readable,
+  findable and searchable by the agentic tools — unless it sits under an excluded directory or is excluded by name.
+
 ### Fixed
 
+- An excluded directory nested in the tree (`packages/a/node_modules`) was listed by `list_directory` although every
+  file in it was refused, so an agent spent iterations on it; it is now excluded as a directory too, in the scan,
+  the listing, the search and the sandbox alike.
 - `server.json` `description` within the registry's 100-character limit (the registry refused the longer one).
 
 ## [1.20.0] - 2026-10-01
