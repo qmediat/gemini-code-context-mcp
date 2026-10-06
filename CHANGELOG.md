@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   findable and searchable by the agentic tools — unless it sits under an excluded directory or is excluded by name.
   A script named like a default build directory (`script/build`, `bin/release`) is a file, not that directory; a
   secret-bearing name (`.aws`), a dot-name (`.git`) and a caller's own `excludeGlobs` entry still match a file of that
-  name. `read_file` refuses any other extensionless file as "not a readable #! script".
+  name, and `read_file` refuses such a script with the generic `EXCLUDED_FILE` (no path), like any excluded source
+  file. `read_file` refuses any other extensionless file as "not a readable #! script".
 
 ### Fixed
 

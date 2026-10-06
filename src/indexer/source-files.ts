@@ -17,13 +17,15 @@ function baseName(relpath: string): string {
   return relpath.slice(relpath.lastIndexOf('/') + 1);
 }
 
-/** Errors that mean "not a script" (gone, a directory, a pipe or socket with no writer) — every other one is logged. */
+/** Errors that mean "not a script" (gone, a directory, a pipe, socket or device) — every other one is logged. */
 const NOT_A_SCRIPT_ERRORS: ReadonlySet<string> = new Set([
   'ENOENT',
   'ENOTDIR',
   'EISDIR',
   'EAGAIN',
   'ENXIO',
+  'ESPIPE',
+  'EINVAL',
 ]);
 
 /**
@@ -36,13 +38,13 @@ export async function startsWithShebang(absolutePath: string): Promise<boolean> 
   try {
     handle = await open(absolutePath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
     const buf = Buffer.alloc(2);
-    const { bytesRead } = await handle.read(buf, 0, 2, 0);
+    const { bytesRead } = await handle.read(buf, 0, 2, null); // from the start; a pipe has no position
     return bytesRead === 2 && buf[0] === 0x23 && buf[1] === 0x21;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code !== undefined && !NOT_A_SCRIPT_ERRORS.has(code)) {
       logger.warn(
-        `not indexed, cannot read the first bytes (${code}): ${safeForLog(absolutePath)}`,
+        `treated as not source, cannot read its first bytes (${code}): ${safeForLog(absolutePath)}`,
       );
     }
     return false;

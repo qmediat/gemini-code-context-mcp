@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_EXCLUDE_DIRS,
   defaultMatchConfig,
@@ -36,6 +36,7 @@ import {
   listDirectoryExecutor,
   readFileExecutor,
 } from '../../src/tools/agentic/workspace-tools.js';
+import { logger } from '../../src/utils/logger.js';
 
 function put(root: string, rel: string, text: string, executable = false): void {
   const abs = join(root, rel);
@@ -244,6 +245,17 @@ describe('the ask_agentic tools', () => {
     });
   });
 
+  it('refuse a #! script a caller excluded with the generic message, never its path', async () => {
+    const root = await agenticRepo();
+    put(root, 'script/build', '#!/bin/sh\nprivate\n', true);
+    const own = defaultMatchConfig({ excludeGlobs: ['build'] });
+    const error = await readFileExecutor(root, 'script/build', undefined, undefined, own).catch(
+      (e) => e,
+    );
+    expect(error).toMatchObject({ code: 'EXCLUDED_FILE' });
+    expect(error.message).not.toContain('script/build');
+  });
+
   it('read and list a #! script named like an excluded directory', async () => {
     const root = await agenticRepo();
     put(root, 'script/build', '#!/bin/sh\nbuild_main\n', true);
@@ -275,7 +287,10 @@ describe('the ask_agentic tools', () => {
     async () => {
       const root = await agenticRepo();
       execFileSync('mkfifo', [join(root, 'tool/bin/pipe')]);
+      const warn = vi.spyOn(logger, 'warn');
       expect(await startsWithShebang(join(root, 'tool/bin/pipe'))).toBe(false);
+      expect(warn).not.toHaveBeenCalled(); // a pipe is "not a script", not an error
+      warn.mockRestore();
       await expect(readFileExecutor(root, 'tool/bin/pipe')).rejects.toMatchObject({
         code: 'NON_SOURCE_FILE',
       });

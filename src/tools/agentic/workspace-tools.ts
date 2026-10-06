@@ -28,7 +28,7 @@ import {
   isPathExcluded,
   matchesAnyIncludeExtension,
 } from '../../indexer/globs.js';
-import { isSourceFile } from '../../indexer/source-files.js';
+import { isExtensionless, isSourceFile, startsWithShebang } from '../../indexer/source-files.js';
 import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
 
 /**
@@ -425,7 +425,11 @@ export async function readFileExecutor(
     // oracle for paths the user explicitly excluded. The third
     // `SandboxError` argument (`relPath`) is preserved either way for
     // internal logging via `requestedPath`.
-    if (!matchesAnyIncludeExtension(target.relpath, config)) {
+    // A `#!` script is source by content, not extension: when it is refused, a rule excluded it (a caller's
+    // `excludeGlobs` naming `build` hides `script/build`) — the generic message, as for a source extension.
+    const sourceByContent =
+      isExtensionless(target.relpath) && (await startsWithShebang(target.absolutePath));
+    if (!matchesAnyIncludeExtension(target.relpath, config) && !sourceByContent) {
       throw new SandboxError(
         'NON_SOURCE_FILE',
         `file extension not in allowed source set, and not a readable #! script: ${target.relpath}`,
