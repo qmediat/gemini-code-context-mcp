@@ -1287,6 +1287,7 @@ async function executeAskBody(
       // v1.21.0+: what the scan left out — the excluded directories it met and the files that are neither source by
       // extension nor a `#!` script — so a caller can tell "not in the workspace" from "not indexed".
       excludedDirs: scan.excludedDirs,
+      excludedDirsTotal: scan.excludedDirsTotal,
       filesSkippedNonSource: scan.skippedNonSource,
       filesUploadFailed: activePrep.uploaded.failedCount,
       ...(activePrep.uploaded.failedCount > 0

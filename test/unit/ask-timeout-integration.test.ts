@@ -113,6 +113,7 @@ beforeEach(() => {
     files: [{ relpath: 'a.ts', size: 1000, contentHash: 'h1', absolutePath: '/fake/a.ts' }],
     skippedTooLarge: 0,
     excludedDirs: [],
+    excludedDirsTotal: 0,
     skippedNonSource: 0,
     truncated: false,
   });

@@ -1,5 +1,5 @@
 import { constants } from 'node:fs';
-import { open, stat } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import { type MatchConfig, isFileIncluded, isPathExcluded } from './globs.js';
 
 /**
@@ -17,14 +17,13 @@ function baseName(relpath: string): string {
 }
 
 /**
- * Whether a regular file starts with `#!`; false for anything else (a directory, a named pipe, a device) and when the
- * file cannot be read — the caller then treats it as not source. A named pipe is never opened for a blocking read: the
- * type is checked first, and `O_NONBLOCK` covers a path swapped for a pipe between the check and the open.
+ * Whether the file starts with `#!`. False for a file that is not a readable `#!` script — no `#!`, unreadable,
+ * a directory, a named pipe — and the caller then treats it as not source. `O_NONBLOCK` keeps a named pipe from
+ * blocking the open and the read (a no-op for a regular file; absent on Windows, which has no pipes in the tree).
  */
 export async function startsWithShebang(absolutePath: string): Promise<boolean> {
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    if (!(await stat(absolutePath)).isFile()) return false;
     handle = await open(absolutePath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
     const buf = Buffer.alloc(2);
     const { bytesRead } = await handle.read(buf, 0, 2, 0);
@@ -46,7 +45,7 @@ export async function isSourceFile(
   config: MatchConfig,
 ): Promise<boolean> {
   if (isFileIncluded(relpath, config)) return true;
-  if (!isExtensionless(relpath) || isPathExcluded(relpath, config)) return false;
+  if (!isExtensionless(relpath) || isPathExcluded(relpath, config, 'file')) return false;
   const base = baseName(relpath);
   if (config.excludeFileNames.some((n) => n.toLowerCase() === base.toLowerCase())) return false;
   return startsWithShebang(absolutePath);

@@ -97,7 +97,9 @@ export const DEFAULT_INCLUDE_EXTENSIONS: readonly string[] = [
  * Path fragments excluded regardless of depth.
  *
  * Matched by `isPathExcluded` (below) against the workspace-relative POSIX path
- * in four modes: exact equality, `${dir}/` prefix, `/${dir}/` substring and `/${dir}` suffix.
+ * by `pathHitsDir`: a path UNDER the directory (`${dir}/` prefix, `/${dir}/` substring) is excluded whatever it is,
+ * and so is a path that NAMES it (exact equality, `/${dir}` suffix) — except a FILE named like one of the default
+ * build/cache directories here, which is a file (a `#!` script called `script/build` or `bin/release`).
  * Entries are therefore typically directory *basenames* (`node_modules`,
  * `.ssh`), but multi-segment fragments like `.config/gcloud` also match
  * correctly — the matcher sees the full relative path, not just `dirent.name`.
@@ -144,11 +146,8 @@ export const DEFAULT_EXCLUDE_DIRS: readonly string[] = [
   '.gradle',
   '.idea',
   '.vscode',
-  // `bin/` itself is NOT here: in Node, Ruby, Python and shell-tool repos it holds source (CLIs, scripts). .NET writes
-  // its build output to `bin/Debug` and `bin/Release` — with `.json` and `.xml` copies the extension filter would keep —
-  // so those two are excluded; Java's `bin/` holds `.class` files, which the extension filter drops.
-  'bin/Debug',
-  'bin/Release',
+  // `bin/` is NOT here: in Node, Ruby, Python and shell-tool repos it holds source (CLIs, scripts). .NET's build output
+  // under it is excluded by `isDotnetBuildOutput`; Java's `bin/` holds `.class` files, which the extension filter drops.
   'obj',
   '.DS_Store',
   '.terraform',
@@ -433,26 +432,76 @@ export function defaultMatchConfig(
  * lowercasing to the agentic sandbox path but missed this eager-path mirror —
  * PR #24 round-4 review (Gemini P1) closed that gap.
  */
-export function isPathExcluded(relpath: string, config: MatchConfig): boolean {
+export function isPathExcluded(relpath: string, config: MatchConfig, kind: PathKind): boolean {
   const relLower = relpath.toLowerCase();
   for (const dir of config.excludeDirs) {
-    if (pathHitsDir(relLower, dir.toLowerCase())) return true;
+    if (pathHitsDir(relLower, dir.toLowerCase(), kind)) return true;
   }
-  return false;
+  return isDotnetBuildOutput(relLower, kind);
 }
 
+/** What a path names. Only a directory can BE an excluded directory; a file can only sit under one. */
+export type PathKind = 'file' | 'dir';
+
 /**
- * Does a lowercased relative path sit in, or name, the lowercased directory `dirLower` — at the root or nested? The
- * directory itself counts too (`pkg/node_modules`), so a listing never offers a directory whose every file would be
- * refused. Shared by `isPathExcluded` and the agentic sandbox.
+ * The secret-bearing entries of `DEFAULT_EXCLUDE_DIRS`, lowercased. A path that names one is refused whatever it is
+ * (a file called `.ssh` too), and the agentic sandbox reports such a hit as `SECRET_DENYLIST`, not `EXCLUDED_DIR`, so
+ * an audit can tell "tried to read secrets" from "tried to read build output".
  */
-export function pathHitsDir(relLower: string, dirLower: string): boolean {
-  return (
-    relLower === dirLower ||
-    relLower.startsWith(`${dirLower}/`) ||
-    relLower.includes(`/${dirLower}/`) ||
-    relLower.endsWith(`/${dirLower}`)
-  );
+export const SECRET_EXCLUDE_DIRS: ReadonlySet<string> = new Set(
+  [
+    '.ssh',
+    '.aws',
+    '.gnupg',
+    '.gpg',
+    '.kube',
+    '.docker',
+    '.1password',
+    '.pki',
+    '.gcloud',
+    '.azure',
+    '.config/gcloud',
+    '.config/azure',
+    'Keychains',
+  ].map((s) => s.toLowerCase()),
+);
+
+/**
+ * The default excluded directories a script could be named after, lowercased: every default entry but the
+ * secret-bearing ones and the dot-names (a dotfile is never an extensionless script, and `.git` / `.DS_Store` files
+ * stay hidden). A FILE named like one of them is a file — `script/build` is a script, not the `build` directory. A
+ * caller's own `excludeGlobs` entry and a secret-bearing name still match a file of that name: they keep something
+ * private.
+ */
+const BUILD_DIR_NAMES_LOWER: ReadonlySet<string> = new Set(
+  DEFAULT_EXCLUDE_DIRS.map((d) => d.toLowerCase()).filter(
+    (d) => !SECRET_EXCLUDE_DIRS.has(d) && !d.startsWith('.'),
+  ),
+);
+
+/**
+ * Does a lowercased relative path hit the lowercased directory `dirLower`, at the root or nested? A path under it
+ * always does; so does a path that names it (`pkg/node_modules`), so a listing never offers a directory whose every
+ * file would be refused — unless the path is a file named like a default build/cache directory (`script/build`).
+ * Shared by `isPathExcluded` and the agentic sandbox.
+ */
+export function pathHitsDir(relLower: string, dirLower: string, kind: PathKind): boolean {
+  if (relLower.startsWith(`${dirLower}/`) || relLower.includes(`/${dirLower}/`)) return true;
+  if (kind === 'file' && BUILD_DIR_NAMES_LOWER.has(dirLower)) return false;
+  return relLower === dirLower || relLower.endsWith(`/${dirLower}`);
+}
+
+/** `Debug` / `Release` directly under a `bin/` or one platform level below it (`bin/x64/Debug`) — .NET build output. */
+const DOTNET_OUTPUT_DIR = /(?:^|\/)bin\/(?:[^/]+\/)?(?:debug|release)(?:\/|$)/;
+const DOTNET_OUTPUT_FILE = /(?:^|\/)bin\/(?:[^/]+\/)?(?:debug|release)\//;
+
+/**
+ * .NET writes its build output to `bin/<Configuration>` or `bin/<Platform>/<Configuration>`, with `.json` and `.xml`
+ * copies the extension filter would keep. A `bin/` of scripts keeps its files, a `#!` script called `release` among
+ * them; a `bin/debug/` directory of scripts in a non-.NET repo is the price of this rule.
+ */
+export function isDotnetBuildOutput(relLower: string, kind: PathKind): boolean {
+  return (kind === 'dir' ? DOTNET_OUTPUT_DIR : DOTNET_OUTPUT_FILE).test(relLower);
 }
 
 /**
@@ -463,7 +512,7 @@ export function pathHitsDir(relLower: string, dirLower: string): boolean {
  * on both sides on each call.
  */
 export function isFileIncluded(relpath: string, config: MatchConfig): boolean {
-  if (isPathExcluded(relpath, config)) return false;
+  if (isPathExcluded(relpath, config, 'file')) return false;
 
   const filename = relpath.includes('/') ? relpath.slice(relpath.lastIndexOf('/') + 1) : relpath;
   const filenameLower = filename.toLowerCase();

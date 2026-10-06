@@ -122,20 +122,23 @@ export interface ScanResult {
   memoHitCount: number;
   /**
    * v1.21.0+: what the scan left out, so a caller can tell "the code is not there" from "the code was not indexed":
-   * the excluded directories it met (relative paths, sorted, at most `EXCLUDED_DIRS_REPORTED`) and the count of
-   * files that are neither source by extension nor a `#!` script.
+   * the excluded directories it met (relative paths, sorted, at most `EXCLUDED_DIRS_REPORTED`), how many it met in
+   * all (`excludedDirsTotal` > `excludedDirs.length` = the list is cut) and the count of files that are neither
+   * source by extension nor a readable `#!` script.
    */
   excludedDirs: string[];
+  excludedDirsTotal: number;
   skippedNonSource: number;
 }
 
-/** How many excluded directories a scan names; the count of the rest is not kept. */
+/** How many excluded directories a scan names; `excludedDirsTotal` counts them all. */
 export const EXCLUDED_DIRS_REPORTED = 50;
 
 interface WalkState {
   acc: string[];
   seen: Set<string>;
   excludedDirs: string[];
+  excludedDirsTotal: number;
   skippedNonSource: number;
 }
 
@@ -151,7 +154,8 @@ async function walk(
     const rel = toPosix(relative(root, absolutePath));
 
     if (entry.isDirectory()) {
-      if (isPathExcluded(rel, config)) {
+      if (isPathExcluded(rel, config, 'dir')) {
+        state.excludedDirsTotal += 1;
         if (state.excludedDirs.length < EXCLUDED_DIRS_REPORTED) state.excludedDirs.push(rel);
         continue;
       }
@@ -180,7 +184,13 @@ export async function scanWorkspace(
   if (options.excludeGlobs !== undefined) matchOpts.excludeGlobs = options.excludeGlobs;
   const config = defaultMatchConfig(matchOpts);
 
-  const state: WalkState = { acc: [], seen: new Set(), excludedDirs: [], skippedNonSource: 0 };
+  const state: WalkState = {
+    acc: [],
+    seen: new Set(),
+    excludedDirs: [],
+    excludedDirsTotal: 0,
+    skippedNonSource: 0,
+  };
   await walk(workspaceRoot, workspaceRoot, config, state);
   const absolutes = state.acc;
   absolutes.sort();
@@ -253,6 +263,7 @@ export async function scanWorkspace(
     truncated,
     memoHitCount,
     excludedDirs: state.excludedDirs.sort(),
+    excludedDirsTotal: state.excludedDirsTotal,
     skippedNonSource: state.skippedNonSource,
   };
 }

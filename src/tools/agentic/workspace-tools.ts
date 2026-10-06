@@ -61,7 +61,7 @@ function resolveMatchConfig(matchConfig: MatchConfig | undefined): MatchConfig {
  * true, which is correct for indexing but wrong for listing.
  */
 function isFileExcludedByConfig(relpath: string, basename: string, config: MatchConfig): boolean {
-  if (isPathExcluded(relpath, config)) return true;
+  if (isPathExcluded(relpath, config, 'file')) return true;
   const lowerBase = basename.toLowerCase();
   for (const name of config.excludeFileNames) {
     if (lowerBase === name.toLowerCase()) return true;
@@ -198,7 +198,7 @@ export async function listDirectoryExecutor(
   // Generic message — no path interpolation — to avoid the same
   // existence-leak via error string (see Finding #2 for the file-level
   // analogue).
-  if (target.relpath && isPathExcluded(target.relpath, config)) {
+  if (target.relpath && isPathExcluded(target.relpath, config, target.kind)) {
     throw new SandboxError('EXCLUDED_DIR', 'directory is excluded by configured policy', relPath);
   }
 
@@ -239,7 +239,7 @@ export async function listDirectoryExecutor(
     // Skip excluded directories (user never gets to recurse into them).
     // Defaults (`node_modules`, `.git`, …) are merged into `config.excludeDirs`
     // by `defaultMatchConfig`; user `excludeGlobs` (dir-shaped) add to it.
-    if (isDir && isPathExcluded(childRel, config)) continue;
+    if (isDir && isPathExcluded(childRel, config, 'dir')) continue;
     // Skip files the user's excludes filter out — exclude-side ONLY.
     // Deliberately NOT requiring include-extension match: `list_directory`
     // is a navigation aid, not a content-access gate, so a `LICENSE` /
@@ -335,7 +335,7 @@ export async function findFilesExecutor(
         // Honour user `excludeGlobs` dir entries in addition to defaults
         // — `isPathExcluded` checks the full nested path, so multi-segment
         // globs like `src/vendor` work even when we hit them mid-walk.
-        if (isPathExcluded(childRel, config)) continue;
+        if (isPathExcluded(childRel, config, 'dir')) continue;
         await walk(join(currentAbs, entry.name), childRel, depth + 1);
         continue;
       }
@@ -428,7 +428,7 @@ export async function readFileExecutor(
     if (!matchesAnyIncludeExtension(target.relpath, config)) {
       throw new SandboxError(
         'NON_SOURCE_FILE',
-        `file extension not in allowed source set (and no #! line): ${target.relpath}`,
+        `file extension not in allowed source set, and not a readable #! script: ${target.relpath}`,
         relPath,
       );
     }
@@ -601,7 +601,7 @@ export async function grepExecutor(
     // excludes but NOT in DEFAULT_EXCLUDE_DIRS) succeeds-with-zero-results
     // when the dir exists vs throws NOT_FOUND when it doesn't — same
     // existence-probe oracle. Generic message, no path leak.
-    if (resolved.relpath && isPathExcluded(resolved.relpath, config)) {
+    if (resolved.relpath && isPathExcluded(resolved.relpath, config, resolved.kind)) {
       throw new SandboxError(
         'EXCLUDED_DIR',
         'pathPrefix is excluded by configured policy',
@@ -661,7 +661,7 @@ export async function grepExecutor(
         // they explicitly excluded — and grep returns matched LINES, so
         // a regex like `password|secret|api_key` could leak content from
         // an excluded `internal-config/` dir straight into the model.
-        if (isPathExcluded(childRel, config)) continue;
+        if (isPathExcluded(childRel, config, 'dir')) continue;
         await walk(join(currentAbs, entry.name), childRel, depth + 1);
         continue;
       }
