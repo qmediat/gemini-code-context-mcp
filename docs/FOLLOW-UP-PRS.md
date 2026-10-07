@@ -696,3 +696,16 @@ removed the worst case; the general one needs a design, because the same list ca
 and the sandbox reads it: a per-call override must split the build/cache entries (overridable) from the secret ones
 (never), keep the sandbox and the scan on one rule, and appear in the cache signature so an override never serves a
 cache built without it. A design note with a threat model first (`docs/DESIGN-*.md`), its own PR. Owner @qmt.
+
+## DEF-SCAN-02 — the scan has no text test: a binary or non-UTF-8 file that passes the extension rule is indexed (2026-10-07, m3-assets-suite #1407 r3)
+
+`isSourceFile` decides by excluded directories, file names, include extensions and the `#!` of an extensionless file; it
+never looks at the bytes. A `.md` or `.txt` with a NUL, or one that is not valid UTF-8 (git's own text test is a NUL in
+the first 8000 bytes, so an 8-byte PNG fixture is text to git), is hashed, uploaded and billed as text. `gccrev` (the
+skills repo's reviewer through this server) now drops such bytes before it builds its workspace and counts them in
+`docs_sanitized`, so the review path is covered; the server's own scan of an arbitrary workspace is not. Fix shape: a
+content test beside the extension rule — a NUL in the first 8000 bytes, or a `TextDecoder('utf-8', {fatal: true})`
+failure on the buffer `hashFile` already reads — counted as `filesSkippedBinary` on `ask` and `code` (like
+`filesSkippedNonSource`); a memo hit must carry the verdict (an optional `text` column, like `mtime_ms` in v1.13.0) or
+re-read, so an old memo row never passes a file the test would refuse. Tests: a NUL file and a non-UTF-8 file under an
+include extension are skipped and counted; a UTF-8 file with CJK text is not. Owner @qmt.
