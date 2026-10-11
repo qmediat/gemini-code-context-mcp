@@ -29,7 +29,6 @@ let cumulativeCost = 0;
 
 function recordCost(label: string, cost: number): void {
   cumulativeCost += cost;
-  // eslint-disable-next-line no-console
   console.log(
     `[cost] ${label}: $${cost.toFixed(4)} | cumulative: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)}`,
   );
@@ -390,9 +389,7 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
       ctx,
     );
     if (result.isError) {
-      // eslint-disable-next-line no-console
       console.error('[T20 cold] FAILED. content:', JSON.stringify(result.content, null, 2));
-      // eslint-disable-next-line no-console
       console.error(
         '[T20 cold] structuredContent:',
         JSON.stringify(result.structuredContent, null, 2),
@@ -432,7 +429,6 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
     expect(result.isError).toBeFalsy();
     const sc = result.structuredContent as Record<string, unknown> | undefined;
     // Diagnostic: dump cache-related fields so we can see WHY cacheHit is false.
-    // eslint-disable-next-line no-console
     console.log(
       `[T20 warm diag] cacheHit=${sc?.cacheHit}, cacheRebuilt=${sc?.cacheRebuilt}, inlineOnly=${sc?.inlineOnly}, cached=${sc?.cachedTokens}, uncached=${sc?.uncachedTokens}, durationMs=${sc?.durationMs}`,
     );
@@ -562,9 +558,7 @@ suite('v1.7.0 — srogi end-to-end test against real Gemini', () => {
   }, 240_000);
 
   it('FINAL: cost summary', () => {
-    // eslint-disable-next-line no-console
     console.log('\n=== SROGI TEST SUITE COST SUMMARY ===');
-    // eslint-disable-next-line no-console
     console.log(
       `Total cumulative cost: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)} cap`,
     );

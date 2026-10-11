@@ -1,0 +1,266 @@
+{
+  "src/attachments.ts": {
+    "complexity": {
+      "count": 2
+    }
+  },
+  "src/auth/credentials-store.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "src/auth/init-command.ts": {
+    "complexity": {
+      "count": 2
+    },
+    "max-depth": {
+      "count": 6
+    },
+    "max-lines-per-function": {
+      "count": 4
+    }
+  },
+  "src/cache/cache-manager.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "src/cache/files-uploader.ts": {
+    "complexity": {
+      "count": 2
+    },
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "src/cache/ttl-watcher.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/config.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/gemini/models.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/gemini/retry.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/gemini/token-counter.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/index.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/indexer/globs.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/indexer/workspace-scanner.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/indexer/workspace-validation.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/manifest/db.ts": {
+    "max-lines-per-function": {
+      "count": 5
+    }
+  },
+  "src/server.ts": {
+    "max-lines-per-function": {
+      "count": 2
+    }
+  },
+  "src/tools/agentic/sandbox.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/agentic/workspace-tools.ts": {
+    "complexity": {
+      "count": 5
+    },
+    "max-lines-per-function": {
+      "count": 6
+    }
+  },
+  "src/tools/ask-agentic.tool.ts": {
+    "complexity": {
+      "count": 3
+    },
+    "max-depth": {
+      "count": 22
+    },
+    "max-lines-per-function": {
+      "count": 4
+    }
+  },
+  "src/tools/ask.tool.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 8
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/code.tool.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 6
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/reindex.tool.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/shared/abort-timeout.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/shared/stream-collector.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-depth": {
+      "count": 8
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/shared/throttle.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/tools/status.tool.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/utils/logger.ts": {
+    "complexity": {
+      "count": 1
+    },
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "src/utils/progress.ts": {
+    "max-lines-per-function": {
+      "count": 1
+    }
+  },
+  "test/integration/v1.7.0-srogi-extras.test.ts": {
+    "complexity": {
+      "count": 3
+    }
+  },
+  "test/integration/v1.7.0-streaming-srogi.test.ts": {
+    "complexity": {
+      "count": 3
+    },
+    "vitest/expect-expect": {
+      "count": 1
+    }
+  },
+  "test/unit/ask-agentic.test.ts": {
+    "complexity": {
+      "count": 2
+    }
+  },
+  "test/unit/gemini-retry.test.ts": {
+    "vitest/require-to-throw-message": {
+      "count": 1
+    }
+  },
+  "test/unit/models.test.ts": {
+    "vitest/require-to-throw-message": {
+      "count": 1
+    }
+  },
+  "test/unit/stream-collector.test.ts": {
+    "complexity": {
+      "count": 4
+    }
+  },
+  "test/unit/throttle.test.ts": {
+    "vitest/require-to-throw-message": {
+      "count": 2
+    }
+  },
+  "test/unit/tool-input-schema.test.ts": {
+    "vitest/expect-expect": {
+      "count": 1
+    }
+  }
+}

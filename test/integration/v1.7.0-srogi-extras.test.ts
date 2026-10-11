@@ -33,7 +33,6 @@ let cumulativeCost = 0;
 
 function recordCost(label: string, cost: number): void {
   cumulativeCost += cost;
-  // eslint-disable-next-line no-console
   console.log(
     `[cost] ${label}: $${cost.toFixed(4)} | cumulative: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)}`,
   );
@@ -300,7 +299,6 @@ afterAll(() => {
   manifest?.close();
   rmSync(tmpStateDir, { recursive: true, force: true });
   rmSync(workspaceRoot, { recursive: true, force: true });
-  // eslint-disable-next-line no-console
   console.log(
     `\n=== EXTRAS SUITE COST: $${cumulativeCost.toFixed(4)} / $${HARD_BUDGET_USD.toFixed(2)} ===`,
   );
@@ -338,15 +336,12 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
     const sc1 = r1.structuredContent as Record<string, unknown> | undefined;
     const sc2 = r2.structuredContent as Record<string, unknown> | undefined;
 
-    // eslint-disable-next-line no-console
     console.log(
       `[E concurrent] r1: cacheHit=${sc1?.cacheHit} rebuilt=${sc1?.cacheRebuilt} cached=${sc1?.cachedTokens} cost=$${sc1?.costEstimateUsd}`,
     );
-    // eslint-disable-next-line no-console
     console.log(
       `[E concurrent] r2: cacheHit=${sc2?.cacheHit} rebuilt=${sc2?.cacheRebuilt} cached=${sc2?.cachedTokens} cost=$${sc2?.costEstimateUsd}`,
     );
-    // eslint-disable-next-line no-console
     console.log(`[E concurrent] elapsed wall-clock: ${(elapsed / 1000).toFixed(1)}s`);
 
     // Real coalesce verification: after BOTH parallel calls finish, the
@@ -358,7 +353,6 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
     // the same cache, not two independently built ones).
     const ws = manifest.getWorkspace(workspaceRoot);
     expect(ws?.cacheId).toBeTruthy();
-    // eslint-disable-next-line no-console
     console.log(`[E concurrent] manifest cacheId: ${ws?.cacheId}`);
     // Both calls should have non-zero cached tokens — proves both rode the
     // same Context Cache. (If they raced and one built / one inlined, only
@@ -390,11 +384,9 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
     const ws = manifest.getWorkspace(workspaceRoot);
     const cacheId = ws?.cacheId;
     if (!cacheId) {
-      // eslint-disable-next-line no-console
       console.log('[F] No cache built (workspace may have gone inline) — test skipped');
       return;
     }
-    // eslint-disable-next-line no-console
     console.log(
       `[F] Built cache: ${cacheId} — externally deleting now to simulate stale-cache event…`,
     );
@@ -405,10 +397,8 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
     const client = createGeminiClient(auth.profile);
     try {
       await client.caches.delete({ name: cacheId });
-      // eslint-disable-next-line no-console
       console.log('[F] External delete succeeded');
     } catch (err) {
-      // eslint-disable-next-line no-console
       console.log(
         `[F] External delete failed (may already be gone): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -428,7 +418,6 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
     );
     expect(r2.isError).toBeFalsy();
     const sc2 = r2.structuredContent as Record<string, unknown> | undefined;
-    // eslint-disable-next-line no-console
     console.log(
       `[F stale-cache E2E] retriedOnStaleCache=${sc2?.retriedOnStaleCache}, cacheRebuilt=${sc2?.cacheRebuilt}, cacheHit=${sc2?.cacheHit}, response.length=${typeof sc2?.responseText === 'string' ? (sc2.responseText as string).length : '?'}`,
     );
@@ -460,7 +449,6 @@ suite('v1.7.0 srogi extras — concurrency, stale-cache E2E, ask_agentic E2E', (
     );
     expect(result.isError).toBeFalsy();
     const sc = result.structuredContent as Record<string, unknown> | undefined;
-    // eslint-disable-next-line no-console
     console.log(
       `[G ask_agentic] iterations=${sc?.iterations}, filesRead=${sc?.filesRead}, cumulativeInputTokens=${sc?.cumulativeInputTokens}, cumulativeOutputTokens=${sc?.cumulativeOutputTokens}`,
     );

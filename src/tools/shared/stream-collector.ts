@@ -321,7 +321,7 @@ export async function collectStream(
                 // Emitter exceptions must not abort the stream — log and
                 // keep collecting. The caller's response shape is more
                 // important than progress notification fidelity.
-                // eslint-disable-next-line no-console -- shared module, no logger dep
+                // console here: a shared module with no logger dependency
                 console.warn(
                   `stream-collector: onThoughtChunk threw, suppressed: ${
                     cbErr instanceof Error ? cbErr.message : String(cbErr)

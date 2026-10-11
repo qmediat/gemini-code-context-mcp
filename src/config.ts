@@ -172,7 +172,6 @@ function readCachingModeEnv(): 'explicit' | 'implicit' {
   // operators still see what they typed (`EXPLICITT`-style typos remain
   // diagnosable), but multi-line forgery attempts collapse to a single
   // safe log line.
-  // eslint-disable-next-line no-console
   console.error(
     `[gemini-code-context-mcp] warning: GEMINI_CODE_CONTEXT_CACHING_MODE="${safeForLog(raw)}" is not a recognised value (expected 'explicit' or 'implicit'); falling back to 'implicit'.`,
   );
