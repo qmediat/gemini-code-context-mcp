@@ -112,9 +112,7 @@ export function listEntries(text) {
  * @returns {Map<string, number>}
  */
 export function duplicateEntries(text) {
-  const lines = JSON.parse(text).duplicatedLines;
-  if (!Number.isInteger(lines) || lines < 0) throw new Error("duplicatedLines is not a count");
-  return new Map([["duplicated lines", lines]]);
+  return new Map([["duplicated lines", countOf(JSON.parse(text).duplicatedLines, "duplicatedLines")]]);
 }
 
 /**

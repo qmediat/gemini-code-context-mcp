@@ -13,18 +13,45 @@ const TESTS = [
   "**/{test,tests,__tests__}/**/*.{ts,tsx,mts,cts,js,jsx,mjs,cjs}",
 ];
 
-// node:test — assert.throws / assert.rejects (also t.assert.…, assert.strict.…, an imported throws) without the expected
-// error passes on any exception; a stub's `.throws(err)` is not an assertion and is left alone. Exported so a
-// project with its own `no-restricted-syntax` for tests can list these selectors beside its own (a rule's options
-// replace, they do not merge).
-export const BARE_THROWS = [
-  "CallExpression[callee.object.name='assert'][callee.property.name=/^(throws|rejects)$/][arguments.length<2]",
-  "CallExpression[callee.object.property.name=/^(assert|strict)$/][callee.property.name=/^(throws|rejects)$/][arguments.length<2]",
-  "CallExpression[callee.type='Identifier'][callee.name=/^(throws|rejects)$/][arguments.length<2]",
-].map((selector) => ({
-  selector,
-  message: "Name the expected error (a class, a RegExp or a validation function): a bare throws passes on any exception.",
-}));
+// node:test — assert.throws / assert.rejects (also t.assert.…, assert.strict.…, an imported throws) with no expected
+// error, or with only a message (a string or a template; a RegExp literal is an expected error), passes on any
+// exception; a stub's `.throws(err)` is not an assertion and is left alone. Exported so a project with its own
+// `no-restricted-syntax` for tests can list these selectors beside its own (a rule's options replace, never merge).
+const THROWS_CALLS = [
+  "CallExpression[callee.object.name='assert'][callee.property.name=/^(throws|rejects)$/]",
+  "CallExpression[callee.object.property.name=/^(assert|strict)$/][callee.property.name=/^(throws|rejects)$/]",
+  "CallExpression[callee.type='Identifier'][callee.name=/^(throws|rejects)$/]",
+];
+const NO_EXPECTED_ERROR = [
+  "[arguments.length<2]",
+  "[arguments.length=2][arguments.1.type='TemplateLiteral']",
+  "[arguments.length=2][arguments.1.type='Literal']:not([arguments.1.regex])",
+];
+export const BARE_THROWS = THROWS_CALLS.flatMap((call) => NO_EXPECTED_ERROR.map((args) => call + args)).map(
+  (selector) => ({
+    selector,
+    message: "Name the expected error (a class, a RegExp or a validation function): a message alone is no expectation.",
+  }),
+);
+
+// node:test — a test whose function calls no assertion passes whatever the code does. An assertion is assert…,
+// t.assert…, a function node:assert exports imported by name, or a helper named assert* / expect*.
+const ASSERT_EXPORTS =
+  "ok|equal|notEqual|strictEqual|notStrictEqual|deepEqual|notDeepEqual|deepStrictEqual|notDeepStrictEqual|" +
+  "partialDeepStrictEqual|throws|doesNotThrow|rejects|doesNotReject|match|doesNotMatch|fail|ifError";
+const ASSERTING = [
+  `CallExpression[callee.type='Identifier'][callee.name=/^(${ASSERT_EXPORTS})$/]`,
+  "CallExpression[callee.object.name='assert']",
+  "CallExpression[callee.object.property.name='assert']",
+  "CallExpression[callee.name=/^(assert|expect)/]",
+  "CallExpression[callee.property.name=/^(assert|expect)/]",
+];
+export const NO_ASSERTION = {
+  selector:
+    "CallExpression[callee.name=/^(test|it)$/] > :matches(ArrowFunctionExpression, FunctionExpression)" +
+    ASSERTING.map((call) => `:not(:has(${call}))`).join(""),
+  message: "A test without an assertion passes whatever the code does: assert, or call a helper named assert* or expect*.",
+};
 
 // Vitest — a toThrow() with no expected error, a test with no assertion, an expect() with no matcher (Vitest's
 // expect takes a message as its second argument). A helper that asserts is named `expect*` or `assert*`, so the
@@ -46,7 +73,7 @@ export function structure({ vitest } = {}) {
   /** @type {Config} */
   const tests = vitest
     ? { files: TESTS, plugins: { vitest }, rules: VITEST_RULES }
-    : { files: TESTS, rules: { "no-restricted-syntax": ["error", ...BARE_THROWS] } };
+    : { files: TESTS, rules: { "no-restricted-syntax": ["error", ...BARE_THROWS, NO_ASSERTION] } };
   return [
     {
       files: SOURCES,
