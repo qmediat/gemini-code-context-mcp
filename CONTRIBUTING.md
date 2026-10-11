@@ -4,7 +4,8 @@ Thank you for considering a contribution to `@qmediat.io/gemini-code-context-mcp
 
 ## Development setup
 
-Requires **Node.js >= 22** and a Google Gemini API key (for integration tests; unit tests can run without).
+Requires **Node.js >= 22** to run it — **>= 22.18 (or >= 24.11)** to develop it (the lint toolchain's Babel 8) — and a
+Google Gemini API key (for integration tests; unit tests can run without).
 
 ```bash
 git clone https://github.com/qmediat/gemini-code-context-mcp.git

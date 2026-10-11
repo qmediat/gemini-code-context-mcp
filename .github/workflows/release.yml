@@ -78,6 +78,8 @@ jobs:
 
       - run: npm ci
       - run: npm run lint
+        env:
+          BASELINE_RATCHET_BASE: HEAD # the tag's tree was checked on its pull request: never against a later main
       - run: npm run typecheck
       - run: npm test
       - run: npm run build

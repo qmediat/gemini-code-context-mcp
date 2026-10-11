@@ -1,1 +1,31 @@
-{"duplicatedLines":2346}
+{
+  "duplicatedLines": 3491,
+  "files": {
+    "src/cache/cache-manager.ts": 58,
+    "src/tools/agentic/workspace-tools.ts": 72,
+    "src/tools/ask-agentic.tool.ts": 11,
+    "src/tools/ask.tool.ts": 457,
+    "src/tools/code.tool.ts": 364,
+    "test/integration/v1.7.0-srogi-extras.test.ts": 29,
+    "test/integration/v1.7.0-streaming-srogi.test.ts": 37,
+    "test/unit/abort-timeout.test.ts": 30,
+    "test/unit/agentic-tools.test.ts": 22,
+    "test/unit/ask-agentic.test.ts": 572,
+    "test/unit/ask-attachments.test.ts": 76,
+    "test/unit/ask-streaming-integration.test.ts": 65,
+    "test/unit/ask-throttle-integration.test.ts": 220,
+    "test/unit/ask-timeout-integration.test.ts": 136,
+    "test/unit/ask-tool.test.ts": 31,
+    "test/unit/cache-manager.test.ts": 414,
+    "test/unit/code-throttle-integration.test.ts": 236,
+    "test/unit/code-tool.test.ts": 28,
+    "test/unit/files-uploader.test.ts": 74,
+    "test/unit/manifest-db.test.ts": 132,
+    "test/unit/preflight-guard.test.ts": 85,
+    "test/unit/service-tier.test.ts": 109,
+    "test/unit/stream-collector.test.ts": 56,
+    "test/unit/token-counter.test.ts": 28,
+    "test/unit/ttl-watcher.test.ts": 43,
+    "test/unit/workspace-scanner.test.ts": 106
+  }
+}
