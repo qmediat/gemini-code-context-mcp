@@ -46,3 +46,4 @@ yarn-error.log*
 *.db-shm
 
 .claude/scheduled_tasks.lock
+.jscpd-report/

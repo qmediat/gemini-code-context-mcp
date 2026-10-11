@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Development only: `npm run lint` checks the structure of the code with a shared preset beside Biome (ESLint with
+  Babel's TypeScript parser — TypeScript 7 has no JavaScript API for typescript-eslint —, jscpd for repeated blocks, a
+  ratchet that keeps the recorded baselines from growing); CI and the release verification run it. Twenty
+  `eslint-disable` comments that disabled nothing (no ESLint ran here) are gone. Nothing in the published package
+  changes.
+
 ## [1.21.0] - 2026-10-06
 
 ### Added

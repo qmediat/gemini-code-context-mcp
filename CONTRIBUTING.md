@@ -93,6 +93,9 @@ The dev server resolves its state to `<XDG_STATE_HOME>/qmediat/gemini-code-conte
 - No `any` — use `unknown` and narrow.
 - Prefer named exports over default exports.
 - Biome formats on save; CI enforces `biome check`.
+- `npm run lint` also checks the structure (function length, complexity, nesting, a reason on every disable directive,
+  no bare `toThrow()`, no test without an assertion), repeated blocks and the baseline ratchet — `docs/SYSTEMIC.md` §1,
+  with the files new code follows.
 
 ## Questions
 
