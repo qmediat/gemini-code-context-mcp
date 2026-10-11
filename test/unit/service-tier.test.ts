@@ -23,6 +23,7 @@ import {
   estimateCostUsd,
   estimatePreCallCostUsd,
 } from '../../src/utils/cost-estimator.js';
+import { okStream } from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -70,19 +71,7 @@ function buildCtx(
   const generateContentStream = vi.fn(async (params: Sent) => {
     sent.push(params);
     if (failWith) failWith();
-    async function* gen() {
-      yield {
-        text: 'ok',
-        candidates: [],
-        usageMetadata: {
-          promptTokenCount: 1_000,
-          cachedContentTokenCount: 0,
-          candidatesTokenCount: 10,
-          thoughtsTokenCount: 0,
-        },
-      };
-    }
-    return gen();
+    return okStream();
   });
   const ctx = {
     server: {} as ToolContext['server'],

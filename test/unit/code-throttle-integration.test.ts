@@ -13,6 +13,7 @@ import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
 import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { forwardingStream } from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -92,13 +93,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
 
   // T20 (v1.7.0) — production calls generateContentStream; wrap the
   // generateContent mock as a single-chunk stream. See ask-throttle-integration.test.ts.
-  const generateContentStream = vi.fn(async (params: unknown) => {
-    const response = await generateContent(params);
-    async function* gen() {
-      yield response;
-    }
-    return gen();
-  });
+  const generateContentStream = vi.fn(forwardingStream(generateContent));
 
   const ctx = {
     server: {} as ToolContext['server'],

@@ -61,6 +61,7 @@ import {
   resolveToolExecutionConcurrency,
 } from '../../src/tools/ask-agentic.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { forwardingStream } from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -168,13 +169,7 @@ function buildCtx(args: {
   // stream-OPENING failure, which is what `withNetworkRetry` wraps in
   // `runAgenticIteration` — exact same retry/error contract as the
   // pre-streaming code path.
-  const generateContentStream = vi.fn().mockImplementation(async (callArg: unknown) => {
-    const response = await generateContent(callArg);
-    async function* singleChunk() {
-      yield response as unknown;
-    }
-    return singleChunk();
-  });
+  const generateContentStream = vi.fn().mockImplementation(forwardingStream(generateContent));
 
   // Budget-enforced scenarios get a real-ish reserveBudget that accepts by
   // default; tests override via `.mockReturnValueOnce({rejected:true,...})`

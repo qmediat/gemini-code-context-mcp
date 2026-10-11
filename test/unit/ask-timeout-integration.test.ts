@@ -18,6 +18,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { forwardingStream } from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -81,13 +82,7 @@ function buildCtx(): {
         // T20 (v1.7.0): production calls generateContentStream. Wrap the
         // generateContent mock as a single-chunk stream so the same
         // mockRejectedValue / mockResolvedValue chains keep working.
-        generateContentStream: vi.fn(async (params: unknown) => {
-          const response = await generateContent(params);
-          async function* gen() {
-            yield response;
-          }
-          return gen();
-        }),
+        generateContentStream: vi.fn(forwardingStream(generateContent)),
       },
     } as unknown as ToolContext['client'],
     manifest: {

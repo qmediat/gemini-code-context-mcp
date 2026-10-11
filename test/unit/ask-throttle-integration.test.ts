@@ -22,6 +22,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { forwardingStream } from '../helpers/stream-mock.js';
 
 // Hoisted mock state — must be declared before `vi.mock` calls so the mock
 // factories close over them. vi.hoisted pattern is the Vitest-official way.
@@ -112,15 +113,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
   // `generateContent` mock as a single-chunk stream so existing test
   // assertions (mock call args, return shape) continue to work without each
   // suite needing a hand-rolled stream factory.
-  const generateContentStream = vi.fn(async (params: unknown) => {
-    // Forward args + resolved value to/from the underlying mock so spies and
-    // mockResolvedValue/mockRejectedValue chains keep their existing semantics.
-    const response = await generateContent(params);
-    async function* gen() {
-      yield response;
-    }
-    return gen();
-  });
+  const generateContentStream = vi.fn(forwardingStream(generateContent));
 
   const ctx = {
     server: {} as ToolContext['server'],
