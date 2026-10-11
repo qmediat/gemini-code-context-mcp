@@ -23,13 +23,13 @@ verification check out with `fetch-depth: 0`).
 | module | `src/indexer/hasher.ts` |
 | module with typed results | `src/utils/cost-estimator.ts` |
 | test | `test/unit/hasher.test.ts` |
-| test helper | `test/helpers/stream-mock.ts` (`forwardingStream`: a `generateContent` mock as a stream, five suites) |
+| test helper | `test/helpers/stream-mock.ts` — a stream mock by its shape: one chunk, several chunks, a failure after some chunks, a `generateContent` mock forwarded as a stream (eight suites; a stream with timing — a hang, a heartbeat — is written where it is read) |
 
 
 
 **Rule 2 — the baselines at adoption.** `eslint-suppressions.json`: 146 violations in 36 files (53 nesting over 3, 46
 functions over 40 lines, 41 over the complexity of 10, 4 bare `toThrow()`, 2 tests without an assertion);
-duplicates: 3 491 lines in a repeat across 26 files (123 repeats, both sides counted). A baseline only shrinks: a function a PR changes leaves it in that PR, the
+duplicates: 3 455 lines in a repeat across 26 files (123 repeats, both sides counted). A baseline only shrinks: a function a PR changes leaves it in that PR, the
 rest of a touched file in the next PR; after a rebase a conflicting `eslint-suppressions.json` is regenerated (the
 base's file, then `npx eslint --prune-suppressions`) and a conflicting `jscpd-baseline.json` re-recorded (the base's file, then `--write-duplicates`), never merged by hand; the ratchet refuses whatever grew. A jscpd version bump can move the measured lines: that PR re-records the baseline with `--write-duplicates`, reviewed like a baseline cleanup.
 

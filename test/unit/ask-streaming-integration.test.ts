@@ -16,6 +16,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { chunkedStream, midStreamFailure, singleChunkStream } from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -123,11 +124,11 @@ beforeEach(() => {
 describe('ask — multi-chunk stream accumulation (T20)', () => {
   it('concatenates text across multiple chunks before returning', async () => {
     const { ctx, generateContentStream } = buildCtx();
-    generateContentStream.mockImplementation(async () => {
-      async function* gen() {
-        yield { text: 'Hello ' };
-        yield { text: 'multi-' };
-        yield {
+    generateContentStream.mockImplementation(
+      chunkedStream([
+        { text: 'Hello ' },
+        { text: 'multi-' },
+        {
           text: 'chunk world.',
           usageMetadata: {
             promptTokenCount: 100,
@@ -135,10 +136,9 @@ describe('ask — multi-chunk stream accumulation (T20)', () => {
             candidatesTokenCount: 50,
             thoughtsTokenCount: 0,
           },
-        };
-      }
-      return gen();
-    });
+        },
+      ]),
+    );
 
     const result = await askTool.execute({ prompt: 'hi' }, ctx);
     expect(result.isError).toBeFalsy();
@@ -149,12 +149,12 @@ describe('ask — multi-chunk stream accumulation (T20)', () => {
 
   it('captures usageMetadata from the FINAL chunk only (not earliest)', async () => {
     const { ctx, generateContentStream } = buildCtx();
-    generateContentStream.mockImplementation(async () => {
-      async function* gen() {
+    generateContentStream.mockImplementation(
+      chunkedStream([
         // Earlier chunk has usage, but the FINAL chunk's must win.
-        yield { text: 'a', usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } };
-        yield { text: 'b' };
-        yield {
+        { text: 'a', usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 } },
+        { text: 'b' },
+        {
           text: 'c',
           usageMetadata: {
             promptTokenCount: 999,
@@ -162,10 +162,9 @@ describe('ask — multi-chunk stream accumulation (T20)', () => {
             candidatesTokenCount: 50,
             thoughtsTokenCount: 10,
           },
-        };
-      }
-      return gen();
-    });
+        },
+      ]),
+    );
 
     const result = await askTool.execute({ prompt: 'hi' }, ctx);
     // Token counts surfaced in metadata reflect the final chunk's usage.
@@ -182,12 +181,8 @@ describe('ask — mid-stream failure semantics (T20 review CRITICAL fix)', () =>
     let openCount = 0;
     generateContentStream.mockImplementation(async () => {
       openCount += 1;
-      async function* gen() {
-        yield { text: 'partial-' };
-        // Mid-stream throw — simulates network drop after some chunks landed.
-        throw new TypeError('fetch failed');
-      }
-      return gen();
+      // Mid-stream throw — simulates network drop after some chunks landed.
+      return midStreamFailure([{ text: 'partial-' }], new TypeError('fetch failed'))();
     });
 
     const result = await askTool.execute({ prompt: 'hi' }, ctx);
@@ -208,18 +203,15 @@ describe('ask — mid-stream failure semantics (T20 review CRITICAL fix)', () =>
         // First open fails BEFORE yielding any chunk → eligible for retry.
         throw new TypeError('fetch failed');
       }
-      async function* gen() {
-        yield {
-          text: 'second-attempt-success',
-          usageMetadata: {
-            promptTokenCount: 50,
-            cachedContentTokenCount: 0,
-            candidatesTokenCount: 25,
-            thoughtsTokenCount: 0,
-          },
-        };
-      }
-      return gen();
+      return singleChunkStream({
+        text: 'second-attempt-success',
+        usageMetadata: {
+          promptTokenCount: 50,
+          cachedContentTokenCount: 0,
+          candidatesTokenCount: 25,
+          thoughtsTokenCount: 0,
+        },
+      })();
     });
 
     const result = await askTool.execute({ prompt: 'hi', timeoutMs: 60_000 }, ctx);

@@ -27,6 +27,7 @@ import type { PreparedContext } from '../../src/cache/cache-manager.js';
 import type { ScanResult } from '../../src/indexer/workspace-scanner.js';
 import { askInputSchema, askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import * as streams from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -112,24 +113,11 @@ interface Harness {
 
 const COUNTED = 1090; // what gemini-3-flash counted for the 1×1 PNG on 2026-10-01
 
-async function* okStream() {
-  yield {
-    text: 'ok',
-    candidates: [],
-    usageMetadata: {
-      promptTokenCount: 1_000,
-      cachedContentTokenCount: 0,
-      candidatesTokenCount: 10,
-      thoughtsTokenCount: 0,
-    },
-  };
-}
-
 function buildCtx(configOverrides: Partial<ToolContext['config']> = {}): Harness {
   const sent: Sent[] = [];
   const generateContentStream = vi.fn(async (params: Sent) => {
     sent.push(params);
-    return okStream();
+    return streams.okStream();
   });
   const countTokens = vi.fn(async () => ({ totalTokens: COUNTED }));
   const ctx = {
