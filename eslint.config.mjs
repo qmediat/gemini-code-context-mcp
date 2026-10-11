@@ -8,7 +8,7 @@ import { structure } from "./lint/structure.mjs";
 export default [
   { ignores: ["dist/**", "coverage/**", ".jscpd-report/**"] },
   {
-    files: ["**/*.ts"],
+    files: ["**/*.{ts,mts,cts}"],
     languageOptions: {
       parser: babelParser,
       parserOptions: {
