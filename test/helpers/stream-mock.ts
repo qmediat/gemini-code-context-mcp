@@ -71,3 +71,15 @@ export function midStreamFailure(
     return gen();
   };
 }
+
+/**
+ * The stream twin of a `generateContent` mock: each call forwards its params to the mock and yields what it resolves
+ * to as one chunk (or rejects as it rejects), so the mock's call records and its mockResolvedValue /
+ * mockRejectedValue chains keep working for code that streams. Give it to `vi.fn(...)` or `.mockImplementation(...)`.
+ */
+export function forwardingStream(
+  generateContent: (params: unknown) => Promise<unknown>,
+): (params: unknown) => Promise<AsyncGenerator<GenerateContentResponse>> {
+  return async (params) =>
+    singleChunkStream((await generateContent(params)) as Partial<GenerateContentResponse>)();
+}

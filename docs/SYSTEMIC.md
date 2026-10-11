@@ -23,9 +23,9 @@ verification check out with `fetch-depth: 0`).
 | module | `src/indexer/hasher.ts` |
 | module with typed results | `src/utils/cost-estimator.ts` |
 | test | `test/unit/hasher.test.ts` |
+| test helper | `test/helpers/stream-mock.ts` (`forwardingStream`: a `generateContent` mock as a stream, five suites) |
 
-No shared test helper is in use yet: `test/helpers/stream-mock.ts` is imported by nothing while ten test files build
-their stream mocks inline — the next PR moves them onto it, and it becomes the helper exemplar.
+
 
 **Rule 2 — the baselines at adoption.** `eslint-suppressions.json`: 146 violations in 36 files (53 nesting over 3, 46
 functions over 40 lines, 41 over the complexity of 10, 4 bare `toThrow()`, 2 tests without an assertion);
