@@ -13,7 +13,11 @@ import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
-import { cachingModeFor } from '../cache/caching-mode.js';
+import {
+  CACHING_MODE_FALLBACK_DESCRIPTION,
+  cachingModeFor,
+  cachingRan,
+} from '../cache/caching-mode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -155,7 +159,7 @@ export const codeInputSchema = z
       .enum(['explicit', 'implicit'])
       .optional()
       .describe(
-        "Cache strategy for the workspace context. **`'implicit'` (default since v1.14.0)** skips `caches.create` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the edit→review→edit cycle — no rebuild wait when files change between queries. **`'explicit'`** builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays the 60–180 s rebuild cost on every file change. Note: `code({ codeExecution: true })` always forces inline content (Gemini rejects `cachedContent` + `tools` simultaneously), so `cachingMode` has no effect when codeExecution is enabled. Hit rate observable via `status.structuredContent.caching.implicitHitRate`. Operator-level override: env `GEMINI_CODE_CONTEXT_CACHING_MODE`.",
+        `Cache strategy for the workspace context. **\`'implicit'\` (default since v1.14.0)** skips \`caches.create\` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the edit→review→edit cycle — no rebuild wait when files change between queries. **\`'explicit'\`** builds a Gemini Context Cache via \`caches.create\` — guaranteed ~75% discount on cached input tokens, but pays the 60–180 s rebuild cost on every file change. Note: \`code({ codeExecution: true })\` always forces inline content (Gemini rejects \`cachedContent\` + \`tools\` simultaneously), so \`cachingMode\` has no effect when codeExecution is enabled. Hit rate observable via \`status.structuredContent.caching.implicitHitRate\`. Operator-level override: env \`GEMINI_CODE_CONTEXT_CACHING_MODE\`.${CACHING_MODE_FALLBACK_DESCRIPTION}`,
       ),
     forceRescan: z
       .boolean()
@@ -855,19 +859,10 @@ async function executeCodeBody(
     });
     const costMicros = toMicrosUsd(cost);
 
-    // v1.13.0 round-2 (FN2 fix): compute the ACTUAL caching mode for telemetry.
-    // - `cacheId !== null`               → caches.create resolved → 'explicit'
-    // - `inlineOnly && requested implicit` → 'implicit' (intended Gemini auto-cache path)
-    // - `inlineOnly && other`             → 'inline' (forced — codeExecution incompatibility,
-    //                                       below cacheMinTokens, allowCaching=false)
-    // The earlier code recorded `requestedCachingMode` directly, which inflated
-    // 'explicit' counts for every codeExecution call (those force inline but never
-    // build a cache). Now the v1.14.0 default-flip telemetry isn't biased.
-    const effectiveCachingMode: 'explicit' | 'implicit' | 'inline' = activePrep.inlineOnly
-      ? requestedCachingMode === 'implicit'
-        ? 'implicit'
-        : 'inline'
-      : 'explicit';
+    // Telemetry and the response record the mode that ran, not the one asked for
+    // (`cachingRan`: a codeExecution call is forced inline and never builds a cache).
+    const ran = cachingRan(activePrep, caching);
+    const effectiveCachingMode = ran.mode;
 
     const durationMs = Date.now() - started;
     if (reservationId !== null) {
@@ -955,7 +950,7 @@ async function executeCodeBody(
         : {}),
       inlineOnly: activePrep.inlineOnly,
       cachingMode: effectiveCachingMode,
-      ...(caching.note !== null ? { cachingModeNote: caching.note } : {}),
+      ...(ran.note !== null ? { cachingModeNote: ran.note } : {}),
       // Preflight token-count provenance — surfaces on every successful
       // call. See ask.tool.ts for the contract; same fields apply here.
       ...(preflight !== undefined

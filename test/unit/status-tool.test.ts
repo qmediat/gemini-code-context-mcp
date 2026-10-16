@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoogleGenAI } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { listAvailableModels } from '../../src/gemini/model-registry.js';
 import { ManifestDb } from '../../src/manifest/db.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import { statusTool } from '../../src/tools/status.tool.js';
@@ -47,6 +48,26 @@ describe('status tool — caching block (v1.13.0+)', () => {
   afterEach(() => {
     db.close();
     rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('lists whether each model supports an explicit cache', async () => {
+    vi.mocked(listAvailableModels).mockResolvedValueOnce([
+      {
+        id: 'gemini-4-argon',
+        resourceName: 'models/gemini-4-argon',
+        displayName: 'Gemini 4 Argon',
+        inputTokenLimit: 1_048_576,
+        outputTokenLimit: 32_768,
+        supportsThinking: true,
+        supportsLongContext: true,
+        supportsCaching: false,
+      },
+    ]);
+    const result = await statusTool.execute({ workspace: '/never-used' }, mkCtx(db));
+    const models = result.structuredContent?.availableModels as Array<{ supportsCaching: boolean }>;
+    expect(models[0]?.supportsCaching).toBe(false);
+    const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+    expect(text).toMatch(/gemini-4-argon \(.+ out, thinking, no explicit cache\)/);
   });
 
   it('hides the caching block when nothing has been logged in 24 h', async () => {

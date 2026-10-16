@@ -75,9 +75,7 @@ function rankKey(id: string): RankKey {
  * from a `pro` / `flash` substring, so a codename family (`gemini-4-argon`) ranks
  * with its tier.
  */
-function compareListing(a: ModelInfo, b: ModelInfo): number {
-  const ka = rankKey(a.id);
-  const kb = rankKey(b.id);
+function compareListing(ka: RankKey, kb: RankKey): number {
   if (ka.category !== kb.category) return ka.category - kb.category;
   if (ka.tier !== kb.tier) return ka.tier - kb.tier;
   if (ka.rolling !== kb.rolling) return ka.rolling - kb.rolling;
@@ -146,12 +144,15 @@ export async function listAvailableModels(
     if (info) out.push(info);
   }
 
-  out.sort(compareListing);
+  // Decorate once: the key runs the taxonomy's regexes, so it is built per model, not per comparison.
+  const ranked = out.map((info) => ({ info, key: rankKey(info.id) }));
+  ranked.sort((a, b) => compareListing(a.key, b.key));
+  const sorted = ranked.map((r) => r.info);
 
-  cached = out;
+  cached = sorted;
   cachedAt = now;
-  logger.debug(`model-registry: loaded ${out.length} models`);
-  return out;
+  logger.debug(`model-registry: loaded ${sorted.length} models`);
+  return sorted;
 }
 
 /** Invalidate the in-process model cache — used by `reindex`. */

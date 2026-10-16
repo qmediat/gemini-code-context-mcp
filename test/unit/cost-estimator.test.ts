@@ -51,19 +51,32 @@ describe('cost estimator', () => {
     expect(microsToDollars(1_230_000)).toBe(1.23);
   });
 
-  it('an unpriced premium-tier model falls to the premium default (10.5 / 30 USD per 1M)', () => {
+  it('an unpriced text-reasoning model is priced at the dearest rate the table knows for its category', () => {
+    // Argon's 4 / 20 input / output; the 0.875 cached rate of a 3.x pro row (0.25 x 3.5).
     for (const model of ['gemini-5-hypothetical-pro', 'gemini-4.1-argon']) {
       const cost = estimateCostUsd({
+        model,
+        uncachedInputTokens: 1_000_000,
+        cachedInputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+      });
+      expect(cost).toBeCloseTo(4 + 0.875 + 20, 6);
+    }
+  });
+
+  it('a rolling alias is priced as the model Google points it at (gemini-pro-latest = gemini-2.5-pro)', () => {
+    const cost = (model: string): number =>
+      estimateCostUsd({
         model,
         uncachedInputTokens: 1_000_000,
         cachedInputTokens: 0,
         outputTokens: 1_000_000,
       });
-      expect(cost).toBeCloseTo(10.5 + 30, 6);
-    }
+    expect(cost('gemini-pro-latest')).toBeCloseTo(cost('gemini-2.5-pro'), 9);
+    expect(cost('gemini-pro-latest')).toBeCloseTo(2.5 + 10, 6);
   });
 
-  it('an unpriced model is priced by its taxonomy tier, not by a substring of its id', () => {
+  it('an unpriced model is priced by its taxonomy category and tier, not by a substring of its id', () => {
     // `gemini-3-pro-image` carries `pro` but is an image model: the premium default, not a text rate.
     const cost = (model: string): number =>
       estimateCostUsd({

@@ -6,8 +6,8 @@
  * at runtime via `GEMINI_PRICING_OVERRIDES` (JSON).
  */
 
-import type { CapabilityFlags } from '../gemini/model-taxonomy.js';
-import { costTierOf } from '../gemini/model-taxonomy.js';
+import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
+import { categorizeModel, costTierOf, isTextGenCategory } from '../gemini/model-taxonomy.js';
 
 export interface PricingEntry {
   inputPerMillion: number;
@@ -31,6 +31,12 @@ const DEFAULT_PRICING: Record<string, PricingEntry> = {
   'gemini-2.5-pro': { inputPerMillion: 2.5, outputPerMillion: 10 },
   'gemini-2.5-flash': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
   'gemini-2.5-flash-lite': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
+  // Google's rolling aliases, priced as the model they point at today: the model
+  // card says "Latest release of Gemini Pro" and Google's docs alias
+  // `gemini-pro-latest` to `gemini-2.5-pro` (the flash ones to 2.5-flash / -lite).
+  'gemini-pro-latest': { inputPerMillion: 2.5, outputPerMillion: 10 },
+  'gemini-flash-latest': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
+  'gemini-flash-lite-latest': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
 };
 
 let overrides: Record<string, PricingEntry> | null = null;
@@ -67,8 +73,9 @@ const UNKNOWN_FLASH_RATE: PricingEntry = { inputPerMillion: 0.3, outputPerMillio
 const UNKNOWN_LITE_RATE: PricingEntry = { inputPerMillion: 0.1, outputPerMillion: 0.4 };
 
 /**
- * The conservative rate per cost tier. A `premium` model the table does not price
- * gets the highest rate we know of: its tier spans pro text, image, music and video.
+ * The conservative rate per cost tier, for a model outside the text categories
+ * (image, audio, video, agent, unknown): the table prices no such family it could
+ * stand for, so a `premium` one gets the highest rate we know of.
  */
 const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], PricingEntry>> = {
   premium: UNKNOWN_PREMIUM_RATE,
@@ -77,15 +84,42 @@ const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], Pricing
   unknown: UNKNOWN_PREMIUM_RATE,
 };
 
+/** The cached-input rate a row bills: its own, else the 0.25× input default. */
+function cachedRate(row: PricingEntry): number {
+  return row.cachedInputPerMillion ?? row.inputPerMillion * 0.25;
+}
+
+/**
+ * The dearest rate the table knows for each text category, per component (the
+ * highest input, output and cached rate of its priced rows): an upper bound for an
+ * unpriced model of that category, read from the table instead of a fixed number.
+ */
+function dearestTextRates(): ReadonlyMap<ModelCategory, PricingEntry> {
+  const out = new Map<ModelCategory, PricingEntry>();
+  for (const [id, row] of Object.entries(DEFAULT_PRICING)) {
+    const category = categorizeModel(id);
+    if (!isTextGenCategory(category)) continue;
+    const held = out.get(category) ?? row;
+    out.set(category, {
+      inputPerMillion: Math.max(held.inputPerMillion, row.inputPerMillion),
+      outputPerMillion: Math.max(held.outputPerMillion, row.outputPerMillion),
+      cachedInputPerMillion: Math.max(cachedRate(held), cachedRate(row)),
+    });
+  }
+  return out;
+}
+
+const DEAREST_TEXT_RATES = dearestTextRates();
+
 function pricingFor(model: string): PricingEntry {
   const ov = loadOverrides();
   if (ov?.[model]) return ov[model];
   if (DEFAULT_PRICING[model]) return DEFAULT_PRICING[model];
-  // Fallback by the taxonomy's cost tier, conservative defaults. A model the
-  // taxonomy cannot place gets the premium rate rather than flash: better to
-  // block an over-budget user than let a never-seen model silently undercharge
-  // and blow past the cap.
-  return UNKNOWN_RATE_BY_TIER[costTierOf(model)];
+  // An unpriced text model: the dearest rate of its category. Anything else: the
+  // conservative rate of its cost tier — a model the taxonomy cannot place gets the
+  // premium rate rather than flash: better to block an over-budget user than let a
+  // never-seen model silently undercharge and blow past the cap.
+  return DEAREST_TEXT_RATES.get(categorizeModel(model)) ?? UNKNOWN_RATE_BY_TIER[costTierOf(model)];
 }
 
 export interface CostInputs {

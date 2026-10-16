@@ -31,7 +31,11 @@ import {
   readAttachments,
 } from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
-import { cachingModeFor } from '../cache/caching-mode.js';
+import {
+  CACHING_MODE_FALLBACK_DESCRIPTION,
+  cachingModeFor,
+  cachingRan,
+} from '../cache/caching-mode.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
@@ -191,7 +195,7 @@ export const askInputSchema = z
       .enum(['explicit', 'implicit'])
       .optional()
       .describe(
-        "Cache strategy for the workspace context. **`'implicit'` (default since v1.14.0)** skips `caches.create` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the review→edit→review workflow — no 60–180 s rebuild wait when files change between queries. **`'explicit'`** builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays the rebuild cost on every file change. Use explicit when you need predictable per-call costs more than warm-path latency; the trade-off is documented in Gemini's docs as 'no cost saving guarantee' for implicit caching. Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. Operator-level override available via env `GEMINI_CODE_CONTEXT_CACHING_MODE`.",
+        `Cache strategy for the workspace context. **\`'implicit'\` (default since v1.14.0)** skips \`caches.create\` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the review→edit→review workflow — no 60–180 s rebuild wait when files change between queries. **\`'explicit'\`** builds a Gemini Context Cache via \`caches.create\` — guaranteed ~75% discount on cached input tokens, but pays the rebuild cost on every file change. Use explicit when you need predictable per-call costs more than warm-path latency; the trade-off is documented in Gemini's docs as 'no cost saving guarantee' for implicit caching. Hit rate is observable via \`status.structuredContent.caching.implicitHitRate\`. Operator-level override available via env \`GEMINI_CODE_CONTEXT_CACHING_MODE\`.${CACHING_MODE_FALLBACK_DESCRIPTION}`,
       ),
     forceRescan: z
       .boolean()
@@ -1208,15 +1212,9 @@ async function executeAskBody(
     });
     const costMicros = toMicrosUsd(cost);
 
-    // v1.13.0 round-2 (FN2 fix): see code.tool.ts for the full rationale.
-    // - cacheId !== null      → 'explicit'
-    // - inlineOnly && implicit-requested → 'implicit'
-    // - inlineOnly && other   → 'inline' (forced — noCache, below cacheMinTokens)
-    const effectiveCachingMode: 'explicit' | 'implicit' | 'inline' = activePrep.inlineOnly
-      ? requestedCachingMode === 'implicit'
-        ? 'implicit'
-        : 'inline'
-      : 'explicit';
+    // Telemetry and the response record the mode that ran, not the one asked for.
+    const ran = cachingRan(activePrep, caching);
+    const effectiveCachingMode = ran.mode;
 
     const durationMs = Date.now() - started;
     if (reservationId !== null) {
@@ -1284,7 +1282,7 @@ async function executeAskBody(
       retriedOnStaleCache,
       inlineOnly: activePrep.inlineOnly,
       cachingMode: effectiveCachingMode,
-      ...(caching.note !== null ? { cachingModeNote: caching.note } : {}),
+      ...(ran.note !== null ? { cachingModeNote: ran.note } : {}),
       filesIndexed: scan.files.length,
       filesSkippedTooLarge: scan.skippedTooLarge,
       // v1.21.0+: what the scan left out — the excluded directories it met and the files that are neither source by

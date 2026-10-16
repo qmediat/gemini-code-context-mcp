@@ -531,6 +531,16 @@ const OK_RESPONSE = {
   },
 };
 
+/** What `prepareContext` returns when the files were uploaded but `caches.create` failed. */
+const CREATE_FAILED_PREP = {
+  cacheId: null,
+  inlineContents: [],
+  reused: false,
+  rebuilt: false,
+  inlineOnly: false,
+  uploaded: { failedCount: 0, failures: [] },
+};
+
 describe('cachingMode tool-level default flip (v1.14.0+)', () => {
   it("ask uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
     const { ctx } = buildCtx({ cachingMode: 'implicit' });
@@ -593,6 +603,48 @@ describe('cachingMode tool-level default flip (v1.14.0+)', () => {
     expect(callArgs.cachingMode).toBe('implicit');
     expect(result.structuredContent?.cachingMode).toBe('implicit');
     expect(String(result.structuredContent?.cachingModeNote)).toMatch(/createCachedContent/);
+  });
+
+  it('ask reports implicit, and names the failed create, when an explicit cache could not be built', async () => {
+    const { ctx, generateContent } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+    generateContent.mockResolvedValue(OK_RESPONSE);
+    mocks.prepareContext.mockResolvedValue(CREATE_FAILED_PREP);
+
+    const result = await askTool.execute({ prompt: 'hi' }, ctx);
+
+    expect(result.structuredContent?.cachingMode).toBe('implicit');
+    expect(String(result.structuredContent?.cachingModeNote)).toMatch(/caches\.create failed/);
+  });
+
+  it('code reports implicit, and names the failed create, when an explicit cache could not be built', async () => {
+    const { ctx, generateContent } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+    generateContent.mockResolvedValue(OK_RESPONSE);
+    mocks.prepareContext.mockResolvedValue(CREATE_FAILED_PREP);
+
+    const result = await codeTool.execute({ task: 'do something' }, ctx);
+
+    expect(result.structuredContent?.cachingMode).toBe('implicit');
+    expect(String(result.structuredContent?.cachingModeNote)).toMatch(/caches\.create failed/);
+  });
+
+  it('(guard) ask reports explicit when the Context Cache served the call', async () => {
+    const { ctx, generateContent } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000);
+    generateContent.mockResolvedValue(OK_RESPONSE);
+    mocks.prepareContext.mockResolvedValue({
+      ...CREATE_FAILED_PREP,
+      cacheId: 'cachedContents/abc',
+    });
+
+    const result = await askTool.execute({ prompt: 'hi' }, ctx);
+
+    expect(result.structuredContent?.cachingMode).toBe('explicit');
+    expect(result.structuredContent?.cachingModeNote).toBeUndefined();
   });
 
   it("code uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
