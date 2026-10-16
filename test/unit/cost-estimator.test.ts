@@ -33,8 +33,8 @@ function cost(model: string, options: CostOptions = {}): number {
 }
 
 /** The input rate alone (1M uncached input tokens, nothing else). */
-function inputRate(model: string, at: Date = READ_DAY): number {
-  return cost(model, { cached: 0, output: 0, at });
+function inputRate(model: string, at: Date = READ_DAY, estimate = estimateCostUsd): number {
+  return cost(model, { cached: 0, output: 0, at, estimate });
 }
 
 /** The output rate alone (1M output tokens minus the input rate). */
@@ -209,6 +209,30 @@ describe('cost estimator', () => {
       expect(reservedInputRate('2026-10-16T12:00:00Z', null)).toBeCloseTo(4, 9);
     });
 
+    it('an untimed reservation takes each component at its dearest from now on, overrides included', async () => {
+      // 3 Flash preview's output drops 20 -> 2.5 on 2027-02-01 while 3.8 Flash's input
+      // doubles on 2027-01-01: a call reserved in December may settle in January.
+      const flash3 = { inputPerMillion: 0.5, outputPerMillion: 20, cachedInputPerMillion: 0.05 };
+      const fresh = await estimatorWith({
+        'gemini-3-flash-preview': {
+          ...flash3,
+          next: { ...flash3, from: '2027-02-01', outputPerMillion: 2.5 },
+        },
+      });
+      const reserve = (at: string): number =>
+        fresh.estimatePreCallCostUsd({
+          model: 'gemini-flash-latest',
+          workspaceBytes: 4_000_000,
+          promptChars: 0,
+          expectedOutputTokens: 1_000_000,
+          coverMs: null,
+          at: new Date(at),
+        });
+      const january = reserve('2027-01-15T12:00:00Z');
+      expect(january).toBeCloseTo(1.5 + 20, 9);
+      expect(reserve('2026-12-15T12:00:00Z')).toBeGreaterThanOrEqual(january);
+    });
+
     it('a settled call is priced at the rate in force when it settles', () => {
       expect(inputRate('gemini-4-argon', new Date('2026-11-30T23:30:00Z'))).toBeCloseTo(2, 9);
     });
@@ -224,10 +248,9 @@ describe('cost estimator', () => {
       expect(pricedRow('alias', src)).toBe(undefined);
     });
 
-    it("an override keyed by the alias id wins over the target's override", () => {
-      const base = { aliasTarget: { alias: 'target' }, rows: { target } };
-      expect(pricedRow('alias', { ...base, overrides: { target: ov } })).toBe(ov);
-      expect(pricedRow('alias', { ...base, overrides: { alias: own, target: ov } })).toBe(own);
+    it("an override keyed by the alias id wins over the target's override", async () => {
+      const fresh = await estimatorWith({ 'gemini-flash-latest': own, 'gemini-3.8-flash': ov });
+      expect(inputRate('gemini-flash-latest', READ_DAY, fresh.estimateCostUsd)).toBeCloseTo(9, 9);
     });
 
     it('a target that is itself an alias is not followed', () => {

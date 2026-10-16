@@ -36,8 +36,30 @@ describe('GEMINI_PRICING_OVERRIDES', () => {
     const { rows, warnings } = parse({ m: { ...RATES, next: noFrom } });
     expect(rows).toEqual({});
     expect(warnings).toEqual([
-      expect.stringContaining('"m" dropped (next.from is not a YYYY-MM-DD date)'),
+      expect.stringContaining('"m" dropped (next.from is not a YYYY-MM-DD calendar date)'),
     ]);
+  });
+
+  it('drops a row whose next.from is not a real calendar day, and says so', () => {
+    for (const from of ['2026-13-01', '2026-02-30']) {
+      const { rows, warnings } = parse({ m: { ...RATES, next: { ...NEXT, from } } });
+      expect(rows).toEqual({});
+      expect(warnings).toEqual([
+        expect.stringContaining('next.from is not a YYYY-MM-DD calendar date'),
+      ]);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it('drops a row keyed __proto__ with a warning, never silently, and keeps the others', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const raw = `{"__proto__": ${JSON.stringify(RATES)}, "good": ${JSON.stringify(RATES)}}`;
+    const rows = parsePricingOverrides(raw);
+    expect(Object.keys(rows)).toEqual(['good']);
+    expect(Object.getPrototypeOf(rows)).toBe(null);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('"__proto__" dropped (not a model id)'),
+    );
   });
 
   it('drops a row whose next names only some rates, and says so', () => {

@@ -22,13 +22,18 @@ function isRate(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0;
 }
 
+/** `value` is a real UTC calendar day written `YYYY-MM-DD` (`2026-13-01` is not). */
+function isUtcDay(value: unknown): value is string {
+  if (typeof value !== 'string' || !UTC_DAY.test(value)) return false;
+  const day = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(day.getTime()) && day.toISOString().slice(0, 10) === value;
+}
+
 /** Why `value` cannot be a row's `next`, or `null` when it can. */
 function nextProblem(value: unknown): string | null {
   const next = asFields(value);
   if (next === null) return 'next is not an object';
-  if (typeof next.from !== 'string' || !UTC_DAY.test(next.from)) {
-    return 'next.from is not a YYYY-MM-DD date';
-  }
+  if (!isUtcDay(next.from)) return 'next.from is not a YYYY-MM-DD calendar date';
   const missing = RATE_KEYS.find((key) => !isRate(next[key]));
   return missing === undefined ? null : `next.${missing} is not a finite rate >= 0`;
 }
@@ -41,6 +46,12 @@ function entryProblem(fields: Fields): string | null {
   if (cached !== undefined && !isRate(cached))
     return 'cachedInputPerMillion is not a finite rate >= 0';
   return fields.next === undefined ? null : nextProblem(fields.next);
+}
+
+/** Why `model`'s value `fields` cannot be a price row, or `null` when it can. */
+function rowProblem(model: string, fields: Fields | null): string | null {
+  if (model === '__proto__') return 'not a model id';
+  return fields === null ? 'not an object' : entryProblem(fields);
 }
 
 /** A typed copy of a row `entryProblem` accepted. */
@@ -80,10 +91,11 @@ export function parsePricingOverrides(raw: string | undefined): Record<string, P
     logger.warn('GEMINI_PRICING_OVERRIDES is not a JSON object of model rows and is ignored');
     return {};
   }
-  const rows: Record<string, PricingEntry> = {};
+  // A null-prototype map: a key such as `__proto__` is a plain key, never a setter.
+  const rows: Record<string, PricingEntry> = Object.create(null);
   for (const [model, value] of Object.entries(map)) {
     const fields = asFields(value);
-    const problem = fields === null ? 'not an object' : entryProblem(fields);
+    const problem = rowProblem(model, fields);
     if (fields === null || problem !== null) {
       logger.warn(
         `GEMINI_PRICING_OVERRIDES: ${JSON.stringify(model)} dropped (${problem}); the table row stays`,

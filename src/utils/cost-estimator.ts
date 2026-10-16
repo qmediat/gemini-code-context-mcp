@@ -154,6 +154,24 @@ function utcDate(at: Date): string {
   return at.toISOString().slice(0, 10);
 }
 
+/**
+ * When rates are read: the instant `at`, or — `onward` — every instant from `at` on,
+ * for a call without a timeout, which may settle after any announced change.
+ */
+interface PriceMoment {
+  at: Date;
+  onward: boolean;
+}
+
+/** The highest of two rate sets, per component. */
+function dearerRates(a: Rates, b: Rates): Rates {
+  return {
+    inputPerMillion: Math.max(a.inputPerMillion, b.inputPerMillion),
+    outputPerMillion: Math.max(a.outputPerMillion, b.outputPerMillion),
+    cachedInputPerMillion: Math.max(cachedRate(a), cachedRate(b)),
+  };
+}
+
 /** The rates of `entry` in force at `at`: its `next` rates from their UTC date on. */
 function ratesAt(entry: PricingEntry, at: Date): Rates {
   const next = entry.next;
@@ -162,26 +180,36 @@ function ratesAt(entry: PricingEntry, at: Date): Rates {
 }
 
 /**
- * The dearest rate `rows` have in force at `at` for a text category, per component
- * (the highest input, output and cached rate of its rows): an upper bound for an
- * unpriced model or an alias of that category, or `undefined` for a category no
- * text row prices.
+ * The dearest rates `entry` bills at `at` or at any later dated change, per component:
+ * what a call that may settle at any time from `at` on can cost.
+ */
+function dearestEverRates(entry: PricingEntry, at: Date): Rates {
+  const next = entry.next;
+  if (next === undefined || utcDate(at) >= next.from) return ratesAt(entry, at);
+  return dearerRates(entry, next);
+}
+
+/** The rates of `entry` for `moment`. */
+function ratesFor(entry: PricingEntry, moment: PriceMoment): Rates {
+  return moment.onward ? dearestEverRates(entry, moment.at) : ratesAt(entry, moment.at);
+}
+
+/**
+ * The dearest rate `rows` have for `moment` in a text category, per component (the
+ * highest input, output and cached rate of its rows): an upper bound for an unpriced
+ * model or an alias of that category, or `undefined` for a category no text row prices.
  */
 function dearestTextRate(
   category: ModelCategory,
-  at: Date,
+  moment: PriceMoment,
   rows: Readonly<Record<string, PricingEntry>>,
 ): Rates | undefined {
   if (!isTextGenCategory(category)) return undefined;
   let held: Rates | undefined;
   for (const [id, entry] of Object.entries(rows)) {
     if (categorizeModel(id) !== category) continue;
-    const row = ratesAt(entry, at);
-    held = {
-      inputPerMillion: Math.max(held?.inputPerMillion ?? 0, row.inputPerMillion),
-      outputPerMillion: Math.max(held?.outputPerMillion ?? 0, row.outputPerMillion),
-      cachedInputPerMillion: Math.max(held ? cachedRate(held) : 0, cachedRate(row)),
-    };
+    const row = ratesFor(entry, moment);
+    held = held === undefined ? row : dearerRates(held, row);
   }
   return held;
 }
@@ -220,7 +248,10 @@ let loaded: LoadedPricing | null = null;
 function loadPricing(): LoadedPricing {
   if (loaded !== null) return loaded;
   const overrides = parsePricingOverrides(process.env.GEMINI_PRICING_OVERRIDES);
-  const boundRows: Record<string, PricingEntry> = { ...DEFAULT_PRICING };
+  const boundRows: Record<string, PricingEntry> = Object.assign(
+    Object.create(null),
+    DEFAULT_PRICING,
+  );
   for (const [id, entry] of Object.entries(overrides)) {
     // An alias never prices as a row, so its override never sets a category's bound.
     if (own(ALIAS_TARGET, id) === undefined) boundRows[id] = entry;
@@ -229,16 +260,16 @@ function loadPricing(): LoadedPricing {
   return loaded;
 }
 
-function pricingFor(model: string, at: Date): Rates {
+function pricingFor(model: string, moment: PriceMoment): Rates {
   const { sources, boundRows } = loadPricing();
   const row = pricedRow(model, sources);
-  if (row) return ratesAt(row, at);
+  if (row) return ratesFor(row, moment);
   // An alias or an unpriced text model: the dearest rate of its category (an alias's
   // is its measured target's). Anything else: the conservative rate of its cost tier —
   // a model the taxonomy cannot place gets the premium rate rather than flash: better
   // to block an over-budget user than let a never-seen model undercharge past the cap.
   const categoryId = own(sources.aliasTarget, model) ?? model;
-  const bound = dearestTextRate(categorizeModel(categoryId), at, boundRows);
+  const bound = dearestTextRate(categorizeModel(categoryId), moment, boundRows);
   return bound ?? UNKNOWN_RATE_BY_TIER[costTierOf(categoryId)];
 }
 
@@ -267,7 +298,11 @@ function tierFactor(tier: 'standard' | 'flex' | undefined): number {
 
 /** Estimated cost in USD (float). Multiply by 1e6 for micros before storing. */
 export function estimateCostUsd(input: CostInputs): number {
-  const p = pricingFor(input.model, input.at ?? new Date());
+  return costFor(input, { at: input.at ?? new Date(), onward: false });
+}
+
+function costFor(input: CostInputs, moment: PriceMoment): number {
+  const p = pricingFor(input.model, moment);
   const uncached = (input.uncachedInputTokens / 1_000_000) * p.inputPerMillion;
   const cached = (input.cachedInputTokens / 1_000_000) * cachedRate(p);
   const output = (input.outputTokens / 1_000_000) * p.outputPerMillion;
@@ -278,19 +313,21 @@ export function estimateCostUsd(input: CostInputs): number {
   return (uncached + cached + output + thinking) * tierFactor(input.serviceTier);
 }
 
-/** A date after every announced price change: where a call without a timeout may still be running. */
-const OPEN_END = new Date('9999-12-31T00:00:00Z');
-
 /**
  * A reservation for a call that may run up to `coverMs` (its timeout; `null`: none):
  * the dearer of the cost at the rates in force at its start and at the end of that
  * window, so a call that crosses a price change settles at or under what it reserved.
- * A call without a timeout reserves at every rate announced.
+ * A call without a timeout reserves at the dearest rate, per component, of every rate
+ * in force from its start on.
  */
 export function estimateReservationUsd(input: CostInputs, coverMs: number | null): number {
   const start = input.at ?? new Date();
-  const end = coverMs === null ? OPEN_END : new Date(start.getTime() + coverMs);
-  return Math.max(estimateCostUsd({ ...input, at: start }), estimateCostUsd({ ...input, at: end }));
+  if (coverMs === null) return costFor(input, { at: start, onward: true });
+  const end = new Date(start.getTime() + coverMs);
+  return Math.max(
+    costFor(input, { at: start, onward: false }),
+    costFor(input, { at: end, onward: false }),
+  );
 }
 
 export function toMicrosUsd(dollars: number): number {

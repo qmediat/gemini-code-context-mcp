@@ -9,7 +9,8 @@ Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by c
 USD per 1M tokens, input / output / cached input. A settled call is priced at the rate in force on the UTC day it
 settles. A daily-budget reservation covers every rate the call can settle under: the dearer of the rate in force when it
 is made and the rate in force when the call's timeout ends (`timeoutMs`; `ask_agentic`: each iteration's timeout, priced
-per iteration). A call without a timeout reserves at the dearest rate announced, so a call that crosses a price change
+per iteration). A call without a timeout reserves each component (input, output, cached) at its dearest
+rate in force from now on, overrides included, so a call that crosses a price change
 never settles above its reservation.
 
 | Model | Rate | From |

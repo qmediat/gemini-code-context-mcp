@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the dates they take effect, instead of a "conservative" later rate booked today: a row may carry `next` rates from a
   UTC date on. A settled call is priced at the rate in force when it settles; a daily-budget reservation at the dearer
   of the rates in force when it is made and when the call's timeout ends (each `ask_agentic` iteration on its own, with
-  its iteration timeout; a call without a timeout at the dearest rate announced), so a call that crosses a price change
+  its iteration timeout; a call without a timeout at each component's dearest rate in force from now on, overrides
+  included), so a call that crosses a price change
   never settles above its reservation.
   `gemini-4-argon` bills 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2 from
   2026-12-01 — this corrects 1.22.0's row, which booked the December rate from the start.
@@ -36,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of its target.
 - `GEMINI_PRICING_OVERRIDES` entries are validated when first read: an entry with a rate that is not a finite number
   ≥ 0, or a `next` without a `YYYY-MM-DD` `from` or without all three rates, is dropped with a warning naming the model
-  and the reason (until now it was taken as it came and could price every call at the later rate or book `NaN`); an
+  and the reason — a `from` that is not a real calendar day (`2026-13-01`) included, and a key `__proto__`
+  (until now it was taken as it came and could price every call at the later rate or book `NaN`); an
   unparseable value is said, not ignored silently. A model id named like an Object prototype member (`constructor`) is
   priced by the fallback instead of `NaN`.
 - The bound for an unpriced text model or an alias is computed over the table with the overrides on top, so an override
