@@ -743,6 +743,19 @@ async function executeAskAgenticBody(
       input.iterationTimeoutMs,
       'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
     );
+    /** One pass's reservation, at the rates in force from now until its timeout. */
+    const reservedModel = resolved.resolved;
+    const passReservationUsd = (inputTokens: number): number =>
+      estimateReservationUsd(
+        {
+          model: reservedModel,
+          uncachedInputTokens: inputTokens,
+          cachedInputTokens: 0,
+          outputTokens: PER_ITERATION_OUTPUT_TOKENS,
+          thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
+        },
+        iterationCoverMs,
+      );
     const dailyBudgetEnforced = Number.isFinite(ctx.config.dailyBudgetUsd);
     const tpmEnforced = ctx.config.tpmThrottleLimit > 0;
 
@@ -752,16 +765,7 @@ async function executeAskAgenticBody(
       // Priced per iteration, covering the rates in force until its timeout: a
       // loop that crosses a price change reserves at the new rate, so each
       // reservation stays an upper bound of what its settlement books.
-      const perIterationCostUsd = estimateReservationUsd(
-        {
-          model: resolved.resolved,
-          uncachedInputTokens: PER_ITERATION_INPUT_TOKENS,
-          cachedInputTokens: 0,
-          outputTokens: PER_ITERATION_OUTPUT_TOKENS,
-          thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
-        },
-        iterationCoverMs,
-      );
+      const perIterationCostUsd = passReservationUsd(PER_ITERATION_INPUT_TOKENS);
 
       // Per-iteration budget reservation (mirrors ask.tool.ts). Each
       // iteration is an independent generateContent billable, so each
@@ -1255,16 +1259,7 @@ async function executeAskAgenticBody(
       lastIterationPromptTokens > 0
         ? lastIterationPromptTokens + lastToolResponseTokens + 5_000
         : PER_ITERATION_INPUT_TOKENS;
-    const finalizationCostUsd = estimateReservationUsd(
-      {
-        model: resolved.resolved,
-        uncachedInputTokens: finalizationEstimate,
-        cachedInputTokens: 0,
-        outputTokens: PER_ITERATION_OUTPUT_TOKENS,
-        thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
-      },
-      iterationCoverMs,
-    );
+    const finalizationCostUsd = passReservationUsd(finalizationEstimate);
 
     if (dailyBudgetEnforced) {
       const reserve = ctx.manifest.reserveBudget({

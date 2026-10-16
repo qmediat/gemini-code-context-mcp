@@ -1244,13 +1244,15 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
       ],
       dailyBudgetUsd: 100,
     });
-    // The first iteration runs until 23:30: the second one's 60-min window reaches 2026-12-01.
+    // A 30-min iteration timeout (the largest the clamp allows). The first iteration
+    // reserves at 22:00 (its window ends 22:30, on 2026-11-30) and runs until 23:45:
+    // the second one's window ends 00:15 on 2026-12-01.
     manifest.reserveBudget.mockImplementationOnce(() => {
-      vi.setSystemTime(new Date('2026-11-30T23:30:00Z'));
+      vi.setSystemTime(new Date('2026-11-30T23:45:00Z'));
       return { id: 1 };
     });
     const result = await askAgenticTool.execute(
-      { prompt: 'q', workspace: root, iterationTimeoutMs: 60 * 60_000 },
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 30 * 60_000 },
       ctx,
     );
     expect(result.isError).toBeUndefined();
