@@ -41,8 +41,8 @@ caller takes responsibility).
 | Category | What it's for | Example IDs | Accepted by tools |
 |---|---|---|---|
 | `text-reasoning` | Deep thinking, code review, long analysis | `gemini-4-argon`, `gemini-pro-latest`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro` | `ask`, `code` |
-| `text-fast` | Quick Q&A, shallow reasoning | `gemini-flash-latest`, `gemini-3.1-flash-preview`, `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
-| `text-lite` | Cheapest text gen, simple classification | `gemini-flash-lite-latest`, `gemini-3.1-flash-lite-preview`, `gemini-2.5-flash-lite` | `ask` |
+| `text-fast` | Quick Q&A, shallow reasoning | `gemini-flash-latest`, `gemini-3.8-flash`, `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
+| `text-lite` | Cheapest text gen, simple classification | `gemini-flash-lite-latest`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite-preview`, `gemini-2.5-flash-lite` | `ask` |
 | `image-generation` | Text → image (different pricing tier!) | `nano-banana-pro-preview`, `gemini-3-pro-image`, `imagen-4-ultra` | — (not supported by ask/code) |
 | `audio-generation` | TTS, music generation, dialog-native audio | `lyria-3-pro-preview`, `*-tts`, `*-native-audio-*` | — |
 | `video-generation` | Video synthesis | `veo-3`, `veo-3.1-preview` | — |
@@ -93,7 +93,10 @@ falling to a different category.
 
 Resolves to the newest pro-tier text model with thinking support. The model list is ranked by the taxonomy: the
 text categories first (reasoning, fast, lite, then the rest), the cost tier, versioned IDs before the rolling unversioned
-`-latest` aliases (`gemini-pro-latest` points at an older model), the ID descending with version numbers compared as
+`-latest` aliases (their target is never newer than the newest versioned ID — measured 2026-10-16: `gemini-pro-latest`
+serves `gemini-3.1-pro-preview`, `gemini-flash-latest` `gemini-3.8-flash`, `gemini-flash-lite-latest`
+`gemini-3.5-flash-lite`; each alias is priced at the dearest rate of its target's category, see
+[cost-model.md](cost-model.md)), the ID descending with version numbers compared as
 numbers (`3.10` above `3.9`), and a GA ID before its `-preview` twin. So `gemini-4-argon` wins over
 `gemini-3.1-pro-preview` and `gemini-pro-latest`, and every alias resolves to a versioned model whenever one is listed.
 Guaranteed to NOT pick up `nano-banana-pro-preview` even if it's in your

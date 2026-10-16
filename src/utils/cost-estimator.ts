@@ -1,64 +1,124 @@
 /**
  * Approximate cost estimator for reporting (not billing authoritative).
  *
- * Rates are per million tokens and reflect public Gemini API pricing as of
- * 2026-04. Update when Google changes pricing; values can also be overridden
- * at runtime via `GEMINI_PRICING_OVERRIDES` (JSON).
+ * Rates are per million tokens, Standard tier, the rates of Google's pricing page
+ * (https://ai.google.dev/gemini-api/docs/pricing, read 2026-10-16) with the dates
+ * they take effect. Where the page has a prompt-size tier (≤ 200k / > 200k tokens)
+ * the dearer tier is the row: the estimator does not see the prompt's size, so the
+ * row stays an upper bound. An unpriced id takes the dearest row of its category.
+ * `GEMINI_PRICING_OVERRIDES` (JSON, keyed by model id) replaces a row at run time.
  */
 
 import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
 import { categorizeModel, costTierOf, isTextGenCategory } from '../gemini/model-taxonomy.js';
+import { parsePricingOverrides } from './pricing-overrides.js';
 
-export interface PricingEntry {
+/** One set of rates, USD per 1M tokens. */
+export interface Rates {
   inputPerMillion: number;
   outputPerMillion: number;
   /** Cached tokens are billed at a reduced rate. Optional — falls back to 0.25× input. */
   cachedInputPerMillion?: number;
 }
 
-const DEFAULT_PRICING: Record<string, PricingEntry> = {
-  // Conservative defaults — if the actual rate is lower, users see a pleasant surprise.
-  // Google's rate from 2026-12-01. Through 2026-11-30 it bills 2 / 10 / 0.1, so
-  // until then this over-estimates by 2× — the conservative side this table keeps,
-  // so a budget stays an upper bound. `GEMINI_PRICING_OVERRIDES` gives the lower
-  // rate to whoever wants the exact figure now.
-  'gemini-4-argon': { inputPerMillion: 4, outputPerMillion: 20, cachedInputPerMillion: 0.2 },
-  'gemini-3-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
-  'gemini-3.1-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
-  'gemini-3-flash-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
-  'gemini-3.1-flash-image-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
-  'gemini-3.1-flash-lite-preview': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
-  'gemini-2.5-pro': { inputPerMillion: 2.5, outputPerMillion: 10 },
-  'gemini-2.5-flash': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
-  'gemini-2.5-flash-lite': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
-  // Google's rolling aliases, priced as the model they point at today: the model
-  // card says "Latest release of Gemini Pro" and Google's docs alias
-  // `gemini-pro-latest` to `gemini-2.5-pro` (the flash ones to 2.5-flash / -lite).
-  'gemini-pro-latest': { inputPerMillion: 2.5, outputPerMillion: 10 },
-  'gemini-flash-latest': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
-  'gemini-flash-lite-latest': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
+/** Rates that replace a row's from a UTC date on (`YYYY-MM-DD`, inclusive). */
+export interface NextRates extends Required<Rates> {
+  from: string;
+}
+
+export interface PricingEntry extends Rates {
+  /** A price change Google has announced: in force from `next.from`. */
+  next?: NextRates;
+}
+
+const FLASH_3X: PricingEntry = {
+  inputPerMillion: 0.75,
+  outputPerMillion: 3.75,
+  cachedInputPerMillion: 0.075,
+  next: {
+    from: '2027-01-01',
+    inputPerMillion: 1.5,
+    outputPerMillion: 7.5,
+    cachedInputPerMillion: 0.15,
+  },
 };
 
-let overrides: Record<string, PricingEntry> | null = null;
+/** The > 200k-token tier of the 3.x Pro previews (≤ 200k: 2 / 12 / 0.2). */
+const PRO_3X_PREVIEW: PricingEntry = {
+  inputPerMillion: 4,
+  outputPerMillion: 18,
+  cachedInputPerMillion: 0.4,
+};
 
-function loadOverrides(): Record<string, PricingEntry> | null {
-  if (overrides !== null) return overrides;
-  const raw = process.env.GEMINI_PRICING_OVERRIDES;
-  if (!raw) {
-    overrides = {};
-    return overrides;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      overrides = parsed as Record<string, PricingEntry>;
-    } else {
-      overrides = {};
-    }
-  } catch {
-    overrides = {};
-  }
-  return overrides;
+/** The 3.1 Flash-Lite rates; the page prices the model once, GA and preview ids alike. */
+const FLASH_LITE_31: PricingEntry = {
+  inputPerMillion: 0.25,
+  outputPerMillion: 1.5,
+  cachedInputPerMillion: 0.025,
+};
+
+const DEFAULT_PRICING: Readonly<Record<string, PricingEntry>> = {
+  'gemini-4-argon': {
+    inputPerMillion: 2,
+    outputPerMillion: 10,
+    cachedInputPerMillion: 0.1,
+    next: {
+      from: '2026-12-01',
+      inputPerMillion: 4,
+      outputPerMillion: 20,
+      cachedInputPerMillion: 0.2,
+    },
+  },
+  'gemini-3-pro-preview': PRO_3X_PREVIEW,
+  'gemini-3.1-pro-preview': PRO_3X_PREVIEW,
+  'gemini-3.8-flash': FLASH_3X,
+  'gemini-3.7-flash': FLASH_3X,
+  'gemini-3.6-flash': FLASH_3X,
+  'gemini-3-flash-preview': {
+    inputPerMillion: 0.5,
+    outputPerMillion: 3,
+    cachedInputPerMillion: 0.05,
+  },
+  // The page lists it as `gemini-3.1-flash-image` (text input / text and thinking output).
+  'gemini-3.1-flash-image-preview': { inputPerMillion: 0.5, outputPerMillion: 3 },
+  'gemini-3.5-flash-lite': {
+    inputPerMillion: 0.3,
+    outputPerMillion: 2.5,
+    cachedInputPerMillion: 0.03,
+  },
+  'gemini-3.1-flash-lite': FLASH_LITE_31,
+  'gemini-3.1-flash-lite-preview': FLASH_LITE_31,
+  // The > 200k-token tier (≤ 200k: 1.25 / 10 / 0.125).
+  'gemini-2.5-pro': { inputPerMillion: 2.5, outputPerMillion: 15, cachedInputPerMillion: 0.25 },
+  'gemini-2.5-flash': { inputPerMillion: 0.3, outputPerMillion: 2.5, cachedInputPerMillion: 0.03 },
+  'gemini-2.5-flash-lite': {
+    inputPerMillion: 0.1,
+    outputPerMillion: 0.4,
+    cachedInputPerMillion: 0.01,
+  },
+};
+
+/**
+ * Google's rolling aliases and the versioned id each served on 2026-10-16 (measured
+ * by the response's `modelVersion`; re-measure when Google moves them). The target
+ * only names the category: Google can move an alias to a dearer model between two
+ * measurements, so an alias prices at the dearest rate of its target's category.
+ */
+// Exported for the tests, which check every target is a priced id.
+export const ALIAS_TARGET: Readonly<Record<string, string>> = {
+  'gemini-pro-latest': 'gemini-3.1-pro-preview',
+  'gemini-flash-latest': 'gemini-3.8-flash',
+  'gemini-flash-lite-latest': 'gemini-3.5-flash-lite',
+};
+
+/** `record[key]` when `key` is the record's own (never a prototype member such as `constructor`). */
+function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
+/** The ids the table prices (an alias is never one of them). Exported for the tests. */
+export function isPricedId(id: string): boolean {
+  return own(DEFAULT_PRICING, id) !== undefined;
 }
 
 /**
@@ -68,16 +128,16 @@ function loadOverrides(): Record<string, PricingEntry> | null {
  * model so a budget-capped user gets blocked at the cap instead of silently
  * overshooting it while we wait for a pricing-table update.
  */
-const UNKNOWN_PREMIUM_RATE: PricingEntry = { inputPerMillion: 10.5, outputPerMillion: 30 };
-const UNKNOWN_FLASH_RATE: PricingEntry = { inputPerMillion: 0.3, outputPerMillion: 2.5 };
-const UNKNOWN_LITE_RATE: PricingEntry = { inputPerMillion: 0.1, outputPerMillion: 0.4 };
+const UNKNOWN_PREMIUM_RATE: Rates = { inputPerMillion: 10.5, outputPerMillion: 30 };
+const UNKNOWN_FLASH_RATE: Rates = { inputPerMillion: 0.3, outputPerMillion: 2.5 };
+const UNKNOWN_LITE_RATE: Rates = { inputPerMillion: 0.1, outputPerMillion: 0.4 };
 
 /**
  * The conservative rate per cost tier, for a model outside the text categories
  * (image, audio, video, agent, unknown): the table prices no such family it could
  * stand for, so a `premium` one gets the highest rate we know of.
  */
-const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], PricingEntry>> = {
+const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], Rates>> = {
   premium: UNKNOWN_PREMIUM_RATE,
   standard: UNKNOWN_FLASH_RATE,
   budget: UNKNOWN_LITE_RATE,
@@ -85,41 +145,132 @@ const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], Pricing
 };
 
 /** The cached-input rate a row bills: its own, else the 0.25× input default. */
-function cachedRate(row: PricingEntry): number {
+function cachedRate(row: Rates): number {
   return row.cachedInputPerMillion ?? row.inputPerMillion * 0.25;
 }
 
-/**
- * The dearest rate the table knows for each text category, per component (the
- * highest input, output and cached rate of its priced rows): an upper bound for an
- * unpriced model of that category, read from the table instead of a fixed number.
- */
-function dearestTextRates(): ReadonlyMap<ModelCategory, PricingEntry> {
-  const out = new Map<ModelCategory, PricingEntry>();
-  for (const [id, row] of Object.entries(DEFAULT_PRICING)) {
-    const category = categorizeModel(id);
-    if (!isTextGenCategory(category)) continue;
-    const held = out.get(category) ?? row;
-    out.set(category, {
-      inputPerMillion: Math.max(held.inputPerMillion, row.inputPerMillion),
-      outputPerMillion: Math.max(held.outputPerMillion, row.outputPerMillion),
-      cachedInputPerMillion: Math.max(cachedRate(held), cachedRate(row)),
-    });
-  }
-  return out;
+/** The UTC calendar date of `at`, `YYYY-MM-DD`. */
+function utcDate(at: Date): string {
+  return at.toISOString().slice(0, 10);
 }
 
-const DEAREST_TEXT_RATES = dearestTextRates();
+/**
+ * When rates are read: the instant `at`, or — `onward` — every instant from `at` on,
+ * for a call without a timeout, which may settle after any announced change.
+ */
+interface PriceMoment {
+  at: Date;
+  onward: boolean;
+}
 
-function pricingFor(model: string): PricingEntry {
-  const ov = loadOverrides();
-  if (ov?.[model]) return ov[model];
-  if (DEFAULT_PRICING[model]) return DEFAULT_PRICING[model];
-  // An unpriced text model: the dearest rate of its category. Anything else: the
-  // conservative rate of its cost tier — a model the taxonomy cannot place gets the
-  // premium rate rather than flash: better to block an over-budget user than let a
-  // never-seen model silently undercharge and blow past the cap.
-  return DEAREST_TEXT_RATES.get(categorizeModel(model)) ?? UNKNOWN_RATE_BY_TIER[costTierOf(model)];
+/** The highest of two rate sets, per component. */
+function dearerRates(a: Rates, b: Rates): Rates {
+  return {
+    inputPerMillion: Math.max(a.inputPerMillion, b.inputPerMillion),
+    outputPerMillion: Math.max(a.outputPerMillion, b.outputPerMillion),
+    cachedInputPerMillion: Math.max(cachedRate(a), cachedRate(b)),
+  };
+}
+
+/** The rates of `entry` in force at `at`: its `next` rates from their UTC date on. */
+function ratesAt(entry: PricingEntry, at: Date): Rates {
+  const next = entry.next;
+  if (next === undefined || utcDate(at) < next.from) return entry;
+  return next;
+}
+
+/**
+ * The dearest rates `entry` bills at `at` or at any later dated change, per component:
+ * what a call that may settle at any time from `at` on can cost.
+ */
+function dearestEverRates(entry: PricingEntry, at: Date): Rates {
+  const next = entry.next;
+  if (next === undefined || utcDate(at) >= next.from) return ratesAt(entry, at);
+  return dearerRates(entry, next);
+}
+
+/** The rates of `entry` for `moment`. */
+function ratesFor(entry: PricingEntry, moment: PriceMoment): Rates {
+  return moment.onward ? dearestEverRates(entry, moment.at) : ratesAt(entry, moment.at);
+}
+
+/**
+ * The dearest rate `rows` have for `moment` in a text category, per component (the
+ * highest input, output and cached rate of its rows): an upper bound for an unpriced
+ * model or an alias of that category, or `undefined` for a category no text row prices.
+ */
+function dearestTextRate(
+  category: ModelCategory,
+  moment: PriceMoment,
+  rows: Readonly<Record<string, PricingEntry>>,
+): Rates | undefined {
+  if (!isTextGenCategory(category)) return undefined;
+  let held: Rates | undefined;
+  for (const [id, entry] of Object.entries(rows)) {
+    if (categorizeModel(id) !== category) continue;
+    const row = ratesFor(entry, moment);
+    held = held === undefined ? row : dearerRates(held, row);
+  }
+  return held;
+}
+
+/**
+ * Where a model's price can come from, in the order `pricedRow` reads them.
+ * Exported with `pricedRow` for the tests.
+ */
+export interface PricingSources {
+  overrides: Readonly<Record<string, PricingEntry>>;
+  aliasTarget: Readonly<Record<string, string>>;
+  rows: Readonly<Record<string, PricingEntry>>;
+}
+
+/**
+ * The row that prices `model`, or `undefined` when its category's bound applies:
+ * an override of the id itself; for an alias, its target's override (an alias never
+ * prices as a row — neither its own nor its target's); else the id's row.
+ */
+export function pricedRow(model: string, src: PricingSources): PricingEntry | undefined {
+  const override = own(src.overrides, model);
+  if (override !== undefined) return override;
+  const target = own(src.aliasTarget, model);
+  if (target !== undefined) return own(src.overrides, target);
+  return own(src.rows, model);
+}
+
+/** The pricing sources, and the rows the category bound reads: the table with the overrides on top. */
+interface LoadedPricing {
+  sources: PricingSources;
+  boundRows: Readonly<Record<string, PricingEntry>>;
+}
+
+let loaded: LoadedPricing | null = null;
+
+function loadPricing(): LoadedPricing {
+  if (loaded !== null) return loaded;
+  const overrides = parsePricingOverrides(process.env.GEMINI_PRICING_OVERRIDES);
+  const boundRows: Record<string, PricingEntry> = Object.assign(
+    Object.create(null),
+    DEFAULT_PRICING,
+  );
+  for (const [id, entry] of Object.entries(overrides)) {
+    // An alias never prices as a row, so its override never sets a category's bound.
+    if (own(ALIAS_TARGET, id) === undefined) boundRows[id] = entry;
+  }
+  loaded = { sources: { overrides, aliasTarget: ALIAS_TARGET, rows: DEFAULT_PRICING }, boundRows };
+  return loaded;
+}
+
+function pricingFor(model: string, moment: PriceMoment): Rates {
+  const { sources, boundRows } = loadPricing();
+  const row = pricedRow(model, sources);
+  if (row) return ratesFor(row, moment);
+  // An alias or an unpriced text model: the dearest rate of its category (an alias's
+  // is its measured target's). Anything else: the conservative rate of its cost tier —
+  // a model the taxonomy cannot place gets the premium rate rather than flash: better
+  // to block an over-budget user than let a never-seen model undercharge past the cap.
+  const categoryId = own(sources.aliasTarget, model) ?? model;
+  const bound = dearestTextRate(categorizeModel(categoryId), moment, boundRows);
+  return bound ?? UNKNOWN_RATE_BY_TIER[costTierOf(categoryId)];
 }
 
 export interface CostInputs {
@@ -130,6 +281,12 @@ export interface CostInputs {
   cachedInputTokens: number;
   outputTokens: number;
   thinkingTokens?: number;
+  /**
+   * The moment whose rates apply. Defaults to now: a settled call is priced at the
+   * rates in force when it settles; a reservation goes through
+   * `estimateReservationUsd`, which covers the call's whole window.
+   */
+  at?: Date | undefined;
 }
 
 /** Google's flex tier is billed at half the standard price for the same model. */
@@ -141,16 +298,36 @@ function tierFactor(tier: 'standard' | 'flex' | undefined): number {
 
 /** Estimated cost in USD (float). Multiply by 1e6 for micros before storing. */
 export function estimateCostUsd(input: CostInputs): number {
-  const p = pricingFor(input.model);
-  const cachedRate = p.cachedInputPerMillion ?? p.inputPerMillion * 0.25;
+  return costFor(input, { at: input.at ?? new Date(), onward: false });
+}
+
+function costFor(input: CostInputs, moment: PriceMoment): number {
+  const p = pricingFor(input.model, moment);
   const uncached = (input.uncachedInputTokens / 1_000_000) * p.inputPerMillion;
-  const cached = (input.cachedInputTokens / 1_000_000) * cachedRate;
+  const cached = (input.cachedInputTokens / 1_000_000) * cachedRate(p);
   const output = (input.outputTokens / 1_000_000) * p.outputPerMillion;
   // Thinking tokens are currently billed as output tokens on Gemini Pro family.
   const thinking = input.thinkingTokens
     ? (input.thinkingTokens / 1_000_000) * p.outputPerMillion
     : 0;
   return (uncached + cached + output + thinking) * tierFactor(input.serviceTier);
+}
+
+/**
+ * A reservation for a call that may run up to `coverMs` (its timeout; `null`: none):
+ * the dearer of the cost at the rates in force at its start and at the end of that
+ * window, so a call that crosses a price change settles at or under what it reserved.
+ * A call without a timeout reserves at the dearest rate, per component, of every rate
+ * in force from its start on.
+ */
+export function estimateReservationUsd(input: CostInputs, coverMs: number | null): number {
+  const start = input.at ?? new Date();
+  if (coverMs === null) return costFor(input, { at: start, onward: true });
+  const end = new Date(start.getTime() + coverMs);
+  return Math.max(
+    costFor(input, { at: start, onward: false }),
+    costFor(input, { at: end, onward: false }),
+  );
 }
 
 export function toMicrosUsd(dollars: number): number {
@@ -170,6 +347,10 @@ export interface PreCallEstimateInputs {
   expectedOutputTokens: number;
   /** Thinking budget, passed through as extra output tokens. */
   thinkingTokens?: number;
+  /** The call's timeout in ms (`null`: none): the reservation covers the rates of that window. */
+  coverMs: number | null;
+  /** When the reservation is made. Defaults to now. */
+  at?: Date | undefined;
 }
 
 /**
@@ -184,14 +365,16 @@ export interface PreCallEstimateInputs {
 export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   const workspaceTokens = Math.ceil(Math.max(0, input.workspaceBytes) / 4);
   const promptTokens = Math.ceil(Math.max(0, input.promptChars) / 4);
-  return estimateCostUsd({
+  const call: CostInputs = {
     model: input.model,
     serviceTier: input.serviceTier,
     uncachedInputTokens: workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0),
     cachedInputTokens: 0,
     outputTokens: Math.max(0, input.expectedOutputTokens),
+    at: input.at,
     ...(input.thinkingTokens !== undefined ? { thinkingTokens: input.thinkingTokens } : {}),
-  });
+  };
+  return estimateReservationUsd(call, input.coverMs);
 }
 
 /**

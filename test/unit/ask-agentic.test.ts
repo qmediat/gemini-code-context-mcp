@@ -1226,6 +1226,43 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     expect(rescueReserve).toBeLessThan(75_000);
   });
 
+  it('each iteration reserves at the rates its timeout window can settle under (a loop crossing a price change)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
+    writeFileSync(join(root, 'a.ts'), 'x');
+    // gemini-4-argon doubles every rate on 2026-12-01. Only Date is faked: the
+    // loop's timers stay real (see the fake-timer hazard at the top of this file).
+    mocks.resolveModel.mockResolvedValueOnce({
+      ...(await mocks.resolveModel()),
+      resolved: 'gemini-4-argon',
+    });
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-30T22:00:00Z'));
+    const { ctx, manifest } = buildCtx({
+      script: [
+        { functionCalls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+        { text: 'Answer.' },
+      ],
+      dailyBudgetUsd: 100,
+    });
+    // A 30-min iteration timeout (the largest the clamp allows). The first iteration
+    // reserves at 22:00 (its window ends 22:30, on 2026-11-30) and runs until 23:45:
+    // the second one's window ends 00:15 on 2026-12-01.
+    manifest.reserveBudget.mockImplementationOnce(() => {
+      vi.setSystemTime(new Date('2026-11-30T23:45:00Z'));
+      return { id: 1 };
+    });
+    const result = await askAgenticTool.execute(
+      { prompt: 'q', workspace: root, iterationTimeoutMs: 30 * 60_000 },
+      ctx,
+    );
+    expect(result.isError).toBeUndefined();
+    const reserved = manifest.reserveBudget.mock.calls.map(
+      (call) => (call[0] as { estimatedCostMicros: number }).estimatedCostMicros,
+    );
+    expect(reserved).toHaveLength(2);
+    expect(reserved[1]).toBe(2 * (reserved[0] ?? 0));
+  });
+
   it('finalization pass daily-budget reserve uses dynamic cost estimate (Fix 6.1 — symmetric with TPM reserve)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');

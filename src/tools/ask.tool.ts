@@ -860,6 +860,7 @@ async function executeAskBody(
         // advertised `outputTokenLimit`.
         expectedOutputTokens: effectiveOutputCap,
         thinkingTokens: thinkingTokensForEstimate,
+        coverMs: timeoutController.timeoutMs,
       });
       const reserve = ctx.manifest.reserveBudget({
         workspaceRoot,

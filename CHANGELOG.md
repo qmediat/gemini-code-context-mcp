@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The cost estimate and the recorded spend use the rates of Google's pricing page (read 2026-10-16, Standard tier) with
+  the dates they take effect, instead of a "conservative" later rate booked today: a row may carry `next` rates from a
+  UTC date on. A settled call is priced at the rate in force when it settles; a daily-budget reservation at the dearer
+  of the rates in force when it is made and when the call's timeout ends (each `ask_agentic` iteration on its own, with
+  its iteration timeout; a call without a timeout at each component's dearest rate in force from now on, overrides
+  included), so a call that crosses a price change
+  never settles above its reservation.
+  `gemini-4-argon` bills 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2 from
+  2026-12-01 — this corrects 1.22.0's row, which booked the December rate from the start.
+- Rows brought up to the page: `gemini-3.1-pro-preview` and `gemini-3-pro-preview` 4 / 18 / 0.4 (the > 200k-token tier;
+  the estimator does not see the prompt's size, so the dearer tier is the row), `gemini-2.5-pro` 2.5 / 15 / 0.25
+  (its > 200k tier), `gemini-3-flash-preview` 0.5 / 3 / 0.05, `gemini-3.1-flash-image-preview` 0.5 / 3, `gemini-2.5-flash`
+  cached 0.03, `gemini-2.5-flash-lite` cached 0.01.
+- New rows: `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash` at 0.75 / 3.75 / 0.075 through 2026-12-31 and
+  1.5 / 7.5 / 0.15 from 2027-01-01; `gemini-3.5-flash-lite` at 0.3 / 2.5 / 0.03; `gemini-3.1-flash-lite` at 0.25 / 1.5 /
+  0.025, and `gemini-3.1-flash-lite-preview` at the same rates (the page prices the model once; it was 0.1 / 0.4).
+  `gemini-3.5-flash` has no row — the page does not list it — and prices at the `text-fast` bound.
+- The rolling aliases are no longer priced as the 2.5 line, as 1.22.0's entry had it: on 2026-10-16 the response's
+  `modelVersion` showed `gemini-pro-latest` serving `gemini-3.1-pro-preview`, `gemini-flash-latest` `gemini-3.8-flash`
+  and `gemini-flash-lite-latest` `gemini-3.5-flash-lite`. See Changed for how an alias is priced now.
+
+### Changed
+
+- A rolling alias prices at the dearest rate of its measured target's category (Google may move an alias to a dearer
+  model between two measurements), never as a row of its own; an override keyed by the alias id wins, then an override
+  of its target.
+- `GEMINI_PRICING_OVERRIDES` entries are validated when first read: an entry with a rate that is not a finite number
+  ≥ 0, or a `next` without a `YYYY-MM-DD` `from` or without all three rates, is dropped with a warning naming the model
+  and the reason — a `from` that is not a real calendar day (`2026-13-01`) included, and a key `__proto__`
+  (until now it was taken as it came and could price every call at the later rate or book `NaN`); an
+  unparseable value is said, not ignored silently. A model id named like an Object prototype member (`constructor`) is
+  priced by the fallback instead of `NaN`.
+- The bound for an unpriced text model or an alias is computed over the table with the overrides on top, so an override
+  that adds a dearer model of the category lifts it.
+- The bound for an unpriced text model is the dearest rate its category has in force on the day, so the new rows raise
+  it: an unpriced `text-fast` model is priced at 0.75 / 3.75 (1.5 / 7.5 from 2027-01-01; was 0.3 / 2.5), an unpriced
+  `text-lite` one at 0.3 / 2.5 (was 0.1 / 0.4), an unpriced `text-reasoning` one at 4 / 18 / 0.4 (4 / 20 / 0.4 from
+  2026-12-01; was 4 / 20 / 0.875).
+
 ## [1.22.0] - 2026-10-16
 
 ### Added
