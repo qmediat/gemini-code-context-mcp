@@ -174,6 +174,7 @@ export async function resolveModel(
     outputTokenLimit: picked.outputTokenLimit,
     category: picked.category,
     capabilities: picked.capabilities,
+    supportsCaching: picked.supportsCaching,
   });
 
   const enforceCategory = (picked: ClassifiedModel): void => {

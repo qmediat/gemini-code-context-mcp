@@ -6,6 +6,9 @@
  * at runtime via `GEMINI_PRICING_OVERRIDES` (JSON).
  */
 
+import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
+import { categorizeModel, costTierOf, isTextGenCategory } from '../gemini/model-taxonomy.js';
+
 export interface PricingEntry {
   inputPerMillion: number;
   outputPerMillion: number;
@@ -15,6 +18,11 @@ export interface PricingEntry {
 
 const DEFAULT_PRICING: Record<string, PricingEntry> = {
   // Conservative defaults — if the actual rate is lower, users see a pleasant surprise.
+  // Google's rate from 2026-12-01. Through 2026-11-30 it bills 2 / 10 / 0.1, so
+  // until then this over-estimates by 2× — the conservative side this table keeps,
+  // so a budget stays an upper bound. `GEMINI_PRICING_OVERRIDES` gives the lower
+  // rate to whoever wants the exact figure now.
+  'gemini-4-argon': { inputPerMillion: 4, outputPerMillion: 20, cachedInputPerMillion: 0.2 },
   'gemini-3-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3.1-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3-flash-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
@@ -23,6 +31,12 @@ const DEFAULT_PRICING: Record<string, PricingEntry> = {
   'gemini-2.5-pro': { inputPerMillion: 2.5, outputPerMillion: 10 },
   'gemini-2.5-flash': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
   'gemini-2.5-flash-lite': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
+  // Google's rolling aliases, priced as the model they point at today: the model
+  // card says "Latest release of Gemini Pro" and Google's docs alias
+  // `gemini-pro-latest` to `gemini-2.5-pro` (the flash ones to 2.5-flash / -lite).
+  'gemini-pro-latest': { inputPerMillion: 2.5, outputPerMillion: 10 },
+  'gemini-flash-latest': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
+  'gemini-flash-lite-latest': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
 };
 
 let overrides: Record<string, PricingEntry> | null = null;
@@ -48,30 +62,64 @@ function loadOverrides(): Record<string, PricingEntry> | null {
 }
 
 /**
- * Conservative defaults for models we've never seen — one for each tier we
- * recognise by name, plus an "unknown premium" fallback that assumes the
+ * Conservative defaults for models we've never seen — one for each cost tier
+ * the taxonomy assigns, plus an "unknown premium" fallback that assumes the
  * highest rate we know of. The goal is to over-estimate cost for a brand-new
  * model so a budget-capped user gets blocked at the cap instead of silently
  * overshooting it while we wait for a pricing-table update.
  */
 const UNKNOWN_PREMIUM_RATE: PricingEntry = { inputPerMillion: 10.5, outputPerMillion: 30 };
-const UNKNOWN_PRO_RATE: PricingEntry = { inputPerMillion: 3.5, outputPerMillion: 10.5 };
 const UNKNOWN_FLASH_RATE: PricingEntry = { inputPerMillion: 0.3, outputPerMillion: 2.5 };
 const UNKNOWN_LITE_RATE: PricingEntry = { inputPerMillion: 0.1, outputPerMillion: 0.4 };
+
+/**
+ * The conservative rate per cost tier, for a model outside the text categories
+ * (image, audio, video, agent, unknown): the table prices no such family it could
+ * stand for, so a `premium` one gets the highest rate we know of.
+ */
+const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], PricingEntry>> = {
+  premium: UNKNOWN_PREMIUM_RATE,
+  standard: UNKNOWN_FLASH_RATE,
+  budget: UNKNOWN_LITE_RATE,
+  unknown: UNKNOWN_PREMIUM_RATE,
+};
+
+/** The cached-input rate a row bills: its own, else the 0.25× input default. */
+function cachedRate(row: PricingEntry): number {
+  return row.cachedInputPerMillion ?? row.inputPerMillion * 0.25;
+}
+
+/**
+ * The dearest rate the table knows for each text category, per component (the
+ * highest input, output and cached rate of its priced rows): an upper bound for an
+ * unpriced model of that category, read from the table instead of a fixed number.
+ */
+function dearestTextRates(): ReadonlyMap<ModelCategory, PricingEntry> {
+  const out = new Map<ModelCategory, PricingEntry>();
+  for (const [id, row] of Object.entries(DEFAULT_PRICING)) {
+    const category = categorizeModel(id);
+    if (!isTextGenCategory(category)) continue;
+    const held = out.get(category) ?? row;
+    out.set(category, {
+      inputPerMillion: Math.max(held.inputPerMillion, row.inputPerMillion),
+      outputPerMillion: Math.max(held.outputPerMillion, row.outputPerMillion),
+      cachedInputPerMillion: Math.max(cachedRate(held), cachedRate(row)),
+    });
+  }
+  return out;
+}
+
+const DEAREST_TEXT_RATES = dearestTextRates();
 
 function pricingFor(model: string): PricingEntry {
   const ov = loadOverrides();
   if (ov?.[model]) return ov[model];
   if (DEFAULT_PRICING[model]) return DEFAULT_PRICING[model];
-  // Fallback heuristic — name-based classification, conservative defaults.
-  // When the model name gives no useful signal we assume premium-tier rates
-  // rather than flash: better to block an over-budget user than let a
+  // An unpriced text model: the dearest rate of its category. Anything else: the
+  // conservative rate of its cost tier — a model the taxonomy cannot place gets the
+  // premium rate rather than flash: better to block an over-budget user than let a
   // never-seen model silently undercharge and blow past the cap.
-  const lower = model.toLowerCase();
-  if (lower.includes('lite')) return UNKNOWN_LITE_RATE;
-  if (lower.includes('flash')) return UNKNOWN_FLASH_RATE;
-  if (lower.includes('pro')) return UNKNOWN_PRO_RATE;
-  return UNKNOWN_PREMIUM_RATE;
+  return DEAREST_TEXT_RATES.get(categorizeModel(model)) ?? UNKNOWN_RATE_BY_TIER[costTierOf(model)];
 }
 
 export interface CostInputs {

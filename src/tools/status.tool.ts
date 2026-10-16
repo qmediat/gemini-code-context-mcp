@@ -68,6 +68,7 @@ export const statusTool: ToolDefinition<StatusInput> = {
           id: m.id,
           inputTokenLimit: m.inputTokenLimit,
           supportsThinking: m.supportsThinking,
+          supportsCaching: m.supportsCaching,
         })),
         workspaceState: ws
           ? {
@@ -164,7 +165,7 @@ export const statusTool: ToolDefinition<StatusInput> = {
           .slice(0, 8)
           .map(
             (m) =>
-              `  - ${m.id} (${m.inputTokenLimit?.toLocaleString() ?? '?'} in / ${m.outputTokenLimit?.toLocaleString() ?? '?'} out${m.supportsThinking ? ', thinking' : ''})`,
+              `  - ${m.id} (${m.inputTokenLimit?.toLocaleString() ?? '?'} in / ${m.outputTokenLimit?.toLocaleString() ?? '?'} out${m.supportsThinking ? ', thinking' : ''}${m.supportsCaching ? '' : ', no explicit cache'})`,
           ),
         '',
         ws ? 'workspace cache:' : 'workspace cache: (none yet — ask or code will create it)',

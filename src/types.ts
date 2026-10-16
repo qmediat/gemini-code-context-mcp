@@ -32,6 +32,8 @@ export interface ResolvedModel {
    * cost tier). Multiple can apply to a single model.
    */
   capabilities: import('./gemini/model-taxonomy.js').CapabilityFlags;
+  /** The model accepts an explicit Context Cache (`caches.create`); see `ModelInfo.supportsCaching`. */
+  supportsCaching: boolean;
 }
 
 /** Canonical workspace row stored in the manifest DB. */

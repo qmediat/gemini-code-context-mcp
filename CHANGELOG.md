@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gemini 4 codenames are classified: `gemini-4-argon` (and a point release such as `gemini-4.1-argon`) is
+  `text-reasoning` at the `premium` cost tier; an `-image` / `-tts` / `-live` variant keeps its specialised category and
+  an `-argon-lite` / `-argon-flash` variant its tier.
+- `latest-pro`, `latest-pro-thinking` and `latest-vision` resolve to `gemini-4-argon` when the key lists it beside
+  `gemini-3.1-pro-preview`: the model list is ranked by the taxonomy's category and cost tier instead of a `pro` /
+  `flash` substring of the ID. The `status` listing leads with the text models.
+- A price row for `gemini-4-argon`: 4 / 20 / 0.2 USD per 1M input / output / cached tokens, Google's rate from
+  2026-12-01. Through 2026-11-30 Google bills 2 / 10 / 0.1, so until then the estimate is 2× high — the conservative
+  side; `GEMINI_PRICING_OVERRIDES` gives the lower rate.
+- `ask` and `code` report `cachingMode` (the mode the call ran with) and, when it differs from the one requested,
+  `cachingModeNote`; the `cachingMode` input's description says when `'explicit'` runs as `'implicit'`.
+- `status` lists `supportsCaching` for each available model (and `no explicit cache` in its text listing).
+
+### Fixed
+
+- `ask` with `gemini-4-argon` no longer refuses the model as `unknown`.
+- `latest-pro` / `latest-pro-thinking` / `latest-flash` / `latest-lite` no longer resolve to a rolling unversioned
+  `gemini-*-latest` alias (which Google points at an older model) when a versioned id is listed; a `-latest` id that
+  carries a version keeps its version rank.
+- `latest-lite` (and every alias) picks a GA id before its `-preview` twin (`gemini-3.1-flash-lite` over
+  `gemini-3.1-flash-lite-preview`), and version numbers compare as numbers (`gemini-3.10-*` above `gemini-3.9-*`).
+- `cachingMode: 'explicit'` on a model without `createCachedContent` (`gemini-4-argon`) no longer uploads the files and
+  attempts a cache that can only fail: the call runs implicit and says so.
+- When `caches.create` fails and the files go without a cache, `ask` / `code` and the usage telemetry record
+  `cachingMode: 'implicit'` (with a `cachingModeNote` naming the failed create) instead of `explicit`: `explicit` now
+  means a Context Cache served the call.
+- A model the price table does not list is priced by its taxonomy category instead of a `pro` / `flash` / `lite`
+  substring of its id: an unpriced text model gets the dearest rate the table knows for its category (text-reasoning
+  today: 4 / 20 input / output, 0.875 cached — until now 3.5 / 10.5 for a `-pro` id), any other model the
+  conservative rate of its cost tier (10.5 / 30 for a premium one).
+- Price rows for Google's rolling aliases, as the model each points at today: `gemini-pro-latest` as `gemini-2.5-pro`,
+  `gemini-flash-latest` as `gemini-2.5-flash`, `gemini-flash-lite-latest` as `gemini-2.5-flash-lite`.
+
 ### Changed
 
 - Development only: `npm run lint` checks the structure of the code with a shared preset beside Biome (ESLint with

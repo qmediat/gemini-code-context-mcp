@@ -36,6 +36,7 @@ function mkModel(): ResolvedModel {
     requested: 'latest-pro-thinking',
     resolved: 'gemini-3-pro-preview',
     fallbackApplied: false,
+    supportsCaching: true,
     inputTokenLimit: 1_000_000,
     outputTokenLimit: 65_536,
     category: 'text-reasoning',
