@@ -11,8 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The cost estimate and the recorded spend use the rates of Google's pricing page (read 2026-10-16, Standard tier) with
   the dates they take effect, instead of a "conservative" later rate booked today: a row may carry `next` rates from a
-  UTC date on, and a call is priced at the rate in force on the UTC day it is priced (the reservation when it is made, the settled
-  cost when the call returns).
+  UTC date on. A settled call is priced at the rate in force when it settles; a daily-budget reservation at the dearer
+  of the rates in force when it is made and when the call's timeout ends (each `ask_agentic` iteration on its own, with
+  its iteration timeout; a call without a timeout at the dearest rate announced), so a call that crosses a price change
+  never settles above its reservation.
   `gemini-4-argon` bills 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2 from
   2026-12-01 — this corrects 1.22.0's row, which booked the December rate from the start.
 - Rows brought up to the page: `gemini-3.1-pro-preview` and `gemini-3-pro-preview` 4 / 18 / 0.4 (the > 200k-token tier;
@@ -32,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A rolling alias prices at the dearest rate of its measured target's category (Google may move an alias to a dearer
   model between two measurements), never as a row of its own; an override keyed by the alias id wins, then an override
   of its target.
+- `GEMINI_PRICING_OVERRIDES` entries are validated when first read: an entry with a rate that is not a finite number
+  ≥ 0, or a `next` without a `YYYY-MM-DD` `from` or without all three rates, is dropped with a warning naming the model
+  and the reason (until now it was taken as it came and could price every call at the later rate or book `NaN`); an
+  unparseable value is said, not ignored silently. A model id named like an Object prototype member (`constructor`) is
+  priced by the fallback instead of `NaN`.
+- The bound for an unpriced text model or an alias is computed over the table with the overrides on top, so an override
+  that adds a dearer model of the category lifts it.
 - The bound for an unpriced text model is the dearest rate its category has in force on the day, so the new rows raise
   it: an unpriced `text-fast` model is priced at 0.75 / 3.75 (1.5 / 7.5 from 2027-01-01; was 0.3 / 2.5), an unpriced
   `text-lite` one at 0.3 / 2.5 (was 0.1 / 0.4), an unpriced `text-reasoning` one at 4 / 18 / 0.4 (4 / 20 / 0.4 from

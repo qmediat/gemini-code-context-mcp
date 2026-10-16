@@ -200,6 +200,7 @@ describe('service tier (1.19.0)', () => {
       workspaceBytes: 400_000,
       promptChars: 40,
       expectedOutputTokens: 100,
+      coverMs: null,
     };
     expect(estimatePreCallCostUsd({ ...pre, serviceTier: 'flex' })).toBeCloseTo(
       estimatePreCallCostUsd(pre) * FLEX_PRICE_FACTOR,

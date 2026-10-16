@@ -147,7 +147,7 @@ Gemini prices change; our estimator ships with defaults verified at build time. 
 }
 ```
 
-All three rate fields are in USD per million tokens. `cachedInputPerMillion` is optional — when omitted, the estimator charges cached tokens at 25 % of the `inputPerMillion` rate, so name it when the real cached rate differs (Google's is 10 % of input on the current models). An override replaces the whole row, its dated `next` rates included: add `"next":{"from":"YYYY-MM-DD","inputPerMillion":…,"outputPerMillion":…,"cachedInputPerMillion":…}` to keep an announced price change.
+All three rate fields are in USD per million tokens. `cachedInputPerMillion` is optional — when omitted, the estimator charges cached tokens at 25 % of the `inputPerMillion` rate, so name it when the real cached rate differs (Google's is 10 % of input on the current models). An override replaces the whole row, its dated `next` rates included: add `"next":{"from":"YYYY-MM-DD","inputPerMillion":…,"outputPerMillion":…,"cachedInputPerMillion":…}` to keep an announced price change. Each entry is checked when the server first prices a call: the rates must be finite numbers ≥ 0, and a `next` needs a `YYYY-MM-DD` `from` and all three rates; an entry that fails is dropped with one warning naming the model and the reason, and the built-in row stays. An override of a model the table does not list also raises the bound an unpriced model or alias of its category is priced at.
 
 A rolling alias (`gemini-pro-latest`, `gemini-flash-latest`, `gemini-flash-lite-latest`) takes, in this order: an
 override keyed by the alias id itself; else an override of its measured target (`gemini-flash-latest` →

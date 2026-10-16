@@ -11,6 +11,7 @@
 
 import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
 import { categorizeModel, costTierOf, isTextGenCategory } from '../gemini/model-taxonomy.js';
+import { parsePricingOverrides } from './pricing-overrides.js';
 
 /** One set of rates, USD per 1M tokens. */
 export interface Rates {
@@ -103,37 +104,21 @@ const DEFAULT_PRICING: Readonly<Record<string, PricingEntry>> = {
  * only names the category: Google can move an alias to a dearer model between two
  * measurements, so an alias prices at the dearest rate of its target's category.
  */
+// Exported for the tests, which check every target is a priced id.
 export const ALIAS_TARGET: Readonly<Record<string, string>> = {
   'gemini-pro-latest': 'gemini-3.1-pro-preview',
   'gemini-flash-latest': 'gemini-3.8-flash',
   'gemini-flash-lite-latest': 'gemini-3.5-flash-lite',
 };
 
-/** The ids the table prices (an alias is never one of them). */
-export function isPricedId(id: string): boolean {
-  return Object.hasOwn(DEFAULT_PRICING, id);
+/** `record[key]` when `key` is the record's own (never a prototype member such as `constructor`). */
+function own<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
-let overrides: Record<string, PricingEntry> | null = null;
-
-function loadOverrides(): Record<string, PricingEntry> | null {
-  if (overrides !== null) return overrides;
-  const raw = process.env.GEMINI_PRICING_OVERRIDES;
-  if (!raw) {
-    overrides = {};
-    return overrides;
-  }
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      overrides = parsed as Record<string, PricingEntry>;
-    } else {
-      overrides = {};
-    }
-  } catch {
-    overrides = {};
-  }
-  return overrides;
+/** The ids the table prices (an alias is never one of them). Exported for the tests. */
+export function isPricedId(id: string): boolean {
+  return own(DEFAULT_PRICING, id) !== undefined;
 }
 
 /**
@@ -170,22 +155,26 @@ function utcDate(at: Date): string {
 }
 
 /** The rates of `entry` in force at `at`: its `next` rates from their UTC date on. */
-export function ratesAt(entry: PricingEntry, at: Date): Rates {
+function ratesAt(entry: PricingEntry, at: Date): Rates {
   const next = entry.next;
   if (next === undefined || utcDate(at) < next.from) return entry;
   return next;
 }
 
 /**
- * The dearest rate the table has in force at `at` for a text category, per
- * component (the highest input, output and cached rate of its rows): an upper bound
- * for an unpriced model or an alias of that category, or `undefined` for a category
- * the table prices no text row of.
+ * The dearest rate `rows` have in force at `at` for a text category, per component
+ * (the highest input, output and cached rate of its rows): an upper bound for an
+ * unpriced model or an alias of that category, or `undefined` for a category no
+ * text row prices.
  */
-function dearestTextRate(category: ModelCategory, at: Date): Rates | undefined {
+function dearestTextRate(
+  category: ModelCategory,
+  at: Date,
+  rows: Readonly<Record<string, PricingEntry>>,
+): Rates | undefined {
   if (!isTextGenCategory(category)) return undefined;
   let held: Rates | undefined;
-  for (const [id, entry] of Object.entries(DEFAULT_PRICING)) {
+  for (const [id, entry] of Object.entries(rows)) {
     if (categorizeModel(id) !== category) continue;
     const row = ratesAt(entry, at);
     held = {
@@ -197,7 +186,10 @@ function dearestTextRate(category: ModelCategory, at: Date): Rates | undefined {
   return held;
 }
 
-/** Where a model's price can come from, in the order `pricedRow` reads them. */
+/**
+ * Where a model's price can come from, in the order `pricedRow` reads them.
+ * Exported with `pricedRow` for the tests.
+ */
 export interface PricingSources {
   overrides: Readonly<Record<string, PricingEntry>>;
   aliasTarget: Readonly<Record<string, string>>;
@@ -210,28 +202,44 @@ export interface PricingSources {
  * prices as a row — neither its own nor its target's); else the id's row.
  */
 export function pricedRow(model: string, src: PricingSources): PricingEntry | undefined {
-  if (src.overrides[model]) return src.overrides[model];
-  const target = src.aliasTarget[model];
-  if (target !== undefined) return src.overrides[target];
-  return src.rows[model];
+  const override = own(src.overrides, model);
+  if (override !== undefined) return override;
+  const target = own(src.aliasTarget, model);
+  if (target !== undefined) return own(src.overrides, target);
+  return own(src.rows, model);
+}
+
+/** The pricing sources, and the rows the category bound reads: the table with the overrides on top. */
+interface LoadedPricing {
+  sources: PricingSources;
+  boundRows: Readonly<Record<string, PricingEntry>>;
+}
+
+let loaded: LoadedPricing | null = null;
+
+function loadPricing(): LoadedPricing {
+  if (loaded !== null) return loaded;
+  const overrides = parsePricingOverrides(process.env.GEMINI_PRICING_OVERRIDES);
+  const boundRows: Record<string, PricingEntry> = { ...DEFAULT_PRICING };
+  for (const [id, entry] of Object.entries(overrides)) {
+    // An alias never prices as a row, so its override never sets a category's bound.
+    if (own(ALIAS_TARGET, id) === undefined) boundRows[id] = entry;
+  }
+  loaded = { sources: { overrides, aliasTarget: ALIAS_TARGET, rows: DEFAULT_PRICING }, boundRows };
+  return loaded;
 }
 
 function pricingFor(model: string, at: Date): Rates {
-  const sources = {
-    overrides: loadOverrides() ?? {},
-    aliasTarget: ALIAS_TARGET,
-    rows: DEFAULT_PRICING,
-  };
+  const { sources, boundRows } = loadPricing();
   const row = pricedRow(model, sources);
   if (row) return ratesAt(row, at);
   // An alias or an unpriced text model: the dearest rate of its category (an alias's
   // is its measured target's). Anything else: the conservative rate of its cost tier —
   // a model the taxonomy cannot place gets the premium rate rather than flash: better
   // to block an over-budget user than let a never-seen model undercharge past the cap.
-  const categoryId = ALIAS_TARGET[model] ?? model;
-  return (
-    dearestTextRate(categorizeModel(categoryId), at) ?? UNKNOWN_RATE_BY_TIER[costTierOf(categoryId)]
-  );
+  const categoryId = own(sources.aliasTarget, model) ?? model;
+  const bound = dearestTextRate(categorizeModel(categoryId), at, boundRows);
+  return bound ?? UNKNOWN_RATE_BY_TIER[costTierOf(categoryId)];
 }
 
 export interface CostInputs {
@@ -243,9 +251,9 @@ export interface CostInputs {
   outputTokens: number;
   thinkingTokens?: number;
   /**
-   * The moment whose rates apply. Defaults to now: a settled call is priced as it
-   * settles, a reservation as it is made — the same UTC day but for a call that
-   * straddles midnight.
+   * The moment whose rates apply. Defaults to now: a settled call is priced at the
+   * rates in force when it settles; a reservation goes through
+   * `estimateReservationUsd`, which covers the call's whole window.
    */
   at?: Date | undefined;
 }
@@ -270,6 +278,21 @@ export function estimateCostUsd(input: CostInputs): number {
   return (uncached + cached + output + thinking) * tierFactor(input.serviceTier);
 }
 
+/** A date after every announced price change: where a call without a timeout may still be running. */
+const OPEN_END = new Date('9999-12-31T00:00:00Z');
+
+/**
+ * A reservation for a call that may run up to `coverMs` (its timeout; `null`: none):
+ * the dearer of the cost at the rates in force at its start and at the end of that
+ * window, so a call that crosses a price change settles at or under what it reserved.
+ * A call without a timeout reserves at every rate announced.
+ */
+export function estimateReservationUsd(input: CostInputs, coverMs: number | null): number {
+  const start = input.at ?? new Date();
+  const end = coverMs === null ? OPEN_END : new Date(start.getTime() + coverMs);
+  return Math.max(estimateCostUsd({ ...input, at: start }), estimateCostUsd({ ...input, at: end }));
+}
+
 export function toMicrosUsd(dollars: number): number {
   return Math.round(dollars * 1_000_000);
 }
@@ -287,6 +310,10 @@ export interface PreCallEstimateInputs {
   expectedOutputTokens: number;
   /** Thinking budget, passed through as extra output tokens. */
   thinkingTokens?: number;
+  /** The call's timeout in ms (`null`: none): the reservation covers the rates of that window. */
+  coverMs: number | null;
+  /** When the reservation is made. Defaults to now. */
+  at?: Date | undefined;
 }
 
 /**
@@ -301,14 +328,16 @@ export interface PreCallEstimateInputs {
 export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   const workspaceTokens = Math.ceil(Math.max(0, input.workspaceBytes) / 4);
   const promptTokens = Math.ceil(Math.max(0, input.promptChars) / 4);
-  return estimateCostUsd({
+  const call: CostInputs = {
     model: input.model,
     serviceTier: input.serviceTier,
     uncachedInputTokens: workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0),
     cachedInputTokens: 0,
     outputTokens: Math.max(0, input.expectedOutputTokens),
+    at: input.at,
     ...(input.thinkingTokens !== undefined ? { thinkingTokens: input.thinkingTokens } : {}),
-  });
+  };
+  return estimateReservationUsd(call, input.coverMs);
 }
 
 /**

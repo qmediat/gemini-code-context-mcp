@@ -47,7 +47,7 @@ import {
   WorkspaceValidationError,
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
-import { estimateCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
+import { estimateCostUsd, estimateReservationUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { SandboxError, resolveInsideWorkspace, resolveWorkspaceRoot } from './agentic/sandbox.js';
@@ -58,7 +58,12 @@ import {
   readFileExecutor,
 } from './agentic/workspace-tools.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import {
+  createTimeoutController,
+  getTimeoutKind,
+  isTimeoutAbort,
+  resolveTotalTimeoutMs,
+} from './shared/abort-timeout.js';
 import { collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_AGENTIC } from './shared/system-instruction-safety.js';
 import { THINKING_LEVELS } from './shared/thinking.js';
@@ -732,18 +737,31 @@ async function executeAskAgenticBody(
     const PER_ITERATION_INPUT_TOKENS = 50_000;
     const PER_ITERATION_OUTPUT_TOKENS =
       typeof input.maxOutputTokens === 'number' ? input.maxOutputTokens : 4096;
-    const perIterationCostUsd = estimateCostUsd({
-      model: resolved.resolved,
-      uncachedInputTokens: PER_ITERATION_INPUT_TOKENS,
-      cachedInputTokens: 0,
-      outputTokens: PER_ITERATION_OUTPUT_TOKENS,
-      thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
-    });
+    // The longest an iteration (or the finalization pass) can run: the window
+    // each reservation covers.
+    const iterationCoverMs = resolveTotalTimeoutMs(
+      input.iterationTimeoutMs,
+      'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS',
+    );
     const dailyBudgetEnforced = Number.isFinite(ctx.config.dailyBudgetUsd);
     const tpmEnforced = ctx.config.tpmThrottleLimit > 0;
 
     while (iterations < maxIterations) {
       iterations += 1;
+
+      // Priced per iteration, covering the rates in force until its timeout: a
+      // loop that crosses a price change reserves at the new rate, so each
+      // reservation stays an upper bound of what its settlement books.
+      const perIterationCostUsd = estimateReservationUsd(
+        {
+          model: resolved.resolved,
+          uncachedInputTokens: PER_ITERATION_INPUT_TOKENS,
+          cachedInputTokens: 0,
+          outputTokens: PER_ITERATION_OUTPUT_TOKENS,
+          thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
+        },
+        iterationCoverMs,
+      );
 
       // Per-iteration budget reservation (mirrors ask.tool.ts). Each
       // iteration is an independent generateContent billable, so each
@@ -1237,13 +1255,16 @@ async function executeAskAgenticBody(
       lastIterationPromptTokens > 0
         ? lastIterationPromptTokens + lastToolResponseTokens + 5_000
         : PER_ITERATION_INPUT_TOKENS;
-    const finalizationCostUsd = estimateCostUsd({
-      model: resolved.resolved,
-      uncachedInputTokens: finalizationEstimate,
-      cachedInputTokens: 0,
-      outputTokens: PER_ITERATION_OUTPUT_TOKENS,
-      thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
-    });
+    const finalizationCostUsd = estimateReservationUsd(
+      {
+        model: resolved.resolved,
+        uncachedInputTokens: finalizationEstimate,
+        cachedInputTokens: 0,
+        outputTokens: PER_ITERATION_OUTPUT_TOKENS,
+        thinkingTokens: PER_ITERATION_OUTPUT_TOKENS,
+      },
+      iterationCoverMs,
+    );
 
     if (dailyBudgetEnforced) {
       const reserve = ctx.manifest.reserveBudget({

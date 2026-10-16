@@ -535,6 +535,7 @@ async function executeCodeBody(
         promptChars: input.task.length,
         expectedOutputTokens: effectiveOutputCap,
         thinkingTokens: thinkingTokensForEstimate,
+        coverMs: timeoutController.timeoutMs,
       });
       const reserve = ctx.manifest.reserveBudget({
         workspaceRoot,

@@ -6,8 +6,11 @@ Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by c
 
 ## The estimator's rates
 
-USD per 1M tokens, input / output / cached input. The estimator prices a call at the rate in force on the UTC day it is
-priced: a reservation when it is made, the settled cost when the call returns.
+USD per 1M tokens, input / output / cached input. A settled call is priced at the rate in force on the UTC day it
+settles. A daily-budget reservation covers every rate the call can settle under: the dearer of the rate in force when it
+is made and the rate in force when the call's timeout ends (`timeoutMs`; `ask_agentic`: each iteration's timeout, priced
+per iteration). A call without a timeout reserves at the dearest rate announced, so a call that crosses a price change
+never settles above its reservation.
 
 | Model | Rate | From |
 |---|---|---|
@@ -32,7 +35,8 @@ Rules the estimator keeps, so a daily budget stays an upper bound:
   rate of their measured target's category (targets measured 2026-10-16: `gemini-3.1-pro-preview`, `gemini-3.8-flash`,
   `gemini-3.5-flash-lite`): Google may move an alias to a dearer model between two measurements.
 - **An unpriced model** (`gemini-3.5-flash`, which the page does not list, or a model newer than this table) prices at
-  the dearest rate its category has in force on the day; a model outside the text categories at the conservative rate
+  the dearest rate its category has in force on the day, `GEMINI_PRICING_OVERRIDES` rows included (an override that
+  adds a dearer model lifts the bound); a model outside the text categories at the conservative rate
   of its cost tier (10.5 / 30 for a premium one).
 
 ## What Gemini bills for

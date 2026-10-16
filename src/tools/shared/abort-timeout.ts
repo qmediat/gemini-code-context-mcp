@@ -97,6 +97,20 @@ function readEnvMs(envVarName: string): number {
 }
 
 /**
+ * The total wall-clock cap a controller built from `totalMs` / `totalEnvVar` keeps,
+ * in ms, or `null` when it keeps none — the bound a budget reservation covers
+ * before the controller exists.
+ */
+export function resolveTotalTimeoutMs(
+  totalMs: number | undefined,
+  totalEnvVar: string,
+): number | null {
+  const requested = totalMs !== undefined ? totalMs : readEnvMs(totalEnvVar);
+  if (!Number.isFinite(requested) || requested <= 0) return null;
+  return Math.max(ABSOLUTE_MIN_MS, Math.min(ABSOLUTE_MAX_MS, Math.floor(requested)));
+}
+
+/**
  * Build a composite controller for a tool dispatch.
  *
  * The returned `signal` fires on EITHER (a) the wall-clock cap (`timeoutMs`)
@@ -116,12 +130,7 @@ function readEnvMs(envVarName: string): number {
  * callers (`ask`, `code`, `ask_agentic`) now pass options.
  */
 export function createTimeoutController(opts: CreateTimeoutControllerOpts): TimeoutController {
-  // Resolve total wall-clock cap.
-  const totalRequested = opts.totalMs !== undefined ? opts.totalMs : readEnvMs(opts.totalEnvVar);
-  const totalEffective =
-    Number.isFinite(totalRequested) && totalRequested > 0
-      ? Math.max(ABSOLUTE_MIN_MS, Math.min(ABSOLUTE_MAX_MS, Math.floor(totalRequested)))
-      : 0;
+  const totalEffective = resolveTotalTimeoutMs(opts.totalMs, opts.totalEnvVar) ?? 0;
 
   // Resolve stall watchdog.
   const stallRequested = opts.stallMs !== undefined ? opts.stallMs : readEnvMs(opts.stallEnvVar);

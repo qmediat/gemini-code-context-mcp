@@ -3,6 +3,7 @@ import {
   ALIAS_TARGET,
   type PricingEntry,
   estimateCostUsd,
+  estimatePreCallCostUsd,
   isPricedId,
   microsToDollars,
   pricedRow,
@@ -41,6 +42,15 @@ function outputRate(model: string, at: Date = READ_DAY): number {
   return cost(model, { cached: 0, at }) - inputRate(model, at);
 }
 
+type Estimator = typeof import('../../src/utils/cost-estimator.js');
+
+/** The estimator loaded afresh with `overrides` as GEMINI_PRICING_OVERRIDES. */
+async function estimatorWith(overrides: unknown): Promise<Estimator> {
+  vi.resetModules();
+  vi.stubEnv('GEMINI_PRICING_OVERRIDES', JSON.stringify(overrides));
+  return import('../../src/utils/cost-estimator.js');
+}
+
 describe('cost estimator', () => {
   // A developer's own overrides must not change what these tests price.
   beforeEach(() => {
@@ -48,6 +58,7 @@ describe('cost estimator', () => {
   });
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.resetModules();
   });
 
   it('prices pro models higher than flash', () => {
@@ -157,17 +168,49 @@ describe('cost estimator', () => {
 
     it("an override of an alias's target prices the alias (all three values named)", async () => {
       const lower = { inputPerMillion: 0.5, outputPerMillion: 2, cachedInputPerMillion: 0.05 };
-      vi.resetModules();
-      vi.stubEnv('GEMINI_PRICING_OVERRIDES', JSON.stringify({ 'gemini-3.8-flash': lower }));
-      try {
-        const fresh = await import('../../src/utils/cost-estimator.js');
-        expect(cost('gemini-flash-latest', { estimate: fresh.estimateCostUsd })).toBeCloseTo(
-          0.5 + 0.05 + 2,
-          9,
-        );
-      } finally {
-        vi.resetModules();
+      const fresh = await estimatorWith({ 'gemini-3.8-flash': lower });
+      expect(cost('gemini-flash-latest', { estimate: fresh.estimateCostUsd })).toBeCloseTo(
+        0.5 + 0.05 + 2,
+        9,
+      );
+    });
+
+    it('an override of a dearer model lifts the bound an alias and an unpriced id of its category take', async () => {
+      const dearer = { inputPerMillion: 6, outputPerMillion: 30, cachedInputPerMillion: 0.6 };
+      const fresh = await estimatorWith({ 'gemini-5-pro': dearer });
+      for (const model of ['gemini-pro-latest', 'gemini-6-hypothetical-pro']) {
+        expect(cost(model, { estimate: fresh.estimateCostUsd })).toBeCloseTo(6 + 0.6 + 30, 9);
       }
+    });
+  });
+
+  describe('a reservation covers every rate the call can settle under', () => {
+    /** The reserved input rate: 1M input tokens (4 bytes a token), nothing else. */
+    function reservedInputRate(at: string, coverMs: number | null): number {
+      return estimatePreCallCostUsd({
+        model: 'gemini-4-argon',
+        workspaceBytes: 4_000_000,
+        promptChars: 0,
+        expectedOutputTokens: 0,
+        coverMs,
+        at: new Date(at),
+      });
+    }
+
+    it('a call reserved at 23:30 UTC on 2026-11-30 with a 60-min timeout reserves at the 2026-12-01 rate', () => {
+      expect(reservedInputRate('2026-11-30T23:30:00Z', 60 * 60_000)).toBeCloseTo(4, 9);
+    });
+
+    it('a call reserved at 22:00 UTC on 2026-11-30 with a 60-min timeout reserves at the 2026-11-30 rate', () => {
+      expect(reservedInputRate('2026-11-30T22:00:00Z', 60 * 60_000)).toBeCloseTo(2, 9);
+    });
+
+    it('a call without a timeout reserves at every rate announced', () => {
+      expect(reservedInputRate('2026-10-16T12:00:00Z', null)).toBeCloseTo(4, 9);
+    });
+
+    it('a settled call is priced at the rate in force when it settles', () => {
+      expect(inputRate('gemini-4-argon', new Date('2026-11-30T23:30:00Z'))).toBeCloseTo(2, 9);
     });
   });
 
@@ -209,6 +252,12 @@ describe('cost estimator', () => {
       expect(outputRate('gemini-3.5-flash')).toBeCloseTo(3.75, 9);
       expect(inputRate('gemini-4-argon-lite')).toBeCloseTo(0.3, 9);
       expect(outputRate('gemini-4-argon-lite')).toBeCloseTo(2.5, 9);
+    });
+
+    it('an id named like an Object prototype member is priced by the fallback, never NaN', () => {
+      for (const model of ['constructor', 'toString', 'hasOwnProperty']) {
+        expect(inputRate(model)).toBeCloseTo(10.5, 9);
+      }
     });
 
     it('a non-text model takes the conservative rate of its tier, not a substring of its id', () => {
