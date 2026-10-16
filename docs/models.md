@@ -93,7 +93,9 @@ falling to a different category.
 
 Resolves to the newest pro-tier text model with thinking support. The model list is ranked by the taxonomy: the
 text categories first (reasoning, fast, lite, then the rest), the cost tier, versioned IDs before the rolling unversioned
-`-latest` aliases (`gemini-pro-latest` points at an older model), the ID descending with version numbers compared as
+`-latest` aliases (their target is never newer than the newest versioned ID — measured 2026-10-16: `gemini-pro-latest`
+serves `gemini-3.1-pro-preview`, `gemini-flash-latest` `gemini-3.8-flash`, `gemini-flash-lite-latest`
+`gemini-3.5-flash-lite`; each is priced as that target), the ID descending with version numbers compared as
 numbers (`3.10` above `3.9`), and a GA ID before its `-preview` twin. So `gemini-4-argon` wins over
 `gemini-3.1-pro-preview` and `gemini-pro-latest`, and every alias resolves to a versioned model whenever one is listed.
 Guaranteed to NOT pick up `nano-banana-pro-preview` even if it's in your

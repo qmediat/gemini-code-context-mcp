@@ -1,9 +1,9 @@
 /**
  * Approximate cost estimator for reporting (not billing authoritative).
  *
- * Rates are per million tokens and reflect public Gemini API pricing as of
- * 2026-04. Update when Google changes pricing; values can also be overridden
- * at runtime via `GEMINI_PRICING_OVERRIDES` (JSON).
+ * Rates are per million tokens, Standard tier, from public Gemini API pricing
+ * (https://ai.google.dev/gemini-api/docs/pricing). Update when Google changes
+ * pricing; values can also be overridden at runtime via `GEMINI_PRICING_OVERRIDES` (JSON).
  */
 
 import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
@@ -25,18 +25,41 @@ const DEFAULT_PRICING: Record<string, PricingEntry> = {
   'gemini-4-argon': { inputPerMillion: 4, outputPerMillion: 20, cachedInputPerMillion: 0.2 },
   'gemini-3-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3.1-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
+  // The 3.6–3.8 Flash, 3.5 Flash-Lite and 3.1 Flash-Lite rows: the pricing page read
+  // 2026-10-16. The three Flash rows carry Google's rate from 2027-01-01; through
+  // 2026-12-31 they bill 0.75 / 3.75 / 0.075,
+  // so until then the estimate is 2× high — the conservative side, as for Argon;
+  // `GEMINI_PRICING_OVERRIDES` gives the lower rate.
+  'gemini-3.8-flash': { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.15 },
+  'gemini-3.7-flash': { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.15 },
+  'gemini-3.6-flash': { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.15 },
   'gemini-3-flash-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
   'gemini-3.1-flash-image-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
+  'gemini-3.5-flash-lite': {
+    inputPerMillion: 0.3,
+    outputPerMillion: 2.5,
+    cachedInputPerMillion: 0.03,
+  },
+  'gemini-3.1-flash-lite': {
+    inputPerMillion: 0.25,
+    outputPerMillion: 1.5,
+    cachedInputPerMillion: 0.025,
+  },
   'gemini-3.1-flash-lite-preview': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
   'gemini-2.5-pro': { inputPerMillion: 2.5, outputPerMillion: 10 },
   'gemini-2.5-flash': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
   'gemini-2.5-flash-lite': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
-  // Google's rolling aliases, priced as the model they point at today: the model
-  // card says "Latest release of Gemini Pro" and Google's docs alias
-  // `gemini-pro-latest` to `gemini-2.5-pro` (the flash ones to 2.5-flash / -lite).
-  'gemini-pro-latest': { inputPerMillion: 2.5, outputPerMillion: 10 },
-  'gemini-flash-latest': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
-  'gemini-flash-lite-latest': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
+};
+
+/**
+ * Google's rolling aliases and the versioned id each serves, measured 2026-10-16
+ * by the response's `modelVersion`; re-measure when Google moves them. An alias
+ * prices as its target's row (or the target's override), never as a row of its own.
+ */
+const ALIAS_TARGET: Readonly<Record<string, string>> = {
+  'gemini-pro-latest': 'gemini-3.1-pro-preview',
+  'gemini-flash-latest': 'gemini-3.8-flash',
+  'gemini-flash-lite-latest': 'gemini-3.5-flash-lite',
 };
 
 let overrides: Record<string, PricingEntry> | null = null;
@@ -115,6 +138,8 @@ function pricingFor(model: string): PricingEntry {
   const ov = loadOverrides();
   if (ov?.[model]) return ov[model];
   if (DEFAULT_PRICING[model]) return DEFAULT_PRICING[model];
+  const target = ALIAS_TARGET[model];
+  if (target) return pricingFor(target);
   // An unpriced text model: the dearest rate of its category. Anything else: the
   // conservative rate of its cost tier — a model the taxonomy cannot place gets the
   // premium rate rather than flash: better to block an over-budget user than let a

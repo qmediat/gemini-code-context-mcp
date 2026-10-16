@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { estimateCostUsd, microsToDollars, toMicrosUsd } from '../../src/utils/cost-estimator.js';
 
 describe('cost estimator', () => {
@@ -64,16 +64,69 @@ describe('cost estimator', () => {
     }
   });
 
-  it('a rolling alias is priced as the model Google points it at (gemini-pro-latest = gemini-2.5-pro)', () => {
+  it('each rolling alias is priced as its measured target, not the 2.5 line', () => {
+    // Targets measured 2026-10-16 by the response's modelVersion.
     const cost = (model: string): number =>
       estimateCostUsd({
         model,
         uncachedInputTokens: 1_000_000,
+        cachedInputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+      });
+    const targets: ReadonlyArray<readonly [string, string, number]> = [
+      ['gemini-pro-latest', 'gemini-3.1-pro-preview', 3.5 + 0.875 + 10.5],
+      ['gemini-flash-latest', 'gemini-3.8-flash', 1.5 + 0.15 + 7.5],
+      ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 0.3 + 0.03 + 2.5],
+    ];
+    for (const [alias, target, expected] of targets) {
+      expect(cost(alias)).toBeCloseTo(cost(target), 9);
+      expect(cost(alias)).toBeCloseTo(expected, 6);
+    }
+  });
+
+  it("an override of an alias's target prices the alias too (the lower 2026 Flash rate)", async () => {
+    vi.resetModules();
+    vi.stubEnv(
+      'GEMINI_PRICING_OVERRIDES',
+      JSON.stringify({ 'gemini-3.8-flash': { inputPerMillion: 0.75, outputPerMillion: 3.75 } }),
+    );
+    try {
+      const fresh = await import('../../src/utils/cost-estimator.js');
+      const cost = fresh.estimateCostUsd({
+        model: 'gemini-flash-latest',
+        uncachedInputTokens: 1_000_000,
         cachedInputTokens: 0,
         outputTokens: 1_000_000,
       });
-    expect(cost('gemini-pro-latest')).toBeCloseTo(cost('gemini-2.5-pro'), 9);
-    expect(cost('gemini-pro-latest')).toBeCloseTo(2.5 + 10, 6);
+      expect(cost).toBeCloseTo(0.75 + 3.75, 6);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
+  it('prices gemini-3.8-flash at the 2027-01-01 rate (1.5 / 7.5 / 0.15 USD per 1M), the conservative one', () => {
+    for (const model of ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash']) {
+      const cost = estimateCostUsd({
+        model,
+        uncachedInputTokens: 1_000_000,
+        cachedInputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+      });
+      expect(cost).toBeCloseTo(1.5 + 0.15 + 7.5, 6);
+    }
+  });
+
+  it('prices the 3.x Flash-Lite GA rows from the 2026-10-16 pricing page', () => {
+    const cost = (model: string): number =>
+      estimateCostUsd({
+        model,
+        uncachedInputTokens: 1_000_000,
+        cachedInputTokens: 1_000_000,
+        outputTokens: 1_000_000,
+      });
+    expect(cost('gemini-3.5-flash-lite')).toBeCloseTo(0.3 + 0.03 + 2.5, 6);
+    expect(cost('gemini-3.1-flash-lite')).toBeCloseTo(0.25 + 0.025 + 1.5, 6);
   });
 
   it('an unpriced model is priced by its taxonomy category and tier, not by a substring of its id', () => {
@@ -85,8 +138,10 @@ describe('cost estimator', () => {
         cachedInputTokens: 0,
         outputTokens: 0,
       });
+    // A text model takes the dearest input rate of its category's rows:
+    // 0.3 for text-lite (3.5 Flash-Lite), 1.5 for text-fast (3.6–3.8 Flash).
     expect(cost('gemini-3-pro-image')).toBeCloseTo(10.5, 6);
-    expect(cost('gemini-4-argon-lite')).toBeCloseTo(0.1, 6);
-    expect(cost('gemini-9-flash')).toBeCloseTo(0.3, 6);
+    expect(cost('gemini-4-argon-lite')).toBeCloseTo(0.3, 6);
+    expect(cost('gemini-9-flash')).toBeCloseTo(1.5, 6);
   });
 });

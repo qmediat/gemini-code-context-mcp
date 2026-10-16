@@ -16,9 +16,11 @@ import {
 
 /**
  * Google's unversioned `-latest` ids (`gemini-pro-latest`, `gemini-flash-latest`,
- * `gemini-flash-lite-latest`) are rolling aliases whose target is older than the
- * newest versioned id (`gemini-pro-latest` points at `gemini-2.5-pro`); the
- * `latest-*` aliases here must pick a versioned model, so these rank after it.
+ * `gemini-flash-lite-latest`) are rolling aliases whose target is never newer than
+ * the newest versioned id (measured 2026-10-16 by the response's `modelVersion`:
+ * `gemini-pro-latest` serves `gemini-3.1-pro-preview` while `gemini-4-argon` is
+ * listed, `gemini-flash-latest` serves `gemini-3.8-flash`); the `latest-*` aliases
+ * here must pick a versioned model, so these rank after it.
  * An id that carries a version digit is a versioned model whatever its suffix.
  */
 function isRollingAlias(id: string): boolean {

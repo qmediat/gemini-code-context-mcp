@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The rolling aliases are priced as their measured targets (3.1-pro-preview, 3.8-flash, 3.5-flash-lite), not the 2.5
+  line: on 2026-10-16 the response's `modelVersion` showed `gemini-pro-latest` serving `gemini-3.1-pro-preview`,
+  `gemini-flash-latest` `gemini-3.8-flash` and `gemini-flash-lite-latest` `gemini-3.5-flash-lite`. This corrects
+  1.22.0's entry, which priced them as `gemini-2.5-pro` / `-flash` / `-flash-lite`. An alias now prices as its target's
+  row, so an override of the target (`GEMINI_PRICING_OVERRIDES`) prices the alias too.
+- Rows for the 3.5–3.8 Flash line and 3.5 Flash-Lite (Standard tier, Google's pricing page read 2026-10-16), which until
+  now fell to the derived fallback: `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash` at 1.5 / 7.5 / 0.15 USD
+  per 1M input / output / cached tokens — Google's rate from 2027-01-01; through 2026-12-31 they bill 0.75 / 3.75 /
+  0.075, so the estimate is 2× high until then (the conservative side; `GEMINI_PRICING_OVERRIDES` gives the lower rate)
+  —, `gemini-3.5-flash-lite` at 0.3 / 2.5 / 0.03 and `gemini-3.1-flash-lite` at 0.25 / 1.5 / 0.025.
+- An unpriced model is priced at the dearest rate the table knows for its category, so the new rows raise that bound:
+  an unpriced `text-fast` model is now priced at 1.5 / 7.5 (was 0.3 / 2.5), an unpriced `text-lite` one at 0.3 / 2.5
+  (was 0.1 / 0.4).
+
 ## [1.22.0] - 2026-10-16
 
 ### Added
