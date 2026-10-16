@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.1] - 2026-10-16
+
 ### Fixed
 
 - The cost estimate and the recorded spend use the rates of Google's pricing page (read 2026-10-16, Standard tier) with
@@ -1728,7 +1730,8 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.0...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.1...HEAD
+[1.22.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.0...v1.22.1
 [1.22.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.21.0...v1.22.0
 [1.21.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.20.0...v1.21.0
 [1.0.0]: https://github.com/qmediat/gemini-code-context-mcp/releases/tag/v1.0.0
