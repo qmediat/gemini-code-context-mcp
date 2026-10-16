@@ -20,16 +20,17 @@ const DEFAULT_PRICING: Record<string, PricingEntry> = {
   // Conservative defaults — if the actual rate is lower, users see a pleasant surprise.
   // Google's rate from 2026-12-01. Through 2026-11-30 it bills 2 / 10 / 0.1, so
   // until then this over-estimates by 2× — the conservative side this table keeps,
-  // so a budget stays an upper bound. `GEMINI_PRICING_OVERRIDES` gives the lower
-  // rate to whoever wants the exact figure now.
+  // so a budget stays an upper bound. The exact figure now, all three values named
+  // (an override without `cachedInputPerMillion` bills cached input at 0.25× input):
+  //   GEMINI_PRICING_OVERRIDES='{"gemini-4-argon":{"inputPerMillion":2,"outputPerMillion":10,"cachedInputPerMillion":0.1}}'
   'gemini-4-argon': { inputPerMillion: 4, outputPerMillion: 20, cachedInputPerMillion: 0.2 },
   'gemini-3-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3.1-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   // The 3.6–3.8 Flash, 3.5 Flash-Lite and 3.1 Flash-Lite rows: the pricing page read
   // 2026-10-16. The three Flash rows carry Google's rate from 2027-01-01; through
-  // 2026-12-31 they bill 0.75 / 3.75 / 0.075,
-  // so until then the estimate is 2× high — the conservative side, as for Argon;
-  // `GEMINI_PRICING_OVERRIDES` gives the lower rate.
+  // 2026-12-31 they bill 0.75 / 3.75 / 0.075, so until then the estimate is 2× high —
+  // the conservative side, as for Argon. The exact figure now, per id, all three values:
+  //   GEMINI_PRICING_OVERRIDES='{"gemini-3.8-flash":{"inputPerMillion":0.75,"outputPerMillion":3.75,"cachedInputPerMillion":0.075}}'
   'gemini-3.8-flash': { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.15 },
   'gemini-3.7-flash': { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.15 },
   'gemini-3.6-flash': { inputPerMillion: 1.5, outputPerMillion: 7.5, cachedInputPerMillion: 0.15 },
@@ -45,7 +46,12 @@ const DEFAULT_PRICING: Record<string, PricingEntry> = {
     outputPerMillion: 1.5,
     cachedInputPerMillion: 0.025,
   },
-  'gemini-3.1-flash-lite-preview': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
+  // The same model as the GA row: the page prices it once.
+  'gemini-3.1-flash-lite-preview': {
+    inputPerMillion: 0.25,
+    outputPerMillion: 1.5,
+    cachedInputPerMillion: 0.025,
+  },
   'gemini-2.5-pro': { inputPerMillion: 2.5, outputPerMillion: 10 },
   'gemini-2.5-flash': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
   'gemini-2.5-flash-lite': { inputPerMillion: 0.1, outputPerMillion: 0.4 },
@@ -54,7 +60,8 @@ const DEFAULT_PRICING: Record<string, PricingEntry> = {
 /**
  * Google's rolling aliases and the versioned id each serves, measured 2026-10-16
  * by the response's `modelVersion`; re-measure when Google moves them. An alias
- * prices as its target's row (or the target's override), never as a row of its own.
+ * prices as its target (the target's override, then its row), never as a row of its
+ * own; a target that is itself an alias or has no row gets the fallback.
  */
 const ALIAS_TARGET: Readonly<Record<string, string>> = {
   'gemini-pro-latest': 'gemini-3.1-pro-preview',
@@ -134,12 +141,34 @@ function dearestTextRates(): ReadonlyMap<ModelCategory, PricingEntry> {
 
 const DEAREST_TEXT_RATES = dearestTextRates();
 
+/** Where a model's price can come from, in the order `pricedRow` reads them. */
+export interface PricingSources {
+  overrides: Readonly<Record<string, PricingEntry>>;
+  aliasTarget: Readonly<Record<string, string>>;
+  rows: Readonly<Record<string, PricingEntry>>;
+}
+
+/**
+ * The priced row for `model`, or `undefined` when the caller's fallback applies:
+ * an override of the id itself, then — for an alias — its target's override or row
+ * (one hop, no recursion: a target that is an alias prices nothing), else the id's row.
+ */
+export function pricedRow(model: string, src: PricingSources): PricingEntry | undefined {
+  if (src.overrides[model]) return src.overrides[model];
+  const target = src.aliasTarget[model];
+  if (target === undefined) return src.rows[model];
+  if (src.aliasTarget[target] !== undefined) return undefined;
+  return src.overrides[target] ?? src.rows[target];
+}
+
 function pricingFor(model: string): PricingEntry {
-  const ov = loadOverrides();
-  if (ov?.[model]) return ov[model];
-  if (DEFAULT_PRICING[model]) return DEFAULT_PRICING[model];
-  const target = ALIAS_TARGET[model];
-  if (target) return pricingFor(target);
+  const sources = {
+    overrides: loadOverrides() ?? {},
+    aliasTarget: ALIAS_TARGET,
+    rows: DEFAULT_PRICING,
+  };
+  const row = pricedRow(model, sources);
+  if (row) return row;
   // An unpriced text model: the dearest rate of its category. Anything else: the
   // conservative rate of its cost tier — a model the taxonomy cannot place gets the
   // premium rate rather than flash: better to block an over-budget user than let a

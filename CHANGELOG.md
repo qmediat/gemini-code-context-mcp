@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per 1M input / output / cached tokens — Google's rate from 2027-01-01; through 2026-12-31 they bill 0.75 / 3.75 /
   0.075, so the estimate is 2× high until then (the conservative side; `GEMINI_PRICING_OVERRIDES` gives the lower rate)
   —, `gemini-3.5-flash-lite` at 0.3 / 2.5 / 0.03 and `gemini-3.1-flash-lite` at 0.25 / 1.5 / 0.025.
+- `gemini-3.1-flash-lite-preview` is priced as its GA twin (0.25 / 1.5 / 0.025; the page prices the model once) instead
+  of the earlier guess 0.1 / 0.4.
 - An unpriced model is priced at the dearest rate the table knows for its category, so the new rows raise that bound:
   an unpriced `text-fast` model is now priced at 1.5 / 7.5 (was 0.3 / 2.5), an unpriced `text-lite` one at 0.3 / 2.5
   (was 0.1 / 0.4).
