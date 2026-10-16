@@ -10,18 +10,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Gemini 4 codenames are classified: `gemini-4-argon` (and a point release such as `gemini-4.1-argon`) is
-  `text-reasoning` at the `premium` cost tier; an `-image` / `-tts` / `-live` variant keeps its specialised category.
-- `latest-pro` and `latest-pro-thinking` resolve to `gemini-4-argon` when the key lists it beside
-  `gemini-3.1-pro-preview`: the model list is ranked by the taxonomy's cost tier instead of a `pro` / `flash`
-  substring of the ID.
-- A price row for `gemini-4-argon`: 2 / 10 / 0.1 USD per 1M input / output / cached tokens, Google's Standard rate
-  through 2026-11-30 (4 / 20 / 0.2 from 2026-12-01 — set `GEMINI_PRICING_OVERRIDES` until the release that carries it).
+  `text-reasoning` at the `premium` cost tier; an `-image` / `-tts` / `-live` variant keeps its specialised category and
+  an `-argon-lite` / `-argon-flash` variant its tier.
+- `latest-pro`, `latest-pro-thinking` and `latest-vision` resolve to `gemini-4-argon` when the key lists it beside
+  `gemini-3.1-pro-preview`: the model list is ranked by the taxonomy's category and cost tier instead of a `pro` /
+  `flash` substring of the ID. The `status` listing leads with the text models.
+- A price row for `gemini-4-argon`: 4 / 20 / 0.2 USD per 1M input / output / cached tokens, Google's rate from
+  2026-12-01. Through 2026-11-30 Google bills 2 / 10 / 0.1, so until then the estimate is 2× high — the conservative
+  side; `GEMINI_PRICING_OVERRIDES` gives the lower rate.
+- `ask` and `code` report `cachingMode` (the mode the call ran with) and, when it differs from the one requested,
+  `cachingModeNote`.
 
 ### Fixed
 
 - `ask` with `gemini-4-argon` no longer refuses the model as `unknown`.
-- `latest-pro` / `latest-pro-thinking` / `latest-flash` no longer resolve to a rolling `gemini-*-latest` alias (which
-  Google points at an older model) when a versioned id is listed.
+- `latest-pro` / `latest-pro-thinking` / `latest-flash` / `latest-lite` no longer resolve to a rolling unversioned
+  `gemini-*-latest` alias (which Google points at an older model) when a versioned id is listed; a `-latest` id that
+  carries a version keeps its version rank.
+- `latest-lite` (and every alias) picks a GA id before its `-preview` twin (`gemini-3.1-flash-lite` over
+  `gemini-3.1-flash-lite-preview`), and version numbers compare as numbers (`gemini-3.10-*` above `gemini-3.9-*`).
+- `cachingMode: 'explicit'` on a model without `createCachedContent` (`gemini-4-argon`) no longer uploads the files and
+  attempts a cache that can only fail: the call runs implicit and says so.
+- A model the price table does not list is priced by its taxonomy cost tier instead of a `pro` / `flash` / `lite`
+  substring of its id; an unpriced premium model (an unpriced `-pro` id included, until now 3.5 / 10.5) gets the
+  conservative premium default, 10.5 / 30 USD per 1M.
 
 ### Changed
 

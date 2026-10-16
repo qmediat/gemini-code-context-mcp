@@ -6,6 +6,9 @@
  * at runtime via `GEMINI_PRICING_OVERRIDES` (JSON).
  */
 
+import type { CapabilityFlags } from '../gemini/model-taxonomy.js';
+import { costTierOf } from '../gemini/model-taxonomy.js';
+
 export interface PricingEntry {
   inputPerMillion: number;
   outputPerMillion: number;
@@ -15,10 +18,11 @@ export interface PricingEntry {
 
 const DEFAULT_PRICING: Record<string, PricingEntry> = {
   // Conservative defaults — if the actual rate is lower, users see a pleasant surprise.
-  // The Standard rate through 2026-11-30; from 2026-12-01 Google bills 4 / 20 / 0.2.
-  // The estimator has no date support: `GEMINI_PRICING_OVERRIDES` carries the
-  // later rate until the release that changes this row.
-  'gemini-4-argon': { inputPerMillion: 2, outputPerMillion: 10, cachedInputPerMillion: 0.1 },
+  // Google's rate from 2026-12-01. Through 2026-11-30 it bills 2 / 10 / 0.1, so
+  // until then this over-estimates by 2× — the conservative side this table keeps,
+  // so a budget stays an upper bound. `GEMINI_PRICING_OVERRIDES` gives the lower
+  // rate to whoever wants the exact figure now.
+  'gemini-4-argon': { inputPerMillion: 4, outputPerMillion: 20, cachedInputPerMillion: 0.2 },
   'gemini-3-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3.1-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3-flash-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },
@@ -52,30 +56,36 @@ function loadOverrides(): Record<string, PricingEntry> | null {
 }
 
 /**
- * Conservative defaults for models we've never seen — one for each tier we
- * recognise by name, plus an "unknown premium" fallback that assumes the
+ * Conservative defaults for models we've never seen — one for each cost tier
+ * the taxonomy assigns, plus an "unknown premium" fallback that assumes the
  * highest rate we know of. The goal is to over-estimate cost for a brand-new
  * model so a budget-capped user gets blocked at the cap instead of silently
  * overshooting it while we wait for a pricing-table update.
  */
 const UNKNOWN_PREMIUM_RATE: PricingEntry = { inputPerMillion: 10.5, outputPerMillion: 30 };
-const UNKNOWN_PRO_RATE: PricingEntry = { inputPerMillion: 3.5, outputPerMillion: 10.5 };
 const UNKNOWN_FLASH_RATE: PricingEntry = { inputPerMillion: 0.3, outputPerMillion: 2.5 };
 const UNKNOWN_LITE_RATE: PricingEntry = { inputPerMillion: 0.1, outputPerMillion: 0.4 };
+
+/**
+ * The conservative rate per cost tier. A `premium` model the table does not price
+ * gets the highest rate we know of: its tier spans pro text, image, music and video.
+ */
+const UNKNOWN_RATE_BY_TIER: Readonly<Record<CapabilityFlags['costTier'], PricingEntry>> = {
+  premium: UNKNOWN_PREMIUM_RATE,
+  standard: UNKNOWN_FLASH_RATE,
+  budget: UNKNOWN_LITE_RATE,
+  unknown: UNKNOWN_PREMIUM_RATE,
+};
 
 function pricingFor(model: string): PricingEntry {
   const ov = loadOverrides();
   if (ov?.[model]) return ov[model];
   if (DEFAULT_PRICING[model]) return DEFAULT_PRICING[model];
-  // Fallback heuristic — name-based classification, conservative defaults.
-  // When the model name gives no useful signal we assume premium-tier rates
-  // rather than flash: better to block an over-budget user than let a
-  // never-seen model silently undercharge and blow past the cap.
-  const lower = model.toLowerCase();
-  if (lower.includes('lite')) return UNKNOWN_LITE_RATE;
-  if (lower.includes('flash')) return UNKNOWN_FLASH_RATE;
-  if (lower.includes('pro')) return UNKNOWN_PRO_RATE;
-  return UNKNOWN_PREMIUM_RATE;
+  // Fallback by the taxonomy's cost tier, conservative defaults. A model the
+  // taxonomy cannot place gets the premium rate rather than flash: better to
+  // block an over-budget user than let a never-seen model silently undercharge
+  // and blow past the cap.
+  return UNKNOWN_RATE_BY_TIER[costTierOf(model)];
 }
 
 export interface CostInputs {

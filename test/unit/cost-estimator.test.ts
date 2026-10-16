@@ -36,14 +36,14 @@ describe('cost estimator', () => {
     expect(allCached).toBeCloseTo(allUncached * 0.25, 4);
   });
 
-  it('prices gemini-4-argon at its Standard rate (2 / 10 / 0.1 USD per 1M)', () => {
+  it('prices gemini-4-argon at the 2026-12-01 rate (4 / 20 / 0.2 USD per 1M), the conservative one', () => {
     const cost = estimateCostUsd({
       model: 'gemini-4-argon',
       uncachedInputTokens: 1_000_000,
       cachedInputTokens: 1_000_000,
       outputTokens: 1_000_000,
     });
-    expect(cost).toBeCloseTo(2 + 0.1 + 10, 6);
+    expect(cost).toBeCloseTo(4 + 0.2 + 20, 6);
   });
 
   it('converts dollars to micros and back', () => {
@@ -51,14 +51,29 @@ describe('cost estimator', () => {
     expect(microsToDollars(1_230_000)).toBe(1.23);
   });
 
-  it('falls back to pro pricing for unknown pro-class models', () => {
-    const cost = estimateCostUsd({
-      model: 'gemini-5-hypothetical-pro',
-      uncachedInputTokens: 1_000_000,
-      cachedInputTokens: 0,
-      outputTokens: 0,
-    });
-    // Non-zero and at pro rate ($3.50 / 1M).
-    expect(cost).toBeCloseTo(3.5, 2);
+  it('an unpriced premium-tier model falls to the premium default (10.5 / 30 USD per 1M)', () => {
+    for (const model of ['gemini-5-hypothetical-pro', 'gemini-4.1-argon']) {
+      const cost = estimateCostUsd({
+        model,
+        uncachedInputTokens: 1_000_000,
+        cachedInputTokens: 0,
+        outputTokens: 1_000_000,
+      });
+      expect(cost).toBeCloseTo(10.5 + 30, 6);
+    }
+  });
+
+  it('an unpriced model is priced by its taxonomy tier, not by a substring of its id', () => {
+    // `gemini-3-pro-image` carries `pro` but is an image model: the premium default, not a text rate.
+    const cost = (model: string): number =>
+      estimateCostUsd({
+        model,
+        uncachedInputTokens: 1_000_000,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+      });
+    expect(cost('gemini-3-pro-image')).toBeCloseTo(10.5, 6);
+    expect(cost('gemini-4-argon-lite')).toBeCloseTo(0.1, 6);
+    expect(cost('gemini-9-flash')).toBeCloseTo(0.3, 6);
   });
 });

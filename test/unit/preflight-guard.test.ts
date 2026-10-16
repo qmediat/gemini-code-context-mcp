@@ -163,13 +163,14 @@ function mockScanOfBytes(totalBytes: number): void {
   });
 }
 
-function mockModelWithLimit(inputTokenLimit: number | null): void {
+function mockModelWithLimit(inputTokenLimit: number | null, supportsCaching = true): void {
   mocks.resolveModel.mockResolvedValue({
     requested: 'latest-pro',
     resolved: 'gemini-3-pro-preview',
     inputTokenLimit,
     outputTokenLimit: 65_536,
     fallbackApplied: false,
+    supportsCaching,
     category: 'text-reasoning',
     capabilities: {
       supportsThinking: true,
@@ -519,6 +520,17 @@ describe('code preflight workspace guard (v1.5.0)', () => {
 // resolves through `ctx.config.cachingMode` and passes the result to
 // `prepareContext`. Catches regressions where someone re-introduces the
 // conditional spread that was the v1.13.0 bug shape.
+const OK_RESPONSE = {
+  text: 'ok',
+  candidates: [],
+  usageMetadata: {
+    promptTokenCount: 300,
+    cachedContentTokenCount: 0,
+    candidatesTokenCount: 10,
+    thoughtsTokenCount: 0,
+  },
+};
+
 describe('cachingMode tool-level default flip (v1.14.0+)', () => {
   it("ask uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {
     const { ctx } = buildCtx({ cachingMode: 'implicit' });
@@ -553,6 +565,34 @@ describe('cachingMode tool-level default flip (v1.14.0+)', () => {
 
     const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
     expect(callArgs.cachingMode).toBe('explicit');
+  });
+
+  it('ask runs an explicit request as implicit on a model without createCachedContent, and says so', async () => {
+    const { ctx, generateContent } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000, false);
+    generateContent.mockResolvedValue(OK_RESPONSE);
+
+    const result = await askTool.execute({ prompt: 'hi', cachingMode: 'explicit' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('implicit');
+    expect(result.structuredContent?.cachingMode).toBe('implicit');
+    expect(String(result.structuredContent?.cachingModeNote)).toMatch(/createCachedContent/);
+  });
+
+  it('code runs an explicit request as implicit on a model without createCachedContent, and says so', async () => {
+    const { ctx, generateContent } = buildCtx({ cachingMode: 'explicit' });
+    mockScanOfBytes(1_000);
+    mockModelWithLimit(1_000_000, false);
+    generateContent.mockResolvedValue(OK_RESPONSE);
+
+    const result = await codeTool.execute({ task: 'do something' }, ctx);
+
+    const callArgs = mocks.prepareContext.mock.calls[0]?.[0] as { cachingMode?: string };
+    expect(callArgs.cachingMode).toBe('implicit');
+    expect(result.structuredContent?.cachingMode).toBe('implicit');
+    expect(String(result.structuredContent?.cachingModeNote)).toMatch(/createCachedContent/);
   });
 
   it("code uses ctx.config.cachingMode='implicit' when input.cachingMode is unset", async () => {

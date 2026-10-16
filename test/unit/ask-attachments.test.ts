@@ -165,6 +165,7 @@ const resolved = (supportsVision: boolean) => ({
   inputTokenLimit: 2_000_000,
   outputTokenLimit: 65_536,
   fallbackApplied: false,
+  supportsCaching: true,
   category: 'text-reasoning' as const,
   capabilities: {
     supportsThinking: true,

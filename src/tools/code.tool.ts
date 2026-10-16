@@ -13,6 +13,7 @@ import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { cachingModeFor } from '../cache/caching-mode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
@@ -559,8 +560,8 @@ async function executeCodeBody(
     // regardless because Gemini rejects `cachedContent` + `tools` together;
     // telemetry records the ACTUAL mode (FN2 fix) so the mode flip + the
     // codeExecution-forced-inline path stay distinguishable.
-    const requestedCachingMode: 'explicit' | 'implicit' =
-      input.cachingMode ?? ctx.config.cachingMode;
+    const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
+    const requestedCachingMode = caching.mode;
 
     const ctxPrep = await prepareContext({
       client: ctx.client,
@@ -953,6 +954,8 @@ async function executeCodeBody(
         ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
         : {}),
       inlineOnly: activePrep.inlineOnly,
+      cachingMode: effectiveCachingMode,
+      ...(caching.note !== null ? { cachingModeNote: caching.note } : {}),
       // Preflight token-count provenance — surfaces on every successful
       // call. See ask.tool.ts for the contract; same fields apply here.
       ...(preflight !== undefined

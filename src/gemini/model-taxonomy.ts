@@ -129,12 +129,6 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   { pattern: /(?:^|-)customtools(?:-|$)/i, category: 'agent', costTier: 'premium' },
 
   // === Text tiers — AFTER all specialisations above ===
-  // Gemini 4 frontier models ship under a codename with no pro/flash token
-  // (`gemini-4-argon`, a later `gemini-4.1-argon`). Argon is the reasoning
-  // tier: thinking, 2 / 10 USD per 1M tokens — premium. Placed after every
-  // specialisation so an `-image` / `-tts` / `-live` variant keeps its
-  // specialised category.
-  { pattern: /^gemini-4(?:\.\d+)?-argon(?:-|$)/i, category: 'text-reasoning', costTier: 'premium' },
   // Lite (budget / smallest). Matches `gemini-3-flash-lite`, `gemini-flash-lite`,
   // `flash-lite`. The single `-lite` rule is a superset of the previously
   // also-listed `flash-lite` rule — the latter was unreachable dead code
@@ -143,6 +137,13 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // Flash (standard speed tier).
   { pattern: /^gemini-.*-flash/i, category: 'text-fast', costTier: 'standard' },
   { pattern: /-flash(?:-|$)/i, category: 'text-fast', costTier: 'standard' },
+  // Gemini 4 frontier models ship under a codename with no pro/flash token
+  // (`gemini-4-argon`, a later `gemini-4.1-argon`). Argon is the reasoning
+  // tier: thinking, 2 / 10 USD per 1M tokens — premium. Placed after every
+  // specialisation and after the lite / flash rules, so an `-image` / `-tts` /
+  // `-live` variant keeps its specialised category and an `-argon-lite` /
+  // `-argon-flash` variant its tier: the more specific tier wins.
+  { pattern: /^gemini-4(?:\.\d+)?-argon(?:-|$)/i, category: 'text-reasoning', costTier: 'premium' },
   // Pro (reasoning / premium tier). Only reaches here if no specialisation
   // above claimed the model. The `^gemini-pro` rule previously at the end
   // of this list was unreachable because `/-pro(?:-|$)/i` already matches

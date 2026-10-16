@@ -145,6 +145,23 @@ describe('categorizeModel — Gemini 4 codenames', () => {
     expect(costTierOf('gemini-4.1-argon')).toBe('premium');
   });
 
+  it('a lite / flash variant of the codename lands in its tier, not in text-reasoning', () => {
+    expect(categorizeModel('gemini-4-argon-lite')).toBe('text-lite');
+    expect(costTierOf('gemini-4-argon-lite')).toBe('budget');
+    expect(categorizeModel('gemini-4-argon-flash')).toBe('text-fast');
+    expect(costTierOf('gemini-4-argon-flash')).toBe('standard');
+  });
+
+  it('(guard) a tts / live variant keeps its specialisation', () => {
+    expect(categorizeModel('gemini-4-argon-tts')).toBe('audio-generation');
+    expect(categorizeModel('gemini-4-argon-live')).toBe('agent');
+  });
+
+  it('(guard) the rule is anchored: gemini-40-argon and gemini-4-argonaut stay unknown', () => {
+    expect(categorizeModel('gemini-40-argon')).toBe('unknown');
+    expect(categorizeModel('gemini-4-argonaut')).toBe('unknown');
+  });
+
   it('the open Gemma 4 models listed on the same endpoint stay unknown', () => {
     expect(categorizeModel('gemma-4-31b-it')).toBe('unknown');
     expect(categorizeModel('gemma-4-26b-a4b-it')).toBe('unknown');

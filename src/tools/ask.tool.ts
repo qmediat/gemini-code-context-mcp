@@ -31,6 +31,7 @@ import {
   readAttachments,
 } from '../attachments.js';
 import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { cachingModeFor } from '../cache/caching-mode.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
@@ -887,8 +888,8 @@ async function executeAskBody(
     // `'explicit'` when they need predictable per-call billing more than
     // warm-path speed. Telemetry on the actual mode (vs requested) is computed
     // AFTER `prepareContext` returns from `activePrep.inlineOnly` — see FN2 fix.
-    const requestedCachingMode: 'explicit' | 'implicit' =
-      input.cachingMode ?? ctx.config.cachingMode;
+    const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
+    const requestedCachingMode = caching.mode;
 
     const ctxPrep = await prepareContext({
       client: ctx.client,
@@ -1282,6 +1283,8 @@ async function executeAskBody(
       cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
       retriedOnStaleCache,
       inlineOnly: activePrep.inlineOnly,
+      cachingMode: effectiveCachingMode,
+      ...(caching.note !== null ? { cachingModeNote: caching.note } : {}),
       filesIndexed: scan.files.length,
       filesSkippedTooLarge: scan.skippedTooLarge,
       // v1.21.0+: what the scan left out — the excluded directories it met and the files that are neither source by

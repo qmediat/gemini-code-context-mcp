@@ -1,6 +1,6 @@
 import type { GoogleGenAI } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { invalidateModelCache } from '../../src/gemini/model-registry.js';
+import { invalidateModelCache, listAvailableModels } from '../../src/gemini/model-registry.js';
 import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
 import { describeAlias, isAlias, listAliases, resolveModel } from '../../src/gemini/models.js';
 
@@ -10,6 +10,7 @@ interface FakeModel {
   inputTokenLimit?: number;
   outputTokenLimit?: number;
   thinking?: boolean;
+  supportedActions?: string[];
 }
 
 function fakeClient(models: FakeModel[]): GoogleGenAI {
@@ -65,17 +66,7 @@ describe('resolveModel', () => {
     expect(result.resolved).toBe('gemini-3-pro-preview');
   });
 
-  it("'latest-pro' and 'latest-pro-thinking' prefer gemini-4-argon over gemini-3.1-pro-preview", async () => {
-    const client = fakeClient([
-      { name: 'models/gemini-3.1-pro-preview', inputTokenLimit: 1_048_576, thinking: true },
-      { name: 'models/gemini-3.8-flash', inputTokenLimit: 1_048_576, thinking: true },
-      { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },
-    ]);
-    expect((await resolveModel('latest-pro', client)).resolved).toBe('gemini-4-argon');
-    expect((await resolveModel('latest-pro-thinking', client)).resolved).toBe('gemini-4-argon');
-  });
-
-  it('latest-pro and latest-pro-thinking pick a versioned id over the rolling gemini-pro-latest', async () => {
+  it('latest-pro and latest-pro-thinking pick gemini-4-argon over gemini-3.1-pro-preview and the rolling gemini-pro-latest', async () => {
     const client = fakeClient([
       { name: 'models/gemini-pro-latest', inputTokenLimit: 1_048_576, thinking: true },
       { name: 'models/gemini-3.1-pro-preview', inputTokenLimit: 1_048_576, thinking: true },
@@ -91,6 +82,47 @@ describe('resolveModel', () => {
       { name: 'models/gemini-3.8-flash', inputTokenLimit: 1_048_576, thinking: true },
     ]);
     expect((await resolveModel('latest-flash', client)).resolved).toBe('gemini-3.8-flash');
+  });
+
+  it('a -latest id that carries a version is a versioned model, not a rolling alias', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-2.5-pro', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-3-pro-latest', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    expect((await resolveModel('latest-pro', client)).resolved).toBe('gemini-3-pro-latest');
+  });
+
+  it('latest-lite picks the GA id over its -preview twin and over the rolling alias', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-flash-lite-latest', inputTokenLimit: 1_048_576 },
+      { name: 'models/gemini-3.1-flash-lite-preview', inputTokenLimit: 1_048_576 },
+      { name: 'models/gemini-3.1-flash-lite', inputTokenLimit: 1_048_576 },
+    ]);
+    expect((await resolveModel('latest-lite', client)).resolved).toBe('gemini-3.1-flash-lite');
+  });
+
+  it('a -preview twin does not beat its GA model (gemini-4-argon-preview)', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-4-argon-preview', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    expect((await resolveModel('latest-pro-thinking', client)).resolved).toBe('gemini-4-argon');
+  });
+
+  it('version segments compare as numbers: gemini-3.10-flash above gemini-3.9-flash', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-3.9-flash', inputTokenLimit: 1_048_576 },
+      { name: 'models/gemini-3.10-flash', inputTokenLimit: 1_048_576 },
+    ]);
+    expect((await resolveModel('latest-flash', client)).resolved).toBe('gemini-3.10-flash');
+  });
+
+  it('(guard) latest-vision prefers the premium versioned model: gemini-4-argon over gemini-3.8-flash', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-3.8-flash', inputTokenLimit: 1_048_576 },
+      { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    expect((await resolveModel('latest-vision', client)).resolved).toBe('gemini-4-argon');
   });
 
   it("a literal 'gemini-4-argon' passes requiredCategory ['text-reasoning']", async () => {
@@ -287,5 +319,46 @@ describe('alias registry', () => {
     expect(vision.requiresVision).toBe(true);
     expect(vision.acceptedCategories).toContain('text-reasoning');
     expect(vision.acceptedCategories).toContain('text-fast');
+  });
+});
+
+describe('model registry listing', () => {
+  beforeEach(() => {
+    invalidateModelCache();
+  });
+
+  it('lists the text models first, ahead of premium media models', async () => {
+    const client = fakeClient([
+      { name: 'models/veo-3' },
+      { name: 'models/imagen-4-ultra' },
+      { name: 'models/gemini-3.8-flash' },
+      { name: 'models/gemini-4-argon', thinking: true },
+    ]);
+    const ids = (await listAvailableModels(client)).map((m) => m.id);
+    expect(ids.slice(0, 2)).toEqual(['gemini-4-argon', 'gemini-3.8-flash']);
+  });
+
+  it('a model whose actions lack createCachedContent does not support caching', async () => {
+    const client = fakeClient([
+      {
+        name: 'models/gemini-4-argon',
+        thinking: true,
+        supportedActions: ['generateContent', 'countTokens', 'batchGenerateContent'],
+      },
+    ]);
+    const resolved = await resolveModel('gemini-4-argon', client);
+    expect(resolved.supportsCaching).toBe(false);
+  });
+
+  it('(guard) a model that lists createCachedContent, or no actions at all, supports caching', async () => {
+    const client = fakeClient([
+      {
+        name: 'models/gemini-3.1-pro-preview',
+        supportedActions: ['generateContent', 'createCachedContent'],
+      },
+      { name: 'models/gemini-2.5-pro' },
+    ]);
+    const models = await listAvailableModels(client);
+    expect(models.map((m) => m.supportsCaching)).toEqual([true, true]);
   });
 });
