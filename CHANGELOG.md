@@ -9,21 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The rolling aliases are priced as their measured targets (3.1-pro-preview, 3.8-flash, 3.5-flash-lite), not the 2.5
-  line: on 2026-10-16 the response's `modelVersion` showed `gemini-pro-latest` serving `gemini-3.1-pro-preview`,
-  `gemini-flash-latest` `gemini-3.8-flash` and `gemini-flash-lite-latest` `gemini-3.5-flash-lite`. This corrects
-  1.22.0's entry, which priced them as `gemini-2.5-pro` / `-flash` / `-flash-lite`. An alias now prices as its target's
-  row, so an override of the target (`GEMINI_PRICING_OVERRIDES`) prices the alias too.
-- Rows for the 3.5–3.8 Flash line and 3.5 Flash-Lite (Standard tier, Google's pricing page read 2026-10-16), which until
-  now fell to the derived fallback: `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash` at 1.5 / 7.5 / 0.15 USD
-  per 1M input / output / cached tokens — Google's rate from 2027-01-01; through 2026-12-31 they bill 0.75 / 3.75 /
-  0.075, so the estimate is 2× high until then (the conservative side; `GEMINI_PRICING_OVERRIDES` gives the lower rate)
-  —, `gemini-3.5-flash-lite` at 0.3 / 2.5 / 0.03 and `gemini-3.1-flash-lite` at 0.25 / 1.5 / 0.025.
-- `gemini-3.1-flash-lite-preview` is priced as its GA twin (0.25 / 1.5 / 0.025; the page prices the model once) instead
-  of the earlier guess 0.1 / 0.4.
-- An unpriced model is priced at the dearest rate the table knows for its category, so the new rows raise that bound:
-  an unpriced `text-fast` model is now priced at 1.5 / 7.5 (was 0.3 / 2.5), an unpriced `text-lite` one at 0.3 / 2.5
-  (was 0.1 / 0.4).
+- The cost estimate and the recorded spend use the rates of Google's pricing page (read 2026-10-16, Standard tier) with
+  the dates they take effect, instead of a "conservative" later rate booked today: a row may carry `next` rates from a
+  UTC date on, and a call is priced at the rate in force on the UTC day it is priced (the reservation when it is made, the settled
+  cost when the call returns).
+  `gemini-4-argon` bills 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2 from
+  2026-12-01 — this corrects 1.22.0's row, which booked the December rate from the start.
+- Rows brought up to the page: `gemini-3.1-pro-preview` and `gemini-3-pro-preview` 4 / 18 / 0.4 (the > 200k-token tier;
+  the estimator does not see the prompt's size, so the dearer tier is the row), `gemini-2.5-pro` 2.5 / 15 / 0.25
+  (its > 200k tier), `gemini-3-flash-preview` 0.5 / 3 / 0.05, `gemini-3.1-flash-image-preview` 0.5 / 3, `gemini-2.5-flash`
+  cached 0.03, `gemini-2.5-flash-lite` cached 0.01.
+- New rows: `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash` at 0.75 / 3.75 / 0.075 through 2026-12-31 and
+  1.5 / 7.5 / 0.15 from 2027-01-01; `gemini-3.5-flash-lite` at 0.3 / 2.5 / 0.03; `gemini-3.1-flash-lite` at 0.25 / 1.5 /
+  0.025, and `gemini-3.1-flash-lite-preview` at the same rates (the page prices the model once; it was 0.1 / 0.4).
+  `gemini-3.5-flash` has no row — the page does not list it — and prices at the `text-fast` bound.
+- The rolling aliases are no longer priced as the 2.5 line, as 1.22.0's entry had it: on 2026-10-16 the response's
+  `modelVersion` showed `gemini-pro-latest` serving `gemini-3.1-pro-preview`, `gemini-flash-latest` `gemini-3.8-flash`
+  and `gemini-flash-lite-latest` `gemini-3.5-flash-lite`. See Changed for how an alias is priced now.
+
+### Changed
+
+- A rolling alias prices at the dearest rate of its measured target's category (Google may move an alias to a dearer
+  model between two measurements), never as a row of its own; an override keyed by the alias id wins, then an override
+  of its target.
+- The bound for an unpriced text model is the dearest rate its category has in force on the day, so the new rows raise
+  it: an unpriced `text-fast` model is priced at 0.75 / 3.75 (1.5 / 7.5 from 2027-01-01; was 0.3 / 2.5), an unpriced
+  `text-lite` one at 0.3 / 2.5 (was 0.1 / 0.4), an unpriced `text-reasoning` one at 4 / 18 / 0.4 (4 / 20 / 0.4 from
+  2026-12-01; was 4 / 20 / 0.875).
 
 ## [1.22.0] - 2026-10-16
 

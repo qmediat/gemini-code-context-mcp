@@ -17,10 +17,9 @@ import {
 /**
  * Google's unversioned `-latest` ids (`gemini-pro-latest`, `gemini-flash-latest`,
  * `gemini-flash-lite-latest`) are rolling aliases whose target is never newer than
- * the newest versioned id (measured 2026-10-16 by the response's `modelVersion`:
- * `gemini-pro-latest` serves `gemini-3.1-pro-preview` while `gemini-4-argon` is
- * listed, `gemini-flash-latest` serves `gemini-3.8-flash`); the `latest-*` aliases
- * here must pick a versioned model, so these rank after it.
+ * the newest versioned id (the measured targets: `ALIAS_TARGET` in
+ * `utils/cost-estimator.ts`); the `latest-*` aliases here must pick a versioned
+ * model, so these rank after it.
  * An id that carries a version digit is a versioned model whatever its suffix.
  */
 function isRollingAlias(id: string): boolean {

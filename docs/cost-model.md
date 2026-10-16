@@ -2,52 +2,82 @@
 
 Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by caching. Here's how billing actually works and what knobs you have.
 
-> **Rates verified 2026-04-18.** Google updates prices without notice — always cross-check at [ai.google.dev/pricing](https://ai.google.dev/pricing). You can override defaults at runtime via `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) without waiting for a patch release.
+> **Rates read 2026-10-16** from [Google's pricing page](https://ai.google.dev/gemini-api/docs/pricing) (Standard tier). Google changes prices; cross-check there. `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) replaces a row at run time without a release.
+
+## The estimator's rates
+
+USD per 1M tokens, input / output / cached input. The estimator prices a call at the rate in force on the UTC day it is
+priced: a reservation when it is made, the settled cost when the call returns.
+
+| Model | Rate | From |
+|---|---|---|
+| `gemini-4-argon` | 2 / 10 / 0.1 | through 2026-11-30 |
+| | 4 / 20 / 0.2 | 2026-12-01 |
+| `gemini-3.1-pro-preview`, `gemini-3-pro-preview` | 4 / 18 / 0.4 (the > 200k-token tier; ≤ 200k: 2 / 12 / 0.2) | |
+| `gemini-2.5-pro` | 2.5 / 15 / 0.25 (the > 200k-token tier; ≤ 200k: 1.25 / 10 / 0.125) | |
+| `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash` | 0.75 / 3.75 / 0.075 | through 2026-12-31 |
+| | 1.5 / 7.5 / 0.15 | 2027-01-01 |
+| `gemini-3-flash-preview` | 0.5 / 3 / 0.05 | |
+| `gemini-3.1-flash-image-preview` | 0.5 / 3 / 0.125 (no cached rate on the page: 0.25 × input) | |
+| `gemini-3.5-flash-lite` | 0.3 / 2.5 / 0.03 | |
+| `gemini-3.1-flash-lite`, `gemini-3.1-flash-lite-preview` | 0.25 / 1.5 / 0.025 | |
+| `gemini-2.5-flash` | 0.3 / 2.5 / 0.03 | |
+| `gemini-2.5-flash-lite` | 0.1 / 0.4 / 0.01 | |
+
+Rules the estimator keeps, so a daily budget stays an upper bound:
+
+- **Prompt-size tiers:** where the page prices a prompt above 200k tokens higher, the row is that dearer tier — the
+  estimator does not see the prompt's size.
+- **Rolling aliases** (`gemini-pro-latest`, `gemini-flash-latest`, `gemini-flash-lite-latest`) price at the dearest
+  rate of their measured target's category (targets measured 2026-10-16: `gemini-3.1-pro-preview`, `gemini-3.8-flash`,
+  `gemini-3.5-flash-lite`): Google may move an alias to a dearer model between two measurements.
+- **An unpriced model** (`gemini-3.5-flash`, which the page does not list, or a model newer than this table) prices at
+  the dearest rate its category has in force on the day; a model outside the text categories at the conservative rate
+  of its cost tier (10.5 / 30 for a premium one).
 
 ## What Gemini bills for
 
 | Line item | Typical rate |
 |---|---|
-| Input tokens (uncached) | $3.50 / M for Pro, $0.30 / M for Flash |
-| Input tokens (cached, explicit mode) | ~$0.87 / M for Pro (≈ 25 % of uncached — the estimator's assumption when a model lists no cached rate; check Google's current price) |
-| Output tokens | $10.50 / M for Pro, $2.50 / M for Flash |
-| Thinking tokens (Pro) | Billed as output |
+| Input tokens (uncached) | $4.00 / M for 3.1 Pro (> 200k prompt), $0.75 / M for 3.8 Flash (through 2026-12-31) |
+| Input tokens (cached, explicit mode) | $0.40 / M for 3.1 Pro (10 % of uncached; the estimator assumes 25 % when a row lists no cached rate) |
+| Output tokens | $18.00 / M for 3.1 Pro (> 200k prompt), $3.75 / M for 3.8 Flash (through 2026-12-31) |
+| Thinking tokens | Billed as output |
 | Cache storage | $4.50 / M tokens / hour (Pro); prorated |
 | Code execution | Bundled; no separate line item |
 | Files API storage | Free; auto-deleted after 48 h |
 
-Rates vary — always check [ai.google.dev/pricing](https://ai.google.dev/pricing). Our defaults are conservative.
-
 ## How the cache changes the math
 
-**Scenario:** 500 k-token repo, 20 queries in a working day with `gemini-3-pro-preview`.
+**Scenario:** 500 k-token repo, 20 queries in a working day with `gemini-3.1-pro-preview` (a 500 k prompt bills
+the > 200k tier).
 
 Without caching (what jamubc gives you):
 
 ```
-20 calls × 500 k input × $3.50/M   = $35.00 on input
-20 calls × ~1 k output × $10.50/M  = $0.21 on output
-                                   = ~$35.21 / day
+20 calls × 500 k input × $4.00/M   = $40.00 on input
+20 calls × ~1 k output × $18.00/M  = $0.36 on output
+                                   = ~$40.36 / day
 ```
 
 With this server's cache:
 
 ```
-1 cache build: 500 k input × $3.50/M       = $1.75
+1 cache build: 500 k input × $4.00/M       = $2.00
 19 cached calls: ~1 k uncached + 500 k cached
-                 19 × (1 k × $3.50/M + 500 k × $0.87/M)  = $8.36
-20 calls × ~1 k output                        = $0.21
+                 19 × (1 k × $4.00/M + 500 k × $0.40/M)  = $3.88
+20 calls × ~1 k output                        = $0.36
 Cache storage (1 h avg): 500 k × 1 h × $4.50/M/h  = $2.25
-                                                = ~$12.57 / day
+                                                = ~$8.49 / day
 ```
 
-**~64 % savings** in explicit `cachingMode` (measured 2026-04-22: first call ~125 s, repeats ~14 s on a 670 k-token workspace). In the default implicit mode there is no cache storage charge and no guaranteed discount: a repeat costs at most the inline price.
+**~79 % savings** in explicit `cachingMode` (latency measured 2026-04-22: first call ~125 s, repeats ~14 s on a 670 k-token workspace). In the default implicit mode there is no cache storage charge and no guaranteed discount: a repeat costs at most the inline price.
 
 ## Tools for cost control
 
 1. **Daily budget cap.** `GEMINI_DAILY_BUDGET_USD` — hard stop once exceeded, resets at UTC midnight. Set this.
 2. **Model alias.** `latest-flash` for cheap Q&A, `latest-pro` for heavy reasoning. The alias auto-picks the best available at that tier.
-3. **Pricing overrides.** If Google drops prices and we haven't pushed an update, `GEMINI_PRICING_OVERRIDES='{"gemini-3-pro-preview":{"inputPerMillion":2.5,...}}'` updates the estimator at runtime.
+3. **Pricing overrides.** If Google drops prices and we haven't pushed an update, `GEMINI_PRICING_OVERRIDES='{"gemini-3.1-pro-preview":{"inputPerMillion":2,"outputPerMillion":12,"cachedInputPerMillion":0.2}}'` updates the estimator at runtime.
 4. **`status` tool.** Shows today's spend, cumulative spend, cache hits.
 5. **Include/exclude globs.** Smaller context = cheaper. Exclude `generated/`, `vendor/`, large test fixtures.
 
@@ -75,7 +105,7 @@ If your pattern is "one query a week on the same repo", consider running `clear`
 
 ## Thinking tokens (`code` tool)
 
-`code` allocates `thinkingBudget` reasoning tokens before generation. Gemini bills these at the output rate. Default is 16 384; that's ~$0.17 per call on Pro.
+`code` allocates `thinkingBudget` reasoning tokens before generation. Gemini bills these at the output rate. Default is 16 384; that's ~$0.29 per call on 3.1 Pro at the estimator's 18 / M.
 
 Raise it (`{ thinkingBudget: 32000 }`) when the task is hard. Drop it (`{ thinkingBudget: 0 }`) when you want a quick generation without deliberation.
 

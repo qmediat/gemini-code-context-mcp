@@ -33,7 +33,7 @@ The server picks the highest-trust source available, in this order:
 | `GEMINI_CODE_CONTEXT_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. **At `debug` level, the agentic dispatcher writes a one-liner per refused tool call that includes the full path the model asked for** (e.g. `agentic dispatch refused: tool=read_file code=EXCLUDED_FILE requestedPath=internal-secrets/api-key.ts`) — useful for diagnosing "why is my file being blocked?" but means paths your `excludeGlobs` is intentionally hiding from the model become visible in stderr. Don't enable `debug` if you ship stderr to environments (centralized log analyzers, audit pipelines) that shouldn't see those paths. Untrusted-source values in every log line are escaped (`\n`/`\r`/control chars → printable form, max 2 000 chars per value) so a model-controlled string cannot forge a fake log record. |
 | `GEMINI_CODE_CONTEXT_TELEMETRY` | `false` | Set `true` to opt into anonymous usage counts (nothing happens yet — reserved for future public dashboard) |
 | `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE` | `false` | Set `true` to bypass the `validateWorkspacePath` guard that rejects paths outside the MCP host's cwd unless they contain a recognised workspace marker. Only set this for genuinely unconventional roots (CI sandboxes, generated build dirs). Do NOT set it to work around a prompt-injection vector — the guard is the security control. |
-| `GEMINI_PRICING_OVERRIDES` | — | JSON map of `model → {inputPerMillion, outputPerMillion, cachedInputPerMillion?}`. See example below. |
+| `GEMINI_PRICING_OVERRIDES` | — | JSON map of `model → {inputPerMillion, outputPerMillion, cachedInputPerMillion?, next?}`. See example below. |
 | `XDG_CONFIG_HOME` | — | Override the config directory (defaults to `~/.config`) |
 | `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` *(v1.6.0+)* | disabled | Wall-clock timeout in ms for `ask`. Bounded `[1000, 1_800_000]` (1 s to 30 min). Aborts the in-flight `generateContent` request via `AbortController` when exceeded. Empty / `0` / negative = disabled. Per-call `ask({ timeoutMs })` always wins. **Caveat:** `AbortSignal` is client-only — Gemini may still finish server-side and bill for completed work (per `@google/genai` SDK docs). |
 | `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS` *(v1.6.0+)* | disabled | Same shape as the `ask` variant, applied to the `code` tool. Per-call override: `code({ timeoutMs })`. |
@@ -147,7 +147,11 @@ Gemini prices change; our estimator ships with defaults verified at build time. 
 }
 ```
 
-All three rate fields are in USD per million tokens. `cachedInputPerMillion` is optional — when omitted, the estimator charges cached tokens at 25 % of the `inputPerMillion` rate.
+All three rate fields are in USD per million tokens. `cachedInputPerMillion` is optional — when omitted, the estimator charges cached tokens at 25 % of the `inputPerMillion` rate, so name it when the real cached rate differs (Google's is 10 % of input on the current models). An override replaces the whole row, its dated `next` rates included: add `"next":{"from":"YYYY-MM-DD","inputPerMillion":…,"outputPerMillion":…,"cachedInputPerMillion":…}` to keep an announced price change.
+
+A rolling alias (`gemini-pro-latest`, `gemini-flash-latest`, `gemini-flash-lite-latest`) takes, in this order: an
+override keyed by the alias id itself; else an override of its measured target (`gemini-flash-latest` →
+`gemini-3.8-flash`); else the dearest rate the table has for the target's category (see [cost-model.md](cost-model.md)).
 
 Use this to:
 - Keep cost estimates accurate after a Google price change before we publish a patch.
