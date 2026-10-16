@@ -9,6 +9,15 @@ import type { GoogleGenAI, Model } from '@google/genai';
 import { logger } from '../utils/logger.js';
 import { type CapabilityFlags, costTierOf } from './model-taxonomy.js';
 
+/**
+ * Google's `gemini-*-latest` ids are rolling aliases whose target is older than
+ * the newest versioned id (`gemini-pro-latest` points at `gemini-2.5-pro`); the
+ * `latest-*` aliases here must pick a versioned model, so these rank after it.
+ */
+function isRollingAlias(id: string): boolean {
+  return /-latest$/i.test(id);
+}
+
 /** Listing rank of each cost tier: the premium tier first, unclassified last. */
 const TIER_RANK: Readonly<Record<CapabilityFlags['costTier'], number>> = {
   premium: 0,
@@ -72,13 +81,17 @@ export async function listAvailableModels(
   }
 
   // Stable ordering — the taxonomy's cost tier (premium → standard → budget →
-  // unknown), then version desc by name. The tier comes from the taxonomy, not
-  // from a `pro` / `flash` substring, so a codename family (`gemini-4-argon`)
-  // ranks with the tier it belongs to and `latest-*` picks it by its version.
+  // unknown), then versioned ids before rolling `-latest` aliases, then version
+  // desc by name. The tier comes from the taxonomy, not from a `pro` / `flash`
+  // substring, so a codename family (`gemini-4-argon`) ranks with the tier it
+  // belongs to and `latest-*` picks it by its version.
   out.sort((a, b) => {
     const ra = TIER_RANK[costTierOf(a.id)];
     const rb = TIER_RANK[costTierOf(b.id)];
     if (ra !== rb) return ra - rb;
+    const aa = Number(isRollingAlias(a.id));
+    const ab = Number(isRollingAlias(b.id));
+    if (aa !== ab) return aa - ab;
     return b.id.localeCompare(a.id);
   });
 

@@ -31,18 +31,18 @@ function model(id: string, inputTokenLimit: number): ModelInfo {
   };
 }
 
-// The registry's comparator: tier by ID substring (`pro` before `flash` before `lite`, so
-// `gemini-flash-lite-latest` ranks as flash), then ID descending — `omni` sorts before the digits
-// and `flash-lite-latest` before `flash-latest`.
+// The registry's comparator: the taxonomy's cost tier (premium, standard, budget), then versioned
+// ids before the rolling `-latest` aliases, then ID descending — `omni` (an agent at the standard
+// tier) sorts before the digits, so it sits ahead of every versioned flash model.
 const LIVE_ORDER: ModelInfo[] = [
-  model('gemini-pro-latest', 1_048_576),
   model('gemini-3.1-pro-preview', 1_048_576),
+  model('gemini-pro-latest', 1_048_576),
   model('gemini-omni-flash-preview', 131_072),
   model('gemini-omni-1.1-flash', 131_072),
-  model('gemini-flash-lite-latest', 1_048_576),
-  model('gemini-flash-latest', 1_048_576),
   model('gemini-3.8-flash', 1_048_576),
   model('gemini-3.7-flash', 1_048_576),
+  model('gemini-flash-latest', 1_048_576),
+  model('gemini-flash-lite-latest', 1_048_576),
 ];
 
 describe('resolveModel — Interactions-API-only models never satisfy a text alias', () => {
@@ -53,14 +53,14 @@ describe('resolveModel — Interactions-API-only models never satisfy a text ali
 
   it('latest-flash skips gemini-omni-* and resolves the newest flash text model', async () => {
     const resolved = await resolveModel('latest-flash', {} as never);
-    expect(resolved.resolved).toBe('gemini-flash-latest');
+    expect(resolved.resolved).toBe('gemini-3.8-flash');
     expect(resolved.category).toBe('text-fast');
     expect(resolved.fallbackApplied).toBe(false);
   });
 
   it('latest-pro is unaffected', async () => {
     const resolved = await resolveModel('latest-pro', {} as never);
-    expect(resolved.resolved).toBe('gemini-pro-latest');
+    expect(resolved.resolved).toBe('gemini-3.1-pro-preview');
   });
 
   it('a literal omni ID fails the text-fast category check with an actionable error', async () => {

@@ -91,7 +91,9 @@ falling to a different category.
 ```
 
 Resolves to the newest pro-tier text model with thinking support. The model list is ranked by the taxonomy's cost
-tier (premium first), then by ID descending, so `gemini-4-argon` wins over `gemini-3.1-pro-preview`.
+tier (premium first), then by ID descending, so `gemini-4-argon` wins over `gemini-3.1-pro-preview`. Within a tier
+versioned IDs rank before the rolling `-latest` aliases (`gemini-pro-latest` points at an older model), so an alias
+here resolves to a versioned model whenever one is listed.
 Guaranteed to NOT pick up `nano-banana-pro-preview` even if it's in your
 model list.
 

@@ -75,6 +75,24 @@ describe('resolveModel', () => {
     expect((await resolveModel('latest-pro-thinking', client)).resolved).toBe('gemini-4-argon');
   });
 
+  it('latest-pro and latest-pro-thinking pick a versioned id over the rolling gemini-pro-latest', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-pro-latest', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-3.1-pro-preview', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    expect((await resolveModel('latest-pro', client)).resolved).toBe('gemini-4-argon');
+    expect((await resolveModel('latest-pro-thinking', client)).resolved).toBe('gemini-4-argon');
+  });
+
+  it('latest-flash picks a versioned id over the rolling gemini-flash-latest', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-flash-latest', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-3.8-flash', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    expect((await resolveModel('latest-flash', client)).resolved).toBe('gemini-3.8-flash');
+  });
+
   it("a literal 'gemini-4-argon' passes requiredCategory ['text-reasoning']", async () => {
     const client = fakeClient([
       { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },

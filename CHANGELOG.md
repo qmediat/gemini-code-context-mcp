@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `ask` with `gemini-4-argon` no longer refuses the model as `unknown`.
+- `latest-pro` / `latest-pro-thinking` / `latest-flash` no longer resolve to a rolling `gemini-*-latest` alias (which
+  Google points at an older model) when a versioned id is listed.
 
 ### Changed
 
