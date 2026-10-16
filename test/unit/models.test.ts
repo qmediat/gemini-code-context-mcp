@@ -65,6 +65,27 @@ describe('resolveModel', () => {
     expect(result.resolved).toBe('gemini-3-pro-preview');
   });
 
+  it("'latest-pro' and 'latest-pro-thinking' prefer gemini-4-argon over gemini-3.1-pro-preview", async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-3.1-pro-preview', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-3.8-flash', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    expect((await resolveModel('latest-pro', client)).resolved).toBe('gemini-4-argon');
+    expect((await resolveModel('latest-pro-thinking', client)).resolved).toBe('gemini-4-argon');
+  });
+
+  it("a literal 'gemini-4-argon' passes requiredCategory ['text-reasoning']", async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-4-argon', inputTokenLimit: 1_048_576, thinking: true },
+    ]);
+    const result = await resolveModel('gemini-4-argon', client, {
+      requiredCategory: ['text-reasoning'],
+    });
+    expect(result.resolved).toBe('gemini-4-argon');
+    expect(result.capabilities.costTier).toBe('premium');
+  });
+
   it('resolves literal model IDs when they are in the registry', async () => {
     const client = fakeClient([
       { name: 'models/gemini-3-pro-preview', inputTokenLimit: 2_000_000 },

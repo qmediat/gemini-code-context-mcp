@@ -101,6 +101,10 @@ describe('categorizeModel — precedence (the invariant v1.4.0 fixes)', () => {
     expect(categorizeModel('gemini-omni-1.1-flash')).toBe('agent');
   });
 
+  it('a Gemini 4 codename variant keeps its specialisation (-image before the argon rule)', () => {
+    expect(categorizeModel('gemini-4-argon-image')).toBe('image-generation');
+  });
+
   it('lite wins over flash when both match (lite is the more specific tier)', () => {
     // `gemini-3-flash-lite` contains both `flash` and `lite`. Lite rule
     // runs before flash, so model resolves to `text-lite` (cheapest tier),
@@ -127,6 +131,23 @@ describe('categorizeModel — unknown fallback', () => {
   it('whitespace-only → unknown', () => {
     // Not matched by any rule (patterns expect alphanumeric tokens).
     expect(categorizeModel('   ')).toBe('unknown');
+  });
+});
+
+describe('categorizeModel — Gemini 4 codenames', () => {
+  it('gemini-4-argon is text-reasoning at the premium tier', () => {
+    expect(categorizeModel('gemini-4-argon')).toBe('text-reasoning');
+    expect(costTierOf('gemini-4-argon')).toBe('premium');
+  });
+
+  it('a point release of the codename (gemini-4.1-argon) classifies the same', () => {
+    expect(categorizeModel('gemini-4.1-argon')).toBe('text-reasoning');
+    expect(costTierOf('gemini-4.1-argon')).toBe('premium');
+  });
+
+  it('the open Gemma 4 models listed on the same endpoint stay unknown', () => {
+    expect(categorizeModel('gemma-4-31b-it')).toBe('unknown');
+    expect(categorizeModel('gemma-4-26b-a4b-it')).toBe('unknown');
   });
 });
 

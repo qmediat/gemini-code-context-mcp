@@ -7,6 +7,15 @@
 
 import type { GoogleGenAI, Model } from '@google/genai';
 import { logger } from '../utils/logger.js';
+import { type CapabilityFlags, costTierOf } from './model-taxonomy.js';
+
+/** Listing rank of each cost tier: the premium tier first, unclassified last. */
+const TIER_RANK: Readonly<Record<CapabilityFlags['costTier'], number>> = {
+  premium: 0,
+  standard: 1,
+  budget: 2,
+  unknown: 3,
+};
 
 export interface ModelInfo {
   /** Normalized short ID (e.g. `gemini-3-pro-preview`). */
@@ -62,16 +71,13 @@ export async function listAvailableModels(
     if (info) out.push(info);
   }
 
-  // Stable ordering — pro → flash → lite → others, then version desc by name.
+  // Stable ordering — the taxonomy's cost tier (premium → standard → budget →
+  // unknown), then version desc by name. The tier comes from the taxonomy, not
+  // from a `pro` / `flash` substring, so a codename family (`gemini-4-argon`)
+  // ranks with the tier it belongs to and `latest-*` picks it by its version.
   out.sort((a, b) => {
-    const tierRank = (id: string): number => {
-      if (id.includes('pro')) return 0;
-      if (id.includes('flash')) return 1;
-      if (id.includes('lite')) return 2;
-      return 3;
-    };
-    const ra = tierRank(a.id);
-    const rb = tierRank(b.id);
+    const ra = TIER_RANK[costTierOf(a.id)];
+    const rb = TIER_RANK[costTierOf(b.id)];
     if (ra !== rb) return ra - rb;
     return b.id.localeCompare(a.id);
   });

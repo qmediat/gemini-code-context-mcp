@@ -15,6 +15,10 @@ export interface PricingEntry {
 
 const DEFAULT_PRICING: Record<string, PricingEntry> = {
   // Conservative defaults — if the actual rate is lower, users see a pleasant surprise.
+  // The Standard rate through 2026-11-30; from 2026-12-01 Google bills 4 / 20 / 0.2.
+  // The estimator has no date support: `GEMINI_PRICING_OVERRIDES` carries the
+  // later rate until the release that changes this row.
+  'gemini-4-argon': { inputPerMillion: 2, outputPerMillion: 10, cachedInputPerMillion: 0.1 },
   'gemini-3-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3.1-pro-preview': { inputPerMillion: 3.5, outputPerMillion: 10.5 },
   'gemini-3-flash-preview': { inputPerMillion: 0.3, outputPerMillion: 2.5 },

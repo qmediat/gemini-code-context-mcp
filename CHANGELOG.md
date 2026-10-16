@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gemini 4 codenames are classified: `gemini-4-argon` (and a point release such as `gemini-4.1-argon`) is
+  `text-reasoning` at the `premium` cost tier; an `-image` / `-tts` / `-live` variant keeps its specialised category.
+- `latest-pro` and `latest-pro-thinking` resolve to `gemini-4-argon` when the key lists it beside
+  `gemini-3.1-pro-preview`: the model list is ranked by the taxonomy's cost tier instead of a `pro` / `flash`
+  substring of the ID.
+- A price row for `gemini-4-argon`: 2 / 10 / 0.1 USD per 1M input / output / cached tokens, Google's Standard rate
+  through 2026-11-30 (4 / 20 / 0.2 from 2026-12-01 — set `GEMINI_PRICING_OVERRIDES` until the release that carries it).
+
+### Fixed
+
+- `ask` with `gemini-4-argon` no longer refuses the model as `unknown`.
+
 ### Changed
 
 - Development only: `npm run lint` checks the structure of the code with a shared preset beside Biome (ESLint with

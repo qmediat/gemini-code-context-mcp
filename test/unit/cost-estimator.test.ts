@@ -36,6 +36,16 @@ describe('cost estimator', () => {
     expect(allCached).toBeCloseTo(allUncached * 0.25, 4);
   });
 
+  it('prices gemini-4-argon at its Standard rate (2 / 10 / 0.1 USD per 1M)', () => {
+    const cost = estimateCostUsd({
+      model: 'gemini-4-argon',
+      uncachedInputTokens: 1_000_000,
+      cachedInputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+    });
+    expect(cost).toBeCloseTo(2 + 0.1 + 10, 6);
+  });
+
   it('converts dollars to micros and back', () => {
     expect(toMicrosUsd(1.23)).toBe(1_230_000);
     expect(microsToDollars(1_230_000)).toBe(1.23);

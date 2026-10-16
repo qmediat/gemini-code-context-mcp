@@ -40,7 +40,7 @@ caller takes responsibility).
 
 | Category | What it's for | Example IDs | Accepted by tools |
 |---|---|---|---|
-| `text-reasoning` | Deep thinking, code review, long analysis | `gemini-pro-latest`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro` | `ask`, `code` |
+| `text-reasoning` | Deep thinking, code review, long analysis | `gemini-4-argon`, `gemini-pro-latest`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro` | `ask`, `code` |
 | `text-fast` | Quick Q&A, shallow reasoning | `gemini-flash-latest`, `gemini-3.1-flash-preview`, `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
 | `text-lite` | Cheapest text gen, simple classification | `gemini-flash-lite-latest`, `gemini-3.1-flash-lite-preview`, `gemini-2.5-flash-lite` | `ask` |
 | `image-generation` | Text → image (different pricing tier!) | `nano-banana-pro-preview`, `gemini-3-pro-image`, `imagen-4-ultra` | — (not supported by ask/code) |
@@ -49,6 +49,11 @@ caller takes responsibility).
 | `embedding` | Vector embeddings | `text-embedding-004`, `gemini-embedding-001` | — |
 | `agent` | Specialised agents and Interactions-API-only models (not drop-in text models) | `gemini-deep-research-*`, `*-customtools`, `gemini-omni-*` | — |
 | `unknown` | Family we haven't classified yet | A newly-released Google model not in our rules | — (aliases refuse; explicit ID pass fails category check) |
+
+Gemini 4 ships its frontier models under a codename with no `pro` / `flash` token: `gemini-4-argon` (and a later
+`gemini-4.N-argon`) is the premium reasoning tier, with thinking, 32 768 output tokens on the API and implicit caching
+only (it does not offer `createCachedContent`). The open Gemma models listed on the same endpoint (`gemma-4-*`) are
+not text tiers here and stay `unknown`.
 
 ## Capability flags
 
@@ -59,7 +64,7 @@ Orthogonal to category — multiple can apply to a single model:
 | `supportsThinking` | Model supports reasoning / extended thinking (Gemini 2.5+, Gemini 3.x) |
 | `supportsVision` | Accepts image / PDF input (every text-generation tier, Flash-Lite included since v1.20.0; not embeddings or media generation) |
 | `supportsCodeExecution` | Works with the `code_execution` tool (all text-gen tiers) |
-| `costTier` | `premium` (pro / image-gen / music), `standard` (flash), `budget` (lite / embeddings), `unknown` |
+| `costTier` | `premium` (pro / Gemini 4 Argon / image-gen / music), `standard` (flash), `budget` (lite / embeddings), `unknown` |
 
 ## Aliases
 
@@ -85,7 +90,8 @@ falling to a different category.
 { "tool": "code", "task": "Review my PR for memory safety issues" }
 ```
 
-Resolves to the newest pro-tier text model with thinking support.
+Resolves to the newest pro-tier text model with thinking support. The model list is ranked by the taxonomy's cost
+tier (premium first), then by ID descending, so `gemini-4-argon` wins over `gemini-3.1-pro-preview`.
 Guaranteed to NOT pick up `nano-banana-pro-preview` even if it's in your
 model list.
 
