@@ -32,6 +32,23 @@ describe('tools/list inputSchema conformance', () => {
     });
   }
 
+  it('keeps the published contract: an object takes no unnamed key, an integer no safe-integer ceiling', () => {
+    const visit = (node: unknown, seen: Record<string, unknown>[]): Record<string, unknown>[] => {
+      if (Array.isArray(node)) for (const item of node) visit(item, seen);
+      else if (node && typeof node === 'object') {
+        seen.push(node as Record<string, unknown>);
+        for (const value of Object.values(node)) visit(value, seen);
+      }
+      return seen;
+    };
+    const nodes = TOOLS.flatMap((tool) => visit(buildToolInputSchema(tool), []));
+    const objects = nodes.filter((node) => node.type === 'object');
+    expect(objects.length).toBeGreaterThanOrEqual(TOOLS.length);
+    expect(objects.every((node) => node.additionalProperties === false)).toBe(true);
+    expect(nodes.some((node) => node.maximum === Number.MAX_SAFE_INTEGER)).toBe(false);
+    expect(nodes.some((node) => node.type === 'integer')).toBe(true);
+  });
+
   it('produces a tools/list response that passes the SDK validator', () => {
     const payload = {
       tools: TOOLS.map((tool) => ({

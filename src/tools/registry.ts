@@ -4,8 +4,7 @@
 
 import type { GoogleGenAI } from '@google/genai';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import type { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
+import { z } from 'zod';
 import type { TtlWatcher } from '../cache/ttl-watcher.js';
 import type { Config } from '../config.js';
 import type { ManifestDb } from '../manifest/db.js';
@@ -124,19 +123,19 @@ export function errorResult(message: string, extra?: Record<string, unknown>): T
  * Build the `inputSchema` payload for a tool's entry in a `tools/list`
  * response. Two non-negotiable constraints on the serialisation:
  *
- *   1. The `name` option is deliberately omitted. With `name` set,
- *      `zod-to-json-schema` wraps its output in `{ $ref, definitions }` — a
- *      shape that lacks the `type: "object"` the MCP spec mandates at the
- *      root. Strict clients (Claude Code, Claude Desktop) reject that with
+ *   1. The root is `type: "object"` — the MCP spec mandates it. Strict
+ *      clients (Claude Code, Claude Desktop) reject anything else with
  *      `Invalid input: expected "object"` and silently drop every tool from
- *      their namespace. This was the v1.0.0 / v1.0.1 ship-blocker fixed in
- *      PR #5.
+ *      their namespace (the v1.0.0 / v1.0.1 ship-blocker).
  *
- *   2. `$refStrategy: 'none'` is required. MCP clients do not dereference
- *      `$ref` inside `inputSchema`, so any internal reference would leave
- *      the schema unresolvable on the client side. The trade-off is payload
+ *   2. No `$ref`: `reused: 'inline'`. MCP clients do not dereference `$ref`
+ *      inside `inputSchema`, so any internal reference would leave the
+ *      schema unresolvable on the client side. The trade-off is payload
  *      size when heavily-reused sub-schemas appear — acceptable for our
  *      workload, forced by spec anyway.
+ *
+ * `io: 'input'` describes what a caller sends: a field with a default is
+ * optional. `target: 'draft-7'` is the dialect the tools were published in.
  *
  * The runtime assert is a belt-and-suspenders guard: `ToolDefinition.schema`
  * is currently typed loosely as `z.ZodSchema<TInput>`, which permits
@@ -146,8 +145,24 @@ export function errorResult(message: string, extra?: Record<string, unknown>): T
  * much clearer than the silent tool-list rejection the spec-violation path
  * produces. Compile-time narrowing is tracked in `docs/FOLLOW-UP-PRS.md`.
  */
+/** How a tool's zod schema is written as the JSON Schema of `tools/list` (see `buildToolInputSchema`). */
+const JSON_SCHEMA_OPTIONS = {
+  target: 'draft-7',
+  reused: 'inline',
+  io: 'input',
+  // The published contract, kept as it was: an object takes no key its schema does not name,
+  // and an integer carries only the bounds its schema states (not the safe-integer ceiling).
+  override: ({ jsonSchema }: { jsonSchema: Record<string, unknown> }) => {
+    if (jsonSchema.type === 'object' && jsonSchema.additionalProperties === undefined) {
+      jsonSchema.additionalProperties = false;
+    }
+    if (jsonSchema.maximum === Number.MAX_SAFE_INTEGER) jsonSchema.maximum = undefined;
+    if (jsonSchema.minimum === Number.MIN_SAFE_INTEGER) jsonSchema.minimum = undefined;
+  },
+} as const;
+
 export function buildToolInputSchema(tool: ToolDefinition<unknown>): McpInputSchema {
-  const payload = zodToJsonSchema(tool.schema, { $refStrategy: 'none' }) as Record<string, unknown>;
+  const payload = z.toJSONSchema(tool.schema, JSON_SCHEMA_OPTIONS) as Record<string, unknown>;
   if (payload.type !== 'object') {
     throw new Error(
       `buildToolInputSchema: tool '${tool.name}' produced a non-object root schema ` +

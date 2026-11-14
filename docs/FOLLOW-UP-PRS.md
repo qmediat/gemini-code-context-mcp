@@ -239,7 +239,7 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T15. Migrate from `zod-to-json-schema` to Zod 4's built-in `z.toJSONSchema()`
+## ~~T15.~~ ✅ SHIPPED 2026-11-14 — Migrate from `zod-to-json-schema` to Zod 4's built-in `z.toJSONSchema()`
 
 **Source:** Dependabot PR #13 closure (April 2026). Zod 4 is a type-internals rewrite: the `$ZodTypeInternals` shape replaces `ZodTypeDef`, and `zod-to-json-schema@3.x` rejects the new type with `TS2345: Argument of type 'ZodType<unknown, unknown, $ZodTypeInternals<unknown, unknown>>' is not assignable to parameter of type 'ZodType<any, ZodTypeDef, any>'` at the call site in `src/tools/registry.ts`.
 
