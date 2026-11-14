@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { ListToolsResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import { describe, expect, it } from 'vitest';
 import { TOOLS } from '../../src/tools/index.js';
@@ -15,6 +16,8 @@ describe('tools/list inputSchema conformance', () => {
         const inputSchema = buildToolInputSchema(tool);
         expect(inputSchema).not.toHaveProperty('$ref');
         expect(inputSchema).not.toHaveProperty('definitions');
+        expect(inputSchema).not.toHaveProperty('$defs');
+        expect(JSON.stringify(inputSchema)).not.toContain('"$ref"');
       });
 
       it('emits a well-formed `properties` (object or undefined per MCP spec)', () => {
@@ -46,7 +49,21 @@ describe('tools/list inputSchema conformance', () => {
     expect(objects.length).toBeGreaterThanOrEqual(TOOLS.length);
     expect(objects.every((node) => node.additionalProperties === false)).toBe(true);
     expect(nodes.some((node) => node.maximum === Number.MAX_SAFE_INTEGER)).toBe(false);
+    expect(nodes.some((node) => 'maximum' in node && node.maximum === undefined)).toBe(false);
     expect(nodes.some((node) => node.type === 'integer')).toBe(true);
+  });
+
+  it('publishes the inputSchema of 1.22.1 for every tool, key for key', () => {
+    // The fixture is the zod-3 build's output: a Zod release that writes a schema differently turns this red.
+    const published = JSON.parse(
+      readFileSync(new URL('../fixtures/tools-input-schema-1.22.1.json', import.meta.url), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(TOOLS.map((tool) => tool.name).sort()).toEqual(Object.keys(published).sort());
+    for (const tool of TOOLS) {
+      expect(JSON.parse(JSON.stringify(buildToolInputSchema(tool))), tool.name).toEqual(
+        published[tool.name],
+      );
+    }
   });
 
   it('produces a tools/list response that passes the SDK validator', () => {

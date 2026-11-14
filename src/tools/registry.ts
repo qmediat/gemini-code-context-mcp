@@ -119,6 +119,23 @@ export function errorResult(message: string, extra?: Record<string, unknown>): T
   };
 }
 
+/** How a tool's zod schema is written as the JSON Schema of `tools/list` (see `buildToolInputSchema`). */
+const JSON_SCHEMA_OPTIONS = {
+  target: 'draft-7',
+  reused: 'inline',
+  io: 'input',
+  // The published contract, kept as it was: an object takes no key its schema does not name,
+  // and an integer carries only the bounds its schema states — not Zod 4's safe-integer ceiling,
+  // which the parser still enforces (every integer here states its own minimum).
+  override: ({ jsonSchema }: { jsonSchema: Record<string, unknown> }) => {
+    if (jsonSchema.type === 'object' && jsonSchema.additionalProperties === undefined) {
+      jsonSchema.additionalProperties = false;
+    }
+    // biome-ignore lint/performance/noDelete: the key must be absent, not undefined — a client's deep-equal sees the difference
+    if (jsonSchema.maximum === Number.MAX_SAFE_INTEGER) delete jsonSchema.maximum;
+  },
+} as const;
+
 /**
  * Build the `inputSchema` payload for a tool's entry in a `tools/list`
  * response. Two non-negotiable constraints on the serialisation:
@@ -139,28 +156,12 @@ export function errorResult(message: string, extra?: Record<string, unknown>): T
  *
  * The runtime assert is a belt-and-suspenders guard: `ToolDefinition.schema`
  * is currently typed loosely as `z.ZodSchema<TInput>`, which permits
- * non-object roots (unions, primitives, `ZodEffects`) to compile cleanly.
+ * non-object roots (unions, primitives) to compile cleanly.
  * `runServer()` exercises this helper on every tool at startup, so a
  * malformed schema fails before the stdio transport accepts connections —
  * much clearer than the silent tool-list rejection the spec-violation path
  * produces. Compile-time narrowing is tracked in `docs/FOLLOW-UP-PRS.md`.
  */
-/** How a tool's zod schema is written as the JSON Schema of `tools/list` (see `buildToolInputSchema`). */
-const JSON_SCHEMA_OPTIONS = {
-  target: 'draft-7',
-  reused: 'inline',
-  io: 'input',
-  // The published contract, kept as it was: an object takes no key its schema does not name,
-  // and an integer carries only the bounds its schema states (not the safe-integer ceiling).
-  override: ({ jsonSchema }: { jsonSchema: Record<string, unknown> }) => {
-    if (jsonSchema.type === 'object' && jsonSchema.additionalProperties === undefined) {
-      jsonSchema.additionalProperties = false;
-    }
-    if (jsonSchema.maximum === Number.MAX_SAFE_INTEGER) jsonSchema.maximum = undefined;
-    if (jsonSchema.minimum === Number.MIN_SAFE_INTEGER) jsonSchema.minimum = undefined;
-  },
-} as const;
-
 export function buildToolInputSchema(tool: ToolDefinition<unknown>): McpInputSchema {
   const payload = z.toJSONSchema(tool.schema, JSON_SCHEMA_OPTIONS) as Record<string, unknown>;
   if (payload.type !== 'object') {

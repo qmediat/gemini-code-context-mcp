@@ -30,7 +30,7 @@ Your Gemini API key and your workspace content. We treat them with different thr
 | Prompt-injected agent redirecting `workspace` at `$HOME` or `/etc` | `validateWorkspacePath` refuses paths that are neither descendants of the MCP host's cwd nor contain a recognised workspace marker (`.git`, `package.json`, `Cargo.toml`, `go.mod`, `pyproject.toml`, `Makefile`, `Dockerfile`, …). Both sides of the cwd-ancestry check are canonicalised via `realpath`, so symlinks cannot bypass the guard. Escape hatch for genuine non-workspace roots: `GEMINI_CODE_CONTEXT_ALLOW_NONWORKSPACE=true`. |
 | Arbitrary file read via workspace path argument | Handled by the same `validateWorkspacePath` check above. Paths are never executed — only passed to `readdir(withFileTypes)` — but unrestricted paths were a content-exfiltration vector before this guard landed. |
 | Arbitrary code execution via `code` tool | The `codeExecution` flag enables **Gemini's** sandboxed Python env, not local exec. Nothing runs on your machine. |
-| Supply-chain compromise of a dependency | Only 4 runtime deps (`@modelcontextprotocol/sdk`, `@google/genai`, `better-sqlite3`, `zod`). CI runs `npm audit`. Dependabot alerts on. |
+| Supply-chain compromise of a dependency | Only 4 direct runtime deps (`@modelcontextprotocol/sdk`, `@google/genai`, `better-sqlite3`, `zod`). CI runs `npm audit`. Dependabot alerts on. |
 
 ## What we do NOT protect against
 

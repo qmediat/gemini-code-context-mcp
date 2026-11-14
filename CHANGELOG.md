@@ -11,7 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `zod` 4.6.7 (was 3.25): GHSA-mrhx-c7xc-m3w5, memory exhaustion while validating oversized constrained collections.
   The tool schemas are written to `tools/list` by Zod's own `z.toJSONSchema` — the `zod-to-json-schema` dependency is
-  gone — and the published `inputSchema` of every tool is unchanged (compared key by key against 1.22.1).
+  gone as a direct dependency (the MCP SDK still installs it) — and the published `inputSchema` of every tool is
+  unchanged, held by a test against the 1.22.1 output. Two things a caller can see do change with Zod 4: the wording
+  of an `Invalid arguments` error (`prompt: Invalid input: expected string, received undefined`, was `prompt:
+  Required`; an enum now reads `Invalid option: expected one of …`), and an integer above 2^53 − 1 is refused.
+  Dependabot proposes Zod majors again.
 - Transitive dependencies brought past their advisories (`body-parser`, `hono`, `@hono/node-server`, `fast-uri`,
   `ip-address`, `qs`): `npm audit --omit=dev --audit-level=high` is clean again.
 
