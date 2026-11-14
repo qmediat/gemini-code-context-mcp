@@ -68,12 +68,32 @@ interface CategoryRule {
   readonly costTier: CapabilityFlags['costTier'];
 }
 
+/**
+ * The Gemini 4 codenames in the order Google shipped them within a tier (argon 2026-10-13, carbon 2026-11-10;
+ * hydrogen 2026-11-12). Among ids of the same version the LATER codename ranks first in the listing — an alias
+ * (`latest-pro`) resolves to it — by this declared order, never by the alphabet. A new codename is added here.
+ */
+export const GEMINI_4_CODENAMES: readonly string[] = ['argon', 'carbon', 'hydrogen'];
+
+/** A Gemini 4 id that is exactly `gemini-4[.N]-<codename>` or its `-preview` twin. */
+function codenameId(names: readonly string[]): RegExp {
+  return new RegExp(`^gemini-4(?:\\.\\d+)?-(?:${names.join('|')})(?:-preview)?$`, 'i');
+}
+
+/** The listing rank a codename gives an id (0 for an id without one): a later codename ranks higher. */
+export function codenameRank(modelId: string): number {
+  const found = /^gemini-4(?:\.\d+)?-([a-z]+)/i.exec(modelId);
+  return found ? GEMINI_4_CODENAMES.indexOf((found[1] ?? '').toLowerCase()) + 1 : 0;
+}
+
 const CATEGORY_RULES: readonly CategoryRule[] = [
   // === Image generation — MUST come before pro/flash text rules ===
   // `nano-banana-*` is Google's image-gen family (pro/flash tiers), IDs
   // like `nano-banana-pro-preview`. Shares the `pro` token with text models
   // but bills at the image tier (~10× text rates).
   { pattern: /^nano-banana/i, category: 'image-generation', costTier: 'premium' },
+  // Since 2.1 the family carries the `gemini-` prefix (`gemini-nano-banana-2.1`).
+  { pattern: /^gemini-nano-banana(?:-|$)/i, category: 'image-generation', costTier: 'premium' },
   // `*-image` suffix (e.g. `gemini-3-pro-image`) identifies Gemini's native
   // image-output variants.
   { pattern: /-image(?:-|$)/i, category: 'image-generation', costTier: 'premium' },
@@ -137,13 +157,18 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // Flash (standard speed tier).
   { pattern: /^gemini-.*-flash/i, category: 'text-fast', costTier: 'standard' },
   { pattern: /-flash(?:-|$)/i, category: 'text-fast', costTier: 'standard' },
-  // Gemini 4 frontier models ship under a codename with no pro/flash token
-  // (`gemini-4-argon`, a later `gemini-4.1-argon`). Argon is the reasoning
-  // tier: thinking, 2 / 10 USD per 1M tokens — premium. Placed after every
-  // specialisation and after the lite / flash rules, so an `-image` / `-tts` /
-  // `-live` variant keeps its specialised category and an `-argon-lite` /
-  // `-argon-flash` variant its tier: the more specific tier wins.
-  { pattern: /^gemini-4(?:\.\d+)?-argon(?:-|$)/i, category: 'text-reasoning', costTier: 'premium' },
+  // Gemini 4 models ship under a codename with no pro/flash token
+  // (`gemini-4-argon`, a later `gemini-4.1-argon`). Carbon and Argon are the
+  // reasoning tier: thinking, 2 / 10 USD per 1M tokens — premium. Hydrogen is
+  // the fast tier (Google's successor of 3.8 Flash, 1.5 / 7.5 USD) — standard.
+  // Placed after every specialisation and after the lite / flash rules, so an
+  // `-image` / `-tts` / `-live` variant keeps its specialised category and a
+  // `-<codename>-lite` / `-<codename>-flash` variant its tier: the more
+  // specific tier wins. A codename this list does not name stays `unknown`.
+  // A bare codename id or its `-preview` twin only: `gemini-4-carbon-computer-use-preview` is another product
+  // and stays `unknown` until a rule names it.
+  { pattern: codenameId(['argon', 'carbon']), category: 'text-reasoning', costTier: 'premium' },
+  { pattern: codenameId(['hydrogen']), category: 'text-fast', costTier: 'standard' },
   // Pro (reasoning / premium tier). Only reaches here if no specialisation
   // above claimed the model. The `^gemini-pro` rule previously at the end
   // of this list was unreachable because `/-pro(?:-|$)/i` already matches

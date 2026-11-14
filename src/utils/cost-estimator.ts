@@ -57,17 +57,28 @@ const FLASH_LITE_31: PricingEntry = {
   cachedInputPerMillion: 0.025,
 };
 
+/** Gemini 4 Argon and Carbon: one row on the page, the same rise on 2026-12-01. */
+const REASONING_4: PricingEntry = {
+  inputPerMillion: 2,
+  outputPerMillion: 10,
+  cachedInputPerMillion: 0.1,
+  next: {
+    from: '2026-12-01',
+    inputPerMillion: 4,
+    outputPerMillion: 20,
+    cachedInputPerMillion: 0.2,
+  },
+};
+
 const DEFAULT_PRICING: Readonly<Record<string, PricingEntry>> = {
-  'gemini-4-argon': {
-    inputPerMillion: 2,
-    outputPerMillion: 10,
-    cachedInputPerMillion: 0.1,
-    next: {
-      from: '2026-12-01',
-      inputPerMillion: 4,
-      outputPerMillion: 20,
-      cachedInputPerMillion: 0.2,
-    },
+  'gemini-4-carbon': REASONING_4,
+  'gemini-4-argon': REASONING_4,
+  // Read 2026-11-14 (as Carbon's row). Flat: the page lists no dated change. Its cached rate is 0.075 on the page — 5 % of the input
+  // rate, not the Flash line's 10 %.
+  'gemini-4-hydrogen': {
+    inputPerMillion: 1.5,
+    outputPerMillion: 7.5,
+    cachedInputPerMillion: 0.075,
   },
   'gemini-3-pro-preview': PRO_3X_PREVIEW,
   'gemini-3.1-pro-preview': PRO_3X_PREVIEW,

@@ -53,11 +53,12 @@ describe('tools/list inputSchema conformance', () => {
     expect(nodes.some((node) => node.type === 'integer')).toBe(true);
   });
 
-  it('publishes the inputSchema of 1.22.1 for every tool, key for key', () => {
-    // The fixture is the output of the 1.22.1 build (commit 87a3ea1, zod 3.25.76 + zod-to-json-schema), dumped
-    // before the migration: a Zod release that writes a schema differently turns this red.
+  it('publishes the recorded inputSchema for every tool, key for key', () => {
+    // The fixture is the published contract: first the output of the 1.22.1 build (zod 3 + zod-to-json-schema),
+    // since then changed only on purpose (`XHIGH`). A Zod release that writes a schema differently turns this
+    // red; a deliberate change of a tool's arguments updates the fixture in the same commit.
     const published = JSON.parse(
-      readFileSync(new URL('../fixtures/tools-input-schema-1.22.1.json', import.meta.url), 'utf8'),
+      readFileSync(new URL('../fixtures/tools-input-schema.json', import.meta.url), 'utf8'),
     ) as Record<string, unknown>;
     expect(TOOLS.map((tool) => tool.name).sort()).toEqual(Object.keys(published).sort());
     for (const tool of TOOLS) {

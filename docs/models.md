@@ -40,8 +40,8 @@ caller takes responsibility).
 
 | Category | What it's for | Example IDs | Accepted by tools |
 |---|---|---|---|
-| `text-reasoning` | Deep thinking, code review, long analysis | `gemini-4-argon`, `gemini-pro-latest`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro` | `ask`, `code` |
-| `text-fast` | Quick Q&A, shallow reasoning | `gemini-flash-latest`, `gemini-3.8-flash`, `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
+| `text-reasoning` | Deep thinking, code review, long analysis | `gemini-4-carbon`, `gemini-4-argon`, `gemini-pro-latest`, `gemini-3.1-pro-preview`, `gemini-3-pro-preview`, `gemini-2.5-pro` | `ask`, `code` |
+| `text-fast` | Quick Q&A, shallow reasoning | `gemini-4-hydrogen`, `gemini-flash-latest`, `gemini-3.8-flash`, `gemini-3-flash-preview`, `gemini-2.5-flash` | `ask` |
 | `text-lite` | Cheapest text gen, simple classification | `gemini-flash-lite-latest`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite-preview`, `gemini-2.5-flash-lite` | `ask` |
 | `image-generation` | Text → image (different pricing tier!) | `nano-banana-pro-preview`, `gemini-3-pro-image`, `imagen-4-ultra` | — (not supported by ask/code) |
 | `audio-generation` | TTS, music generation, dialog-native audio | `lyria-3-pro-preview`, `*-tts`, `*-native-audio-*` | — |
@@ -50,8 +50,11 @@ caller takes responsibility).
 | `agent` | Specialised agents and Interactions-API-only models (not drop-in text models) | `gemini-deep-research-*`, `*-customtools`, `gemini-omni-*` | — |
 | `unknown` | Family we haven't classified yet | A newly-released Google model not in our rules | — (aliases refuse; explicit ID pass fails category check) |
 
-Gemini 4 ships its frontier models under a codename with no `pro` / `flash` token: `gemini-4-argon` (and a later
-`gemini-4.N-argon`) is the premium reasoning tier, with thinking, 32 768 output tokens on the API and implicit caching
+Gemini 4 ships its models under a codename with no `pro` / `flash` token. `gemini-4-carbon` and `gemini-4-argon` are
+the premium reasoning tier; `gemini-4-hydrogen` — Google's successor of 3.8 Flash — is the fast tier and the one model
+that takes `thinkingLevel: "XHIGH"`. Among same-tier models the listing order decides an alias (below): `latest-pro`
+and `latest-pro-thinking` resolve to `gemini-4-carbon` when the key lists it, `latest-flash` to `gemini-4-hydrogen`.
+`gemini-4-argon` (and a later `gemini-4.N-argon`) is a premium reasoning model, with thinking, 32 768 output tokens on the API and implicit caching
 only (it does not offer `createCachedContent`: an `ask` / `code` call with `cachingMode: 'explicit'` runs implicit on it
 and says so in `cachingModeNote`, with `cachingMode: 'implicit'` in the response). The open Gemma models listed on the same endpoint (`gemma-4-*`) are
 not text tiers here and stay `unknown`.
@@ -65,7 +68,7 @@ Orthogonal to category — multiple can apply to a single model:
 | `supportsThinking` | Model supports reasoning / extended thinking (Gemini 2.5+, Gemini 3.x) |
 | `supportsVision` | Accepts image / PDF input (every text-generation tier, Flash-Lite included since v1.20.0; not embeddings or media generation) |
 | `supportsCodeExecution` | Works with the `code_execution` tool (all text-gen tiers) |
-| `costTier` | `premium` (pro / Gemini 4 Argon / image-gen / music), `standard` (flash), `budget` (lite / embeddings), `unknown` |
+| `costTier` | `premium` (pro / Gemini 4 Carbon and Argon / image-gen / music), `standard` (flash / Gemini 4 Hydrogen), `budget` (lite / embeddings), `unknown` |
 
 ## Aliases
 
@@ -73,7 +76,7 @@ Orthogonal to category — multiple can apply to a single model:
 |---|---|---|---|
 | `latest-pro` | `text-reasoning` | — | Newest pro-tier text model |
 | `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | The default for every tool when `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` is unset; preferred for deep work |
-| `latest-flash` | `text-fast` | — | Faster + cheaper than pro; no deep thinking |
+| `latest-flash` | `text-fast` | — | Faster + cheaper than pro. Gemini 4 Hydrogen (what it resolves to when listed) thinks by default; bound it with `thinkingLevel` |
 | `latest-lite` | `text-lite` | — | Cheapest tier; limited capabilities. A GA ID before its `-preview` twin (`gemini-3.1-flash-lite` over `gemini-3.1-flash-lite-preview`), a versioned ID before `gemini-flash-lite-latest` |
 | `latest-vision` | `text-reasoning` or `text-fast` | `supportsVision=true` | Screenshot analysis, image Q&A — give the images with `ask`'s `attachments` *(v1.20.0+)* |
 
@@ -97,8 +100,8 @@ text categories first (reasoning, fast, lite, then the rest), the cost tier, ver
 serves `gemini-3.1-pro-preview`, `gemini-flash-latest` `gemini-3.8-flash`, `gemini-flash-lite-latest`
 `gemini-3.5-flash-lite`; each alias is priced at the dearest rate of its target's category, see
 [cost-model.md](cost-model.md)), the ID descending with version numbers compared as
-numbers (`3.10` above `3.9`), and a GA ID before its `-preview` twin. So `gemini-4-argon` wins over
-`gemini-3.1-pro-preview` and `gemini-pro-latest`, and every alias resolves to a versioned model whenever one is listed.
+numbers (`3.10` above `3.9`), and a GA ID before its `-preview` twin. So `gemini-4-carbon` wins over `gemini-4-argon` (the id
+descending), both over `gemini-3.1-pro-preview` and `gemini-pro-latest`, and every alias resolves to a versioned model whenever one is listed.
 Guaranteed to NOT pick up `nano-banana-pro-preview` even if it's in your
 model list.
 
@@ -125,7 +128,7 @@ reasoning overhead.
 }
 ```
 
-Picks the newest vision-capable text model — prefers pro tier (`gemini-4-argon` when it is listed) but falls
+Picks the newest vision-capable text model — prefers pro tier (`gemini-4-carbon`, else `gemini-4-argon`, when listed) but falls
 back to flash if pro is unavailable.
 
 ### Explicit model ID

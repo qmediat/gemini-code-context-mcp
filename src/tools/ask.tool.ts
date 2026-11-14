@@ -61,7 +61,11 @@ import {
 } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import {
+  THINKING_LEVEL_FIELD,
+  THINKING_LEVEL_RESERVE,
+  emptyAtOutputCap,
+} from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 /**
@@ -146,12 +150,7 @@ export const askInputSchema = z
       .describe(
         "Explicit reasoning-token cap. OMIT to use each model's native default — recommended on Gemini 3 (Google flags explicit `thinkingBudget` as 'legacy'). Pass a value only when you need a specific cap: `-1` = legacy dynamic, `0` = disable thinking (rejected by Gemini 3 Pro), positive integer = fixed cap. CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang — use `-1` or ≥4096 if you must bound it there. For discrete-tier control on Gemini 3 use `thinkingLevel` instead — the two are mutually exclusive.",
       ),
-    thinkingLevel: z
-      .enum(THINKING_LEVELS)
-      .optional()
-      .describe(
-        "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
-      ),
+    thinkingLevel: THINKING_LEVEL_FIELD,
     maxOutputTokens: z
       .number()
       .int()
@@ -1255,6 +1254,10 @@ async function executeAskBody(
         cachedContentTokenCount: cached,
       });
     }
+
+    // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
+    const starved = emptyAtOutputCap(response, thinking);
+    if (starved !== null) return errorResult(`ask: ${starved}`);
 
     if (scan.truncated) {
       logger.warn(

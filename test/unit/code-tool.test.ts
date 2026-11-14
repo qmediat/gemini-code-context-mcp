@@ -15,6 +15,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { codeInputSchema } from '../../src/tools/code.tool.js';
+import { THINKING_LEVELS } from '../../src/tools/shared/thinking.js';
 
 describe('code input schema — thinkingBudget', () => {
   it('accepts omitted thinkingBudget (runtime applies the 16384 default)', () => {
@@ -77,7 +78,16 @@ describe('code input schema — thinkingLevel', () => {
     }
   });
 
-  it.each(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const)('accepts %s', (level) => {
+  it('refuses XHIGH with the reason and the way out (only a fast-tier model takes it; code runs reasoning-tier models)', () => {
+    const parsed = codeInputSchema.safeParse({ task: 'hi', thinkingLevel: 'XHIGH' });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.path).toEqual(['thinkingLevel']);
+      expect(parsed.error.issues[0]?.message).toContain('gemini-4-hydrogen');
+    }
+  });
+
+  it.each(THINKING_LEVELS.filter((level) => level !== 'XHIGH'))('accepts %s', (level) => {
     const parsed = codeInputSchema.safeParse({ task: 'hi', thinkingLevel: level });
     expect(parsed.success).toBe(true);
     if (parsed.success) {

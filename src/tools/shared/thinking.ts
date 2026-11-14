@@ -9,6 +9,8 @@
  * call sites (and any future reasoning-capable tool we add).
  */
 
+import { z } from 'zod';
+
 /**
  * Accepted values for `thinkingLevel` on both `ask` and `code`. Uppercased
  * to match `ThinkingLevel` enum members in `@google/genai` — we pass the
@@ -25,11 +27,23 @@
  *   - Gemini 3 Pro supports LOW / MEDIUM / HIGH (not MINIMAL); default HIGH.
  *   - Gemini 3 Flash supports all four; Flash-Lite defaults to MINIMAL.
  *   - Gemini 2.5 family does NOT support `thinkingLevel` — use `thinkingBudget`.
- * Both tools accept all four values at the schema boundary and let Gemini
+ *   - Gemini 4 Hydrogen adds XHIGH above HIGH (changelog 2026-11-12: low,
+ *     medium, high — its default — and xhigh).
+ * Every tool accepts all five values at the schema boundary and lets Gemini
  * reject unsupported combinations at request time, so the MCP surface stays
  * stable across model rollouts.
  */
-export const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const;
+export const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH'] as const;
+
+/** The one description of `thinkingLevel` (`THINKING_LEVEL_FIELD` carries it). */
+const THINKING_LEVEL_DESCRIPTION =
+  "Discrete reasoning tier for Gemini 3 and Gemini 4 models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only — a fast-tier model, which `ask` and `ask_agentic` can run and `code` cannot; Gemini 4 Argon and Carbon answer it with a 400). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').";
+
+/** The `thinkingLevel` argument of every tool that takes one (`ask`, `code`, `ask_agentic`): one schema, one text. */
+export const THINKING_LEVEL_FIELD = z
+  .enum(THINKING_LEVELS)
+  .optional()
+  .describe(THINKING_LEVEL_DESCRIPTION);
 
 /**
  * Literal-union type matching the schema's accepted `thinkingLevel` values.
@@ -57,7 +71,7 @@ export type ThinkingLevelLiteral = (typeof THINKING_LEVELS)[number];
  * decides to spend); a subsequent call will see the larger measured cost
  * in the budget ledger.
  *
- * HIGH intentionally maps to `null` → call sites substitute
+ * HIGH and XHIGH intentionally map to `null` → call sites substitute
  * `maxOutputTokens - 1024` so the value tracks each tool's actual output
  * cap (8_192 for `ask`, 32_768 for `code`) rather than a hard-coded
  * duplicate.
@@ -67,4 +81,22 @@ export const THINKING_LEVEL_RESERVE: Record<ThinkingLevelLiteral, number | null>
   LOW: 2_048,
   MEDIUM: 4_096,
   HIGH: null,
+  XHIGH: null,
 };
+
+/**
+ * A call that ended at the output cap with no answer: the model's thinking used the cap (thinking tokens count
+ * against `maxOutputTokens`, and Gemini 4 Carbon / Hydrogen and the 3.x Pro models think without being asked).
+ * The message names the cause and the remedy; `null` for any call that produced text or stopped for another reason.
+ */
+export function emptyAtOutputCap(
+  response: {
+    readonly text: string;
+    readonly candidates?: readonly { finishReason?: unknown }[] | undefined;
+  },
+  thinkingTokens: number,
+): string | null {
+  const stopped = response.candidates?.[0]?.finishReason;
+  if (response.text.trim() !== '' || stopped !== 'MAX_TOKENS') return null;
+  return `the model stopped at the output cap before writing an answer (thinking used ${thinkingTokens} tokens of it; the call was billed). Raise \`maxOutputTokens\`, or bound the thinking with \`thinkingLevel: "LOW"\` / a smaller \`thinkingBudget\`.`;
+}

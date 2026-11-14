@@ -11,6 +11,7 @@ import {
   type CapabilityFlags,
   type ModelCategory,
   categorizeModel,
+  codenameRank,
   costTierOf,
 } from './model-taxonomy.js';
 
@@ -53,6 +54,10 @@ interface RankKey {
   readonly rolling: number;
   /** The id without a trailing `-preview`: a GA model and its preview twin share it. */
   readonly base: string;
+  /** The id's version (`gemini-4.1-argon` → `4.1`): compared before a codename, so 4.1 Argon is above 4 Carbon. */
+  readonly version: string;
+  /** The declared rank of a Gemini 4 codename (0 without one): the later codename first, never the alphabet. */
+  readonly codename: number;
   readonly preview: number;
 }
 
@@ -63,6 +68,8 @@ function rankKey(id: string): RankKey {
     tier: TIER_RANK[costTierOf(id)],
     rolling: Number(isRollingAlias(id)),
     base,
+    version: /^gemini-(\d+(?:\.\d+)?)-/i.exec(base)?.[1] ?? '',
+    codename: codenameRank(base),
     preview: Number(base !== id),
   };
 }
@@ -80,6 +87,11 @@ function compareListing(ka: RankKey, kb: RankKey): number {
   if (ka.category !== kb.category) return ka.category - kb.category;
   if (ka.tier !== kb.tier) return ka.tier - kb.tier;
   if (ka.rolling !== kb.rolling) return ka.rolling - kb.rolling;
+  if (ka.codename !== 0 && kb.codename !== 0) {
+    const byVersion = kb.version.localeCompare(ka.version, undefined, { numeric: true });
+    if (byVersion !== 0) return byVersion;
+    if (ka.codename !== kb.codename) return kb.codename - ka.codename;
+  }
   const byBase = kb.base.localeCompare(ka.base, undefined, { numeric: true });
   if (byBase !== 0) return byBase;
   return ka.preview - kb.preview;

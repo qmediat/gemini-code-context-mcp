@@ -14,9 +14,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  GEMINI_4_CODENAMES,
   type ModelCategory,
   ModelCategoryMismatchError,
   categorizeModel,
+  codenameRank,
   costTierOf,
   extractCapabilityFlags,
   isTextGenCategory,
@@ -138,6 +140,48 @@ describe('categorizeModel — Gemini 4 codenames', () => {
   it('gemini-4-argon is text-reasoning at the premium tier', () => {
     expect(categorizeModel('gemini-4-argon')).toBe('text-reasoning');
     expect(costTierOf('gemini-4-argon')).toBe('premium');
+  });
+
+  it('gemini-4-carbon is text-reasoning at the premium tier, gemini-4-hydrogen text-fast at the standard tier', () => {
+    expect(categorizeModel('gemini-4-carbon')).toBe('text-reasoning');
+    expect(costTierOf('gemini-4-carbon')).toBe('premium');
+    expect(categorizeModel('gemini-4-hydrogen')).toBe('text-fast');
+    expect(costTierOf('gemini-4-hydrogen')).toBe('standard');
+    expect(categorizeModel('gemini-4.1-hydrogen')).toBe('text-fast');
+  });
+
+  it('(guard) a Gemini 4 codename the rules do not name stays unknown; hydrogen-lite is a lite model', () => {
+    expect(categorizeModel('gemini-4-helium')).toBe('unknown');
+    expect(categorizeModel('gemini-4-hydrogenated')).toBe('unknown');
+    expect(categorizeModel('gemini-4-hydrogen-lite')).toBe('text-lite');
+  });
+
+  it('(guard) an image / tts / live variant of carbon or hydrogen keeps its specialisation', () => {
+    for (const codename of ['carbon', 'hydrogen']) {
+      expect(categorizeModel(`gemini-4-${codename}-image`)).toBe('image-generation');
+      expect(categorizeModel(`gemini-4-${codename}-tts`)).toBe('audio-generation');
+      expect(categorizeModel(`gemini-4-${codename}-live`)).toBe('agent');
+    }
+    expect(categorizeModel('gemini-4-carbon-preview')).toBe('text-reasoning');
+  });
+
+  it('a codename id with another product suffix is not that text model', () => {
+    expect(categorizeModel('gemini-4-carbon-computer-use-preview')).toBe('unknown');
+    expect(categorizeModel('gemini-4-hydrogen-computer-use-preview')).toBe('unknown');
+  });
+
+  it('the codenames rank in the order they shipped, not by the alphabet', () => {
+    expect(codenameRank('gemini-4-argon')).toBeLessThan(codenameRank('gemini-4-carbon'));
+    expect(codenameRank('gemini-4-carbon')).toBeLessThan(codenameRank('gemini-4-hydrogen'));
+    expect(codenameRank('gemini-4.1-argon')).toBe(codenameRank('gemini-4-argon'));
+    expect(codenameRank('gemini-3.8-flash')).toBe(0);
+    expect(GEMINI_4_CODENAMES.indexOf('carbon')).toBeGreaterThan(
+      GEMINI_4_CODENAMES.indexOf('argon'),
+    );
+  });
+
+  it('gemini-nano-banana-2.1 is image generation, not a text tier', () => {
+    expect(categorizeModel('gemini-nano-banana-2.1')).toBe('image-generation');
   });
 
   it('a point release of the codename (gemini-4.1-argon) classifies the same', () => {

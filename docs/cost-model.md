@@ -2,7 +2,7 @@
 
 Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by caching. Here's how billing actually works and what knobs you have.
 
-> **Rates read 2026-10-16** from [Google's pricing page](https://ai.google.dev/gemini-api/docs/pricing) (Standard tier). Google changes prices; cross-check there. `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) replaces a row at run time without a release.
+> **Rates read 2026-10-16** (the Gemini 4 Carbon and Hydrogen rows: 2026-11-14) from [Google's pricing page](https://ai.google.dev/gemini-api/docs/pricing) (Standard tier). Google changes prices; cross-check there. `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) replaces a row at run time without a release.
 
 ## The estimator's rates
 
@@ -15,8 +15,9 @@ never settles above its reservation.
 
 | Model | Rate | From |
 |---|---|---|
-| `gemini-4-argon` | 2 / 10 / 0.1 | through 2026-11-30 |
+| `gemini-4-carbon`, `gemini-4-argon` | 2 / 10 / 0.1 | through 2026-11-30 |
 | | 4 / 20 / 0.2 | 2026-12-01 |
+| `gemini-4-hydrogen` | 1.5 / 7.5 / 0.075 | |
 | `gemini-3.1-pro-preview`, `gemini-3-pro-preview` | 4 / 18 / 0.4 (the > 200k-token tier; ≤ 200k: 2 / 12 / 0.2) | |
 | `gemini-2.5-pro` | 2.5 / 15 / 0.25 (the > 200k-token tier; ≤ 200k: 1.25 / 10 / 0.125) | |
 | `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash` | 0.75 / 3.75 / 0.075 | through 2026-12-31 |

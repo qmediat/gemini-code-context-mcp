@@ -41,7 +41,7 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
 
   it("resolves 'latest-flash' alias against live registry", async () => {
     const resolved = await resolveModel('latest-flash', client);
-    expect(resolved.resolved).toMatch(/flash/);
+    expect(resolved.resolved).toMatch(/flash|hydrogen/);
   }, 30_000);
 
   it('uploads files + builds cache + reuses on follow-up (small workspace → inline fallback)', async () => {
@@ -116,7 +116,8 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
 
     const manifest = new ManifestDb(join(root, 'manifest.db'));
     try {
-      const resolved = await resolveModel('latest-flash', client);
+      // A model that offers `createCachedContent`: `latest-flash` is Gemini 4 Hydrogen now, which caches implicitly only.
+      const resolved = await resolveModel('gemini-3.8-flash', client);
       const scan = await scanWorkspace(root, { maxFiles: 50, maxFileSizeBytes: 100_000 });
 
       const first = await prepareContext({
@@ -132,13 +133,8 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
       });
       // If Gemini rejected cache build for another reason, the fallback keeps us
       // correct — but we want to explicitly assert the happy path works.
-      if (first.cacheId === null) {
-        // Log for operator visibility; don't fail — could be a tier mismatch.
-        console.warn(
-          'cache build skipped/rejected for large workspace test — run with a Pro tier key for full coverage.',
-        );
-        return;
-      }
+      // The model was chosen because it offers explicit caching: no cache here is a failure, not a skip.
+      expect(first.cacheId).not.toBeNull();
       expect(first.rebuilt).toBe(true);
       expect(first.cacheId).toMatch(/cachedContents\//);
 
