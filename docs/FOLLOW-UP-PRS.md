@@ -227,6 +227,26 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
+## T37. Settle a call at the rates of the model that answered (`modelVersion`), keep the category bound for the reservation
+
+**Source:** cross-model review of PR #121 (2026-11-14).
+
+**Why:** a rolling alias (`gemini-flash-latest`) and a text id the table does not price settle at the dearest rate of their category. Since Gemini 4 Hydrogen joined the fast tier that bound is 1.5 / 7.5 USD per 1M while Google serves `gemini-3.8-flash` (0.75 / 3.75) under the alias (measured 2026-11-14 by the response's `modelVersion`): the ledger books twice the bill and `GEMINI_DAILY_BUDGET_USD` rejects at half the real spend. The bound is right for a RESERVATION (Google may move the alias mid-call); the settlement can know better.
+
+**Scope:** carry `modelVersion` out of `collectStream` (and the non-streaming `ask_agentic` response); in `ask`, `code` and `ask_agentic` price the settlement by it when it names a priced row, else as today. Test: a `gemini-flash-latest` call whose response names `gemini-3.8-flash` settles at 3.75 USD per 1M output.
+
+---
+
+## T38. `ask_agentic` reserves 4 096 thinking + 4 096 output tokens per iteration, and caps neither on the wire
+
+**Source:** cross-model review of PR #121 (2026-11-14); true for the 3.x Pro defaults before it.
+
+**Why:** the default model now thinks without being asked (Gemini 4 Carbon), so an iteration settles above its reservation more often; the daily budget stays a cap across completed calls (the settlement overwrites the estimate), the preflight acceptance is what is optimistic.
+
+**Scope:** either send `maxOutputTokens` matching the reservation, or reserve from the resolved model's output cap. Decide with a measurement of real iterations on Carbon.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.

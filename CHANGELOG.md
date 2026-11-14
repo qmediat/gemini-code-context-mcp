@@ -7,20 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **What the aliases resolve to, when your key lists the new models.** `latest-pro` and `latest-pro-thinking` (the
+  server's default) → `gemini-4-carbon` (was `gemini-4-argon`); `latest-flash` → `gemini-4-hydrogen` (was
+  `gemini-3.8-flash`). What that changes for a call that names no model:
+  - Carbon and Hydrogen think without being asked (Argon and a default `ask` did not): more output tokens are billed
+    and a call takes longer. Bound it with `thinkingLevel`.
+  - Hydrogen costs 1.5 / 7.5 USD per 1M against 3.8 Flash's 0.75 / 3.75 through 2026-12-31 (the same from
+    2027-01-01), and offers implicit caching only — `cachingMode: 'explicit'` runs implicit on it, as on Argon and
+    Carbon, and says so.
+  - Pass a model id (`gemini-4-argon`, `gemini-3.8-flash`) to keep the previous one.
+- Among Gemini 4 models of one version an alias takes the codename Google shipped last (a declared order:
+  argon, carbon, hydrogen) — a point release (`gemini-4.1-argon`) outranks any codename of the older version.
+- A call that stops at the output cap with no answer is an error that names the cause (the model's thinking used
+  `maxOutputTokens`) and the remedy, on `ask` and `code` — it used to come back as an empty success. The call is
+  billed either way.
+- The fast tier's price bound is Hydrogen's: `gemini-flash-latest` and a fast-tier id the table does not price are
+  estimated at 1.5 / 7.5 USD per 1M (was 3.8 Flash's 0.75 / 3.75) — the dearest row of the category, as before,
+  although Google serves `gemini-3.8-flash` under that alias today.
+
 ### Added
 
-- Gemini 4 Carbon and Gemini 4 Hydrogen (GA 2026-11-10 and 2026-11-12). `gemini-4-carbon` is a premium reasoning model
-  like Argon; `gemini-4-hydrogen` is the fast tier. Until now both were `unknown`: no alias picked them and an explicit
-  id failed the category check of `ask` / `code`. With them listed on the key, `latest-pro` / `latest-pro-thinking`
-  resolve to `gemini-4-carbon` (was `gemini-4-argon`; the same rates) and `latest-flash` to `gemini-4-hydrogen` (was
-  `gemini-3.8-flash`; 1.5 / 7.5 USD per 1M against 0.75 / 3.75 through 2026-12-31) — pass a model id to keep the
-  previous one.
-- `thinkingLevel: "XHIGH"` on `ask`, `code` and `ask_agentic` — the level Google added with Gemini 4 Hydrogen. Other
-  models reject it at request time, as they do any level they do not offer.
+- Gemini 4 Carbon and Gemini 4 Hydrogen (GA 2026-11-10 and 2026-11-12): `gemini-4-carbon` is a premium reasoning
+  model like Argon, `gemini-4-hydrogen` the fast tier. Until now both were `unknown`: no alias picked them and an
+  explicit id failed the category check of `ask` / `code`. A codename id with another product's suffix
+  (`gemini-4-carbon-computer-use-preview`) stays `unknown`.
+- `thinkingLevel: "XHIGH"` — the level Google added with Gemini 4 Hydrogen, the one model that takes it (`ask`,
+  `ask_agentic`; Argon, Carbon and the 3.x models answer it with a 400, so on `code`, which runs reasoning-tier
+  models only, it is always refused). One description of the field serves the three tools.
 - Rates: `gemini-4-carbon` 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2
   from 2026-12-01 (Argon's row); `gemini-4-hydrogen` 1.5 / 7.5 / 0.075, flat (pricing page read 2026-11-14).
-- The fast tier's price bound is Hydrogen's: `gemini-flash-latest` and a fast-tier id the table does not price are
-  estimated at 1.5 / 7.5 USD per 1M (was 3.8 Flash's 0.75 / 3.75) — the dearest row of the category, as before.
 - `gemini-nano-banana-2.1` classifies as image generation (the family's ids carry the `gemini-` prefix since 2.1).
 
 ### Security

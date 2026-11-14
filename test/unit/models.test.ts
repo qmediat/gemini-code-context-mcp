@@ -88,6 +88,19 @@ describe('resolveModel', () => {
     expect((await resolveModel('latest-flash', client)).resolved).toBe('gemini-4-hydrogen');
   });
 
+  it('a point release outranks a later codename of the older version, and a product suffix never wins an alias', async () => {
+    const client = fakeClient([
+      { name: 'models/gemini-4-carbon', inputTokenLimit: 1_048_576, thinking: true },
+      { name: 'models/gemini-4.1-argon', inputTokenLimit: 1_048_576, thinking: true },
+      {
+        name: 'models/gemini-4-carbon-computer-use-preview',
+        inputTokenLimit: 1_048_576,
+        thinking: true,
+      },
+    ]);
+    expect((await resolveModel('latest-pro', client)).resolved).toBe('gemini-4.1-argon');
+  });
+
   it('latest-flash picks a versioned id over the rolling gemini-flash-latest', async () => {
     const client = fakeClient([
       { name: 'models/gemini-flash-latest', inputTokenLimit: 1_048_576, thinking: true },

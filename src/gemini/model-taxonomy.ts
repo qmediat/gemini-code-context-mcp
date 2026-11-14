@@ -68,6 +68,24 @@ interface CategoryRule {
   readonly costTier: CapabilityFlags['costTier'];
 }
 
+/**
+ * The Gemini 4 codenames in the order Google shipped them within a tier (argon 2026-10-13, carbon 2026-11-10;
+ * hydrogen 2026-11-12). Among ids of the same version the LATER codename ranks first in the listing — an alias
+ * (`latest-pro`) resolves to it — by this declared order, never by the alphabet. A new codename is added here.
+ */
+export const GEMINI_4_CODENAMES: readonly string[] = ['argon', 'carbon', 'hydrogen'];
+
+/** A Gemini 4 id that is exactly `gemini-4[.N]-<codename>` or its `-preview` twin. */
+function codenameId(names: readonly string[]): RegExp {
+  return new RegExp(`^gemini-4(?:\\.\\d+)?-(?:${names.join('|')})(?:-preview)?$`, 'i');
+}
+
+/** The listing rank a codename gives an id (0 for an id without one): a later codename ranks higher. */
+export function codenameRank(modelId: string): number {
+  const found = /^gemini-4(?:\.\d+)?-([a-z]+)/i.exec(modelId);
+  return found ? GEMINI_4_CODENAMES.indexOf((found[1] ?? '').toLowerCase()) + 1 : 0;
+}
+
 const CATEGORY_RULES: readonly CategoryRule[] = [
   // === Image generation — MUST come before pro/flash text rules ===
   // `nano-banana-*` is Google's image-gen family (pro/flash tiers), IDs
@@ -147,12 +165,10 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // `-image` / `-tts` / `-live` variant keeps its specialised category and a
   // `-<codename>-lite` / `-<codename>-flash` variant its tier: the more
   // specific tier wins. A codename this list does not name stays `unknown`.
-  {
-    pattern: /^gemini-4(?:\.\d+)?-(?:argon|carbon)(?:-|$)/i,
-    category: 'text-reasoning',
-    costTier: 'premium',
-  },
-  { pattern: /^gemini-4(?:\.\d+)?-hydrogen(?:-|$)/i, category: 'text-fast', costTier: 'standard' },
+  // A bare codename id or its `-preview` twin only: `gemini-4-carbon-computer-use-preview` is another product
+  // and stays `unknown` until a rule names it.
+  { pattern: codenameId(['argon', 'carbon']), category: 'text-reasoning', costTier: 'premium' },
+  { pattern: codenameId(['hydrogen']), category: 'text-fast', costTier: 'standard' },
   // Pro (reasoning / premium tier). Only reaches here if no specialisation
   // above claimed the model. The `^gemini-pro` rule previously at the end
   // of this list was unreachable because `/-pro(?:-|$)/i` already matches

@@ -83,3 +83,20 @@ export const THINKING_LEVEL_RESERVE: Record<ThinkingLevelLiteral, number | null>
   HIGH: null,
   XHIGH: null,
 };
+
+/**
+ * A call that ended at the output cap with no answer: the model's thinking used the cap (thinking tokens count
+ * against `maxOutputTokens`, and Gemini 4 Carbon / Hydrogen and the 3.x Pro models think without being asked).
+ * The message names the cause and the remedy; `null` for any call that produced text or stopped for another reason.
+ */
+export function emptyAtOutputCap(
+  response: {
+    readonly text: string;
+    readonly candidates?: readonly { finishReason?: unknown }[] | undefined;
+  },
+  thinkingTokens: number,
+): string | null {
+  const stopped = response.candidates?.[0]?.finishReason;
+  if (response.text.trim() !== '' || stopped !== 'MAX_TOKENS') return null;
+  return `the model stopped at the output cap before writing an answer (thinking used ${thinkingTokens} tokens of it; the call was billed). Raise \`maxOutputTokens\`, or bound the thinking with \`thinkingLevel: "LOW"\` / a smaller \`thinkingBudget\`.`;
+}

@@ -44,7 +44,11 @@ import {
 } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVEL_FIELD, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import {
+  THINKING_LEVEL_FIELD,
+  THINKING_LEVEL_RESERVE,
+  emptyAtOutputCap,
+} from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 /**
@@ -895,6 +899,10 @@ async function executeCodeBody(
         cachedContentTokenCount: cached,
       });
     }
+
+    // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
+    const starved = emptyAtOutputCap(response, thinking);
+    if (starved !== null) return errorResult(`code: ${starved}`);
 
     if (scan.truncated) {
       logger.warn(

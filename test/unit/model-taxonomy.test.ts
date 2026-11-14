@@ -14,9 +14,11 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  GEMINI_4_CODENAMES,
   type ModelCategory,
   ModelCategoryMismatchError,
   categorizeModel,
+  codenameRank,
   costTierOf,
   extractCapabilityFlags,
   isTextGenCategory,
@@ -161,6 +163,21 @@ describe('categorizeModel — Gemini 4 codenames', () => {
       expect(categorizeModel(`gemini-4-${codename}-live`)).toBe('agent');
     }
     expect(categorizeModel('gemini-4-carbon-preview')).toBe('text-reasoning');
+  });
+
+  it('a codename id with another product suffix is not that text model', () => {
+    expect(categorizeModel('gemini-4-carbon-computer-use-preview')).toBe('unknown');
+    expect(categorizeModel('gemini-4-hydrogen-computer-use-preview')).toBe('unknown');
+  });
+
+  it('the codenames rank in the order they shipped, not by the alphabet', () => {
+    expect(codenameRank('gemini-4-argon')).toBeLessThan(codenameRank('gemini-4-carbon'));
+    expect(codenameRank('gemini-4-carbon')).toBeLessThan(codenameRank('gemini-4-hydrogen'));
+    expect(codenameRank('gemini-4.1-argon')).toBe(codenameRank('gemini-4-argon'));
+    expect(codenameRank('gemini-3.8-flash')).toBe(0);
+    expect(GEMINI_4_CODENAMES.indexOf('carbon')).toBeGreaterThan(
+      GEMINI_4_CODENAMES.indexOf('argon'),
+    );
   });
 
   it('gemini-nano-banana-2.1 is image generation, not a text tier', () => {

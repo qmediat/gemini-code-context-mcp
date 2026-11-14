@@ -76,7 +76,7 @@ Orthogonal to category — multiple can apply to a single model:
 |---|---|---|---|
 | `latest-pro` | `text-reasoning` | — | Newest pro-tier text model |
 | `latest-pro-thinking` | `text-reasoning` | `supportsThinking=true` | The default for every tool when `GEMINI_CODE_CONTEXT_DEFAULT_MODEL` is unset; preferred for deep work |
-| `latest-flash` | `text-fast` | — | Faster + cheaper than pro; no deep thinking |
+| `latest-flash` | `text-fast` | — | Faster + cheaper than pro. Gemini 4 Hydrogen (what it resolves to when listed) thinks by default; bound it with `thinkingLevel` |
 | `latest-lite` | `text-lite` | — | Cheapest tier; limited capabilities. A GA ID before its `-preview` twin (`gemini-3.1-flash-lite` over `gemini-3.1-flash-lite-preview`), a versioned ID before `gemini-flash-lite-latest` |
 | `latest-vision` | `text-reasoning` or `text-fast` | `supportsVision=true` | Screenshot analysis, image Q&A — give the images with `ask`'s `attachments` *(v1.20.0+)* |
 

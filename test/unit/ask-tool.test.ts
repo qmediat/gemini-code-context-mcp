@@ -189,6 +189,7 @@ describe('THINKING_LEVEL_RESERVE — per-tier cost-estimate reservations', () =>
     // a runtime check guards against accidental `as const` regressions.
     const keys = Object.keys(THINKING_LEVEL_RESERVE).sort();
     expect(keys).toEqual(['HIGH', 'LOW', 'MEDIUM', 'MINIMAL', 'XHIGH']);
+    expect(THINKING_LEVEL_RESERVE.XHIGH).toBeNull(); // the worst-case reserve, like HIGH: never a small guess
   });
 });
 
