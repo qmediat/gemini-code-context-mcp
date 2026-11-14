@@ -68,7 +68,7 @@ Orthogonal to category — multiple can apply to a single model:
 | `supportsThinking` | Model supports reasoning / extended thinking (Gemini 2.5+, Gemini 3.x) |
 | `supportsVision` | Accepts image / PDF input (every text-generation tier, Flash-Lite included since v1.20.0; not embeddings or media generation) |
 | `supportsCodeExecution` | Works with the `code_execution` tool (all text-gen tiers) |
-| `costTier` | `premium` (pro / Gemini 4 Argon / image-gen / music), `standard` (flash), `budget` (lite / embeddings), `unknown` |
+| `costTier` | `premium` (pro / Gemini 4 Carbon and Argon / image-gen / music), `standard` (flash / Gemini 4 Hydrogen), `budget` (lite / embeddings), `unknown` |
 
 ## Aliases
 
@@ -100,8 +100,8 @@ text categories first (reasoning, fast, lite, then the rest), the cost tier, ver
 serves `gemini-3.1-pro-preview`, `gemini-flash-latest` `gemini-3.8-flash`, `gemini-flash-lite-latest`
 `gemini-3.5-flash-lite`; each alias is priced at the dearest rate of its target's category, see
 [cost-model.md](cost-model.md)), the ID descending with version numbers compared as
-numbers (`3.10` above `3.9`), and a GA ID before its `-preview` twin. So `gemini-4-argon` wins over
-`gemini-3.1-pro-preview` and `gemini-pro-latest`, and every alias resolves to a versioned model whenever one is listed.
+numbers (`3.10` above `3.9`), and a GA ID before its `-preview` twin. So `gemini-4-carbon` wins over `gemini-4-argon` (the id
+descending), both over `gemini-3.1-pro-preview` and `gemini-pro-latest`, and every alias resolves to a versioned model whenever one is listed.
 Guaranteed to NOT pick up `nano-banana-pro-preview` even if it's in your
 model list.
 
@@ -128,7 +128,7 @@ reasoning overhead.
 }
 ```
 
-Picks the newest vision-capable text model — prefers pro tier (`gemini-4-argon` when it is listed) but falls
+Picks the newest vision-capable text model — prefers pro tier (`gemini-4-carbon`, else `gemini-4-argon`, when listed) but falls
 back to flash if pro is unavailable.
 
 ### Explicit model ID

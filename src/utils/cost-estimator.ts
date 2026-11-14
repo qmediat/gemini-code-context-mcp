@@ -73,7 +73,8 @@ const REASONING_4: PricingEntry = {
 const DEFAULT_PRICING: Readonly<Record<string, PricingEntry>> = {
   'gemini-4-carbon': REASONING_4,
   'gemini-4-argon': REASONING_4,
-  // Flat: the page lists no dated change (read 2026-11-14).
+  // Flat: the page lists no dated change (read 2026-11-14). Its cached rate is 0.075 on the page — 5 % of the input
+  // rate, not the Flash line's 10 %.
   'gemini-4-hydrogen': {
     inputPerMillion: 1.5,
     outputPerMillion: 7.5,

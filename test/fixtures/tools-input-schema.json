@@ -80,7 +80,7 @@
         "type": "integer"
       },
       "thinkingLevel": {
-        "description": "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+        "description": "Discrete reasoning tier for Gemini 3 and Gemini 4 models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only — a fast-tier model, which `ask` and `ask_agentic` can run and `code` cannot; Gemini 4 Argon and Carbon answer it with a 400). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
         "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"],
         "type": "string"
       },
@@ -164,6 +164,7 @@
         "type": "integer"
       },
       "thinkingLevel": {
+        "description": "Discrete reasoning tier for Gemini 3 and Gemini 4 models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only — a fast-tier model, which `ask` and `ask_agentic` can run and `code` cannot; Gemini 4 Argon and Carbon answer it with a 400). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
         "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"],
         "type": "string"
       },
@@ -259,7 +260,7 @@
         "type": "integer"
       },
       "thinkingLevel": {
-        "description": "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+        "description": "Discrete reasoning tier for Gemini 3 and Gemini 4 models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only — a fast-tier model, which `ask` and `ask_agentic` can run and `code` cannot; Gemini 4 Argon and Carbon answer it with a 400). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
         "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"],
         "type": "string"
       },

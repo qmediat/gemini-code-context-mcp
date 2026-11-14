@@ -66,7 +66,7 @@ import {
 } from './shared/abort-timeout.js';
 import { collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_AGENTIC } from './shared/system-instruction-safety.js';
-import { THINKING_LEVELS } from './shared/thinking.js';
+import { THINKING_LEVEL_FIELD } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 // ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ export const askAgenticInputSchema = z
         'Additional patterns to exclude. Same three shapes as `ask` / `code`: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised. Case-insensitive. No mid-string `*` / `**` / `?`. **Privacy-relevant:** when `ask` falls back to `ask_agentic` on `WORKSPACE_TOO_LARGE`, the user-supplied excludes here are honoured by every executor: `read_file` rejects with `EXCLUDED_FILE` (generic message — does NOT echo the excluded path, so the error string cannot be used as a path-existence oracle); `list_directory` and `grep` reject the requested directory / `pathPrefix` itself with `EXCLUDED_DIR` when it matches an exclude (top-level gate, not just child filtering); `find_files` skips the dir during walk; child entries inside an unexcluded parent are still hidden when they themselves match an exclude.',
       ),
     thinkingBudget: z.number().int().min(-1).max(65_536).optional(),
-    thinkingLevel: z.enum(THINKING_LEVELS).optional(),
+    thinkingLevel: THINKING_LEVEL_FIELD,
     maxOutputTokens: z.number().int().min(1).optional(),
     maxIterations: z
       .number()

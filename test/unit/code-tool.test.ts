@@ -15,6 +15,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { codeInputSchema } from '../../src/tools/code.tool.js';
+import { THINKING_LEVELS } from '../../src/tools/shared/thinking.js';
 
 describe('code input schema — thinkingBudget', () => {
   it('accepts omitted thinkingBudget (runtime applies the 16384 default)', () => {
@@ -77,7 +78,7 @@ describe('code input schema — thinkingLevel', () => {
     }
   });
 
-  it.each(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const)('accepts %s', (level) => {
+  it.each(THINKING_LEVELS)('accepts %s', (level) => {
     const parsed = codeInputSchema.safeParse({ task: 'hi', thinkingLevel: level });
     expect(parsed.success).toBe(true);
     if (parsed.success) {

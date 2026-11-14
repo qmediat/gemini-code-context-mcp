@@ -44,7 +44,7 @@ import {
 } from './shared/service-tier.js';
 import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVELS, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import { THINKING_LEVEL_FIELD, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 /**
@@ -102,12 +102,7 @@ export const codeInputSchema = z
       .describe(
         'Explicit reasoning-token cap. Default (when both `thinkingBudget` and `thinkingLevel` are omitted): 16384 — a strong default for coding. Pass a positive integer to cap reasoning at that many tokens; `0` disables thinking (rejected by Gemini 3 Pro with 400). CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang — use ≥4096 if you must bound it. For discrete-tier control on Gemini 3 use `thinkingLevel` instead — the two are mutually exclusive.',
       ),
-    thinkingLevel: z
-      .enum(THINKING_LEVELS)
-      .optional()
-      .describe(
-        "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
-      ),
+    thinkingLevel: THINKING_LEVEL_FIELD,
     codeExecution: z
       .boolean()
       .optional()

@@ -9,6 +9,8 @@
  * call sites (and any future reasoning-capable tool we add).
  */
 
+import { z } from 'zod';
+
 /**
  * Accepted values for `thinkingLevel` on both `ask` and `code`. Uppercased
  * to match `ThinkingLevel` enum members in `@google/genai` — we pass the
@@ -32,6 +34,16 @@
  * stable across model rollouts.
  */
 export const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH'] as const;
+
+/** The one description of `thinkingLevel` (`THINKING_LEVEL_FIELD` carries it). */
+const THINKING_LEVEL_DESCRIPTION =
+  "Discrete reasoning tier for Gemini 3 and Gemini 4 models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only — a fast-tier model, which `ask` and `ask_agentic` can run and `code` cannot; Gemini 4 Argon and Carbon answer it with a 400). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').";
+
+/** The `thinkingLevel` argument of every tool that takes one (`ask`, `code`, `ask_agentic`): one schema, one text. */
+export const THINKING_LEVEL_FIELD = z
+  .enum(THINKING_LEVELS)
+  .optional()
+  .describe(THINKING_LEVEL_DESCRIPTION);
 
 /**
  * Literal-union type matching the schema's accepted `thinkingLevel` values.

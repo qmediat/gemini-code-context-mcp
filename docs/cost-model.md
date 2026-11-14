@@ -2,7 +2,7 @@
 
 Gemini API is pay-as-you-go. This server's whole pitch is making it cheaper by caching. Here's how billing actually works and what knobs you have.
 
-> **Rates read 2026-10-16** from [Google's pricing page](https://ai.google.dev/gemini-api/docs/pricing) (Standard tier). Google changes prices; cross-check there. `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) replaces a row at run time without a release.
+> **Rates read 2026-10-16** (the Gemini 4 Carbon and Hydrogen rows: 2026-11-14) from [Google's pricing page](https://ai.google.dev/gemini-api/docs/pricing) (Standard tier). Google changes prices; cross-check there. `GEMINI_PRICING_OVERRIDES` (see [configuration.md](configuration.md)) replaces a row at run time without a release.
 
 ## The estimator's rates
 

@@ -154,6 +154,15 @@ describe('categorizeModel — Gemini 4 codenames', () => {
     expect(categorizeModel('gemini-4-hydrogen-lite')).toBe('text-lite');
   });
 
+  it('(guard) an image / tts / live variant of carbon or hydrogen keeps its specialisation', () => {
+    for (const codename of ['carbon', 'hydrogen']) {
+      expect(categorizeModel(`gemini-4-${codename}-image`)).toBe('image-generation');
+      expect(categorizeModel(`gemini-4-${codename}-tts`)).toBe('audio-generation');
+      expect(categorizeModel(`gemini-4-${codename}-live`)).toBe('agent');
+    }
+    expect(categorizeModel('gemini-4-carbon-preview')).toBe('text-reasoning');
+  });
+
   it('gemini-nano-banana-2.1 is image generation, not a text tier', () => {
     expect(categorizeModel('gemini-nano-banana-2.1')).toBe('image-generation');
   });
