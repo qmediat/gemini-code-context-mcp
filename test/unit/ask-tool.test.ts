@@ -81,7 +81,7 @@ describe('ask input schema — thinkingLevel', () => {
     }
   });
 
-  it.each(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const)('accepts %s', (level) => {
+  it.each(['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH'] as const)('accepts %s', (level) => {
     const parsed = askInputSchema.safeParse({ prompt: 'hi', thinkingLevel: level });
     expect(parsed.success).toBe(true);
     if (parsed.success) {
@@ -188,7 +188,7 @@ describe('THINKING_LEVEL_RESERVE — per-tier cost-estimate reservations', () =>
     // enforces this via `Record<(typeof THINKING_LEVELS)[number], …>`, but
     // a runtime check guards against accidental `as const` regressions.
     const keys = Object.keys(THINKING_LEVEL_RESERVE).sort();
-    expect(keys).toEqual(['HIGH', 'LOW', 'MEDIUM', 'MINIMAL']);
+    expect(keys).toEqual(['HIGH', 'LOW', 'MEDIUM', 'MINIMAL', 'XHIGH']);
   });
 });
 

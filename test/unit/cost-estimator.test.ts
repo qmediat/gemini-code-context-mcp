@@ -80,6 +80,20 @@ describe('cost estimator', () => {
   });
 
   describe('dated rates: the rate in force on the UTC day of the call', () => {
+    it('gemini-4-carbon carries Argon rates and rise; gemini-4-hydrogen is flat at 1.5 / 7.5 / 0.075', () => {
+      expect(cost('gemini-4-carbon', { at: new Date('2026-11-30T23:59:59Z') })).toBeCloseTo(
+        2 + 0.1 + 10,
+        9,
+      );
+      expect(cost('gemini-4-carbon', { at: new Date('2026-12-01T00:00:00Z') })).toBeCloseTo(
+        4 + 0.2 + 20,
+        9,
+      );
+      for (const at of [new Date('2026-11-14T00:00:00Z'), new Date('2027-06-01T00:00:00Z')]) {
+        expect(cost('gemini-4-hydrogen', { at })).toBeCloseTo(1.5 + 0.075 + 7.5, 9);
+      }
+    });
+
     it('gemini-4-argon bills 2 / 10 / 0.1 through 2026-11-30 and 4 / 20 / 0.2 from 2026-12-01', () => {
       expect(cost('gemini-4-argon', { at: new Date('2026-11-30T23:59:59Z') })).toBeCloseTo(
         2 + 0.1 + 10,
@@ -158,7 +172,8 @@ describe('cost estimator', () => {
     });
 
     it('gemini-flash-latest and gemini-flash-lite-latest price at their categories bounds, not the 2.5 line', () => {
-      expect(cost('gemini-flash-latest')).toBeCloseTo(0.75 + 0.075 + 3.75, 9);
+      // text-fast's bound: Hydrogen's 1.5 / 7.5 from the start, 3.8 Flash's cached 0.15 from 2027.
+      expect(cost('gemini-flash-latest')).toBeCloseTo(1.5 + 0.075 + 7.5, 9);
       expect(cost('gemini-flash-latest', { at: new Date('2027-01-01T00:00:00Z') })).toBeCloseTo(
         1.5 + 0.15 + 7.5,
         9,
@@ -271,8 +286,8 @@ describe('cost estimator', () => {
       const y2027 = new Date('2027-01-01T00:00:00Z');
       expect(inputRate('gemini-9-flash', y2027)).toBeCloseTo(1.5, 9);
       expect(outputRate('gemini-9-flash', y2027)).toBeCloseTo(7.5, 9);
-      expect(inputRate('gemini-3.5-flash')).toBeCloseTo(0.75, 9);
-      expect(outputRate('gemini-3.5-flash')).toBeCloseTo(3.75, 9);
+      expect(inputRate('gemini-3.5-flash')).toBeCloseTo(1.5, 9);
+      expect(outputRate('gemini-3.5-flash')).toBeCloseTo(7.5, 9);
       expect(inputRate('gemini-4-argon-lite')).toBeCloseTo(0.3, 9);
       expect(outputRate('gemini-4-argon-lite')).toBeCloseTo(2.5, 9);
     });

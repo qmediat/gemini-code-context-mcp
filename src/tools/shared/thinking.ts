@@ -25,11 +25,13 @@
  *   - Gemini 3 Pro supports LOW / MEDIUM / HIGH (not MINIMAL); default HIGH.
  *   - Gemini 3 Flash supports all four; Flash-Lite defaults to MINIMAL.
  *   - Gemini 2.5 family does NOT support `thinkingLevel` — use `thinkingBudget`.
- * Both tools accept all four values at the schema boundary and let Gemini
+ *   - Gemini 4 Hydrogen adds XHIGH above HIGH (changelog 2026-11-12: low,
+ *     medium, high — its default — and xhigh).
+ * Every tool accepts all five values at the schema boundary and lets Gemini
  * reject unsupported combinations at request time, so the MCP surface stays
  * stable across model rollouts.
  */
-export const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH'] as const;
+export const THINKING_LEVELS = ['MINIMAL', 'LOW', 'MEDIUM', 'HIGH', 'XHIGH'] as const;
 
 /**
  * Literal-union type matching the schema's accepted `thinkingLevel` values.
@@ -57,7 +59,7 @@ export type ThinkingLevelLiteral = (typeof THINKING_LEVELS)[number];
  * decides to spend); a subsequent call will see the larger measured cost
  * in the budget ledger.
  *
- * HIGH intentionally maps to `null` → call sites substitute
+ * HIGH and XHIGH intentionally map to `null` → call sites substitute
  * `maxOutputTokens - 1024` so the value tracks each tool's actual output
  * cap (8_192 for `ask`, 32_768 for `code`) rather than a hard-coded
  * duplicate.
@@ -67,4 +69,5 @@ export const THINKING_LEVEL_RESERVE: Record<ThinkingLevelLiteral, number | null>
   LOW: 2_048,
   MEDIUM: 4_096,
   HIGH: null,
+  XHIGH: null,
 };

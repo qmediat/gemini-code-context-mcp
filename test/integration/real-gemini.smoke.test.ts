@@ -41,7 +41,7 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
 
   it("resolves 'latest-flash' alias against live registry", async () => {
     const resolved = await resolveModel('latest-flash', client);
-    expect(resolved.resolved).toMatch(/flash/);
+    expect(resolved.resolved).toMatch(/flash|hydrogen/);
   }, 30_000);
 
   it('uploads files + builds cache + reuses on follow-up (small workspace → inline fallback)', async () => {

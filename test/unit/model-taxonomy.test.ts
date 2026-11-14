@@ -140,6 +140,24 @@ describe('categorizeModel — Gemini 4 codenames', () => {
     expect(costTierOf('gemini-4-argon')).toBe('premium');
   });
 
+  it('gemini-4-carbon is text-reasoning at the premium tier, gemini-4-hydrogen text-fast at the standard tier', () => {
+    expect(categorizeModel('gemini-4-carbon')).toBe('text-reasoning');
+    expect(costTierOf('gemini-4-carbon')).toBe('premium');
+    expect(categorizeModel('gemini-4-hydrogen')).toBe('text-fast');
+    expect(costTierOf('gemini-4-hydrogen')).toBe('standard');
+    expect(categorizeModel('gemini-4.1-hydrogen')).toBe('text-fast');
+  });
+
+  it('(guard) a Gemini 4 codename the rules do not name stays unknown; hydrogen-lite is a lite model', () => {
+    expect(categorizeModel('gemini-4-helium')).toBe('unknown');
+    expect(categorizeModel('gemini-4-hydrogenated')).toBe('unknown');
+    expect(categorizeModel('gemini-4-hydrogen-lite')).toBe('text-lite');
+  });
+
+  it('gemini-nano-banana-2.1 is image generation, not a text tier', () => {
+    expect(categorizeModel('gemini-nano-banana-2.1')).toBe('image-generation');
+  });
+
   it('a point release of the codename (gemini-4.1-argon) classifies the same', () => {
     expect(categorizeModel('gemini-4.1-argon')).toBe('text-reasoning');
     expect(costTierOf('gemini-4.1-argon')).toBe('premium');

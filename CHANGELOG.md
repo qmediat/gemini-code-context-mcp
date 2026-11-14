@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Gemini 4 Carbon and Gemini 4 Hydrogen (GA 2026-11-10 and 2026-11-12). `gemini-4-carbon` is a premium reasoning model
+  like Argon; `gemini-4-hydrogen` is the fast tier. Until now both were `unknown`: no alias picked them and an explicit
+  id failed the category check of `ask` / `code`. With them listed on the key, `latest-pro` / `latest-pro-thinking`
+  resolve to `gemini-4-carbon` (was `gemini-4-argon`; the same rates) and `latest-flash` to `gemini-4-hydrogen` (was
+  `gemini-3.8-flash`; 1.5 / 7.5 USD per 1M against 0.75 / 3.75 through 2026-12-31) — pass a model id to keep the
+  previous one.
+- `thinkingLevel: "XHIGH"` on `ask`, `code` and `ask_agentic` — the level Google added with Gemini 4 Hydrogen. Other
+  models reject it at request time, as they do any level they do not offer.
+- Rates: `gemini-4-carbon` 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2
+  from 2026-12-01 (Argon's row); `gemini-4-hydrogen` 1.5 / 7.5 / 0.075, flat (pricing page read 2026-11-14).
+- The fast tier's price bound is Hydrogen's: `gemini-flash-latest` and a fast-tier id the table does not price are
+  estimated at 1.5 / 7.5 USD per 1M (was 3.8 Flash's 0.75 / 3.75) — the dearest row of the category, as before.
+- `gemini-nano-banana-2.1` classifies as image generation (the family's ids carry the `gemini-` prefix since 2.1).
+
 ## [1.22.1] - 2026-10-16
 
 ### Fixed

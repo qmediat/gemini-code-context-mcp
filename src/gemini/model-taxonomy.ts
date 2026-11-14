@@ -74,6 +74,8 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // like `nano-banana-pro-preview`. Shares the `pro` token with text models
   // but bills at the image tier (~10× text rates).
   { pattern: /^nano-banana/i, category: 'image-generation', costTier: 'premium' },
+  // Since 2.1 the family carries the `gemini-` prefix (`gemini-nano-banana-2.1`).
+  { pattern: /^gemini-nano-banana(?:-|$)/i, category: 'image-generation', costTier: 'premium' },
   // `*-image` suffix (e.g. `gemini-3-pro-image`) identifies Gemini's native
   // image-output variants.
   { pattern: /-image(?:-|$)/i, category: 'image-generation', costTier: 'premium' },
@@ -137,13 +139,20 @@ const CATEGORY_RULES: readonly CategoryRule[] = [
   // Flash (standard speed tier).
   { pattern: /^gemini-.*-flash/i, category: 'text-fast', costTier: 'standard' },
   { pattern: /-flash(?:-|$)/i, category: 'text-fast', costTier: 'standard' },
-  // Gemini 4 frontier models ship under a codename with no pro/flash token
-  // (`gemini-4-argon`, a later `gemini-4.1-argon`). Argon is the reasoning
-  // tier: thinking, 2 / 10 USD per 1M tokens — premium. Placed after every
-  // specialisation and after the lite / flash rules, so an `-image` / `-tts` /
-  // `-live` variant keeps its specialised category and an `-argon-lite` /
-  // `-argon-flash` variant its tier: the more specific tier wins.
-  { pattern: /^gemini-4(?:\.\d+)?-argon(?:-|$)/i, category: 'text-reasoning', costTier: 'premium' },
+  // Gemini 4 models ship under a codename with no pro/flash token
+  // (`gemini-4-argon`, a later `gemini-4.1-argon`). Carbon and Argon are the
+  // reasoning tier: thinking, 2 / 10 USD per 1M tokens — premium. Hydrogen is
+  // the fast tier (Google's successor of 3.8 Flash, 1.5 / 7.5 USD) — standard.
+  // Placed after every specialisation and after the lite / flash rules, so an
+  // `-image` / `-tts` / `-live` variant keeps its specialised category and a
+  // `-<codename>-lite` / `-<codename>-flash` variant its tier: the more
+  // specific tier wins. A codename this list does not name stays `unknown`.
+  {
+    pattern: /^gemini-4(?:\.\d+)?-(?:argon|carbon)(?:-|$)/i,
+    category: 'text-reasoning',
+    costTier: 'premium',
+  },
+  { pattern: /^gemini-4(?:\.\d+)?-hydrogen(?:-|$)/i, category: 'text-fast', costTier: 'standard' },
   // Pro (reasoning / premium tier). Only reaches here if no specialisation
   // above claimed the model. The `^gemini-pro` rule previously at the end
   // of this list was unreachable because `/-pro(?:-|$)/i` already matches
