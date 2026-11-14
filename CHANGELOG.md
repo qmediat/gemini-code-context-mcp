@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   estimated at 1.5 / 7.5 USD per 1M (was 3.8 Flash's 0.75 / 3.75) — the dearest row of the category, as before.
 - `gemini-nano-banana-2.1` classifies as image generation (the family's ids carry the `gemini-` prefix since 2.1).
 
+### Security
+
+- `zod` 4.6.7 (was 3.25): GHSA-mrhx-c7xc-m3w5, memory exhaustion while validating oversized constrained collections.
+  The tool schemas are written to `tools/list` by Zod's own `z.toJSONSchema` — the `zod-to-json-schema` dependency is
+  gone as a direct dependency (the MCP SDK still installs it) — and the published `inputSchema` of every tool is
+  unchanged, held by a test against the 1.22.1 output. Two things a caller can see do change with Zod 4: the wording
+  of an `Invalid arguments` error (`prompt: Invalid input: expected string, received undefined`, was `prompt:
+  Required`; an enum now reads `Invalid option: expected one of …`), and an integer above 2^53 − 1 is refused.
+  Dependabot proposes Zod majors again.
+- Transitive dependencies brought past their advisories (`body-parser`, `hono`, `@hono/node-server`, `fast-uri`,
+  `ip-address`, `qs`): `npm audit --omit=dev --audit-level=high` is clean again.
+
 ## [1.22.1] - 2026-10-16
 
 ### Fixed

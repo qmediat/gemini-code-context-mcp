@@ -1,0 +1,306 @@
+{
+  "ask": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "attachments": {
+        "description": "Local image or PDF files (png, jpg, jpeg, webp, pdf; up to 8, 10 MB each, 14 MB together) sent inline before the question — a screenshot of the bug, a diagram, a spec. Paths are inside the workspace (relative to it or absolute; a symlink is refused, the sandbox's secret rules apply, the first bytes must match the type). They belong to THIS question only, never to the workspace cache. Their tokens are counted by Gemini (one free countTokens call) and enter the size preflight, the budget reservation and the TPM throttle; a count that cannot be obtained refuses the call (ATTACHMENT_TOKENS_UNCOUNTED — retryable after a transient failure: no status, 429, 5xx; not after 401/403/404; a 400 means Gemini refused the parts: ATTACHMENT_INVALID). The model must support vision (ATTACHMENTS_UNSUPPORTED otherwise); a bad file is ATTACHMENT_INVALID, never retryable, and costs nothing. Not available with the ask_agentic fallback.",
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "cachingMode": {
+        "description": "Cache strategy for the workspace context. **`'implicit'` (default since v1.14.0)** skips `caches.create` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the review→edit→review workflow — no 60–180 s rebuild wait when files change between queries. **`'explicit'`** builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays the rebuild cost on every file change. Use explicit when you need predictable per-call costs more than warm-path latency; the trade-off is documented in Gemini's docs as 'no cost saving guarantee' for implicit caching. Hit rate is observable via `status.structuredContent.caching.implicitHitRate`. Operator-level override available via env `GEMINI_CODE_CONTEXT_CACHING_MODE`. A model without `createCachedContent` (`gemini-4-argon`) runs `'explicit'` as `'implicit'`, and a failed `caches.create` sends the files without a cache; either way the response says what ran in `cachingMode` and why in `cachingModeNote`.",
+        "enum": ["explicit", "implicit"],
+        "type": "string"
+      },
+      "excludeGlobs": {
+        "description": "Additional patterns to exclude. Supports three shapes: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match, including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.map`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised (backslashes → `/`, leading `./` and trailing `/` stripped). Case-insensitive. No mid-string `*` / `**` / `?` — split into dir + extension patterns if needed.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "forceRescan": {
+        "description": "Bypass the v1.13.0 scan memo and re-hash every file in the workspace (default `false`). The scan memo skips per-file SHA256 when `mtime_ms` and `size` match the previously-stored values — typically ~95% of files on a warm rescan, cutting scan wall-clock by ≥10× on large workspaces. Set this when you suspect the manifest is stale (e.g. files mutated outside the dev workflow, NTP clock-skew, or you ran `git checkout` on a directory tree). Equivalent to setting env `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` for a single call.",
+        "type": "boolean"
+      },
+      "includeGlobs": {
+        "description": "Additional file extensions or filenames to include.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "maxOutputTokens": {
+        "description": "Per-call opt-in cap on response length (tokens). OMIT for the default 'auto' behaviour — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value when you want a bounded response (e.g. strict summary length, tighter budget per call). Values larger than the resolved model's limit are clamped down. Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` stays a true upper bound.",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "model": {
+        "description": "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash', 'latest-lite', 'latest-vision') or literal model ID. Defaults to the configured default.",
+        "type": "string"
+      },
+      "noCache": {
+        "description": "Skip the context cache and embed files inline (slower, more expensive).",
+        "type": "boolean"
+      },
+      "onWorkspaceTooLarge": {
+        "description": "Behaviour when the v1.5.0 preflight detects the workspace exceeds the model's `inputTokenLimit × workspaceGuardRatio` (v1.11.0+). `'error'` (default — preserves v1.5.0 behaviour) returns a structured `errorCode: 'WORKSPACE_TOO_LARGE'` and lets the caller decide how to recover. `'fallback-to-agentic'` opt-in: the server transparently re-routes through `ask_agentic` (sandboxed file-access loop — no eager upload, scales to arbitrarily large repos), wraps the agentic result, and surfaces `fallbackApplied: 'ask_agentic'` in `structuredContent` so callers can audit the swap. **Semantic divergence:** `ask_agentic` runs as a multi-iteration loop, so `timeoutMs` (ask's wall-clock cap) translates to `iterationTimeoutMs` (per-iteration cap); total wall-clock can be N × timeoutMs. Cost shape also changes (multiple smaller calls vs one big eager call). Recommended setting for orchestrators that prioritise getting an answer over a single round-trip; default stays `'error'` so existing callers see no behaviour change. **`code` does NOT support this field** — `code`'s OLD/NEW edit format is load-bearing for Claude's Edit pipeline, and `ask_agentic` returns prose only.",
+        "enum": ["error", "fallback-to-agentic"],
+        "type": "string"
+      },
+      "preflightMode": {
+        "description": "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + prompt + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
+        "enum": ["heuristic", "exact", "auto"],
+        "type": "string"
+      },
+      "prompt": {
+        "description": "The question or analysis request.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "serviceTier": {
+        "description": "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry and never re-sends — the result says RATE_LIMIT / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price. A flex request queued longer than Node's 300 s header wait fails as NETWORK_ERROR, retryable (the server does not raise that wait yet). Not available on the Vertex AI backend (refused by name).",
+        "enum": ["standard", "flex"],
+        "type": "string"
+      },
+      "stallMs": {
+        "description": "Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking — the streaming heartbeat (every ~1500ms via `onThoughtChunk`) keeps the watchdog reset. This is the right knob for \"kill dead sockets quickly without penalising deep reasoning.\" Recommended setting: `60_000` (60s) — Gemini Pro can pause 15-30s mid-reasoning between thought chunks under heavy thinking; 60s absorbs jitter while still killing truly dead sockets ~30× faster than the wall-clock alternative. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_STALL_MS`, then to disabled. Returns `errorCode: \"TIMEOUT\"` with `timeoutKind: \"stall\"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.",
+        "maximum": 600000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "thinkingBudget": {
+        "description": "Explicit reasoning-token cap. OMIT to use each model's native default — recommended on Gemini 3 (Google flags explicit `thinkingBudget` as 'legacy'). Pass a value only when you need a specific cap: `-1` = legacy dynamic, `0` = disable thinking (rejected by Gemini 3 Pro), positive integer = fixed cap. CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang — use `-1` or ≥4096 if you must bound it there. For discrete-tier control on Gemini 3 use `thinkingLevel` instead — the two are mutually exclusive.",
+        "maximum": 65536,
+        "minimum": -1,
+        "type": "integer"
+      },
+      "thinkingLevel": {
+        "description": "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+        "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"],
+        "type": "string"
+      },
+      "timeoutMs": {
+        "description": "Per-call wall-clock TOTAL timeout in ms (1s–30min). The cost ceiling — aborts the in-flight `generateContent` request even if it is actively streaming. Gemini still finishes server-side and bills tokens for completed work. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled. v1.12.0 RECOMMENDATION: prefer `stallMs` for liveness — `timeoutMs` is the cost cap, `stallMs` is the heartbeat-aware liveness watchdog that does NOT fire while the model is actively thinking. Both can be set simultaneously. Returns `errorCode: \"TIMEOUT\"` with `timeoutKind: \"total\"` on abort.",
+        "maximum": 1800000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "workspace": {
+        "description": "Absolute or cwd-relative path to the workspace. Defaults to process.cwd().",
+        "type": "string"
+      }
+    },
+    "required": ["prompt"],
+    "type": "object"
+  },
+  "ask_agentic": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "excludeGlobs": {
+        "description": "Additional patterns to exclude. Same three shapes as `ask` / `code`: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised. Case-insensitive. No mid-string `*` / `**` / `?`. **Privacy-relevant:** when `ask` falls back to `ask_agentic` on `WORKSPACE_TOO_LARGE`, the user-supplied excludes here are honoured by every executor: `read_file` rejects with `EXCLUDED_FILE` (generic message — does NOT echo the excluded path, so the error string cannot be used as a path-existence oracle); `list_directory` and `grep` reject the requested directory / `pathPrefix` itself with `EXCLUDED_DIR` when it matches an exclude (top-level gate, not just child filtering); `find_files` skips the dir during walk; child entries inside an unexcluded parent are still hidden when they themselves match an exclude.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "includeGlobs": {
+        "description": "Additional file extensions or filenames to include. Honoured by the four agentic tools (`list_directory`, `find_files`, `read_file`, `grep`) — the model never sees paths outside these globs. Mirrors the `ask` / `code` semantics so callers (or `ask` → `ask_agentic` fallback in v1.9.0+) get consistent filtering.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "iterationTimeoutMs": {
+        "description": "Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls + per-iteration TPM throttle wait) is bounded by this. **A single iteration that times out FAILS THE WHOLE agentic call** with `errorCode: 'TIMEOUT'` (the failed iteration's function-call results never came back, leaving the conversation structurally incomplete — continuing with partial state would 400 on the next turn). The post-loop forced-finalization rescue pass is ALSO bounded by this timeout, but its timeout behaviour DIFFERS: rescue timeouts are caught best-effort and fall through to the original `subReason: 'AGENTIC_MAX_ITERATIONS'` shape with `errorCode: 'UNKNOWN'` (NOT `'TIMEOUT'`) — the rescue is the documented exit path, and surfacing TIMEOUT for it would obscure the underlying maxIterations exhaustion. Operators detect rescue-attempted-but-failed via `apiCalls > iterations` and `convergenceForced` absent. Whole-loop budget is also bounded by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled.",
+        "maximum": 1800000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "maxFilesRead": {
+        "description": "Cap on distinct files opened via `read_file` during this agentic call. Default 40.",
+        "maximum": 500,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "maxIterations": {
+        "description": "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract. **v1.15.0:** rescue-attempted-but-failed paths additionally surface `structuredContent.rescueErrorCode` (`'TIMEOUT' | 'RATE_LIMIT' | 'INTERNAL' | 'API_ERROR' | 'NETWORK' | 'EMPTY_TEXT'`) + `rescueErrorMessage` (truncated to 500 chars) so wrappers can branch retry behaviour without log scraping. Retry policy: TIMEOUT → raise iterationTimeoutMs; RATE_LIMIT → wait retry-hint window; INTERNAL → investigate code (don't retry blindly); API_ERROR → check status (don't retry 4xx); NETWORK → safe to retry; EMPTY_TEXT → narrow prompt.",
+        "maximum": 50,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "maxOutputTokens": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "maxTotalInputTokens": {
+        "description": "Cumulative input-token budget across all iterations. Default 1_000_000. Loop iterations HARD-STOP past this cap (subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'). The post-loop forced-finalization rescue is NOT gated on this cap — it may push cumulative tokens past by one call's worth, signalled via `overBudget: true` on the result. Rescue cost remains bounded by `dailyBudgetUsd`; wall-clock by `iterationTimeoutMs`.",
+        "minimum": 10000,
+        "type": "integer"
+      },
+      "model": {
+        "description": "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash') or literal model ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile, then `latest-pro-thinking`).",
+        "type": "string"
+      },
+      "prompt": {
+        "description": "The question or analysis request.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "stallMs": {
+        "description": "Per-iteration HEARTBEAT-AWARE stall watchdog in ms (1s–10min). Resets on every chunk yielded by `generateContentStream` (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Right knob for \"kill dead sockets quickly without penalising deep reasoning.\" Recommended: `60_000` (60s). Falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`, then disabled. Returns `errorCode: \"TIMEOUT\"` with `timeoutKind: \"stall\"` on abort. Independent of `iterationTimeoutMs` — both can be set; whichever fires first wins. **Loop iterations only — the post-loop forced-finalization rescue pass keeps the v1.15.0 `apiCallSucceeded` non-streaming contract.**",
+        "maximum": 600000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "thinkingBudget": {
+        "maximum": 65536,
+        "minimum": -1,
+        "type": "integer"
+      },
+      "thinkingLevel": {
+        "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"],
+        "type": "string"
+      },
+      "workspace": {
+        "description": "Absolute or cwd-relative path to the workspace. Defaults to process.cwd().",
+        "type": "string"
+      }
+    },
+    "required": ["prompt"],
+    "type": "object"
+  },
+  "clear": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "workspace": {
+        "description": "Workspace path (default: cwd).",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "code": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "cachingMode": {
+        "description": "Cache strategy for the workspace context. **`'implicit'` (default since v1.14.0)** skips `caches.create` entirely; file content is sent inline every call and Gemini 2.5+/3 Pro applies its automatic implicit caching on the repeated workspace prefix when prefix matches across calls. Optimised for the edit→review→edit cycle — no rebuild wait when files change between queries. **`'explicit'`** builds a Gemini Context Cache via `caches.create` — guaranteed ~75% discount on cached input tokens, but pays the 60–180 s rebuild cost on every file change. Note: `code({ codeExecution: true })` always forces inline content (Gemini rejects `cachedContent` + `tools` simultaneously), so `cachingMode` has no effect when codeExecution is enabled. Hit rate observable via `status.structuredContent.caching.implicitHitRate`. Operator-level override: env `GEMINI_CODE_CONTEXT_CACHING_MODE`. A model without `createCachedContent` (`gemini-4-argon`) runs `'explicit'` as `'implicit'`, and a failed `caches.create` sends the files without a cache; either way the response says what ran in `cachingMode` and why in `cachingModeNote`.",
+        "enum": ["explicit", "implicit"],
+        "type": "string"
+      },
+      "codeExecution": {
+        "description": "Enable Gemini's Code Execution tool — Gemini can run Python in a sandbox to verify its output. Off by default.",
+        "type": "boolean"
+      },
+      "excludeGlobs": {
+        "description": "Additional patterns to exclude. Supports three shapes: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match, including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.map`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised (backslashes → `/`, leading `./` and trailing `/` stripped). Case-insensitive. No mid-string `*` / `**` / `?` — split into dir + extension patterns if needed.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "expectEdits": {
+        "description": "Request OLD/NEW diff format in the response (default: true).",
+        "type": "boolean"
+      },
+      "forceRescan": {
+        "description": "Bypass the v1.13.0 scan memo and re-hash every file in the workspace (default `false`). The scan memo skips per-file SHA256 when `mtime_ms` and `size` match the previously-stored values. Set this when you suspect the manifest is stale (e.g. files mutated outside the dev workflow). Equivalent to setting env `GEMINI_CODE_CONTEXT_FORCE_RESCAN=true` for a single call.",
+        "type": "boolean"
+      },
+      "includeGlobs": {
+        "description": "Additional file extensions or filenames to include.",
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "maxOutputTokens": {
+        "description": "Per-call opt-in cap on response length (tokens). OMIT for auto — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value to bound a specific call (e.g. `maxOutputTokens: 16384` for a tight code-review summary). Values larger than the resolved model's limit are clamped. Operators who want EVERY call at full model capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level — that env override is still beaten by this per-call field.",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "model": {
+        "description": "Model alias or literal ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile); a configured default that resolves but cannot reason or think (a flash/lite tier) is replaced by 'latest-pro-thinking' for this tool and the response says so (configuredModelReplaced); a model named here is never replaced.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "preflightMode": {
+        "description": "Token-count strategy for the WORKSPACE_TOO_LARGE preflight (v1.10.0+). `'heuristic'` = bytes/4 fast estimate (skips API call; coarse — undercounts dense Unicode by 30-50%). `'exact'` = always call Gemini's `countTokens` (free, no quota share with `generateContent`; ~hundreds of ms per call; cached per (filesHash + task + model) — `filesHash` is post-glob-filter so changing globs that resolve to different files invalidates automatically). `'auto'` (default, recommended) = heuristic when the workspace is well under 50% of the model's input limit; exact when near the cliff where accuracy matters. Use `'exact'` in CI / tests where you want predictable, accurate behaviour regardless of size.",
+        "enum": ["heuristic", "exact", "auto"],
+        "type": "string"
+      },
+      "serviceTier": {
+        "description": "Gemini service tier for this call. `'flex'` is Google's half-price tier (longer latency; a request may be refused under load with 429 or 503, which this server does NOT retry and never re-sends — the result says RATE_LIMIT / OVERLOADED, retryable, and the client retries); `'standard'` is the default. Operator default via env `GEMINI_CODE_CONTEXT_SERVICE_TIER`. The cost estimate and the daily budget use the flex price. A flex request queued longer than Node's 300 s header wait fails as NETWORK_ERROR, retryable (the server does not raise that wait yet). Not available on the Vertex AI backend (refused by name).",
+        "enum": ["standard", "flex"],
+        "type": "string"
+      },
+      "stallMs": {
+        "description": "Per-call HEARTBEAT-AWARE stall watchdog in ms (1s–10min, v1.12.0+). Resets on every chunk (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Recommended setting: `60_000` (60s). When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_STALL_MS`, then to disabled. Returns `errorCode: \"TIMEOUT\"` with `timeoutKind: \"stall\"` on abort. Independent of `timeoutMs` — both can be set; whichever fires first wins.",
+        "maximum": 600000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "task": {
+        "description": "Describe the coding task — what to build, refactor, or fix.",
+        "minLength": 1,
+        "type": "string"
+      },
+      "thinkingBudget": {
+        "description": "Explicit reasoning-token cap. Default (when both `thinkingBudget` and `thinkingLevel` are omitted): 16384 — a strong default for coding. Pass a positive integer to cap reasoning at that many tokens; `0` disables thinking (rejected by Gemini 3 Pro with 400). CAVEAT on Gemini 3 Pro: low positive values (empirically ≤256 with cached content) can cause the API to hang — use ≥4096 if you must bound it. For discrete-tier control on Gemini 3 use `thinkingLevel` instead — the two are mutually exclusive.",
+        "maximum": 65536,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "thinkingLevel": {
+        "description": "Discrete reasoning tier for Gemini 3 family models — Google's recommended knob on those (ai.google.dev/gemini-api/docs/gemini-3). Values: `MINIMAL` (Flash-Lite only), `LOW`, `MEDIUM`, `HIGH` (Gemini 3 Pro's default), `XHIGH` (Gemini 4 Hydrogen only). Gemini 2.5 models do NOT support this — use `thinkingBudget` instead. Mutually exclusive with `thinkingBudget`: passing both returns a validation error before we even hit Gemini (Gemini itself also rejects with 400 'cannot use both thinking_level and the legacy thinking_budget parameter').",
+        "enum": ["MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"],
+        "type": "string"
+      },
+      "timeoutMs": {
+        "description": "Per-call wall-clock TOTAL timeout in ms (1s–30min). The cost ceiling — aborts the in-flight `generateContent` request even if it is actively streaming. Gemini still finishes server-side and bills tokens for completed work. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS`, then to disabled. v1.12.0 RECOMMENDATION: prefer `stallMs` for liveness — `timeoutMs` is the cost cap, `stallMs` is the heartbeat-aware liveness watchdog that does NOT fire while the model is actively thinking. Both can be set simultaneously. Returns `errorCode: \"TIMEOUT\"` with `timeoutKind: \"total\"` on abort.",
+        "maximum": 1800000,
+        "minimum": 1000,
+        "type": "integer"
+      },
+      "workspace": {
+        "description": "Workspace path (default: cwd).",
+        "type": "string"
+      }
+    },
+    "required": ["task"],
+    "type": "object"
+  },
+  "reindex": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "alsoRefreshModels": {
+        "description": "Also invalidate the model registry cache (default: false).",
+        "type": "boolean"
+      },
+      "workspace": {
+        "description": "Workspace path (default: cwd).",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "status": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "additionalProperties": false,
+    "properties": {
+      "workspace": {
+        "description": "Workspace path (default: cwd).",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  }
+}

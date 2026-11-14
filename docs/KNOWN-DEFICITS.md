@@ -55,13 +55,13 @@ Root cause is on Google's side: Gemini 3 Pro is a "thinking-only" model with an 
 
 ---
 
-## Zod `.refine()` cross-field constraints don't round-trip through `zod-to-json-schema`
+## Zod `.refine()` cross-field constraints don't round-trip into JSON Schema (`z.toJSONSchema`)
 
 **Source:** April 2026 three-way code review on PR #16 (Gemini P2 finding).
 
 **Status:** WATCH. Not fixed; documented in schema descriptions instead.
 
-**What is the issue?** Our `askInputSchema` enforces `thinkingBudget ⊕ thinkingLevel` (mutually exclusive) via a `.refine()` at the root (`src/tools/ask.tool.ts:114-118`). Runtime Zod validation catches any caller that sets both and returns a clear `"Cannot specify both ... mutually exclusive"` error before we hit Gemini. However, `zod-to-json-schema` (used in `src/tools/registry.ts:92` to expose `inputSchema` in MCP `tools/list`) does **not** emit `.refine()` constraints into the generated JSON Schema — it has no canonical mapping from an arbitrary refinement predicate to JSON Schema's `not`/`oneOf`/`dependentSchemas` keywords. The schema surface visible to MCP clients therefore shows both fields as independent optionals, and clients that rely on the schema alone (not on description docs or runtime probes) will allow a caller to set both.
+**What is the issue?** Our `askInputSchema` enforces `thinkingBudget ⊕ thinkingLevel` (mutually exclusive) via a `.refine()` at the root (`src/tools/ask.tool.ts:114-118`). Runtime Zod validation catches any caller that sets both and returns a clear `"Cannot specify both ... mutually exclusive"` error before we hit Gemini. However, Zod's `z.toJSONSchema` (called by `buildToolInputSchema` in `src/tools/registry.ts` to expose `inputSchema` in MCP `tools/list`) does **not** emit `.refine()` constraints into the generated JSON Schema — it has no canonical mapping from an arbitrary refinement predicate to JSON Schema's `not`/`oneOf`/`dependentSchemas` keywords. The schema surface visible to MCP clients therefore shows both fields as independent optionals, and clients that rely on the schema alone (not on description docs or runtime probes) will allow a caller to set both.
 
 **Impact today:** LLM-based clients (Claude, GPT) read field descriptions before constructing a call — both `thinkingBudget` and `thinkingLevel` descriptions explicitly state the mutual-exclusion rule, so these clients avoid the combination. Form-rendering MCP clients that only consume the JSON Schema can present both fields as checkable, then get a runtime error. The error path (`path: []` after finding F6 fix) renders at the schema root, which is the correct spot for a cross-field violation. Net effect: minor UX wart on non-LLM clients; clear error message; no safety or cost consequence.
 

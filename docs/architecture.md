@@ -75,7 +75,7 @@ Five MCP tools, each validated by a Zod schema and wired into the registry:
 
 Standard MCP stdio bootstrap:
 
-- `ListToolsRequestSchema` → returns `TOOLS.map(t => { name, title, description, inputSchema: zodToJsonSchema(t.schema) })`
+- `ListToolsRequestSchema` → returns `TOOLS.map(t => { name, title, description, inputSchema: buildToolInputSchema(t) })`
 - `CallToolRequestSchema` → parses args through Zod, constructs a `ToolContext`, awaits `tool.execute`
 - SIGINT/SIGTERM → graceful shutdown: stop TTL watcher, close DB, close MCP server
 - Entrypoint dispatches `init` subcommand vs server mode

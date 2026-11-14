@@ -227,7 +227,7 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T14. Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
+## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.
 
@@ -239,7 +239,9 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T15. Migrate from `zod-to-json-schema` to Zod 4's built-in `z.toJSONSchema()`
+## ~~T15.~~ ✅ SHIPPED 2026-11-14 — Migrate from `zod-to-json-schema` to Zod 4's built-in `z.toJSONSchema()`
+
+**Shipped as:** `z.toJSONSchema(schema, { target: 'draft-7', reused: 'inline', io: 'input', override })` — `unrepresentable` stays at Zod's default (a schema that cannot be written fails at startup, before the transport accepts a connection); the override keeps the published 1.22.1 contract (`additionalProperties: false`, no safe-integer bounds), held by `test/fixtures/tools-input-schema.json`. The Dependabot ignore for Zod majors is removed. The scope below is the plan as written in April 2026.
 
 **Source:** Dependabot PR #13 closure (April 2026). Zod 4 is a type-internals rewrite: the `$ZodTypeInternals` shape replaces `ZodTypeDef`, and `zod-to-json-schema@3.x` rejects the new type with `TS2345: Argument of type 'ZodType<unknown, unknown, $ZodTypeInternals<unknown, unknown>>' is not assignable to parameter of type 'ZodType<any, ZodTypeDef, any>'` at the call site in `src/tools/registry.ts`.
 
