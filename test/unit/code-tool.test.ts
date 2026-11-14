@@ -78,7 +78,16 @@ describe('code input schema — thinkingLevel', () => {
     }
   });
 
-  it.each(THINKING_LEVELS)('accepts %s', (level) => {
+  it('refuses XHIGH with the reason and the way out (only a fast-tier model takes it; code runs reasoning-tier models)', () => {
+    const parsed = codeInputSchema.safeParse({ task: 'hi', thinkingLevel: 'XHIGH' });
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues[0]?.path).toEqual(['thinkingLevel']);
+      expect(parsed.error.issues[0]?.message).toContain('gemini-4-hydrogen');
+    }
+  });
+
+  it.each(THINKING_LEVELS.filter((level) => level !== 'XHIGH'))('accepts %s', (level) => {
     const parsed = codeInputSchema.safeParse({ task: 'hi', thinkingLevel: level });
     expect(parsed.success).toBe(true);
     if (parsed.success) {

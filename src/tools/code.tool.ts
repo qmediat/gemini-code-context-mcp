@@ -180,6 +180,11 @@ export const codeInputSchema = z
     // RELATION between two fields, not a problem with either field
     // individually.
     path: [],
+  })
+  .refine((data) => data.thinkingLevel !== 'XHIGH', {
+    message:
+      "`thinkingLevel: 'XHIGH'` is not usable with `code`: only Gemini 4 Hydrogen takes it, a fast-tier model, and `code` runs reasoning-tier models, which answer it with a 400. Use `HIGH` here, or `ask` with `model: 'gemini-4-hydrogen'`.",
+    path: ['thinkingLevel'],
   });
 
 export type CodeInput = z.infer<typeof codeInputSchema>;

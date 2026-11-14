@@ -34,8 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit id failed the category check of `ask` / `code`. A codename id with another product's suffix
   (`gemini-4-carbon-computer-use-preview`) stays `unknown`.
 - `thinkingLevel: "XHIGH"` — the level Google added with Gemini 4 Hydrogen, the one model that takes it (`ask`,
-  `ask_agentic`; Argon, Carbon and the 3.x models answer it with a 400, so on `code`, which runs reasoning-tier
-  models only, it is always refused). One description of the field serves the three tools.
+  `ask_agentic`; Argon, Carbon and the 3.x models answer it with a 400, so `code`, which runs reasoning-tier
+  models only, refuses it up front with the reason and the way out). One description of the field serves the three tools.
 - Rates: `gemini-4-carbon` 2 / 10 / 0.1 USD per 1M input / output / cached tokens through 2026-11-30 and 4 / 20 / 0.2
   from 2026-12-01 (Argon's row); `gemini-4-hydrogen` 1.5 / 7.5 / 0.075, flat (pricing page read 2026-11-14).
 - `gemini-nano-banana-2.1` classifies as image generation (the family's ids carry the `gemini-` prefix since 2.1).
