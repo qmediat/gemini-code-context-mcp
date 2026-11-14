@@ -133,6 +133,8 @@ const JSON_SCHEMA_OPTIONS = {
     }
     // biome-ignore lint/performance/noDelete: the key must be absent, not undefined — a client's deep-equal sees the difference
     if (jsonSchema.maximum === Number.MAX_SAFE_INTEGER) delete jsonSchema.maximum;
+    // biome-ignore lint/performance/noDelete: as above — the floor of an integer that states no minimum
+    if (jsonSchema.minimum === Number.MIN_SAFE_INTEGER) delete jsonSchema.minimum;
   },
 } as const;
 

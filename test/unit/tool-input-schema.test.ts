@@ -54,7 +54,8 @@ describe('tools/list inputSchema conformance', () => {
   });
 
   it('publishes the inputSchema of 1.22.1 for every tool, key for key', () => {
-    // The fixture is the zod-3 build's output: a Zod release that writes a schema differently turns this red.
+    // The fixture is the output of the 1.22.1 build (commit 87a3ea1, zod 3.25.76 + zod-to-json-schema), dumped
+    // before the migration: a Zod release that writes a schema differently turns this red.
     const published = JSON.parse(
       readFileSync(new URL('../fixtures/tools-input-schema-1.22.1.json', import.meta.url), 'utf8'),
     ) as Record<string, unknown>;
