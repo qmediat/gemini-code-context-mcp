@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The README is one screen**: install, try it, the six tools, what the release supports, and a table of the docs.
+  The reference it carried moved to `docs/`: the tools, `ask` vs `ask_agentic` and the `ask_agentic` sandbox to
+  `docs/tools.md`, the comparison with `gemini-mcp-tool` to `docs/why.md`, install methods, supported platforms and
+  upgrading to `docs/getting-started.md`, the measured costs to `docs/cost-model.md`, maintenance and support to
+  `docs/maintenance.md`, trademarks to `docs/TRADEMARKS.md`.
+- `AGENTS.md` holds the guidance for AI coding agents (commands, where things are, rules); `CLAUDE.md` imports it.
+
+### Added
+
+- The README's `## Supports · version X.Y.Z` heading names the version its list describes; `npm run check:supports`
+  fails when it differs from `package.json`, in CI and in the release workflow before anything is published.
+
 ## [1.23.0] - 2026-11-14
 
 ### Changed

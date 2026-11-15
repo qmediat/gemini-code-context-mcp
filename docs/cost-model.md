@@ -79,6 +79,12 @@ Cache storage (1 h avg): 500 k × 1 h × $4.50/M/h  = $2.25
 
 **~79 % savings** in explicit `cachingMode` (latency measured 2026-04-22: first call ~125 s, repeats ~14 s on a 670 k-token workspace). In the default implicit mode there is no cache storage charge and no guaranteed discount: a repeat costs at most the inline price.
 
+## Measured on a real workspace
+
+Measured 2026-04-22 with **explicit** `cachingMode` on `vitejs/vite@main`'s `packages/vite/` (~670 k tokens, 451 files, Gemini 3.1 Pro, `thinkingLevel: LOW`): first query 125 s (scan + Files API upload + cache build), repeat queries ~14 s and **$0.60 per cached query vs $2.35 per inline query** for the same question — about 8× faster and ~75 % cheaper on a cache hit. At 20 queries/day on this workspace that is $35/day per developer ($12 cached vs $47 inline). `HIGH` thinking adds 15–45 s per call in either mode.
+
+The default mode since v1.14.0 is **implicit** caching: no upload and no cache build, the workspace text goes with every call and Gemini's automatic prefix cache decides the discount, so a repeat query costs at most the inline price and often less — no guaranteed discount. The cost estimator assumes cached input at 25 % of the input rate when a model's price sheet lists no cached rate — check Google's current cached-input price for your model. Actual numbers scale with workspace tokens × queries/day × thinking budget. The `status` tool shows the ledger behind these numbers.
+
 ## Tools for cost control
 
 1. **Daily budget cap.** `GEMINI_DAILY_BUDGET_USD` — hard stop once exceeded, resets at UTC midnight. Set this.
