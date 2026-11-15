@@ -27,7 +27,8 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm run check:supports # README "Supports" must name this package version
+      - run: npm run check:supports # README "Supports", server.json and package-lock.json must name this package version
+      - run: npm run check:addresses # every email address in a tracked text file is in qmediat.io
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
