@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.23.1] - 2026-11-15
+
 ### Changed
 
 - **The README is one screen**: install, try it, the six tools, what the release supports, and a table of the docs.
@@ -1796,7 +1798,8 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.0...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.1...HEAD
+[1.23.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.0...v1.23.1
 [1.23.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.1...v1.23.0
 [1.22.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.0...v1.22.1
 [1.22.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.21.0...v1.22.0
