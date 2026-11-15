@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 const SCRIPT = join(import.meta.dirname, '..', '..', 'scripts', 'check-addresses.mjs');
 // Assembled at run time so that this file holds no foreign address for the repository's own check to find.
 const FOREIGN = 'someone' + '@elsewhere.test';
+const addressOf = (local: string, domain: string): string => `${local}${'@'}${domain}`;
 const ENV = { ...process.env, GIT_CEILING_DIRECTORIES: tmpdir() };
 
 interface CheckRun {
@@ -79,8 +80,49 @@ describe('scripts/check-addresses.mjs', () => {
       'npx @qmediat.io/gemini-code-context-mcp@1.2.3 "@modelcontextprotocol/sdk@1.29.x" zod@3.x',
       'git@github.com:qmediat/x.git',
       'ssh://git@github.com/qmediat/x.git',
+      'git+ssh://git@github.com/qmediat/x.git',
     ].join('\n');
     const run = runCheck([makeRepo({ 'README.md': text })]);
+    expect(run.stderr).toBe('');
+    expect(run.status).toBe(0);
+  });
+
+  it('takes an address followed by a path, a port or a colon for an address', () => {
+    const alice = addressOf('alice', 'gmail.com');
+    const someone = addressOf('someone', 'foreign.invalid');
+    const lines = [
+      `https://${alice}/profile`,
+      `see ${alice}/x`,
+      `Contact ${someone}: details`,
+      `${someone}:8080`,
+      `ssh://${addressOf('alice', 'gitlab.invalid')}/x.git`,
+      `${addressOf('x.git', 'github.invalid')}:owner/repo`,
+    ];
+    const run = runCheck([makeRepo({ 'NOTES.md': lines.join('\n') })]);
+    expect(run.status).toBe(1);
+    const found = [
+      alice,
+      alice,
+      someone,
+      someone,
+      addressOf('alice', 'gitlab.invalid'),
+      addressOf('x.git', 'github.invalid'),
+    ];
+    expect(run.stderr).toBe(
+      found.map((address, index) => `NOTES.md:${index + 1}: ${address}\n`).join(''),
+    );
+  });
+
+  it('takes a version pin for one only when its labels before the last are numeric', () => {
+    const named = [addressOf('alice', '1.2.gmail.com'), addressOf('someone', '1.263.com')];
+    const pins = 'name@1.0.0-alpha.beta zod@3.x sdk@1.29.x';
+    const run = runCheck([makeRepo({ 'NOTES.md': [...named, pins].join('\n') })]);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toBe(`NOTES.md:1: ${named[0]}\nNOTES.md:2: ${named[1]}\n`);
+  });
+
+  it('does not take an image at a pixel scale for an address', () => {
+    const run = runCheck([makeRepo({ 'README.md': '![logo](logo@2x.png) ![icon](icon@3x.webp)' })]);
     expect(run.stderr).toBe('');
     expect(run.status).toBe(0);
   });
