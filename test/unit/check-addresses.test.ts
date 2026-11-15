@@ -13,13 +13,12 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const SCRIPT = join(import.meta.dirname, '..', '..', 'scripts', 'check-addresses.mjs');
-// The shared corpus (test/fixtures/address-corpus.json) holds the pattern's cases; every other test address is built
-// at run time by `addressOf`, so that this file holds none for the repository's own check to find.
-const addressOf = (local: string, domain: string): string => `${local}${'@'}${domain}`;
-const FOREIGN = addressOf('someone', 'elsewhere.test');
+// The shared corpus (test/fixtures/address-corpus.json) holds the pattern's cases; every test address, there and here,
+// is written with `(at)` for the at-sign and made an address by `withAtSign` at run time, so that this file holds none
+// for the repository's own check to find.
 
 interface Corpus {
-  findings: { line: string; address: string }[];
+  findings: { line: string; address?: string; addresses?: string[] }[];
   clean: string[];
   allowed: string[];
 }
@@ -29,6 +28,7 @@ const CORPUS: Corpus = JSON.parse(
   readFileSync(join(import.meta.dirname, '..', 'fixtures', 'address-corpus.json'), 'utf8'),
 );
 const withAtSign = (text: string): string => text.replaceAll('(at)', '@');
+const FOREIGN = withAtSign('someone(at)elsewhere.test');
 const ENV = { ...process.env, GIT_CEILING_DIRECTORIES: tmpdir() };
 
 interface CheckRun {
@@ -76,19 +76,22 @@ describe('scripts/check-addresses.mjs', () => {
     expect(run.stderr).toBe(`NOTES.md:3: ${FOREIGN}\n`);
   });
 
-  /** Runs the check on one file of `lines` and expects line N to report `found[N]`, and nothing else. */
-  function expectEachFound(lines: string[], found: string[]): void {
+  /** Runs the check on one file of `lines` and expects line N to report `found[N]`, in order, and nothing else. */
+  function expectEachFound(lines: string[], found: string[][]): void {
     const run = runCheck([makeRepo({ 'NOTES.md': lines.join('\n') })]);
     expect(run.status).toBe(1);
-    expect(run.stderr).toBe(
-      found.map((address, index) => `NOTES.md:${index + 1}: ${address}\n`).join(''),
+    const expected = found.flatMap((addresses, index) =>
+      addresses.map((address) => `NOTES.md:${index + 1}: ${address}\n`),
     );
+    expect(run.stderr).toBe(expected.join(''));
   }
 
-  it('reports every corpus finding as exactly its address, with its path and line', () => {
+  it('reports every corpus finding as exactly its addresses, with its path and line', () => {
     expectEachFound(
       CORPUS.findings.map(({ line }) => withAtSign(line)),
-      CORPUS.findings.map(({ address }) => withAtSign(address)),
+      CORPUS.findings.map(({ address, addresses }) =>
+        (addresses ?? [address ?? '']).map(withAtSign),
+      ),
     );
   });
 
