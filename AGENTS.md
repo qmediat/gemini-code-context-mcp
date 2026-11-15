@@ -10,7 +10,7 @@ This is a public open-source repository: everything written here ships with the 
 | Build | `npm run build` |
 | Check before a commit | `npm run lint && npm run typecheck && npm test` |
 | README "Supports", `server.json` and `package-lock.json` against the package version | `npm run check:supports` |
-| Every email address in a tracked file in `qmediat.io` | `npm run check:addresses` |
+| Every address-shaped text in a tracked file in an allowed domain or its subdomain, else in `REPOSITORY_ADDRESSES` | `npm run check:addresses` |
 | Run the local build | `node ./dist/index.js` |
 | `npx` inside this repo | Fails: the repo has the package's name. Use the local build. |
 
@@ -50,5 +50,5 @@ never see this. Any of these avoids it:
 | Examples in docs | Generic placeholders (`/path/to/...`, `your-org/your-repo`) unless the example is `@qmediat.io/...` |
 | TypeScript | Strict, no `any`, no default exports |
 | A user-visible change | One CHANGELOG.md entry (the release notes come from it) |
-| Addresses | The addresses this repository publishes for the project are in `qmediat.io` (`contact@`, `security@`, `dev@`); the qmediat team's commits are authored as `dev@qmediat.io`, a contributor's with their own address; no personal or account address in any file (`npm run check:addresses` enforces it) |
+| Addresses | The addresses this repository publishes for the project are in `qmediat.io` (`contact@`, `security@`, `dev@`); the qmediat team's commits are authored as `dev@qmediat.io`, a contributor's with their own address; no personal or account address in any file; a file that must show other address-shaped text (a git remote with a user, an image name with a scale suffix) adds an exact (file, address) entry to `REPOSITORY_ADDRESSES` in `scripts/check-addresses.mjs` (`npm run check:addresses` enforces it) |
 | A release | README "Supports", `server.json` and `package-lock.json` name the new version; the release check fails when one differs |

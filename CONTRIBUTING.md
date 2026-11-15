@@ -86,7 +86,7 @@ The dev server resolves its state to `<XDG_STATE_HOME>/qmediat/gemini-code-conte
 3. **Keep the diff small** — one logical change per PR. If you need to refactor in the process, submit the refactor as a separate PR first.
 4. **Run `npm run lint` and `npm run typecheck`** before pushing.
 5. **Add a CHANGELOG entry** — under the next version heading in `CHANGELOG.md` (Keep a Changelog format: Added / Changed / Fixed / Security), with the semver bump the change implies.
-6. **A release** bumps the version and, in the same commit, the README heading `## Supports · version X.Y.Z` with its list re-checked, `server.json` (`version` and every `packages[].version`) and the root of `package-lock.json` — `npm run check:supports` (run by CI and by the release workflow before publishing) fails while one of them differs or is missing; the release workflow also runs `npm run check:addresses`.
+6. **A release** bumps the version and, in the same commit, the README heading `## Supports · version X.Y.Z` with its list re-checked, `server.json` (`version` and every `packages[].version`) and the root of `package-lock.json` — `npm run check:supports` (run by CI and by the release workflow before publishing) fails while one of them differs or is missing; the release workflow also runs `npm run check:addresses`: every address-shaped text in a tracked file is in an allowed domain or its subdomain, or a file that must show other address-shaped text (a git remote with a user, an image name with a scale suffix) adds an exact (file, address) entry to `REPOSITORY_ADDRESSES` in `scripts/check-addresses.mjs`.
 7. **Open a PR** against `main` with a clear description and link to any relevant issue.
 
 ## Code style

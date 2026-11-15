@@ -1,12 +1,34 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const SCRIPT = join(import.meta.dirname, '..', '..', 'scripts', 'check-addresses.mjs');
-// Assembled at run time so that this file holds no foreign address for the repository's own check to find.
-const FOREIGN = 'someone' + '@elsewhere.test';
+// The shared corpus (test/fixtures/address-corpus.json) holds the pattern's cases; every test address, there and here,
+// is written with `(at)` for the at-sign and made an address by `withAtSign` at run time, so that this file holds none
+// for the repository's own check to find.
+
+interface Corpus {
+  findings: { line: string; address?: string; addresses?: string[] }[];
+  clean: string[];
+  allowed: string[];
+}
+
+// The corpus every implementation of the check shares; `(at)` stands for the at-sign, so the file holds no address.
+const CORPUS: Corpus = JSON.parse(
+  readFileSync(join(import.meta.dirname, '..', 'fixtures', 'address-corpus.json'), 'utf8'),
+);
+const withAtSign = (text: string): string => text.replaceAll('(at)', '@');
+const FOREIGN = withAtSign('someone(at)elsewhere.test');
 const ENV = { ...process.env, GIT_CEILING_DIRECTORIES: tmpdir() };
 
 interface CheckRun {
@@ -54,33 +76,33 @@ describe('scripts/check-addresses.mjs', () => {
     expect(run.stderr).toBe(`NOTES.md:3: ${FOREIGN}\n`);
   });
 
-  it('fails on an address whose local part has letters outside ASCII', () => {
-    const accented = 'Zoë.Łukasz' + '@elsewhere.test';
-    const run = runCheck([makeRepo({ 'NOTES.md': `write to ${accented}\n` })]);
+  /** Runs the check on one file of `lines` and expects line N to report `found[N]`, in order, and nothing else. */
+  function expectEachFound(lines: string[], found: string[][]): void {
+    const run = runCheck([makeRepo({ 'NOTES.md': lines.join('\n') })]);
     expect(run.status).toBe(1);
-    expect(run.stderr).toBe(`NOTES.md:1: ${accented}\n`);
+    const expected = found.flatMap((addresses, index) =>
+      addresses.map((address) => `NOTES.md:${index + 1}: ${address}\n`),
+    );
+    expect(run.stderr).toBe(expected.join(''));
+  }
+
+  it('reports every corpus finding as exactly its addresses, with its path and line', () => {
+    expectEachFound(
+      CORPUS.findings.map(({ line }) => withAtSign(line)),
+      CORPUS.findings.map(({ address, addresses }) =>
+        (addresses ?? [address ?? '']).map(withAtSign),
+      ),
+    );
   });
 
-  it('passes qmediat.io and the allowed addresses', () => {
-    const text = [
-      'dev@qmediat.io',
-      'Security@QMediat.io',
-      '12345+someone@users.noreply.github.com',
-      'Co-Authored-By: Claude <noreply@anthropic.com>',
-      'jane@example.com, joe@example.org, ann@example.net',
-    ].join('\n');
-    const run = runCheck([makeRepo({ 'AUTHORS.md': text })]);
+  it('finds no address in a corpus clean line', () => {
+    const run = runCheck([makeRepo({ 'NOTES.md': CORPUS.clean.map(withAtSign).join('\n') })]);
     expect(run.stderr).toBe('');
     expect(run.status).toBe(0);
   });
 
-  it('does not take an npm scope, a version pin or a git remote (scp or ssh form) for an address', () => {
-    const text = [
-      'npx @qmediat.io/gemini-code-context-mcp@1.2.3 "@modelcontextprotocol/sdk@1.29.x" zod@3.x',
-      'git@github.com:qmediat/x.git',
-      'ssh://git@github.com/qmediat/x.git',
-    ].join('\n');
-    const run = runCheck([makeRepo({ 'README.md': text })]);
+  it('allows every corpus allowed line', () => {
+    const run = runCheck([makeRepo({ 'AUTHORS.md': CORPUS.allowed.map(withAtSign).join('\n') })]);
     expect(run.stderr).toBe('');
     expect(run.status).toBe(0);
   });
