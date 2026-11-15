@@ -731,3 +731,11 @@ failure on the buffer `hashFile` already reads — counted as `filesSkippedBinar
 `filesSkippedNonSource`); a memo hit must carry the verdict (an optional `text` column, like `mtime_ms` in v1.13.0) or
 re-read, so an old memo row never passes a file the test would refuse. Tests: a NUL file and a non-UTF-8 file under an
 include extension are skipped and counted; a UTF-8 file with CJK text is not. Owner @qmt.
+
+## DEF-VERSION-FILES (2026-11-15). One check for every file that carries the version
+
+`npm run check:supports` compares the README's `## Supports · version X.Y.Z` heading with `package.json` in CI and in
+the release workflow. The `server.json` versions (the MCP registry manifest) are compared with `package.json` only by
+an inline step of `release.yml`, so a stale `server.json` is found at tag time, not at PR time. Move that comparison
+into the same script (one helper, every version-bearing file) and run it in CI. Found by the review of the PR that
+added the Supports check; a different mechanism (the registry manifest), so not part of that PR.

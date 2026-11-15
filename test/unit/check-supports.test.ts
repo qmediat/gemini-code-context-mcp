@@ -60,6 +60,29 @@ describe('scripts/check-supports.mjs', () => {
     expect(run.stderr).toContain('cannot read the versions');
   });
 
+  it('fails when package.json has no version', () => {
+    writeFileSync(readme, '# demo\n\n## Supports · version 2.4.1\n');
+    writeFileSync(pkg, JSON.stringify({ name: 'demo' }));
+    const run = runCheck([readme, pkg]);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('package.json has no version');
+  });
+
+  it('fails when the package.json version is not a string', () => {
+    writeFileSync(readme, '# demo\n\n## Supports · version 1\n');
+    writeFileSync(pkg, JSON.stringify({ name: 'demo', version: 1 }));
+    const run = runCheck([readme, pkg]);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('package.json version is not a string');
+  });
+
+  it('refuses a single file: both are named, or neither', () => {
+    writeFileSync(readme, '# demo\n\n## Supports · version 2.4.1\n');
+    const run = runCheck([readme]);
+    expect(run.status).toBe(2);
+    expect(run.stderr).toContain('name both files');
+  });
+
   it("holds for the repository's own README and package.json", () => {
     const run = runCheck([]);
     expect(run.stderr).toBe('');
