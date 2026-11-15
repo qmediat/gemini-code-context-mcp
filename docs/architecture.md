@@ -63,9 +63,10 @@ The magic:
 
 ### `src/tools/`
 
-Five MCP tools, each validated by a Zod schema and wired into the registry:
+Six MCP tools, each validated by a Zod schema and wired into the registry ([tools.md](tools.md)):
 
 - **`ask`** — Q&A, long-context analysis. Uses cache.
+- **`ask_agentic`** — the same question answered by a sandboxed file-reading loop, for a workspace too large to send whole.
 - **`code`** — coding delegation. Enables `thinkingConfig` + optional `codeExecution`. Parses OLD/NEW diff output so Claude Code can apply edits.
 - **`status`** — inspection tool. Lists available models, cache state, usage/cost.
 - **`reindex`** — force rebuild the cache (skip hash-diff optimization).

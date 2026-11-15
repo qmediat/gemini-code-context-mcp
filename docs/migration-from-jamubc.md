@@ -1,6 +1,6 @@
 # Migration from `gemini-mcp-tool` (jamubc)
 
-If you're reading this, you've probably been using [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool) and noticed it hasn't been updated since 2025-07. That's why we built this server. Here's how to switch.
+If you've been using [jamubc/gemini-mcp-tool](https://github.com/jamubc/gemini-mcp-tool), here's how to switch.
 
 ## TL;DR
 
@@ -25,16 +25,7 @@ Then restart Claude Code. That's it.
 
 ## What's different
 
-| | jamubc | @qmediat.io |
-|---|---|---|
-| Under the hood | Shells out to `gemini` CLI | Direct `@google/genai` SDK |
-| Tool names | `ask-gemini`, `brainstorm`, `fetch-chunk`, `ping`, `Help`, `timeout-test` | `ask`, `code`, `status`, `reindex`, `clear` |
-| Default model | Hardcoded `gemini-2.5-pro` on main, `gemini-3.1-pro-preview` on npm v1.1.4 — frozen, no env var override | Dynamic alias `latest-pro` — resolves against your API key tier at startup |
-| Quota fallback | Hardcoded to `gemini-2.5-flash` | Generic `models.list()` → pick best available |
-| Repeat queries | No caching — each call re-tokenises referenced files | One workspace scan reused; implicit caching by default, an explicit Context Cache on request (measured ~8× faster, ~4× cheaper on repeats in explicit mode) |
-| Coding delegation | Prompt-injected OLD/NEW format (`changeMode`) | Native `thinkingConfig` + optional `codeExecution` |
-| Auth | Inherits `gemini` CLI auth (browser OAuth or `GEMINI_API_KEY` env) | 3-tier: Vertex ADC / profile file (chmod 0600) / env var |
-| Cost control | — | Daily budget cap in USD |
+The two servers side by side, with the date the comparison was checked: [why.md](why.md).
 
 ## Tool name mapping
 

@@ -124,7 +124,7 @@ export function resolveAuth(): ResolvedAuth {
       '  2. `gcloud auth application-default login` + GEMINI_USE_VERTEX=true',
       '  3. Set GEMINI_API_KEY env var (quick test only)',
       '',
-      'See: https://github.com/qmediat/gemini-code-context-mcp#setup',
+      'See: https://github.com/qmediat/gemini-code-context-mcp/blob/main/docs/getting-started.md',
     ].join('\n'),
   );
 }

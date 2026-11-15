@@ -27,6 +27,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
+      - run: npm run check:supports # README "Supports" must name this package version
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test

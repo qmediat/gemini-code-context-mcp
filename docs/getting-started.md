@@ -32,8 +32,11 @@ Credentials land in `~/.config/qmediat/credentials` with `chmod 0600`. The serve
 One command:
 
 ```bash
-claude mcp add --scope user gemini-code-context -e GEMINI_CREDENTIALS_PROFILE=default -- npx -y @qmediat.io/gemini-code-context-mcp
+claude mcp add --scope user gemini-code-context -- npx -y @qmediat.io/gemini-code-context-mcp
 ```
+
+The server reads the profile named `default` when `GEMINI_CREDENTIALS_PROFILE` is unset; for another profile add
+`-e GEMINI_CREDENTIALS_PROFILE=<name>` before the `--`.
 
 or edit `~/.claude.json` and add:
 
@@ -60,6 +63,26 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) w
 ### Cursor
 
 Edit `~/.cursor/mcp.json` with the same block. See [examples/cursor.json](../examples/cursor.json).
+
+### Other ways to install
+
+| Method | Config |
+|---|---|
+| **npx (recommended)** | `"command": "npx", "args": ["-y", "@qmediat.io/gemini-code-context-mcp"]` — the blocks above |
+| **Global install** | `npm install -g @qmediat.io/gemini-code-context-mcp` → `"command": "gemini-code-context-mcp"` |
+| **Local dev** | `git clone …; npm install; npm run build` → `"command": "node", "args": ["/path/to/dist/index.js"]` |
+
+**Supported platforms.** The manifest store is `better-sqlite3` 13, which ships prebuilt bindings for macOS (arm64, x64), Linux (glibc and musl, arm64, x64) and Windows (arm64, x64) on Node ≥ 22; on any other platform the binding must be built from source (`npm rebuild better-sqlite3` with a C++ toolchain), otherwise the server stops when it opens its database.
+
+### Upgrading to a new release
+
+If you use the **npx** method and a new version has been published but you're still getting the old one, clear the npx cache and restart your MCP host:
+
+```bash
+rm -rf ~/.npm/_npx
+```
+
+`npx -y` caches resolved packages, and npm's registry-metadata cache can keep serving the previously-installed version for a while after `npm publish`. The command above forces a fresh fetch on next MCP startup. Global-install and local-dev users upgrade via `npm update -g @qmediat.io/gemini-code-context-mcp` and `git pull && npm run build` respectively.
 
 ## 3. Try it
 

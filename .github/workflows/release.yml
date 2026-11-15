@@ -75,6 +75,13 @@ jobs:
             echo "::error ::CHANGELOG.md has no section with entries for [$v]"
             exit 1
           fi
+      - name: README "Supports" must name this version
+        run: |
+          if [ -f scripts/check-supports.mjs ]; then
+            npm run check:supports
+          else
+            echo "::warning::this tag predates the README Supports check"
+          fi
 
       - run: npm ci
       - run: npm run lint
