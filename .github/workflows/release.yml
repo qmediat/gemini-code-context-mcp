@@ -75,6 +75,8 @@ jobs:
             echo "::error ::CHANGELOG.md has no section with entries for [$v]"
             exit 1
           fi
+      - name: README "Supports" must name this version
+        run: npm run check:supports
 
       - run: npm ci
       - run: npm run lint
