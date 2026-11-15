@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The README's `## Supports · version X.Y.Z` heading names the version its list describes; `npm run check:supports`
   fails when it differs from `package.json`, in CI and in the release workflow before anything is published.
 
+### Fixed
+
+- The "No Gemini credentials found" error links to `docs/getting-started.md`; it named a README anchor (`#setup`)
+  that did not exist.
+
 ## [1.23.0] - 2026-11-14
 
 ### Changed
