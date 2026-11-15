@@ -49,5 +49,5 @@ never see this. Any of these avoids it:
 | Examples in docs | Generic placeholders (`/path/to/...`, `your-org/your-repo`) unless the example is `@qmediat.io/...` |
 | TypeScript | Strict, no `any`, no default exports |
 | A user-visible change | One CHANGELOG.md entry (the release notes come from it) |
-| Addresses | Every email address in this repository is in `qmediat.io` (`contact@`, `security@`, `dev@`); commits are authored as `dev@qmediat.io`; no personal or account address, in any file |
+| Addresses | The addresses this repository publishes for the project are in `qmediat.io` (`contact@`, `security@`, `dev@`); the qmediat team's commits are authored as `dev@qmediat.io`, a contributor's with their own address; no personal or account address in any file |
 | A release | README "Supports" updated to the new version; the release check fails when its version differs |
