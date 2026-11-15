@@ -86,7 +86,7 @@ The dev server resolves its state to `<XDG_STATE_HOME>/qmediat/gemini-code-conte
 3. **Keep the diff small** — one logical change per PR. If you need to refactor in the process, submit the refactor as a separate PR first.
 4. **Run `npm run lint` and `npm run typecheck`** before pushing.
 5. **Add a CHANGELOG entry** — under the next version heading in `CHANGELOG.md` (Keep a Changelog format: Added / Changed / Fixed / Security), with the semver bump the change implies.
-6. **A release** bumps the version and, in the same commit, the README heading `## Supports · version X.Y.Z` with its list re-checked — `npm run check:supports` (run by CI and by the release workflow before publishing) fails while they differ.
+6. **A release** bumps the version and, in the same commit, the README heading `## Supports · version X.Y.Z` with its list re-checked, `server.json` (`version` and every `packages[].version`) and the root of `package-lock.json` — `npm run check:supports` (run by CI and by the release workflow before publishing) fails while one of them differs.
 7. **Open a PR** against `main` with a clear description and link to any relevant issue.
 
 ## Code style

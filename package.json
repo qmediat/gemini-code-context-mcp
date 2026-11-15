@@ -50,6 +50,7 @@
     "format": "biome format --write src test",
     "typecheck": "tsc --noEmit",
     "check:supports": "node scripts/check-supports.mjs",
+    "check:addresses": "node scripts/check-addresses.mjs",
     "prepublishOnly": "npm run check:supports && npm run lint && npm run typecheck && npm run test && npm run build",
     "inspector": "npx @modelcontextprotocol/inspector node dist/index.js"
   },

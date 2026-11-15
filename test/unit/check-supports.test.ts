@@ -83,6 +83,71 @@ describe('scripts/check-supports.mjs', () => {
     expect(run.stderr).toContain('name both files');
   });
 
+  describe('the version files beside package.json', () => {
+    const writeVersions = (
+      server: string,
+      serverPackage: string,
+      lock: string,
+      lockRoot: string,
+    ): void => {
+      writeFileSync(readme, '# demo\n\n## Supports · version 2.4.1\n');
+      const packages = [{ identifier: 'demo', version: serverPackage }];
+      writeFileSync(
+        join(dir, 'server.json'),
+        JSON.stringify({ name: 'io.github.example/demo', version: server, packages }),
+      );
+      const lockPackages = { '': { name: 'demo', version: lockRoot } };
+      writeFileSync(
+        join(dir, 'package-lock.json'),
+        JSON.stringify({ name: 'demo', version: lock, packages: lockPackages }),
+      );
+    };
+
+    it('passes when server.json and package-lock.json name the package version, and says so', () => {
+      writeVersions('2.4.1', '2.4.1', '2.4.1', '2.4.1');
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(0);
+      expect(run.stdout).toContain('README "Supports" and the version files name version 2.4.1');
+    });
+
+    it('fails on a stale top-level server.json version, naming the file, the value and the package version', () => {
+      writeVersions('2.4.0', '2.4.1', '2.4.1', '2.4.1');
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe(
+        'check-supports: server.json version is 2.4.0; package.json is 2.4.1\n',
+      );
+    });
+
+    it('fails on a stale server.json packages[0].version', () => {
+      writeVersions('2.4.1', '2.4.0', '2.4.1', '2.4.1');
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe(
+        'check-supports: server.json packages[0].version is 2.4.0; package.json is 2.4.1\n',
+      );
+    });
+
+    it('fails on a stale package-lock.json root version', () => {
+      writeVersions('2.4.1', '2.4.1', '2.4.1', '2.4.0');
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe(
+        'check-supports: package-lock.json packages[""].version is 2.4.0; package.json is 2.4.1\n',
+      );
+    });
+
+    it('prints one line for each of two stale version fields', () => {
+      writeVersions('2.4.0', '2.4.1', '2.4.0', '2.4.1');
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe(
+        'check-supports: server.json version is 2.4.0; package.json is 2.4.1\n' +
+          'check-supports: package-lock.json version is 2.4.0; package.json is 2.4.1\n',
+      );
+    });
+  });
+
   it("holds for the repository's own README and package.json", () => {
     const run = runCheck([]);
     expect(run.stderr).toBe('');
