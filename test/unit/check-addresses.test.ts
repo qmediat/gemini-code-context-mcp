@@ -5,9 +5,10 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 const SCRIPT = join(import.meta.dirname, '..', '..', 'scripts', 'check-addresses.mjs');
-// Assembled at run time so that this file holds no foreign address for the repository's own check to find.
-const FOREIGN = 'someone' + '@elsewhere.test';
+// Every foreign address is built at run time by `addressOf`, so that this file holds none for the repository's own
+// check to find.
 const addressOf = (local: string, domain: string): string => `${local}${'@'}${domain}`;
+const FOREIGN = addressOf('someone', 'elsewhere.test');
 const ENV = { ...process.env, GIT_CEILING_DIRECTORIES: tmpdir() };
 
 interface CheckRun {
@@ -56,7 +57,7 @@ describe('scripts/check-addresses.mjs', () => {
   });
 
   it('fails on an address whose local part has letters outside ASCII', () => {
-    const accented = 'Zoë.Łukasz' + '@elsewhere.test';
+    const accented = addressOf('Zoë.Łukasz', 'elsewhere.test');
     const run = runCheck([makeRepo({ 'NOTES.md': `write to ${accented}\n` })]);
     expect(run.status).toBe(1);
     expect(run.stderr).toBe(`NOTES.md:1: ${accented}\n`);
@@ -75,12 +76,22 @@ describe('scripts/check-addresses.mjs', () => {
     expect(run.status).toBe(0);
   });
 
-  it('does not take an npm scope, a version pin or a git remote (scp or ssh form) for an address', () => {
+  /** Runs the check on one file of `lines` and expects line N to report `found[N]`, and nothing else. */
+  function expectEachFound(lines: string[], found: string[]): void {
+    const run = runCheck([makeRepo({ 'NOTES.md': lines.join('\n') })]);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toBe(
+      found.map((address, index) => `NOTES.md:${index + 1}: ${address}\n`).join(''),
+    );
+  }
+
+  it('does not take an npm scope, a version pin, an image file name or a git remote for an address', () => {
     const text = [
-      'npx @qmediat.io/gemini-code-context-mcp@1.2.3 "@modelcontextprotocol/sdk@1.29.x" zod@3.x',
-      'git@github.com:qmediat/x.git',
-      'ssh://git@github.com/qmediat/x.git',
-      'git+ssh://git@github.com/qmediat/x.git',
+      'npx @qmediat.io/gemini-code-context-mcp@1.2.3 "@modelcontextprotocol/sdk@1.29.x"',
+      'zod@3.x sdk@1.29.x pkg@1.x.x pkg@1.2.x.x name@1.0.0-alpha.beta',
+      '![logo](logo@2x.png) ![icon](icon@3x.webp)',
+      'git@github.com:owner/repo.git Git@github.com:o/r',
+      'https://git@github.com/o/r ssh://git@github.com/o/r.git git+ssh://git@github.com/o/r.git',
     ].join('\n');
     const run = runCheck([makeRepo({ 'README.md': text })]);
     expect(run.stderr).toBe('');
@@ -95,36 +106,43 @@ describe('scripts/check-addresses.mjs', () => {
       `see ${alice}/x`,
       `Contact ${someone}: details`,
       `${someone}:8080`,
-      `ssh://${addressOf('alice', 'gitlab.invalid')}/x.git`,
-      `${addressOf('x.git', 'github.invalid')}:owner/repo`,
     ];
-    const run = runCheck([makeRepo({ 'NOTES.md': lines.join('\n') })]);
-    expect(run.status).toBe(1);
+    expectEachFound(lines, [alice, alice, someone, someone]);
+  });
+
+  it('takes git@ for a remote only in scp form with a path or after a URL scheme, and no other local part', () => {
+    const git = addressOf('git', 'github.com');
+    const alice = addressOf('alice', 'github.com');
+    const dotted = addressOf('x.git', 'github.com');
+    const lines = [
+      `${git}:8080`,
+      `${git}:`,
+      `${git}/qmediat/x.git`,
+      `ssh://${alice}/o/r`,
+      `${dotted}:owner/repo`,
+    ];
+    expectEachFound(lines, [git, git, git, alice, dotted]);
+  });
+
+  it('takes a host whose first label is a pixel scale for an address, not an image', () => {
     const found = [
-      alice,
-      alice,
-      someone,
-      someone,
-      addressOf('alice', 'gitlab.invalid'),
-      addressOf('x.git', 'github.invalid'),
+      addressOf('bob', '2x.com'),
+      addressOf('sales', '2x.io'),
+      addressOf('info', '10x.media'),
     ];
-    expect(run.stderr).toBe(
-      found.map((address, index) => `NOTES.md:${index + 1}: ${address}\n`).join(''),
-    );
+    expectEachFound(found, found);
   });
 
-  it('takes a version pin for one only when its labels before the last are numeric', () => {
-    const named = [addressOf('alice', '1.2.gmail.com'), addressOf('someone', '1.263.com')];
-    const pins = 'name@1.0.0-alpha.beta zod@3.x sdk@1.29.x';
-    const run = runCheck([makeRepo({ 'NOTES.md': [...named, pins].join('\n') })]);
-    expect(run.status).toBe(1);
-    expect(run.stderr).toBe(`NOTES.md:1: ${named[0]}\nNOTES.md:2: ${named[1]}\n`);
-  });
-
-  it('does not take an image at a pixel scale for an address', () => {
-    const run = runCheck([makeRepo({ 'README.md': '![logo](logo@2x.png) ![icon](icon@3x.webp)' })]);
-    expect(run.stderr).toBe('');
-    expect(run.status).toBe(0);
+  it('takes a host that only starts like a version for an address, not a version pin', () => {
+    const found = [
+      addressOf('bob', '1-pass.com'),
+      addressOf('me', '123-reg.co.uk'),
+      addressOf('info', '2-for-1.com'),
+      addressOf('admin', '1-2.example.com'),
+      addressOf('alice', '1.2.gmail.com'),
+      addressOf('someone', '1.263.com'),
+    ];
+    expectEachFound(found, found);
   });
 
   it('does not read a binary file or package-lock.json', () => {
