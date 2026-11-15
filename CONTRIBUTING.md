@@ -101,4 +101,4 @@ The dev server resolves its state to `<XDG_STATE_HOME>/qmediat/gemini-code-conte
 
 ## Questions
 
-Open a GitHub Discussion or email **contact@qmt.email**.
+Open a GitHub Discussion or email **contact@qmediat.io**.
