@@ -17,16 +17,35 @@ function runCheck(args: string[]): CheckRun {
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
+const serverOf = (version: string, packages: unknown) => ({
+  name: 'io.github.example/demo',
+  version,
+  packages,
+});
+const lockOf = (version: string, rootVersion: string) => ({
+  name: 'demo',
+  version,
+  lockfileVersion: 3,
+  packages: { '': { name: 'demo', version: rootVersion } },
+});
+
 describe('scripts/check-supports.mjs', () => {
   let dir: string;
   let readme: string;
   let pkg: string;
+
+  /** Writes `value` as JSON to `name` in the throwaway directory. */
+  const writeJson = (name: string, value: unknown): void => {
+    writeFileSync(join(dir, name), JSON.stringify(value));
+  };
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'check-supports-'));
     readme = join(dir, 'README.md');
     pkg = join(dir, 'package.json');
     writeFileSync(pkg, JSON.stringify({ name: 'demo', version: '2.4.1' }));
+    writeJson('server.json', serverOf('2.4.1', [{ identifier: 'demo', version: '2.4.1' }]));
+    writeJson('package-lock.json', lockOf('2.4.1', '2.4.1'));
   });
 
   afterEach(() => {
@@ -91,16 +110,8 @@ describe('scripts/check-supports.mjs', () => {
       lockRoot: string,
     ): void => {
       writeFileSync(readme, '# demo\n\n## Supports · version 2.4.1\n');
-      const packages = [{ identifier: 'demo', version: serverPackage }];
-      writeFileSync(
-        join(dir, 'server.json'),
-        JSON.stringify({ name: 'io.github.example/demo', version: server, packages }),
-      );
-      const lockPackages = { '': { name: 'demo', version: lockRoot } };
-      writeFileSync(
-        join(dir, 'package-lock.json'),
-        JSON.stringify({ name: 'demo', version: lock, packages: lockPackages }),
-      );
+      writeJson('server.json', serverOf(server, [{ identifier: 'demo', version: serverPackage }]));
+      writeJson('package-lock.json', lockOf(lock, lockRoot));
     };
 
     it('passes when server.json and package-lock.json name the package version, and says so', () => {
@@ -145,6 +156,43 @@ describe('scripts/check-supports.mjs', () => {
         'check-supports: server.json version is 2.4.0; package.json is 2.4.1\n' +
           'check-supports: package-lock.json version is 2.4.0; package.json is 2.4.1\n',
       );
+    });
+
+    it('fails without server.json: the registry manifest is required', () => {
+      writeVersions('2.4.1', '2.4.1', '2.4.1', '2.4.1');
+      rmSync(join(dir, 'server.json'));
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe('check-supports: server.json is missing\n');
+    });
+
+    it('fails on a server.json whose packages is not an array', () => {
+      writeVersions('2.4.1', '2.4.1', '2.4.1', '2.4.1');
+      writeJson('server.json', serverOf('2.4.1', { identifier: 'demo', version: '2.4.1' }));
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe('check-supports: server.json packages is not an array\n');
+    });
+
+    it('fails without package-lock.json: the lockfile is required', () => {
+      writeVersions('2.4.1', '2.4.1', '2.4.1', '2.4.1');
+      rmSync(join(dir, 'package-lock.json'));
+      const run = runCheck([readme, pkg]);
+      expect(run.status).toBe(1);
+      expect(run.stderr).toBe('check-supports: package-lock.json is missing\n');
+    });
+
+    it('checks a lockfile without a packages map (lockfileVersion 1) on its root version only', () => {
+      writeVersions('2.4.1', '2.4.1', '2.4.1', '2.4.1');
+      writeJson('package-lock.json', {
+        name: 'demo',
+        version: '2.4.1',
+        lockfileVersion: 1,
+        dependencies: {},
+      });
+      const run = runCheck([readme, pkg]);
+      expect(run.stderr).toBe('');
+      expect(run.status).toBe(0);
     });
   });
 

@@ -3,13 +3,15 @@
 // Every file that carries the package version names package.json's, so a version bump that leaves one behind fails
 // before anything is published: the README heading `## Supports · version X.Y.Z` (the version its Supports list
 // describes), server.json's `version` and every `packages[].version`, package-lock.json's `version` and
-// `packages[""].version` — the last two read beside package.json; a version file that does not exist carries none.
+// `packages[""].version` — the last two read beside package.json, both required (a lockfile without a `packages` map
+// carries only its root `version`).
 //
 //   node scripts/check-supports.mjs                             the repository's own files
 //   node scripts/check-supports.mjs <README.md> <package.json>   the two files named
 //
 // Exit: 0 when every version equals package.json's; 1 when one differs, the heading is missing or a file cannot be
-// read — one line on stderr per mismatch, naming the file, the value found and package.json's version; 2 when
+// read — one line on stderr per mismatch, naming the file, the value found and package.json's version, or per version
+// file that is missing; 2 when
 // exactly one file is named.
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -24,6 +26,7 @@ const HEADING = /^## Supports · version (\S+)[ \t]*$/m;
  * @typedef {{ ok: boolean, message: string }} Verdict
  * @typedef {{ version: string } | { problem: string }} PackageVersion
  * @typedef {{ file: string, field: string, value: unknown }} VersionField
+ * @typedef {{ ok: true, fields: VersionField[] } | { ok: false, problem: string }} VersionFields
  */
 
 /**
@@ -52,7 +55,15 @@ function packageVersion(packageText) {
  * @returns {Verdict}
  */
 export function verdict(readmeText, packageText) {
-  const found = packageVersion(packageText);
+  return readmeVerdict(readmeText, packageVersion(packageText));
+}
+
+/**
+ * @param {string} readmeText
+ * @param {PackageVersion} found package.json's version, parsed once by the caller
+ * @returns {Verdict}
+ */
+function readmeVerdict(readmeText, found) {
   if ('problem' in found) return { ok: false, message: found.problem };
   const pkg = found.version;
   const readme = readmeVersion(readmeText);
@@ -66,26 +77,38 @@ export function verdict(readmeText, packageText) {
 }
 
 /**
- * The fields that carry the package version in server.json and package-lock.json.
+ * server.json's version fields: `version` and every `packages[].version`. The registry manifest is required here.
  * @param {any} server the parsed server.json, or undefined when the file does not exist
- * @param {any} lock the parsed package-lock.json, or undefined when the file does not exist
- * @returns {VersionField[]}
+ * @returns {VersionFields}
  */
-export function versionFields(server, lock) {
+function serverFields(server) {
+  if (server === undefined) return { ok: false, problem: 'server.json is missing' };
+  const packages = server.packages ?? [];
+  if (!Array.isArray(packages)) return { ok: false, problem: 'server.json packages is not an array' };
   /** @type {VersionField[]} */
-  const fields = [];
-  if (server !== undefined) {
-    fields.push({ file: 'server.json', field: 'version', value: server.version });
-    const packages = Array.isArray(server.packages) ? server.packages : [];
-    packages.forEach((entry, index) => {
-      fields.push({ file: 'server.json', field: `packages[${index}].version`, value: entry?.version });
-    });
-  }
-  if (lock !== undefined) {
-    fields.push({ file: 'package-lock.json', field: 'version', value: lock.version });
-    fields.push({ file: 'package-lock.json', field: 'packages[""].version', value: lock.packages?.['']?.version });
-  }
-  return fields;
+  const fields = packages.map((entry, index) => ({
+    file: 'server.json',
+    field: `packages[${index}].version`,
+    value: entry?.version,
+  }));
+  return { ok: true, fields: [{ file: 'server.json', field: 'version', value: server.version }, ...fields] };
+}
+
+/**
+ * package-lock.json's version fields: the root `version` and, in a lockfile with a `packages` map (lockfileVersion 2
+ * and 3), `packages[""].version`.
+ * @param {any} lock the parsed package-lock.json, or undefined when the file does not exist
+ * @returns {VersionFields}
+ */
+function lockFields(lock) {
+  if (lock === undefined) return { ok: false, problem: 'package-lock.json is missing' };
+  /** @type {VersionField} */
+  const root = { file: 'package-lock.json', field: 'version', value: lock.version };
+  if (lock.packages === undefined) return { ok: true, fields: [root] };
+  return {
+    ok: true,
+    fields: [root, { file: 'package-lock.json', field: 'packages[""].version', value: lock.packages?.['']?.version }],
+  };
 }
 
 /**
@@ -124,12 +147,15 @@ function readJsonIfPresent(path) {
 /**
  * @param {string} dir the directory holding server.json and package-lock.json
  * @param {string} packageVersion the version in package.json
- * @returns {string[]} one line per version field of those files that names another version
+ * @returns {string[]} one line per version field of those files that names another version, or per file that cannot
+ *   carry one (missing, or `packages` not an array)
  */
 export function versionFileMismatches(dir, packageVersion) {
-  const server = readJsonIfPresent(join(dir, 'server.json'));
-  const lock = readJsonIfPresent(join(dir, 'package-lock.json'));
-  return versionMismatches(versionFields(server, lock), packageVersion);
+  const found = [
+    serverFields(readJsonIfPresent(join(dir, 'server.json'))),
+    lockFields(readJsonIfPresent(join(dir, 'package-lock.json'))),
+  ];
+  return found.flatMap((files) => (files.ok ? versionMismatches(files.fields, packageVersion) : [files.problem]));
 }
 
 /**
@@ -149,11 +175,10 @@ function withMismatches(readme, mismatches) {
  */
 export function verdictForFiles(readmePath, packagePath) {
   try {
-    const packageText = readFileSync(packagePath, 'utf8');
-    const readmeVerdict = verdict(readFileSync(readmePath, 'utf8'), packageText);
-    const found = packageVersion(packageText);
-    if ('problem' in found) return readmeVerdict;
-    const result = withMismatches(readmeVerdict, versionFileMismatches(dirname(packagePath), found.version));
+    const found = packageVersion(readFileSync(packagePath, 'utf8'));
+    const readme = readmeVerdict(readFileSync(readmePath, 'utf8'), found);
+    if ('problem' in found) return readme;
+    const result = withMismatches(readme, versionFileMismatches(dirname(packagePath), found.version));
     if (!result.ok) return result;
     return {
       ok: true,
