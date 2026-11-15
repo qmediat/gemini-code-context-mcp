@@ -51,7 +51,7 @@
 | **Auth profile** | API key (primary) + ADC + Vertex (profile) | SDK idiom; setup command w MCP UX |
 | **Persistencja manifestu** | SQLite (better-sqlite3) w `~/.qmediat/context-bridge/` | local, transactional, no daemon |
 | **Legal entity** | Quantum Media Technologies sp. z o.o. | w LICENSE i package.json |
-| **Contact** | contact@qmt.email | qmediat standard |
+| **Contact** | contact@qmediat.io | qmediat standard |
 
 ---
 

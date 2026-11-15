@@ -739,3 +739,8 @@ the release workflow. The `server.json` versions (the MCP registry manifest) are
 an inline step of `release.yml`, so a stale `server.json` is found at tag time, not at PR time. Move that comparison
 into the same script (one helper, every version-bearing file) and run it in CI. Found by the review of the PR that
 added the Supports check; a different mechanism (the registry manifest), so not part of that PR.
+
+## DEF-ADDRESSES-CHECK (2026-11-15). A check that every email address is in `qmediat.io`
+
+AGENTS.md states the rule; nothing enforces it (`contact@qmt.email` stood in `CONTRIBUTING.md` and `PLAN.md` until
+2026-11-15). Add a check, beside the one above, that fails on an address outside `qmediat.io` in a tracked text file.
