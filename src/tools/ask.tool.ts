@@ -9,10 +9,8 @@
 
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
-import { cachingRan } from '../cache/caching-mode.js';
 import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
-import { logger } from '../utils/logger.js';
 import { fallBackToAgentic } from './ask-agentic-fallback.js';
 import {
   attachmentMetadata,
@@ -22,8 +20,13 @@ import {
 import { type AskInput, askInputSchema } from './ask/input.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './ask/instruction.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
-import { decodeOnContext } from './shared/context-decode.js';
-import { prepareCallContext } from './shared/eager-answer.js';
+import {
+  decodeEagerCall,
+  prepareCallContext,
+  scanFields,
+  settleDecoded,
+  warnTruncatedScan,
+} from './shared/eager-answer.js';
 import {
   type FailedEagerCall,
   type ModelReached,
@@ -39,13 +42,7 @@ import {
   scanForCall,
   workspaceRefusal,
 } from './shared/eager-steps.js';
-import {
-  ServiceTierError,
-  networkAttempts,
-  resolveServiceTier,
-  serviceTierConfig,
-} from './shared/service-tier.js';
-import { settleAnswer } from './shared/settle-call.js';
+import { ServiceTierError, resolveServiceTier, serviceTierConfig } from './shared/service-tier.js';
 import { thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
 
 /**
@@ -100,7 +97,7 @@ async function executeAskBody(
     },
     ctx,
   );
-  const { emitter, completed, tracking, dispatch } = call;
+  const { emitter } = call;
   const timeoutController = call.timeout;
   const abortSignal = timeoutController.signal;
   try {
@@ -248,13 +245,14 @@ async function executeAskBody(
       );
     }
 
-    const { cap: runCap, cut: inputWindowCut } = capThatRuns({
+    const bounded = capThatRuns({
       tool: 'ask',
       cap: outputCap,
       promptTokens: preflight?.effectiveTokens,
       inputTokenLimit: resolved.inputTokenLimit,
       emit: (message) => emitter.emit(message),
     });
+    const runCap = bounded.cap;
 
     // Normalise thinkingBudget:
     //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)
@@ -312,7 +310,7 @@ async function executeAskBody(
       allowCaching: !input.noCache && scan.files.length > 0,
       requestedMode: input.cachingMode ?? ctx.config.cachingMode,
     });
-    const { caching, prepare, prepared: ctxPrep } = context;
+    const { caching, prepared: ctxPrep } = context;
 
     emitter.emit(
       usingThinkingLevel
@@ -391,35 +389,21 @@ async function executeAskBody(
       return [...inline, userTurn];
     };
 
-    // The decode — and, on a stale cache before any request completed, its one retry on a rebuilt cache. The TPM
-    // reservation is taken here, after `prepareContext` and immediately before the first request, so its timestamp
-    // is when the tokens reach Gemini's quota counter; only the OPENING of a request is retried (a mid-stream
-    // failure re-sent would bill the work again).
-    const decoded = await decodeOnContext(
+    const decoded = await decodeEagerCall(
+      call,
+      ctx,
       {
-        client: ctx.client,
-        booking: { workspaceRoot, toolName: 'ask', model: resolved.resolved, serviceTier },
-        cachingMode: (prep) => cachingRan(prep, caching).mode,
+        resolved,
+        serviceTier,
         request: (prep) => ({
           contents: buildContents(prep.cacheId, prep.inlineContents),
           config: buildConfig(prep.cacheId),
         }),
-        cache: {
-          ttlWatcher: ctx.ttlWatcher,
-          manifest: ctx.manifest,
-          ttlSeconds: ctx.config.cacheTtlSeconds,
-          prepare,
-        },
-        openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
-        limits: { maxRequests: runCap.maxRequests, cap: runCap.effective },
-        timeout: timeoutController,
-        emit: (message) => emitter.emit(message),
-        completed,
-        tracking,
-        throttle: dispatch,
-        inputTokens: { estimated: estimate.tokens, counted: preflight?.effectiveTokens },
+        cap: runCap,
+        estimate,
+        countedInputTokens: preflight?.effectiveTokens,
       },
-      ctxPrep,
+      context,
     );
     const { response, prep: activePrep, retriedOnStaleCache } = decoded;
 
@@ -431,32 +415,13 @@ async function executeAskBody(
     // emit (live progress) and post-call summary.
     const thinkingSummary = response.thoughtsSummary;
 
-    // Telemetry and the response record the mode that ran, not the one asked for.
-    const ran = cachingRan(activePrep, caching);
-    const effectiveCachingMode = ran.mode;
-
-    const durationMs = Date.now() - started;
-    // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
-    // API billed is every request that completed, over a long decode and a stale-cache retry alike.
-    const settledReservation = call.trail.reservationId;
-    call.trail.reservationId = null;
-    tracking.ledgerEntry = null;
-    const settled = settleAnswer({
-      manifest: ctx.manifest,
-      reservationId: settledReservation,
-      entry: {
-        workspaceRoot,
-        toolName: 'ask',
-        model: resolved.resolved,
-        serviceTier,
-        cachingMode: effectiveCachingMode,
-      },
-      completed,
-      response,
-      cap: runCap,
-      cut: inputWindowCut,
-      durationMs,
+    const { settled, ran, durationMs } = settleDecoded(call, ctx, decoded, {
+      resolved,
+      serviceTier,
+      caching,
+      bounded,
     });
+    const effectiveCachingMode = ran.mode;
     const finish = settled.finish;
 
     // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
@@ -464,11 +429,7 @@ async function executeAskBody(
       return errorResult(`ask: ${settled.outputCapStop.message}`, settled.outputCapStop.fields);
     }
 
-    if (scan.truncated) {
-      logger.warn(
-        `workspace ${workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,
-      );
-    }
+    warnTruncatedScan(call, ctx, scan);
 
     const metadata: Record<string, unknown> = {
       resolvedModel: resolved.resolved,
@@ -494,15 +455,7 @@ async function executeAskBody(
       ...(ran.note !== null ? { cachingModeNote: ran.note } : {}),
       filesIndexed: scan.files.length,
       filesSkippedTooLarge: scan.skippedTooLarge,
-      // v1.21.0+: what the scan left out — the excluded directories it met and the files that are neither source by
-      // extension nor a `#!` script — so a caller can tell "not in the workspace" from "not indexed".
-      excludedDirs: scan.excludedDirs,
-      excludedDirsTotal: scan.excludedDirsTotal,
-      filesSkippedNonSource: scan.skippedNonSource,
-      filesUploadFailed: activePrep.uploaded.failedCount,
-      ...(activePrep.uploaded.failedCount > 0
-        ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
-        : {}),
+      ...scanFields(scan, activePrep),
       workspaceTruncated: scan.truncated,
       maxFilesCap: ctx.config.maxFilesPerWorkspace,
       // Preflight token-count provenance — surfaces on every successful
