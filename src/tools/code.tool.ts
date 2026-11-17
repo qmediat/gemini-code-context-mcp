@@ -34,10 +34,12 @@ import {
   settleFailedEager,
 } from './shared/eager-call.js';
 import {
+  type SizedCall,
   countPreflight,
   eagerOutputCap,
   estimateInput,
   overWindow,
+  preflightFields,
   reserveCallBudget,
   scanForCall,
   workspaceRefusal,
@@ -449,14 +451,10 @@ async function executeCodeBody(
       runCap,
     );
 
-    const reservation = reserveCallBudget(call, ctx, {
-      resolved,
-      serviceTier,
-      estimate,
+    const sized: SizedCall = { resolved, serviceTier, estimate, count, bounded };
+    const reservation = reserveCallBudget(call, ctx, sized, {
       promptChars: input.task.length,
       extraInputTokens: 0,
-      cap: runCap,
-      countedInputTokens: preflight?.effectiveTokens,
       thinkingTokens: thinkingTokensForEstimate,
     });
     if (reservation.kind === 'rejected') {
@@ -554,17 +552,11 @@ async function executeCodeBody(
     const decoded = await decodeEagerCall(
       call,
       ctx,
-      {
-        resolved,
-        serviceTier,
-        request: (prep) => ({
-          contents: buildContents(prep.cacheId, prep.inlineContents),
-          config: buildConfig(prep.cacheId),
-        }),
-        cap: runCap,
-        estimate,
-        countedInputTokens: preflight?.effectiveTokens,
-      },
+      sized,
+      (prep) => ({
+        contents: buildContents(prep.cacheId, prep.inlineContents),
+        config: buildConfig(prep.cacheId),
+      }),
       context,
     );
     const { response, prep: activePrep, retriedOnStaleCache } = decoded;
@@ -590,12 +582,7 @@ async function executeCodeBody(
     }
     const thinkingSummary = response.thoughtsSummary;
 
-    const { settled, ran, durationMs } = settleDecoded(call, ctx, decoded, {
-      resolved,
-      serviceTier,
-      caching,
-      bounded,
-    });
+    const { settled, ran, durationMs } = settleDecoded(call, ctx, decoded, sized, caching);
     const effectiveCachingMode = ran.mode;
     const finish = settled.finish;
 
@@ -648,15 +635,7 @@ async function executeCodeBody(
       inlineOnly: activePrep.inlineOnly,
       cachingMode: effectiveCachingMode,
       ...(ran.note !== null ? { cachingModeNote: ran.note } : {}),
-      // Preflight token-count provenance — surfaces on every successful
-      // call. See ask.tool.ts for the contract; same fields apply here.
-      ...(preflight !== undefined
-        ? {
-            tokenCountMethod: preflight.method,
-            rawTokenCount: preflight.rawTokens,
-            tokenCountCacheHit: preflight.cacheHit,
-          }
-        : {}),
+      ...preflightFields(count),
       ...(thinkingSummary ? { thinkingSummary } : {}),
       ...(executedCode.length > 0 ? { executedCode } : {}),
       ...(executionOutput.length > 0 ? { executionOutput } : {}),

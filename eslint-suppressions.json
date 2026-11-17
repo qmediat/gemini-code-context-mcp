@@ -107,14 +107,6 @@
       "count": 2
     }
   },
-  "src/tools/ask.tool.ts": {
-    "complexity": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
   "src/tools/code.tool.ts": {
     "complexity": {
       "count": 1

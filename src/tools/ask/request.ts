@@ -5,13 +5,11 @@
 
 import type { Content, GenerateContentConfig } from '@google/genai';
 import type { PreparedContext } from '../../cache/cache-manager.js';
-import type { OutputCap } from '../../gemini/long-decode.js';
 import type { ContextRequest } from '../shared/context-decode.js';
-import { type ServiceTierName, serviceTierConfig } from '../shared/service-tier.js';
-import type { PreparedAttachments } from './attachments.js';
-import type { AskInput } from './input.js';
+import { serviceTierConfig } from '../shared/service-tier.js';
+import type { AskSized } from './call.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './instruction.js';
-import { type AskThinking, thinkingConfigOf } from './thinking.js';
+import { thinkingConfigOf } from './thinking.js';
 
 /**
  * The request builder of one call. Gemini rejects `generateContent({cachedContent, systemInstruction})` with 400
@@ -21,15 +19,11 @@ import { type AskThinking, thinkingConfigOf } from './thinking.js';
  * caller's `maxOutputTokens`, the operator's force-max, or a cap the input window cut); otherwise Gemini applies the
  * model's own default. The user turn carries the attachments first and the question last, with a cache too.
  */
-export function askRequest(
-  input: AskInput,
-  attachments: PreparedAttachments,
-  thinking: AskThinking,
-  cap: OutputCap,
-  serviceTier: ServiceTierName,
-): (prep: PreparedContext) => ContextRequest {
-  const thinkingConfig = thinkingConfigOf(thinking);
-  const tierField = serviceTierConfig(serviceTier);
+export function askRequest(call: AskSized): (prep: PreparedContext) => ContextRequest {
+  const { input, attachments } = call;
+  const cap = call.bounded.cap;
+  const thinkingConfig = thinkingConfigOf(call.thinking);
+  const tierField = serviceTierConfig(call.serviceTier);
   const config = (cacheId: string | null): GenerateContentConfig => {
     const maxOutputField = cap.wire !== undefined ? { maxOutputTokens: cap.wire } : {};
     return cacheId

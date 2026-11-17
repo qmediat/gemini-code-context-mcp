@@ -3,7 +3,7 @@
  * whether the call goes on, ends with a result, or hands off to the `ask_agentic` fallback.
  */
 
-import type { OutputCap } from '../../gemini/long-decode.js';
+import type { BoundedOutputCap, OutputCap } from '../../gemini/long-decode.js';
 import type { ScanResult } from '../../indexer/workspace-scanner.js';
 import type { ResolvedModel } from '../../types.js';
 import type { TextToolResult, ToolContext } from '../registry.js';
@@ -12,6 +12,7 @@ import type { InputEstimate, PreflightCount } from '../shared/eager-steps.js';
 import type { ServiceTierName } from '../shared/service-tier.js';
 import type { PreparedAttachments } from './attachments.js';
 import type { AskInput } from './input.js';
+import type { AskThinking } from './thinking.js';
 
 /** The call as the entry opened it. */
 export interface AskCall {
@@ -44,6 +45,15 @@ export interface AskScanned extends AskAttached {
 export interface AskCounted extends AskScanned {
   /** `null`: the model advertises no input limit; the guard did not run. */
   readonly count: PreflightCount | null;
+}
+
+/**
+ * The cap that runs — after the input window's cut — and the thinking under it: the call as the budget reservation,
+ * the decode and the settlement read it (`SizedCall`), and as the request and the answer read it.
+ */
+export interface AskSized extends AskCounted {
+  readonly bounded: BoundedOutputCap;
+  readonly thinking: AskThinking;
 }
 
 /**

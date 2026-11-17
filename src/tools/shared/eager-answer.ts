@@ -11,15 +11,14 @@ import {
   cachingModeFor,
   cachingRan,
 } from '../../cache/caching-mode.js';
-import type { BoundedOutputCap, OutputCap } from '../../gemini/long-decode.js';
 import type { ScanResult } from '../../indexer/workspace-scanner.js';
 import type { ResolvedModel } from '../../types.js';
 import { logger } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
 import { type ContextDecode, type ContextRequest, decodeOnContext } from './context-decode.js';
 import type { EagerCall, ModelReached } from './eager-call.js';
-import type { InputEstimate } from './eager-steps.js';
-import { type ServiceTierName, networkAttempts } from './service-tier.js';
+import type { SizedCall } from './eager-steps.js';
+import { networkAttempts } from './service-tier.js';
 import { type SettledAnswer, settleAnswer } from './settle-call.js';
 
 /** What the call's context is built from. */
@@ -76,67 +75,51 @@ export async function prepareCallContext(
   return { caching, prepare, prepared: await prepare() };
 }
 
-/** What the decode sends and runs under. */
-export interface DecodeSpec {
-  readonly resolved: ResolvedModel;
-  readonly serviceTier: ServiceTierName;
-  /** The request on a prepared context: with a cache, or inline on a context without one. */
-  readonly request: (prep: PreparedContext) => ContextRequest;
-  /** The cap that runs. */
-  readonly cap: OutputCap;
-  readonly estimate: InputEstimate;
-  /** The preflight's count, when it ran. */
-  readonly countedInputTokens: number | undefined;
-}
-
 /**
- * Decode the answer on the call's context — and, on a stale cache before any request completed, once more on a rebuilt
- * one (`decodeOnContext`). The TPM reservation is taken after the context and just before the first request, so its
+ * Decode the answer on the call's context with the tool's request — with a cache, or inline on a context without one —
+ * and, on a stale cache before any request completed, once more on a rebuilt one (`decodeOnContext`). The TPM reservation is taken after the context and just before the first request, so its
  * timestamp is when the tokens reach Gemini's quota counter; only the OPENING of a request is retried (a flex request
  * never): a mid-stream failure re-sent would bill the work again.
  */
 export function decodeEagerCall(
   call: EagerCall<ModelReached>,
   ctx: ToolContext,
-  spec: DecodeSpec,
+  sized: SizedCall,
+  request: (prep: PreparedContext) => ContextRequest,
   context: CallContext,
 ): Promise<ContextDecode> {
+  const cap = sized.bounded.cap;
   return decodeOnContext(
     {
       client: ctx.client,
       booking: {
         workspaceRoot: call.workspaceRoot,
         toolName: call.tool,
-        model: spec.resolved.resolved,
-        serviceTier: spec.serviceTier,
+        model: sized.resolved.resolved,
+        serviceTier: sized.serviceTier,
       },
       cachingMode: (prep) => cachingRan(prep, context.caching).mode,
-      request: spec.request,
+      request,
       cache: {
         ttlWatcher: ctx.ttlWatcher,
         manifest: ctx.manifest,
         ttlSeconds: ctx.config.cacheTtlSeconds,
         prepare: context.prepare,
       },
-      openAttempts: networkAttempts(spec.serviceTier),
-      limits: { maxRequests: spec.cap.maxRequests, cap: spec.cap.effective },
+      openAttempts: networkAttempts(sized.serviceTier),
+      limits: { maxRequests: cap.maxRequests, cap: cap.effective },
       timeout: call.timeout,
       emit: (message) => call.emitter.emit(message),
       completed: call.completed,
       tracking: call.tracking,
       throttle: call.dispatch,
-      inputTokens: { estimated: spec.estimate.tokens, counted: spec.countedInputTokens },
+      inputTokens: {
+        estimated: sized.estimate.tokens,
+        counted: sized.count?.preflight.effectiveTokens,
+      },
     },
     context.prepared,
   );
-}
-
-/** What the decode ran on: the booking's model and tier, the caching mode, the cap and its cut. */
-export interface DecodeRun {
-  readonly resolved: ResolvedModel;
-  readonly serviceTier: ServiceTierName;
-  readonly caching: CachingModeChoice;
-  readonly bounded: BoundedOutputCap;
 }
 
 /** The answer booked, the caching mode that ran, the call's duration. */
@@ -155,10 +138,11 @@ export function settleDecoded(
   call: EagerCall<ModelReached>,
   ctx: ToolContext,
   decoded: ContextDecode,
-  run: DecodeRun,
+  sized: SizedCall,
+  caching: CachingModeChoice,
 ): SettledDecode {
   // the mode that ran, not the one asked for: telemetry and the result record it
-  const ran = cachingRan(decoded.prep, run.caching);
+  const ran = cachingRan(decoded.prep, caching);
   const durationMs = Date.now() - call.started;
   const settledReservation = call.trail.reservationId;
   call.trail.reservationId = null;
@@ -169,14 +153,14 @@ export function settleDecoded(
     entry: {
       workspaceRoot: call.workspaceRoot,
       toolName: call.tool,
-      model: run.resolved.resolved,
-      serviceTier: run.serviceTier,
+      model: sized.resolved.resolved,
+      serviceTier: sized.serviceTier,
       cachingMode: ran.mode,
     },
     completed: call.completed,
     response: decoded.response,
-    cap: run.bounded.cap,
-    cut: run.bounded.cut,
+    cap: sized.bounded.cap,
+    cut: sized.bounded.cut,
     durationMs,
   });
   return { settled, ran, durationMs };

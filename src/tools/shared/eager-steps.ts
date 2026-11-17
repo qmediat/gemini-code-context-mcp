@@ -4,6 +4,7 @@
  */
 
 import {
+  type BoundedOutputCap,
   type OutputCap,
   type PreflightMode,
   preflightModeFor,
@@ -168,6 +169,22 @@ export async function countPreflight(
   };
 }
 
+/**
+ * The count's provenance as both tools' answers report it: which path produced the count (`heuristic`, `exact`,
+ * `fallback`), whether the cache saved an API round-trip, and the raw count before the system-instruction reserve was
+ * applied — so an orchestrator can see how the guard decided. Nothing when the model advertises no input limit (the
+ * count did not run).
+ */
+export function preflightFields(count: PreflightCount | null): Record<string, unknown> {
+  const preflight = count?.preflight;
+  if (preflight === undefined) return {};
+  return {
+    tokenCountMethod: preflight.method,
+    rawTokenCount: preflight.rawTokens,
+    tokenCountCacheHit: preflight.cacheHit,
+  };
+}
+
 /** A count over the window: the workspace is too large for the eager path. */
 export interface OverWindow {
   /** The count, the extra tokens included. */
@@ -194,19 +211,26 @@ export function overWindow(count: PreflightCount | null, ctx: ToolContext): Over
   return null;
 }
 
-/** What the daily-budget reservation is estimated from. */
-export interface ReservationRequest {
+/**
+ * What a call runs under once it is sized, built once per call: the budget reservation, the decode and the
+ * settlement read the same values.
+ */
+export interface SizedCall {
   readonly resolved: ResolvedModel;
   readonly serviceTier: ServiceTierName;
   readonly estimate: InputEstimate;
+  /** The preflight's count; `null` when the model advertises no input limit (the count did not run). */
+  readonly count: PreflightCount | null;
+  /** The cap that runs — after the input window's cut — and the cut. Its value bounds what a completed request bills;
+   * above the per-request limit (a long decode) every continuation request bills the input again. */
+  readonly bounded: BoundedOutputCap;
+}
+
+/** What the daily-budget reservation adds to the sized call. */
+export interface ReservationRequest {
   readonly promptChars: number;
   /** Input tokens beyond the files and the prompt (`ask`'s attachments; 0 for `code`). */
   readonly extraInputTokens: number;
-  /** The cap that runs: its value bounds what a completed request bills; above the per-request limit (a long decode)
-   * every continuation request bills the input again. */
-  readonly cap: OutputCap;
-  /** The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic. */
-  readonly countedInputTokens: number | undefined;
   readonly thinkingTokens: number;
 }
 
@@ -228,26 +252,29 @@ export type ReservationOutcome =
 export function reserveCallBudget(
   call: EagerCall<ModelReached>,
   ctx: ToolContext,
+  sized: SizedCall,
   req: ReservationRequest,
 ): ReservationOutcome {
   const dailyBudgetUsd = ctx.config.dailyBudgetUsd;
   if (!Number.isFinite(dailyBudgetUsd)) return { kind: 'unbounded' };
+  const cap = sized.bounded.cap;
   const estimateUsd = estimatePreCallCostUsd({
-    model: req.resolved.resolved,
-    serviceTier: req.serviceTier,
+    model: sized.resolved.resolved,
+    serviceTier: sized.serviceTier,
     extraInputTokens: req.extraInputTokens,
-    workspaceBytes: req.estimate.workspaceBytes,
+    workspaceBytes: sized.estimate.workspaceBytes,
     promptChars: req.promptChars,
-    expectedOutputTokens: req.cap.effective,
-    perRequestOutputTokens: req.cap.perRequest,
-    countedInputTokens: req.countedInputTokens,
+    expectedOutputTokens: cap.effective,
+    perRequestOutputTokens: cap.perRequest,
+    // the larger of the preflight's count and the bytes/4 heuristic is reserved
+    countedInputTokens: sized.count?.preflight.effectiveTokens,
     thinkingTokens: req.thinkingTokens,
     coverMs: call.timeout.timeoutMs,
   });
   const reserve = ctx.manifest.reserveBudget({
     workspaceRoot: call.workspaceRoot,
     toolName: call.tool,
-    model: req.resolved.resolved,
+    model: sized.resolved.resolved,
     estimatedCostMicros: toMicrosUsd(estimateUsd),
     dailyBudgetMicros: toMicrosUsd(dailyBudgetUsd),
     nowMs: Date.now(),
