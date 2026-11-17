@@ -9,7 +9,7 @@ import type { ProgressEmitter } from '../utils/progress.js';
 
 /** What `'explicit'` turns into when it cannot be honoured — appended to `ask` / `code`'s `cachingMode` description. */
 export const CACHING_MODE_FALLBACK_DESCRIPTION =
-  " A model without `createCachedContent` (the Gemini 4 models: `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`) runs `'explicit'` as `'implicit'`, and a failed `caches.create` sends the files without a cache; either way the response says what ran in `cachingMode` and why in `cachingModeNote`.";
+  " A model without `createCachedContent` (the Gemini 4 models: `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`) runs `'explicit'` as `'implicit'`, and a Context Cache that cannot be built or recorded sends the files without a cache; either way the response says what ran in `cachingMode` and why in `cachingModeNote`.";
 
 /** The caching mode a call runs with, and why it differs from the one requested. */
 export interface CachingModeChoice {
