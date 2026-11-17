@@ -42,3 +42,27 @@ copies are not reformatted on save.
 **Enforcement.** `npm run lint` in CI (Node 22 and 24) and in the release's verification job, whose ratchet compares
 the tag's tree with itself (`BASELINE_RATCHET_BASE: HEAD`): the tree was checked on its pull request, and a later
 `main` that lowered a baseline must not fail a re-release of an older tag.
+
+## §2 — A cache's TTL goes through one function (2026-11-18)
+
+**Rule — the one definition.** A TTL reaches Google, and becomes a stored expiry, only through `effectiveTtlSeconds`
+(`src/cache/ttl.ts`: whole seconds, at least 60): the create request and the expiry it stores (`createCache` in
+`src/cache/cache-manager.ts`), and the TTL watcher's `caches.update` and the expiry it stores when the answer carries
+none (`src/cache/ttl-watcher.ts`, which shapes the TTL once per hot entry). The setting
+`GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` stays as the operator wrote it (`src/config.ts`); a new place that sends or
+counts a cache TTL reads the function.
+
+**Enforcement.** The unit tests of the create (`test/unit/cache-manager.test.ts`: a TTL of 30 is created and stored
+as 60 s) and of the watcher (`test/unit/ttl-watcher.test.ts`: refreshed as 60 s, the fallback expiry 60 s from now);
+the self-review.
+
+## §3 — No cache id is `null` (2026-11-18)
+
+**Rule — the one definition.** A workspace row read from the manifest names a cache or has `cacheId: null`. An empty
+stored id (`''`) reads as `null` in `rowToWorkspace` (`src/manifest/db.ts`), on the one read path of the row
+(`ManifestDb.getWorkspace`), so no reader tests for `''`: the reuse test, the rebuild's delete of the previous cache,
+the purge, `markCacheStale`, the TTL watcher and `status` all see `null`. A create that answers without a cache name
+is a failed create (`createCache` throws), so no writer stores `''`.
+
+**Enforcement.** `test/unit/manifest-db.test.ts` (a row stored with `''` reads as `null`) and
+`test/unit/cache-manager.test.ts` (a rebuild over such a row deletes nothing).

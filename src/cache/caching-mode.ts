@@ -9,7 +9,7 @@ import type { ProgressEmitter } from '../utils/progress.js';
 
 /** What `'explicit'` turns into when it cannot be honoured — appended to `ask` / `code`'s `cachingMode` description. */
 export const CACHING_MODE_FALLBACK_DESCRIPTION =
-  " A model without `createCachedContent` (the Gemini 4 models: `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`) runs `'explicit'` as `'implicit'`, and a failed `caches.create` sends the files without a cache; either way the response says what ran in `cachingMode` and why in `cachingModeNote`.";
+  " A model without `createCachedContent` (the Gemini 4 models: `gemini-4-argon`, `gemini-4-carbon`, `gemini-4-hydrogen`) runs `'explicit'` as `'implicit'`; when the Context Cache cannot be built or recorded, the files go without a cache; either way the response says what ran in `cachingMode` and why in `cachingModeNote`.";
 
 /** The caching mode a call runs with, and why it differs from the one requested. */
 export interface CachingModeChoice {
@@ -46,14 +46,16 @@ export interface RanCaching {
 }
 
 const CREATE_FAILED_NOTE =
-  "cachingMode 'explicit': the Context Cache could not be created (caches.create failed) — the files went without a cache; Gemini's implicit cache applies.";
+  "cachingMode 'explicit': the Context Cache could not be built or recorded — the files went without a cache; Gemini's implicit cache applies.";
 
 /**
  * The caching mode a prepared context actually ran with: a cache id means the
  * Context Cache served the call (`explicit`); inline-only means the files went
  * inline by choice (`implicit`) or by force (`inline`: no caching allowed, a
- * workspace under the cache floor); neither means `caches.create` failed and the
- * files went without a cache, which Gemini's implicit cache serves (`implicit`).
+ * workspace under the cache floor); neither means the Context Cache could not be
+ * built (`caches.create` failed or named no cache) or recorded in the manifest,
+ * and the files went without a cache, which Gemini's implicit cache serves
+ * (`implicit`).
  */
 export function cachingRan(
   prep: { readonly cacheId: string | null; readonly inlineOnly: boolean },

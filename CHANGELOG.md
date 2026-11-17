@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ask` and `code` with `cachingMode: 'explicit'`: when Gemini created a Context Cache without a name, the question went
+  with neither the cache nor the workspace files; the files now go inline, as after any failed cache build, and the
+  warning says a cache without a usable name may stay billed on Google's side until its TTL. A cache id an earlier
+  release stored empty reads as none: the next rebuild no longer sends a delete for an empty name.
+- `ask` and `code` with `cachingMode: 'explicit'`: with `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` below 60, the Context
+  Cache was created for 60 s but recorded as expiring at the shorter TTL, so the next call rebuilt a cache that was
+  still alive; the recorded expiry is now the TTL the cache was created with, and the TTL watcher refreshes the cache
+  with that TTL too.
+- `ask` and `code` with `cachingMode: 'explicit'`: when the Context Cache was created but recording it in the manifest
+  failed, the cache stayed on Google's side, billed until its TTL, and the warning said the cache build had failed; the
+  new cache is now deleted, the warning names the manifest write, the response's `cachingModeNote` says the cache
+  could not be built or recorded, and the files go inline as before.
+- `ask` and `code` with `cachingMode: 'explicit'`: when rebuilding the Context Cache failed, the previous cache stayed on
+  Google's side, unreachable and billed until its TTL; it is now deleted, as after a successful rebuild.
+
 ## [1.25.0] - 2026-11-17
 
 ### Changed

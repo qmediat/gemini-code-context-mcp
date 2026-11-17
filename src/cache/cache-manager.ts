@@ -2,9 +2,9 @@
  * Build / reuse / invalidate Gemini Context Caches keyed by workspace state.
  *
  * Cache key = `(workspaceRoot, filesHash, model, systemPromptHash)`. When any
- * component changes, we rebuild. When the same key is requested concurrently
- * (two ask() calls in parallel), we coalesce via a per-workspace in-process
- * mutex so only one cache is created.
+ * component changes, we rebuild. Concurrent calls with the same whole call
+ * fingerprint (`inFlightKey`: the cache key plus the caching options) coalesce
+ * onto one in-process build, so only one cache is created for them.
  *
  * Inline fallback path: for small workspaces or `noCache:true`, we skip the
  * Files API upload entirely and embed file text inline. This avoids unnecessary
@@ -26,6 +26,7 @@ import type { ResolvedModel, WorkspaceRow } from '../types.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import type { ProgressEmitter } from '../utils/progress.js';
 import { type UploadResult, uploadWorkspaceFiles } from './files-uploader.js';
+import { effectiveTtlSeconds } from './ttl.js';
 
 export interface PreparedContext {
   /** Cache resource name (`cachedContents/abc123`) or null if caching skipped. */
@@ -67,47 +68,32 @@ export interface BuildOptions {
   emitter: ProgressEmitter;
   allowCaching: boolean;
   /**
-   * Optional abort signal (v1.12.1+). When fired, the upload pool stops
-   * QUEUEING new per-file work and the post-pool abort check throws
-   * `signal.reason` so the caller's `timeoutMs` budget surfaces as a
-   * proper TIMEOUT errorCode. Already-flying `client.files.upload`
-   * calls complete on their own — the SDK doesn't expose abort plumbing
-   * on `files.upload`, so the abort honours user intent best-effort
-   * (stops scheduling new work, propagates the abort error after the
-   * in-flight tasks settle).
-   *
-   * Pre-v1.12.1 the upload phase ignored aborts entirely — the signal
-   * was only threaded into `generateContent`, so a 30s `timeoutMs`
-   * against a workspace whose upload took 90s would burn 60s of
-   * bandwidth before the abort took effect at `generateContent`-call
-   * time. The fix bounds the worst case to "in-flight pool size × max
-   * upload duration" instead of "total file count × max upload duration".
+   * Optional abort signal. When fired, the upload pool stops QUEUEING new
+   * per-file work and the post-pool abort check throws `signal.reason` so the
+   * caller's `timeoutMs` budget surfaces as a proper TIMEOUT errorCode.
+   * Already-flying `client.files.upload` calls complete on their own — the SDK
+   * doesn't expose abort plumbing on `files.upload` — so the time an abort
+   * waits is bounded by "in-flight pool size × max upload duration", never by
+   * "total file count × max upload duration".
    */
   signal?: AbortSignal;
   /**
-   * Caching mode (v1.13.0+). Controls whether `prepareContext` builds
-   * an explicit Gemini Context Cache (`caches.create`) or falls through
-   * to the inline path and relies on Gemini's automatic implicit
-   * caching for Gemini 2.5+/3 models.
+   * Caching mode. Controls whether `prepareContext` builds an explicit Gemini
+   * Context Cache (`caches.create`) or falls through to the inline path and
+   * relies on Gemini's automatic implicit caching for Gemini 2.5+/3 models.
    *
-   * - `'explicit'` (today's behaviour): build + reuse a Context Cache
-   *   for the workspace. Hard ~75 % discount on cached input. Pays
-   *   60–180 s `caches.create` cost on file change.
-   * - `'implicit'` (v1.13.0+ opt-in): skip `caches.create` entirely;
-   *   send file content inline every call. Gemini's automatic implicit
-   *   caching applies a discount when the prefix matches across calls
-   *   (4 096-token minimum, no guarantee). No rebuild wait on file
-   *   change. **Best fit for review→edit→review workflows** where
-   *   files change between queries.
-   * - `undefined`: caller doesn't care; behave as `'explicit'` (the
-   *   v1.12.x default; flip planned for v1.14.0 pending dogfood
-   *   telemetry).
+   * - `'explicit'`: build + reuse a Context Cache for the workspace. Hard
+   *   ~75 % discount on cached input. Pays 60–180 s `caches.create` cost on
+   *   file change.
+   * - `'implicit'`: skip `caches.create` entirely; send file content inline
+   *   every call. Gemini's automatic implicit caching applies a discount when
+   *   the prefix matches across calls (4 096-token minimum, no guarantee). No
+   *   rebuild wait on file change. **Best fit for review→edit→review
+   *   workflows** where files change between queries.
+   * - `undefined`: behaves as `'explicit'`; the tools pass the mode they
+   *   resolved from the call and the configuration.
    */
   cachingMode?: 'explicit' | 'implicit';
-}
-
-function ttlString(seconds: number): string {
-  return `${Math.max(60, Math.floor(seconds))}s`;
 }
 
 /**
@@ -115,8 +101,8 @@ function ttlString(seconds: number): string {
  * `files/<id>` resource name that `client.files.delete` expects.
  *
  * The uploader stores `.uri` in preference to `.name` (see
- * `src/cache/files-uploader.ts:170-176` — `fileData.fileUri` at cache build
- * time rejects the bare `files/abc` form). But the `files.delete` endpoint
+ * `uploadWorkspaceFiles` in `files-uploader.ts` — `fileData.fileUri` at cache
+ * build time rejects the bare `files/abc` form). But the `files.delete` endpoint
  * takes the resource-name form, so we need the reverse transform on
  * teardown. The URI looks like
  * `https://generativelanguage.googleapis.com/v1beta/files/abc123-xyz`;
@@ -139,13 +125,16 @@ function toFileResourceName(identifier: string): string {
   return identifier;
 }
 
+/** A workspace row that names a cache. */
+type RowWithCache = WorkspaceRow & { readonly cacheId: string };
+
 function isUsableExistingCache(
   ws: WorkspaceRow | null,
   scan: ScanResult,
   model: ResolvedModel,
   systemPromptHash: string,
   now: number,
-): boolean {
+): ws is RowWithCache {
   if (!ws) return false;
   if (ws.filesHash !== scan.filesHash) return false;
   if (ws.model !== model.resolved) return false;
@@ -166,7 +155,7 @@ function isUsableExistingCache(
 function buildContentFromUploaded(files: { fileId: string | null; relpath: string }[]): Content[] {
   const parts: Part[] = [];
   for (const f of files) {
-    if (typeof f.fileId !== 'string' || f.fileId.length === 0) continue;
+    if (!isFileId(f.fileId)) continue;
     parts.push({ text: `\n\n--- FILE: ${f.relpath} ---\n` });
     parts.push({
       fileData: {
@@ -194,9 +183,8 @@ function buildContentFromUploaded(files: { fileId: string | null; relpath: strin
 const MAX_INLINE_TOTAL_BYTES = 20 * 1024 * 1024; // 20 MB aggregate inline content
 
 /**
- * v1.13.0 post-review fix: seed the scan memo from a ScanResult on the
- * inline-return paths (`!allowCaching`, `cachingMode: 'implicit'`,
- * small-workspace). The uploader is the only OTHER writer of the memo
+ * Seeds the scan memo from a ScanResult on the inline-return paths
+ * (`!allowCaching`, `cachingMode: 'implicit'`, small-workspace). The uploader is the only OTHER writer of the memo
  * columns; on these paths the uploader is skipped, so without this seed
  * the memo Map next call comes back empty and every file re-hashes.
  *
@@ -246,7 +234,7 @@ async function buildInlineContentFromDisk(scan: ScanResult): Promise<Content[]> 
 }
 
 /**
- * In-process mutex. Concurrent `prepareContext` calls for the SAME
+ * In-process coalescing. Concurrent `prepareContext` calls for the SAME
  * `(workspaceRoot, filesHash, model, systemPromptHash, allowCaching,
  *   cacheMinTokens, cachingMode)` fingerprint coalesce onto a single
  * in-flight promise, avoiding duplicate cache creation (which would leak
@@ -255,14 +243,8 @@ async function buildInlineContentFromDisk(scan: ScanResult): Promise<Content[]> 
  * Keying on the full fingerprint is critical: `ask` and `code` tools use
  * different system instructions, so their `systemPromptHash` differs. Coalescing
  * on workspaceRoot alone would serve one tool's PreparedContext to the other —
- * wrong cache / system-instruction mismatch. This bug was flagged by GPT + Copilot.
- *
- * v1.14.0 round-1 added `cachingMode` to the fingerprint after Copilot
- * caught a HIGH concurrency race (`/6step` F1): pre-fix, two concurrent
- * calls with different `cachingMode` values produced identical keys, sharing
- * one PreparedContext between them. v1.14.0's default flip transformed this
- * from a niche edge case into the mainline collision shape — see the F1
- * comment inside `inFlightKey()` below for the full failure scenario.
+ * wrong cache / system-instruction mismatch. Calls whose keys differ are not
+ * serialised: two builds for one workspace with different keys run at once.
  *
  * Scope: single Node process. Cross-process races (two MCP servers sharing the
  * same manifest DB) are not covered — documented in docs/KNOWN-DEFICITS.md.
@@ -277,18 +259,10 @@ function inFlightKey(opts: BuildOptions): string {
     opts.systemPromptHash,
     String(opts.allowCaching),
     String(opts.cacheMinTokens ?? ''),
-    // v1.14.0 round-1 fix (F1, Copilot HIGH): `cachingMode` MUST be in the
-    // key. Pre-fix, two concurrent calls — one with `'explicit'` (per-call
-    // override), one with `'implicit'` (the v1.14.0 default) — produced
-    // identical keys and shared the SAME PreparedContext via the coalescing
-    // map below. Whichever raced first determined the return shape; the
-    // loser got the wrong caching strategy. Same shape as the v1.13.0
-    // round-3 stale-fileId bug — a missing dimension on an equality-keyed
-    // lookup. v1.14.0's default flip turned this from a niche edge case
-    // into the mainline collision shape because per-call `'explicit'`
-    // overrides routinely race the new default. `?? ''` keeps `undefined`
-    // distinct from `'explicit'` so a future third caching mode can't
-    // silently coalesce with undefined-legacy callers.
+    // `cachingMode` is in the key: two concurrent calls that differ only in
+    // mode want different shapes (a cache for `'explicit'`, inline parts for
+    // `'implicit'`), and a shared promise would hand one of them the other's.
+    // `?? ''` keeps `undefined` distinct from `'explicit'`.
     String(opts.cachingMode ?? ''),
   ].join('\u241E'); // record-separator sentinel unlikely to appear in any field
 }
@@ -308,276 +282,403 @@ export async function prepareContext(opts: BuildOptions): Promise<PreparedContex
   return promise;
 }
 
+/** How a call started: the clock read once and the workspace row as the call found it. */
+interface CallStart {
+  /**
+   * A new row's times, a missing `createdAt`, the reuse test's clock, and the `updatedAt` of the inline exit and of a
+   * failed create.
+   */
+  readonly now: number;
+  /** The row whose `createdAt` every write keeps and whose cache a rebuild replaces. */
+  readonly existing: WorkspaceRow | null;
+}
+
+/** What a row write varies: the cache fields and `updatedAt`; the writer adds the call's fingerprint and `createdAt`. */
+interface CacheFields {
+  readonly cacheId: string | null;
+  readonly cacheExpiresAt: number | null;
+  readonly fileIds: string[];
+  readonly updatedAt: number;
+}
+
+/** A cache Google created and named: its id, its expiry and the clock read after the create returned. */
+interface CreatedCache {
+  readonly cacheId: string;
+  readonly cacheExpiresAt: number;
+  readonly answeredAtMs: number;
+}
+
+/** What a rebuild works from: the call, how it started, the uploads and the file parts the cache holds. */
+interface CacheBuild {
+  readonly opts: BuildOptions;
+  readonly start: CallStart;
+  readonly uploaded: UploadResult;
+  readonly fileContents: Content[];
+}
+
+/** Why a rebuild fell back to inline parts: no named cache came back, or the manifest could not record it. */
+type CreateFailure =
+  | { readonly stage: 'create'; readonly error: unknown }
+  | { readonly stage: 'record'; readonly cacheId: string; readonly error: unknown };
+
+/**
+ * The order of the decisions: the inline modes before the reuse test (a `noCache` or implicit call never uses a
+ * cache), the reuse test before the token floor (reuse costs nothing, and a workspace that shrank below the floor keeps
+ * its valid cache until its TTL instead of orphaning it on Google's side), the uploads only for a build.
+ */
 async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
-  const { client, manifest, scan, model, systemPromptHash, ttlSeconds, emitter, allowCaching } =
-    opts;
-  const now = Date.now();
-  const existing = manifest.getWorkspace(scan.workspaceRoot);
+  const start = startCall(opts);
+  const inlineMode = inlineModeLine(opts);
+  if (inlineMode !== null) return prepareInline(opts, start, inlineMode);
+  if (
+    isUsableExistingCache(start.existing, opts.scan, opts.model, opts.systemPromptHash, start.now)
+  ) {
+    return reusedCache(start.existing);
+  }
+  const tooSmall = tokenFloorLine(opts.scan, opts.cacheMinTokens);
+  if (tooSmall !== null) return prepareInline(opts, start, tooSmall);
+  const uploaded = await uploadForCache(opts);
+  return buildCache(opts, start, uploaded);
+}
 
-  // 1) Ensure the workspace row exists before any file rows reference it.
-  //    The `files` table has a FK to `workspaces(workspace_root)`, so first-time
-  //    uploads on a new workspace would otherwise fail with FOREIGN KEY constraint.
-  if (!existing) {
-    manifest.upsertWorkspace({
-      workspaceRoot: scan.workspaceRoot,
-      filesHash: scan.filesHash,
-      model: model.resolved,
-      systemPromptHash,
+/**
+ * The clock read once and the workspace row as found. A workspace seen for the first time gets its row now, before
+ * any file row references it: the `files` table has a FK to `workspaces(workspace_root)`.
+ */
+function startCall(opts: BuildOptions): CallStart {
+  const start: CallStart = {
+    now: Date.now(),
+    existing: opts.manifest.getWorkspace(opts.scan.workspaceRoot),
+  };
+  if (!start.existing) {
+    writeWorkspaceRow(opts, start, {
       cacheId: null,
       cacheExpiresAt: null,
       fileIds: [],
-      createdAt: now,
-      updatedAt: now,
+      updatedAt: start.now,
     });
   }
+  return start;
+}
 
-  // 2) Inline path — taken when caching is disabled OR the caller opted into
-  //    implicit caching (v1.13.0+). In both cases we skip `caches.create`,
-  //    embed file text inline from disk, and let Gemini handle whatever
-  //    caching it can: zero for `noCache` callers; automatic implicit
-  //    caching on Gemini 2.5+/3 Pro for `cachingMode: 'implicit'` callers.
-  //    No upload round-trip, no 48 h housekeeping.
-  const implicitMode = opts.cachingMode === 'implicit';
-  if (!allowCaching || implicitMode) {
-    logger.debug(
-      implicitMode
-        ? 'caching mode = implicit — embedding files inline from disk; Gemini 2.5+/3 will auto-cache prefix.'
-        : 'caching disabled — embedding files inline from disk.',
-    );
-    const inlineContents = await buildInlineContentFromDisk(scan);
-    manifest.upsertWorkspace({
-      workspaceRoot: scan.workspaceRoot,
-      filesHash: scan.filesHash,
-      model: model.resolved,
-      systemPromptHash,
-      cacheId: null,
-      cacheExpiresAt: null,
-      fileIds: [],
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-    });
-    // v1.13.0 memo-seed (post-review fix): the inline path skips
-    // `uploadWorkspaceFiles`, which is the only other site that calls
-    // `upsertFile`. Without this seed, `mtime_ms` / `size` columns stay
-    // NULL on every file row, `buildScanMemo` filters them out next call,
-    // and the v1.13.0 scan memo silently degrades to cold-every-call —
-    // exactly defeating the perf headline for implicit-mode users.
-    seedScanMemo(manifest, scan);
-    return {
-      cacheId: null,
-      cacheExpiresAt: null,
-      inlineContents,
-      uploaded: { files: [], uploadedCount: 0, reusedCount: 0, failedCount: 0, failures: [] },
-      rebuilt: false,
-      reused: false,
-      inlineOnly: true,
-    };
+/** Writes the call's workspace row with `fields`, keeping the `createdAt` the call found (its start for a new row). */
+function writeWorkspaceRow(opts: BuildOptions, start: CallStart, fields: CacheFields): void {
+  opts.manifest.upsertWorkspace({
+    workspaceRoot: opts.scan.workspaceRoot,
+    filesHash: opts.scan.filesHash,
+    model: opts.model.resolved,
+    systemPromptHash: opts.systemPromptHash,
+    cacheId: fields.cacheId,
+    cacheExpiresAt: fields.cacheExpiresAt,
+    fileIds: fields.fileIds,
+    createdAt: start.existing?.createdAt ?? start.now,
+    updatedAt: fields.updatedAt,
+  });
+}
+
+/**
+ * The debug line of a call whose options skip `caches.create`, or null: caching disabled (`noCache`) sends the files
+ * with no cache; implicit mode leaves the caching to Gemini 2.5+/3's automatic prefix cache.
+ */
+function inlineModeLine(opts: BuildOptions): string | null {
+  if (opts.cachingMode === 'implicit') {
+    return 'caching mode = implicit — embedding files inline from disk; Gemini 2.5+/3 will auto-cache prefix.';
   }
+  if (!opts.allowCaching) return 'caching disabled — embedding files inline from disk.';
+  return null;
+}
 
-  // 3) Reuse existing cache if fingerprints match. This runs BEFORE the
-  //    token-floor check because reuse costs nothing — even a workspace that
-  //    shrank below the floor should keep its valid cache until TTL expiry
-  //    rather than being forced inline (which would orphan the cache on
-  //    Google's side). Reordering from the previous build->reuse order was
-  //    flagged by GPT review.
-  if (isUsableExistingCache(existing, scan, model, systemPromptHash, now)) {
-    logger.debug(`cache hit: ${safeForLog(existing?.cacheId)}`);
-    return {
-      cacheId: existing?.cacheId ?? null,
-      cacheExpiresAt: existing?.cacheExpiresAt ?? null,
-      inlineContents: [],
-      uploaded: { files: [], uploadedCount: 0, reusedCount: 0, failedCount: 0, failures: [] },
-      rebuilt: false,
-      reused: true,
-      inlineOnly: false,
-    };
-  }
-
-  // 4) Token-floor check — Gemini rejects `caches.create` below 1024 tokens.
-  //    Skip the Files API entirely — there's no cache-build benefit for small
-  //    workspaces and we save the upload overhead. Only applies when we're
-  //    about to BUILD a new cache (reuse above already returned).
-  const minTokens = opts.cacheMinTokens ?? 1024;
+/**
+ * The debug line of a workspace too small for a context cache, or null. Gemini rejects `caches.create` below 1024
+ * tokens, and a small workspace gains nothing from the upload; the estimate is 4 bytes a token.
+ */
+function tokenFloorLine(scan: ScanResult, cacheMinTokens: number | undefined): string | null {
+  const minTokens = cacheMinTokens ?? 1024;
   const estimatedTokens = scan.files.reduce(
     (sum: number, f: { size: number }) => sum + Math.ceil(f.size / 4),
     0,
   );
   if (estimatedTokens < minTokens) {
-    logger.debug(
-      `workspace too small for context cache (~${estimatedTokens} tokens < ${minTokens}); embedding inline.`,
-    );
-    const inlineContents = await buildInlineContentFromDisk(scan);
-    manifest.upsertWorkspace({
-      workspaceRoot: scan.workspaceRoot,
-      filesHash: scan.filesHash,
-      model: model.resolved,
-      systemPromptHash,
-      cacheId: null,
-      cacheExpiresAt: null,
-      fileIds: [],
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-    });
-    // v1.13.0 memo-seed (post-review fix): see the same call upstream in
-    // the inline / implicit branch for full rationale.
-    seedScanMemo(manifest, scan);
-    return {
-      cacheId: null,
-      cacheExpiresAt: null,
-      inlineContents,
-      uploaded: { files: [], uploadedCount: 0, reusedCount: 0, failedCount: 0, failures: [] },
-      rebuilt: false,
-      reused: false,
-      inlineOnly: true,
-    };
+    return `workspace too small for context cache (~${estimatedTokens} tokens < ${minTokens}); embedding inline.`;
   }
+  return null;
+}
 
-  // 5) Upload files (parallel pool inside uploadWorkspaceFiles).
-  // v1.12.1: thread `signal` so a fired `timeoutMs` aborts the upload
-  // loop at the next per-file poll point — pre-v1.12.1 the upload phase
-  // ignored aborts.
+/**
+ * The inline exit: the files read from disk and embedded, no upload, no cache; the row drops its cache pointer. The
+ * scan memo is seeded here because the uploader, the only other writer of the memo columns, does not run: without
+ * the seed `mtime_ms` / `size` stay NULL, `buildScanMemo` filters the rows out and every file re-hashes next call.
+ */
+async function prepareInline(
+  opts: BuildOptions,
+  start: CallStart,
+  line: string,
+): Promise<PreparedContext> {
+  logger.debug(line);
+  const inlineContents = await buildInlineContentFromDisk(opts.scan);
+  writeWorkspaceRow(opts, start, {
+    cacheId: null,
+    cacheExpiresAt: null,
+    fileIds: [],
+    updatedAt: start.now,
+  });
+  seedScanMemo(opts.manifest, opts.scan);
+  return {
+    cacheId: null,
+    cacheExpiresAt: null,
+    inlineContents,
+    uploaded: noUploads(),
+    rebuilt: false,
+    reused: false,
+    inlineOnly: true,
+  };
+}
+
+/** The upload result of a call that uploaded nothing. */
+function noUploads(): UploadResult {
+  return { files: [], uploadedCount: 0, reusedCount: 0, failedCount: 0, failures: [] };
+}
+
+/** The cache the row holds, reused as it is: no upload, no write. */
+function reusedCache(existing: RowWithCache): PreparedContext {
+  logger.debug(`cache hit: ${safeForLog(existing.cacheId)}`);
+  return {
+    cacheId: existing.cacheId,
+    cacheExpiresAt: existing.cacheExpiresAt,
+    inlineContents: [],
+    uploaded: noUploads(),
+    rebuilt: false,
+    reused: true,
+    inlineOnly: false,
+  };
+}
+
+/** The workspace files uploaded for a cache; `signal` stops the queueing of uploads once a timeout fires. */
+async function uploadForCache(opts: BuildOptions): Promise<UploadResult> {
+  const { scan, emitter } = opts;
   emitter.emit(`indexing ${scan.files.length} files…`, 0, scan.files.length);
   const uploaded = await uploadWorkspaceFiles({
-    client,
-    manifest,
+    client: opts.client,
+    manifest: opts.manifest,
     workspaceRoot: scan.workspaceRoot,
     files: scan.files,
     emitter,
     ...(opts.uploadConcurrency !== undefined ? { concurrency: opts.uploadConcurrency } : {}),
     ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
   });
+  assertUploadsComplete(scan.files.length, uploaded);
+  return uploaded;
+}
 
-  // If enough uploads failed that the context is clearly lossy, bail now so the
-  // caller surfaces an error instead of silently returning a partial answer.
-  // Threshold: tiny workspaces (≤5 files) fail-fast on ANY upload failure; larger
-  // workspaces tolerate ≤5 % or <3 failures. The tiny-workspace carve-out
-  // prevents a 2-file repo with both uploads failing from falling through to a
-  // confusing Gemini 400 on empty contents.
-  const failureThreshold =
-    scan.files.length <= 5 ? 1 : Math.max(3, Math.ceil(scan.files.length * 0.05));
+/**
+ * Throws when so many uploads failed that the context is clearly lossy, so the caller surfaces an error instead of a
+ * partial answer; the workspace row is not written. Up to 5 files any failure counts (a 2-file repo with both uploads
+ * failed would otherwise reach Gemini as empty contents); above that, max(3, 5 %) failures.
+ */
+function assertUploadsComplete(fileCount: number, uploaded: UploadResult): void {
+  const failureThreshold = fileCount <= 5 ? 1 : Math.max(3, Math.ceil(fileCount * 0.05));
   if (uploaded.failedCount >= failureThreshold) {
     const preview = uploaded.failures
       .slice(0, 3)
       .map((f) => `${f.relpath}: ${f.error}`)
       .join(' | ');
     throw new Error(
-      `Upload failed for ${uploaded.failedCount}/${scan.files.length} files (threshold ${failureThreshold}). First errors: ${preview}`,
+      `Upload failed for ${uploaded.failedCount}/${fileCount} files (threshold ${failureThreshold}). First errors: ${preview}`,
     );
-  }
-
-  // 6) Capture the stale cacheId for async post-create deletion.
-  //    v1.13.0 — pre-fix the delete ran synchronously before the build,
-  //    adding 5–15 s to the user's critical path on every cache rebuild.
-  //    Post-fix we build the new cache first, swap the manifest pointer,
-  //    return to the caller, and delete the old cache async (best-effort,
-  //    retried) — the user's wait drops by the delete's full duration.
-  //    Worst case on persistent delete failure: an orphaned cache lingers
-  //    on Google's side until its TTL expires (~hours-to-day). Storage
-  //    cost is bounded by `cacheTtlSeconds`. Documented in CHANGELOG.
-  const staleCacheIdForAsyncDelete = existing?.cacheId ?? null;
-
-  // 7) Build a new cache.
-  emitter.emit('building context cache…');
-  const fileContents = buildContentFromUploaded(uploaded.files);
-  try {
-    const baseConfig = {
-      contents: fileContents,
-      ttl: ttlString(ttlSeconds),
-      displayName: `gcctx-${scan.workspaceRoot.slice(-40)}`,
-    };
-    const cacheConfig =
-      opts.systemInstruction !== undefined
-        ? { ...baseConfig, systemInstruction: opts.systemInstruction }
-        : baseConfig;
-
-    const created = await client.caches.create({
-      model: model.resolved,
-      config: cacheConfig,
-    });
-    // Re-read the clock AFTER create returns — long uploads would otherwise
-    // make our tracked `cacheExpiresAt` artificially earlier than Google's.
-    const afterCreateMs = Date.now();
-    const cacheId = created.name ?? null;
-    const cacheExpiresAt = afterCreateMs + ttlSeconds * 1000;
-
-    manifest.upsertWorkspace({
-      workspaceRoot: scan.workspaceRoot,
-      filesHash: scan.filesHash,
-      model: model.resolved,
-      systemPromptHash,
-      cacheId,
-      cacheExpiresAt,
-      fileIds: uploaded.files.map((f) => f.fileId).filter((v): v is string => v !== null),
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: afterCreateMs,
-    });
-
-    // v1.13.0 — fire-and-forget delete of the stale cache. Manifest already
-    // points at the new cacheId, so a delete failure is purely a Google-side
-    // orphan (auto-expires at TTL). 3× retry handles transient errors;
-    // permanent failure is logged at warn but doesn't surface to the caller.
-    if (staleCacheIdForAsyncDelete !== null) {
-      void bestEffortDeleteCache(client, staleCacheIdForAsyncDelete);
-    }
-
-    return {
-      cacheId,
-      cacheExpiresAt,
-      inlineContents: [],
-      uploaded,
-      rebuilt: true,
-      reused: false,
-      inlineOnly: false,
-    };
-  } catch (err) {
-    logger.warn(`cache build failed — falling back to inline parts: ${safeForLog(err)}`);
-    manifest.upsertWorkspace({
-      workspaceRoot: scan.workspaceRoot,
-      filesHash: scan.filesHash,
-      model: model.resolved,
-      systemPromptHash,
-      cacheId: null,
-      cacheExpiresAt: null,
-      fileIds: uploaded.files.map((f) => f.fileId).filter((v): v is string => v !== null),
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-    });
-    return {
-      cacheId: null,
-      cacheExpiresAt: null,
-      inlineContents: fileContents,
-      uploaded,
-      rebuilt: false,
-      reused: false,
-      inlineOnly: false,
-    };
   }
 }
 
+/** Builds a new cache from the uploads; a create that fails falls back to the uploaded file parts inline. */
+async function buildCache(
+  opts: BuildOptions,
+  start: CallStart,
+  uploaded: UploadResult,
+): Promise<PreparedContext> {
+  opts.emitter.emit('building context cache…');
+  const build: CacheBuild = {
+    opts,
+    start,
+    uploaded,
+    fileContents: buildContentFromUploaded(uploaded.files),
+  };
+  let created: CreatedCache;
+  try {
+    created = await createCache(build);
+  } catch (error) {
+    return fallBackInline(build, { stage: 'create', error });
+  }
+  return recordCreatedCache(build, created);
+}
+
+/** Points the row at the new cache, then deletes the previous one (`deleteReplacedCache`). */
+function recordCreatedCache(build: CacheBuild, created: CreatedCache): PreparedContext {
+  const { opts, start, uploaded } = build;
+  const { cacheId, cacheExpiresAt } = created;
+  try {
+    const fileIds = uploadedFileIds(uploaded);
+    writeWorkspaceRow(opts, start, {
+      cacheId,
+      cacheExpiresAt,
+      fileIds,
+      updatedAt: created.answeredAtMs,
+    });
+  } catch (error) {
+    return fallBackInline(build, { stage: 'record', cacheId, error });
+  }
+  deleteReplacedCache(opts.client, start, cacheId);
+  return {
+    cacheId,
+    cacheExpiresAt,
+    inlineContents: [],
+    uploaded,
+    rebuilt: true,
+    reused: false,
+    inlineOnly: false,
+  };
+}
+
 /**
- * Best-effort async delete of a stale cache after a successful rebuild
- * (v1.13.0+). Retries 3× with exponential back-off (1 s, 3 s, 9 s) for
- * transient errors. Logs at warn on permanent failure — orphaned caches
- * auto-expire at Google's TTL so the worst case is bounded storage cost.
- *
- * Called as `void bestEffortDeleteCache(...)` so callers don't have to
- * await; the manifest's `cacheId` pointer was already swapped to the new
- * cache before this fires.
+ * Creates the cache and counts its stored expiry from the clock read after the answer, so the stored expiry is later
+ * than Google's own by at most the answer's latency (counted from before the create, it would be earlier by the whole
+ * create); a request sent on a cache that expired in that window meets the stale-cache retry (`isStaleCacheError`).
+ * A create that names no cache built none a request can use: it throws, so the rebuild takes the failed-create path
+ * (the files inline), never a context with neither a cache nor its files.
  */
-async function bestEffortDeleteCache(client: GoogleGenAI, cacheId: string): Promise<void> {
+async function createCache(build: CacheBuild): Promise<CreatedCache> {
+  const { opts } = build;
+  const ttl = effectiveTtlSeconds(opts.ttlSeconds);
+  const baseConfig = {
+    contents: build.fileContents,
+    ttl: `${ttl}s`,
+    displayName: `gcctx-${opts.scan.workspaceRoot.slice(-40)}`,
+  };
+  const cacheConfig =
+    opts.systemInstruction !== undefined
+      ? { ...baseConfig, systemInstruction: opts.systemInstruction }
+      : baseConfig;
+  const created = await opts.client.caches.create({
+    model: opts.model.resolved,
+    config: cacheConfig,
+  });
+  const afterCreateMs = Date.now();
+  if (!created.name) {
+    throw new Error(
+      `caches.create returned no cache name; a cache may exist on Google's side under no name this server can delete, billed until its TTL (${ttl} s)`,
+    );
+  }
+  return {
+    cacheId: created.name,
+    cacheExpiresAt: afterCreateMs + ttl * 1000,
+    answeredAtMs: afterCreateMs,
+  };
+}
+
+/**
+ * The failed-create path: the warning, the row written without a cache (`updatedAt` the call's start), the uploaded
+ * file parts inline. A cache created but not recorded is deleted before the row write, so its delete is fired even
+ * when that write throws too; the previous cache, which the row no longer names, is deleted after it.
+ */
+function fallBackInline(build: CacheBuild, failure: CreateFailure): PreparedContext {
+  const { opts, start, uploaded } = build;
+  reportCreateFailure(opts.client, failure);
+  const fileIds = uploadedFileIds(uploaded);
+  writeWorkspaceRow(opts, start, {
+    cacheId: null,
+    cacheExpiresAt: null,
+    fileIds,
+    updatedAt: start.now,
+  });
+  deleteReplacedCache(opts.client, start, failure.stage === 'record' ? failure.cacheId : null);
+  return {
+    cacheId: null,
+    cacheExpiresAt: null,
+    inlineContents: build.fileContents,
+    uploaded,
+    rebuilt: false,
+    reused: false,
+    inlineOnly: false,
+  };
+}
+
+/** The warning of a failed create; a cache that was created but could not be recorded is deleted, best-effort. */
+function reportCreateFailure(client: GoogleGenAI, failure: CreateFailure): void {
+  if (failure.stage === 'create') {
+    logger.warn(`cache build failed — falling back to inline parts: ${safeForLog(failure.error)}`);
+    return;
+  }
+  logger.warn(
+    `recording cache ${safeForLog(failure.cacheId)} in the manifest failed — deleting it, falling back to inline parts: ${safeForLog(failure.error)}`,
+  );
+  void bestEffortDeleteCache(client, failure.cacheId, 'unrecorded');
+}
+
+/**
+ * Deletes the cache the row named at the call's start, which the call's own row write has just stopped naming. Called
+ * only after that write succeeded, and without waiting: a write that throws leaves the row naming its cache and that
+ * cache alive; a delete that fails leaves an orphan on Google's side until its TTL (bounded by `cacheTtlSeconds`).
+ * `accountedFor` is the cache the call already holds or deletes — the one the row now names, or a new cache whose
+ * `unrecorded` delete is fired — so a create answering with the previous cache's own name never deletes a cache the
+ * row names, nor one name twice.
+ */
+function deleteReplacedCache(
+  client: GoogleGenAI,
+  start: CallStart,
+  accountedFor: string | null,
+): void {
+  const previousCacheId = start.existing?.cacheId ?? null;
+  if (previousCacheId === null || previousCacheId === accountedFor) return;
+  void bestEffortDeleteCache(client, previousCacheId, 'stale');
+}
+
+/**
+ * Whether an uploaded or stored file holds a Files API id. The uploader never yields an empty one (an upload Google
+ * answers without an identifier throws); a file row without an upload holds `null`, and an empty id means none too.
+ */
+function isFileId(fileId: string | null): fileId is string {
+  return typeof fileId === 'string' && fileId.length > 0;
+}
+
+/** The Files API ids of the uploads that have one. */
+function uploadedFileIds(uploaded: UploadResult): string[] {
+  return uploaded.files.map((f) => f.fileId).filter(isFileId);
+}
+
+/**
+ * Which cache a best-effort delete removes, as its log lines name it: the previous cache once the row no longer names
+ * it, after a rebuild that succeeded or failed (`stale`), or a new cache whose row write failed (`unrecorded`).
+ */
+type DeletedCacheKind = 'stale' | 'unrecorded';
+
+/**
+ * Best-effort async delete of a cache no workspace row names. Tries three times in all, waiting 1 s and then 3 s
+ * between attempts, for transient errors. A `NOT_FOUND` answer means the cache is already gone (expired, or deleted by
+ * another call): nothing is orphaned, so it is not warned. Logs at warn on a permanent failure — orphaned caches
+ * auto-expire at Google's TTL so the worst case is bounded storage cost. Called as `void bestEffortDeleteCache(...)`:
+ * the caller never waits for it.
+ */
+async function bestEffortDeleteCache(
+  client: GoogleGenAI,
+  cacheId: string,
+  kind: DeletedCacheKind,
+): Promise<void> {
   const delays = [1000, 3000, 9000];
   for (let attempt = 0; attempt < delays.length; attempt += 1) {
     try {
       await client.caches.delete({ name: cacheId });
-      logger.debug(`async-deleted stale cache ${safeForLog(cacheId)} (attempt ${attempt + 1})`);
+      logger.debug(`async-deleted ${kind} cache ${safeForLog(cacheId)} (attempt ${attempt + 1})`);
       return;
     } catch (err) {
-      // Retry transient errors; give up quickly on 4xx (cache already gone, perms, etc.)
       const msg = err instanceof Error ? err.message : String(err);
-      const isTransient = !msg.includes('NOT_FOUND') && !msg.includes('PERMISSION_DENIED');
+      if (msg.includes('NOT_FOUND')) {
+        logger.debug(
+          `${kind} cache ${safeForLog(cacheId)} was already gone (attempt ${attempt + 1})`,
+        );
+        return;
+      }
+      const isTransient = !msg.includes('PERMISSION_DENIED');
       if (!isTransient || attempt === delays.length - 1) {
         logger.warn(
-          `async-delete of stale cache ${safeForLog(cacheId)} permanently failed (attempt ${attempt + 1}): ${safeForLog(msg)}. Orphan will auto-expire at TTL.`,
+          `async-delete of ${kind} cache ${safeForLog(cacheId)} permanently failed (attempt ${attempt + 1}): ${safeForLog(msg)}. Orphan will auto-expire at TTL.`,
         );
         return;
       }
@@ -616,52 +717,57 @@ export async function invalidateWorkspaceCache(args: {
       logger.debug(`cache delete (${safeForLog(ws.cacheId)}) failed: ${safeForLog(err)}`);
     }
   }
+  const fileIds = storedFileIds(args.manifest, args.workspaceRoot);
+  if (fileIds.length > 0) await releaseUploadedFiles(args.client, fileIds);
+  args.manifest.deleteWorkspace(args.workspaceRoot);
+}
 
-  // De-duplicate fileIds: the manifest's `files` table can have multiple
-  // (workspaceRoot, relpath) rows pointing at the SAME `fileId` when the
-  // uploader reused an existing upload via content-hash dedup (a tool whose
-  // workspace contains the same file at two paths, or a rebuild that found
-  // an existing in-batch dedup hit). Without `Set`, we'd `files.delete(X)`
-  // multiple times — wasteful API calls + 404 noise after the first delete.
-  const fileIds = Array.from(
+/**
+ * The workspace's Files API ids, each once: several file rows can point at one upload (the uploader's content-hash
+ * dedup, the same file at two paths), and a second `files.delete` of it is a wasted call and a 404.
+ */
+function storedFileIds(manifest: ManifestDb, workspaceRoot: string): string[] {
+  return Array.from(
     new Set(
-      args.manifest
-        .getFiles(args.workspaceRoot)
+      manifest
+        .getFiles(workspaceRoot)
         .map((r) => r.fileId)
-        .filter((v): v is string => typeof v === 'string' && v.length > 0),
+        .filter(isFileId),
     ),
   );
-  if (fileIds.length > 0) {
-    const concurrency = Math.min(10, fileIds.length);
-    let idx = 0;
-    await Promise.all(
-      Array.from({ length: concurrency }, async () => {
-        while (idx < fileIds.length) {
-          const i = idx;
-          idx += 1;
-          const id = fileIds[i];
-          if (!id) continue;
-          // `files-uploader.ts:172` deliberately stores `uploaded.uri` (the
-          // `https://…/files/abc` form) rather than `uploaded.name` because
-          // Gemini's `fileData.fileUri` reference rejects the bare `files/abc`
-          // resource-name form at `caches.create` time. But `files.delete`
-          // wants the RESOURCE NAME, not the URI (different endpoint,
-          // different parameter expectation). Normalise here so deletes
-          // actually hit — otherwise B3's cost-leak fix silently no-ops.
-          const deleteName = toFileResourceName(id);
-          try {
-            await args.client.files.delete({ name: deleteName });
-          } catch (err) {
-            logger.debug(
-              `files.delete (${safeForLog(deleteName)}, stored as ${safeForLog(id)}) failed: ${safeForLog(err)}`,
-            );
-          }
-        }
-      }),
+}
+
+/** Releases the uploads through a pool of at most 10 concurrent deletes. */
+async function releaseUploadedFiles(client: GoogleGenAI, fileIds: string[]): Promise<void> {
+  const concurrency = Math.min(10, fileIds.length);
+  let idx = 0;
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (idx < fileIds.length) {
+        const i = idx;
+        idx += 1;
+        const id = fileIds[i];
+        if (!id) continue;
+        await releaseFile(client, id);
+      }
+    }),
+  );
+}
+
+/**
+ * Deletes one upload by its resource name. The manifest stores the `https://…/files/abc` URI (`fileData.fileUri`
+ * rejects the bare `files/abc` form at `caches.create`), while `files.delete` takes the resource name. A failure is
+ * logged and the purge goes on: Gemini deletes every upload 48 h after it was made.
+ */
+async function releaseFile(client: GoogleGenAI, id: string): Promise<void> {
+  const deleteName = toFileResourceName(id);
+  try {
+    await client.files.delete({ name: deleteName });
+  } catch (err) {
+    logger.debug(
+      `files.delete (${safeForLog(deleteName)}, stored as ${safeForLog(id)}) failed: ${safeForLog(err)}`,
     );
   }
-
-  args.manifest.deleteWorkspace(args.workspaceRoot);
 }
 
 /**

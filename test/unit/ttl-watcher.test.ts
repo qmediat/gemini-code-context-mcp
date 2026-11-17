@@ -101,6 +101,30 @@ describe('TtlWatcher', () => {
     expect(db.getWorkspace(ws)?.cacheExpiresAt).toBeGreaterThan(now + 3_500_000);
   });
 
+  it('a TTL under 60 s is refreshed as 60 s, the TTL the cache was created with', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 5 * 60 * 1000, ttlSeconds: 30 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+
+    await (watcher as unknown as PrivateTick).tick();
+
+    expect(client.caches.update).toHaveBeenCalledWith({ name: cacheId, config: { ttl: '60s' } });
+  });
+
+  it('an update answered without an expiry stores 60 s from now for a TTL of 30', async () => {
+    const now = Date.parse('2026-11-18T12:00:00.000Z');
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const watcher = seedHot({ now, ttlMs: 5 * 60 * 1000, ttlSeconds: 30 });
+
+      await (watcher as unknown as PrivateTick).tick();
+
+      expect(db.getWorkspace(ws)?.cacheExpiresAt).toBe(now + 60_000);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it('keepAlive under a signal: a refresh that never settles releases the caller at the abort, with its reason', async () => {
     const now = Date.now();
     const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });

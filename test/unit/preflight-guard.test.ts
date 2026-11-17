@@ -708,7 +708,9 @@ describe('cachingMode tool-level default flip (v1.14.0+)', () => {
     const result = await askTool.execute({ prompt: 'hi' }, ctx);
 
     expect(result.structuredContent?.cachingMode).toBe('implicit');
-    expect(String(result.structuredContent?.cachingModeNote)).toMatch(/caches\.create failed/);
+    expect(String(result.structuredContent?.cachingModeNote)).toMatch(
+      /could not be built or recorded/,
+    );
   });
 
   it('code reports implicit, and names the failed create, when an explicit cache could not be built', async () => {
@@ -721,7 +723,9 @@ describe('cachingMode tool-level default flip (v1.14.0+)', () => {
     const result = await codeTool.execute({ task: 'do something' }, ctx);
 
     expect(result.structuredContent?.cachingMode).toBe('implicit');
-    expect(String(result.structuredContent?.cachingModeNote)).toMatch(/caches\.create failed/);
+    expect(String(result.structuredContent?.cachingModeNote)).toMatch(
+      /could not be built or recorded/,
+    );
   });
 
   it('(guard) ask reports explicit when the Context Cache served the call', async () => {

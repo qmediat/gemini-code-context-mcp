@@ -10,6 +10,7 @@ import type { CachedContent, GoogleGenAI } from '@google/genai';
 import { abortable, throwIfAborted } from '../gemini/retry.js';
 import type { ManifestDb } from '../manifest/db.js';
 import { logger, safeForLog } from '../utils/logger.js';
+import { effectiveTtlSeconds } from './ttl.js';
 
 const TICK_MS = 5 * 60 * 1000; // 5 minutes
 const HOT_WINDOW_MS = 10 * 60 * 1000; // used in last 10 minutes
@@ -19,6 +20,7 @@ interface HotEntry {
   workspaceRoot: string;
   cacheId: string;
   lastUsed: number;
+  /** The TTL each refresh sends and the fallback expiry counts from: the caller's TTL through `effectiveTtlSeconds`. */
   ttlSeconds: number;
 }
 
@@ -86,7 +88,12 @@ export class TtlWatcher {
   }
 
   private hotEntry(workspaceRoot: string, cacheId: string, ttlSeconds: number): HotEntry {
-    const entry: HotEntry = { workspaceRoot, cacheId, lastUsed: Date.now(), ttlSeconds };
+    const entry: HotEntry = {
+      workspaceRoot,
+      cacheId,
+      lastUsed: Date.now(),
+      ttlSeconds: effectiveTtlSeconds(ttlSeconds),
+    };
     this.hot.set(workspaceRoot, entry);
     return entry;
   }

@@ -405,7 +405,9 @@ times without a failure.
 
 ---
 
-## T51. A cache create that returns no name is a failed create
+## ~~T51.~~ ✅ SHIPPED 2026-11-17 — A cache create that returns no name is a failed create
+
+**Shipped as:** a create that answers with an empty name or none takes the failed-create path (the warning, the row without a cache id, the files inline). Two defects of the same create step were fixed with it: the stored expiry now reads the TTL the create request sends (whole seconds, at least 60 — a TTL of 30 was recorded as 30 s against Google's 60 s), and a cache whose manifest write fails after a successful create is deleted, best-effort, with a warning that names the manifest write (before, it stayed alive and unrecorded until its TTL). Each has a `### Fixed` line in the CHANGELOG and a test red on the code before it. `doPrepareContext` (260 lines, complexity 32) is an orchestrator over named steps in `src/cache/cache-manager.ts` — the call's start (`startCall`), one row writer (`writeWorkspaceRow`), the inline exit shared by the inline modes and the token floor (`prepareInline`, fed the debug line by `inlineModeLine` / `tokenFloorLine`), the reuse (`reusedCache`), the uploads and their threshold (`uploadForCache`, `assertUploadsComplete`), the create (`buildCache`, `createCache`), the record with the previous cache's delete (`recordCreatedCache`) and the failed-create path (`fallBackInline`, `reportCreateFailure`) — with typed values between them; `invalidateWorkspaceCache` is split the same way and has unit tests now. The split changes no behaviour: across 92 cases of `prepareContext` (reuse, rebuild, the inline modes, the token floor, failed uploads and creates, manifest faults, concurrent calls), every client call, manifest call, log and progress line, the return and the final rows were compared with the fixed code before the split, and with `main` apart from the cases the three fixes change; the unit tests in `test/unit/cache-manager.test.ts` hold the order of the record failure's delete and row write, the reuse test, the in-flight entry, the expiry clock and the purge. `src/cache/cache-manager.ts` left `eslint-suppressions.json` (80 suppressions in 28 files → 77 in 27) and `jscpd-baseline.json` (2,215 → 2,157 lines). The scope below is the entry as written.
 
 **Source:** the cross-model reading of T47's branch, 2026-11-17 (the request `code` builds). Opened 2026-11-17.
 
@@ -437,6 +439,81 @@ are also a repeat the duplicate baseline holds: adding the class to the two woul
 **Scope:** one factory in the test helpers (where the repository's test-helper exemplar keeps them), read by the
 eight suites through `vi.mock(path, factory)`; the repeated blocks leave `jscpd-baseline.json`. No production
 change.
+
+---
+
+## T53. A live cache orphaned when a call takes the inline path
+
+**Source:** the split of `doPrepareContext` (T51), 2026-11-17. Opened 2026-11-17.
+
+**Why:** two paths of `prepareContext` (`src/cache/cache-manager.ts`) write the workspace row with no cache id
+while the cache the previous row named stays alive on Google's side: the inline exit (`ask`'s `noCache`,
+`cachingMode: 'implicit'`, `code`'s `codeExecution`) and the token-floor exit (a workspace now below
+`cacheMinTokens`), both through `prepareInline`. Nothing deletes that cache and nothing can reuse it, since no row
+names it any more: it is billed until its TTL. For example: the row names a live cache and the next call passes
+`noCache: true`, or its workspace shrank below the floor — the row is written with no cache id and no `caches.delete`
+is sent. The failed-create path (`fallBackInline`) deletes the previous cache after its row write, as a successful
+rebuild does.
+
+**Scope:** a cost decision for the maintainers, one of two remedies: keep the pointer on these paths (the next
+caching call whose fingerprint matches reuses the cache until its TTL), or delete the cache when the pointer is
+dropped (the existing `bestEffortDeleteCache`, as after a rebuild). A test per path, red on the code before; a
+CHANGELOG line.
+
+---
+
+## T54. Two concurrent builds for one workspace with different fingerprints
+
+**Source:** the split of `doPrepareContext` (T51), 2026-11-17. Opened 2026-11-17.
+
+**Why:** the in-flight map of `prepareContext` (`inFlightKey`, `src/cache/cache-manager.ts`) coalesces only calls
+with the same key. Two calls on one workspace whose keys differ — for example `ask` and `code`, whose system prompts
+differ — both upload, both create a cache, both delete the previous cache, and the row keeps the cache of the last
+writer: the other cache is untracked until its TTL. For example: the row names `cachedContents/old`, and `ask` and
+`code` start at once; both read that row, both create a cache, both send `caches.delete` for `cachedContents/old`,
+and the row ends on the cache of the second to write.
+The cache a build deletes can also be the one a concurrent call of that cache's own fingerprint is still decoding on: before that call has completed a request its stale-cache retry rebuilds, after one (a later request of a long decode) it fails with its completed requests billed; the per-workspace build lock of the Scope is what would close it.
+`ttlSeconds` is not in the key, and need not be: it is a process-wide setting, `config.cacheTtlSeconds`
+(`src/config.ts:217`, read from `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS`), which the one caller passes unchanged
+(`src/tools/shared/eager-answer.ts:69`), so two calls in one process cannot ask for different TTLs. The same race
+between two server processes is `docs/KNOWN-DEFICITS.md`'s.
+
+**Scope:** a per-workspace build lock, so a second build for the workspace waits for the first and then decides on
+the row it left — a new mechanism, its own PR, with a concurrency test red on the code before; `docs/ACCEPTED-RISKS.md`
+then says what the lock holds.
+
+---
+
+## T55. One clock for a cache's stored expiry
+
+**Source:** the cross-model reading of T51's branch, 2026-11-18. Opened 2026-11-18.
+
+**Why:** two writers store a workspace row's `cacheExpiresAt` from different clocks. The create (`createCache`,
+`src/cache/cache-manager.ts`) stores the local clock read after the create's answer plus the TTL, so the stored
+expiry is later than Google's own by up to the answer's latency. The TTL watcher (`src/cache/ttl-watcher.ts`) stores
+the `expireTime` Google answers to `caches.update`, and counts locally only when the answer carries none. A local
+count is immune to a skew between this machine's clock and Google's; Google's `expireTime` is exact when the clocks
+agree. The reuse test (`isUsableExistingCache`) compares the stored expiry with the local clock without a margin, so
+a request can be sent on a cache that expired within that latency; the stale-cache retry of `ask` and `code`
+rebuilds it.
+
+**Scope:** a decision for the maintainers, one of two rules: store Google's `expireTime` when the create's answer
+carries one (as the watcher does), or keep the local count and give the reuse test a margin. Either way the create
+and the watcher store the same clock; a test of the rule red on the code before; a CHANGELOG line.
+
+---
+
+## T56. The tests are not type-checked
+
+**Source:** the review of PR #138, 2026-11-18. Opened 2026-11-18.
+
+**Why:** `tsconfig.json` excludes `test`, so `npm run typecheck` checks no test file. A throw-away config that
+includes `test/unit/cache-manager.test.ts` reports two errors there: `mkModel` lacks `longDecodeTokenLimit`, and a
+`resolveCreate?.()` call is narrowed to not callable. The review of that PR also found untyped mocks whose assertions
+did not type-check.
+
+**Scope:** a `tsconfig` for the tests and a `typecheck:test` step in `npm run typecheck` and in CI, the existing
+errors fixed file by file.
 
 ---
 
