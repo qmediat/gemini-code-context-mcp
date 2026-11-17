@@ -35,7 +35,7 @@ Use gemini-code-context.ask to summarize this codebase
 | `reindex` | Scan the workspace again |
 | `clear` | Delete this workspace's cache |
 
-## Supports · version 1.23.1
+## Supports · version 1.24.0
 
 | | |
 |---|---|

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.24.0] - 2026-11-17
+
 ### Added
 
 - **Long decode on Gemini 4** (`ask`, `code`): a `maxOutputTokens` above the per-request limit (65,536) is sent as
@@ -1866,7 +1868,8 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.1...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.24.0...HEAD
+[1.24.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.1...v1.24.0
 [1.23.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.0...v1.23.1
 [1.23.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.1...v1.23.0
 [1.22.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.0...v1.22.1
