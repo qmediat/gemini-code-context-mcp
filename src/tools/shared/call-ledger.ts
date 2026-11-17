@@ -109,10 +109,41 @@ export function usageFields(billed: BilledUsage, continuationHops: number): Usag
   };
 }
 
+/** The settled figures of a billed call, as the ledger row stores them. */
+type SettledRow = Parameters<ManifestDb['finalizeBudgetReservation']>[1];
+
+function settledRowOf(entry: LedgerEntry, billed: BilledUsage, durationMs: number): SettledRow {
+  return {
+    cachedTokens: billed.cachedTokens,
+    uncachedTokens: billed.uncachedTokens,
+    costUsdMicro: toMicrosUsd(billed.costUsd),
+    durationMs: Math.max(1, durationMs),
+    ...(entry.cachingMode === null
+      ? {}
+      : { cachingMode: entry.cachingMode, cachedContentTokenCount: billed.cachedTokens }),
+  };
+}
+
+/** What the log says of a booking that could not be written: what the ledger holds instead. */
+function unwrittenBookingLine(
+  label: string,
+  reservationId: number | null,
+  costUsdMicro: number,
+  err: unknown,
+): string {
+  const held =
+    reservationId === null
+      ? 'insertUsageMetric failed; no usage row was written'
+      : `finalizeBudgetReservation failed for id=${reservationId}; the row keeps its reserved estimate`;
+  return `${label}: ${held}, the billed ${costUsdMicro} micros were not written. Error: ${safeForLog(err)}`;
+}
+
 /**
  * Books a call at what it billed: its reservation finalised at that cost (the rest released), or — with no daily cap,
- * so no reservation — a usage row. A finalise that throws leaves the reservation's estimate booked, which stays a
- * bound; it is logged.
+ * so no reservation — a usage row. The booking is best-effort and never throws: it runs once the call's work is
+ * billed (an answer exists, or a request completed), and a failed write must not lose that answer nor replace the
+ * call's own error. A finalise that throws leaves the reservation's estimate booked, which stays a bound; an insert
+ * that throws leaves no row. Either is logged.
  */
 export function recordBilledCall(
   manifest: ManifestDb,
@@ -122,31 +153,21 @@ export function recordBilledCall(
   durationMs: number,
   label: string = entry.toolName,
 ): void {
-  const settled = {
-    cachedTokens: billed.cachedTokens,
-    uncachedTokens: billed.uncachedTokens,
-    costUsdMicro: toMicrosUsd(billed.costUsd),
-    durationMs: Math.max(1, durationMs),
-    ...(entry.cachingMode === null
-      ? {}
-      : { cachingMode: entry.cachingMode, cachedContentTokenCount: billed.cachedTokens }),
-  };
-  if (reservationId === null) {
-    manifest.insertUsageMetric({
-      workspaceRoot: entry.workspaceRoot,
-      toolName: entry.toolName,
-      model: entry.model,
-      occurredAt: Date.now(),
-      ...settled,
-    });
-    return;
-  }
+  const settled = settledRowOf(entry, billed, durationMs);
   try {
-    manifest.finalizeBudgetReservation(reservationId, settled);
-  } catch (finalizeErr) {
-    logger.error(
-      `${label}: finalizeBudgetReservation failed for id=${reservationId}; the row keeps its reserved estimate, the billed ${settled.costUsdMicro} micros were not written. Error: ${safeForLog(finalizeErr)}`,
-    );
+    if (reservationId === null) {
+      manifest.insertUsageMetric({
+        workspaceRoot: entry.workspaceRoot,
+        toolName: entry.toolName,
+        model: entry.model,
+        occurredAt: Date.now(),
+        ...settled,
+      });
+    } else {
+      manifest.finalizeBudgetReservation(reservationId, settled);
+    }
+  } catch (writeErr) {
+    logger.error(unwrittenBookingLine(label, reservationId, settled.costUsdMicro, writeErr));
   }
 }
 
@@ -166,13 +187,7 @@ export function settleFailedCall(manifest: ManifestDb, failed: FailedCall): Usag
     failed.entry.model,
     failed.entry.serviceTier,
   );
-  try {
-    recordBilledCall(manifest, failed.reservationId, failed.entry, billed, failed.durationMs);
-  } catch (recordErr) {
-    logger.error(
-      `${failed.toolName}: the usage of ${failed.completed.count} completed request(s) could not be recorded. Error: ${safeForLog(recordErr)}`,
-    );
-  }
+  recordBilledCall(manifest, failed.reservationId, failed.entry, billed, failed.durationMs);
   return usageFields(billed, failed.completed.continuationHops());
 }
 

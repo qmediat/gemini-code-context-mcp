@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and release its TPM reservation at 0 tokens, so later calls were throttled as if it had sent nothing.
 - `ask_agentic` without a daily budget (`GEMINI_DAILY_BUDGET_USD` unset) writes a usage row for each pass that
   reached the model, as `ask` and `code` do: `status` (`spentTodayUsd`) counted none of its spend.
+- `ask_agentic`: a loop iteration whose model call completed and which then failed — a timeout in its tool batch, a
+  response that could not be read — is booked at what it billed; it used to book nothing against the daily budget.
+- `ask` and `code`: an answer whose usage row cannot be written (a busy or failing database) is returned, and the
+  failed write is logged; the paid answer used to be lost behind an error.
 
 ## [1.24.0] - 2026-11-17
 

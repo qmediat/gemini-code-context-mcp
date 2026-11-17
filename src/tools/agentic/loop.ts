@@ -14,10 +14,11 @@ import {
 import { type IterationResult, runAgenticIteration } from './iteration.js';
 import {
   NO_THROTTLE_RESERVATION,
+  type PassCall,
   type PassReservations,
-  cancelPass,
+  callNotMade,
+  closePass,
   reservePass,
-  settleBilledPass,
   waitForTpm,
 } from './ledger.js';
 import { detectNoProgress } from './no-progress.js';
@@ -44,6 +45,8 @@ interface IterationFlight extends PassReservations {
    * before runAgenticIteration so any throw after that point counts the dispatched call (Gemini may
    * bill server-side even on aborted-mid-flight calls). */
   dispatched: boolean;
+  /** The model call: marked completed by the iteration the moment its stream ended, so every exit after that books it. */
+  call: PassCall;
 }
 
 type IterationAttempt =
@@ -115,6 +118,7 @@ async function throttledIteration(
     filesReadSet: state.filesReadSet,
     maxFilesRead: run.limits.maxFilesRead,
     abortSignal: iterTimeout.signal,
+    call: flight.call,
     matchConfig: run.matchConfig,
     recordChunk: () => iterTimeout.recordChunk(),
     onThoughtChunk: (text) => {
@@ -125,9 +129,11 @@ async function throttledIteration(
 }
 
 /**
- * A failed iteration: both reservations are released (the 429 retry hint is seeded once, by the call's own catch).
- * A timeout becomes the structured TIMEOUT result naming the iteration (`timeoutKind` says whether the
- * stall or the total cap fired); any other failure gives `null`, for the caller to re-throw.
+ * A failed iteration is closed (`closePass`): booked at what it billed when its model call had completed — a timeout
+ * in its tool batch, a throw while its response was read — and both reservations released when the call had not (the
+ * 429 retry hint is seeded once, by the call's own catch). A timeout becomes the structured TIMEOUT result naming the
+ * iteration (`timeoutKind` says whether the stall or the total cap fired); any other failure gives `null`, for the
+ * caller to re-throw.
  */
 function iterationFailure(
   run: AgenticRun,
@@ -136,7 +142,7 @@ function iterationFailure(
   iterTimeout: TimeoutController,
   flight: IterationFlight,
 ): TextToolResult | null {
-  cancelPass(run.ctx, flight.reservationId, flight.throttleReservationId, 'ask_agentic');
+  closePass(run, flight, flight.call);
   if (!isTimeoutAbort(iterErr)) return null;
   const kind = getTimeoutKind(iterErr) ?? 'total';
   const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
@@ -153,8 +159,8 @@ function iterationFailure(
 
 /**
  * The TPM wait and the iteration call run INSIDE the same try/catch, so a timeout firing during the
- * throttle wait flows through the same cancel/TIMEOUT path as a timeout firing during the SDK call —
- * neither reservation leaks. The iteration timeout is disposed whatever happens.
+ * throttle wait flows through the same close/TIMEOUT path as a timeout firing during the SDK call or the
+ * tool batch — neither reservation leaks. The iteration timeout is disposed whatever happens.
  */
 async function attemptIteration(
   run: AgenticRun,
@@ -224,12 +230,13 @@ async function runIteration(run: AgenticRun, state: LoopState): Promise<TextTool
     throttleReservationId: NO_THROTTLE_RESERVATION,
     estimate,
     dispatched: false,
+    call: callNotMade(),
     startedAt: Date.now(),
   };
   const attempt = await attemptIteration(run, state, iterTimeout, flight);
   if (attempt.kind === 'timed-out') return attempt.result;
   const { iteration } = attempt;
-  settleBilledPass(run, flight, iteration.usage);
+  closePass(run, flight, flight.call);
   absorbIteration(state, iteration);
   run.emitter.emit(
     `iter ${state.iterations}/${run.limits.maxIterations}: ${iteration.functionCallCount} tool calls, ${state.cumulativeInputTokens} in-tokens so far`,

@@ -1,9 +1,12 @@
 /**
  * The budget ledger and TPM throttle calls of `ask_agentic`. Each pass (a loop iteration or the forced-finalization
- * pass) is an independent `generateContent` billable, so each is reserved and settled on its own: a pass that reached
- * Google is booked at what it billed (`recordBilledCall`, the rule of `ask` / `code` — its reservation finalised under
- * a daily cap, a usage row without one) and its TPM reservation released at the input it billed; a pass that never
- * did has both reservations cancelled. A ledger failure while settling is logged, never thrown.
+ * pass) is an independent `generateContent` billable, so each is reserved and closed on its own, once, by `closePass`:
+ * a pass whose model call completed — the stream reached its end, or `generateContent` returned — is booked at what it
+ * billed (`recordBilledCall`, the rule of `ask` / `code` — its reservation finalised under a daily cap, a usage row
+ * without one) and its TPM reservation released at the input it billed, whatever failed after the call (reading the
+ * response, the tool batch, the iteration's timeout); a pass whose call did not complete (refused, failed at its
+ * opening or mid-stream, aborted before its end) has both reservations cancelled. A ledger failure while settling is
+ * logged, never thrown.
  */
 
 import { abortableSleep } from '../../gemini/retry.js';
@@ -23,6 +26,23 @@ export type BudgetReservation = ReturnType<ToolContext['manifest']['reserveBudge
 
 /** A TPM reservation id that was never taken. */
 export const NO_THROTTLE_RESERVATION = -1;
+
+/**
+ * A pass's model call as far as it went: `completed` is set the moment the call completed (its work is billed), before
+ * its response is read; `usage` holds the counts read from the response, zero until they are read.
+ */
+export interface PassCall {
+  completed: boolean;
+  usage: UsageCounts;
+}
+
+/** A pass's model call before it is made. */
+export function callNotMade(): PassCall {
+  return {
+    completed: false,
+    usage: { promptTokenCount: 0, candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+  };
+}
 
 /** A pass's reservations and when it started. */
 export interface PassReservations {
@@ -67,8 +87,8 @@ export async function waitForTpm(
   }
 }
 
-/** Release both reservations of a pass that never reached Google's billing; `label` names the pass in the log. */
-export function cancelPass(
+/** Release both reservations of a pass whose call never completed; `label` names the pass in the log. */
+function cancelPass(
   ctx: ToolContext,
   reservationId: number | null,
   throttleReservationId: number,
@@ -98,17 +118,34 @@ function ledgerEntryOf(run: AgenticRun): LedgerEntry {
 }
 
 /**
- * Settle a pass whose API call returned (its tokens were billed, even when reading the response threw afterwards).
+ * Close a pass, on every exit it has: settled as billed when its model call completed, both reservations cancelled
+ * when it did not. Called once per pass; `label` names the pass in the log.
+ */
+export function closePass(
+  run: AgenticRun,
+  pass: PassReservations,
+  call: PassCall,
+  label = 'ask_agentic',
+): void {
+  if (call.completed) {
+    settleBilledPass(run, pass, call.usage, label);
+    return;
+  }
+  cancelPass(run.ctx, pass.reservationId, pass.throttleReservationId, label);
+}
+
+/**
+ * Settle a pass whose API call completed (its tokens were billed, even when reading the response threw afterwards).
  * The input it billed is the prompt tokens it reported, else — a response without usage, or a read that threw before
  * the usage — the pass's estimate (`billedInputTokens`): under-billing a completed call is the worse error, and the
  * estimate keeps the daily cap and the TPM window a bound. The booking and the TPM release use that one figure; the
- * booking's `durationMs` is the pass's wall time.
+ * booking's `durationMs` is the pass's wall time; a booking that cannot be written is logged by `recordBilledCall`.
  */
-export function settleBilledPass(
+function settleBilledPass(
   run: AgenticRun,
   pass: PassReservations,
   usage: UsageCounts,
-  label = 'ask_agentic',
+  label: string,
 ): void {
   const billedInput = billedInputTokens(usage.promptTokenCount, pass.estimate);
   const billed = billedUsage(
@@ -120,20 +157,14 @@ export function settleBilledPass(
     run.resolved.resolved,
     undefined,
   );
-  try {
-    recordBilledCall(
-      run.ctx.manifest,
-      pass.reservationId,
-      ledgerEntryOf(run),
-      billed,
-      Date.now() - pass.startedAt,
-      label,
-    );
-  } catch (recordErr) {
-    logger.error(
-      `ask_agentic: the usage of a billed pass could not be recorded: ${safeForLog(recordErr)}`,
-    );
-  }
+  recordBilledCall(
+    run.ctx.manifest,
+    pass.reservationId,
+    ledgerEntryOf(run),
+    billed,
+    Date.now() - pass.startedAt,
+    label,
+  );
   if (pass.throttleReservationId !== NO_THROTTLE_RESERVATION) {
     run.ctx.throttle.release(pass.throttleReservationId, billedInput);
   }

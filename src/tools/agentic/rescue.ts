@@ -26,9 +26,8 @@ import { SYSTEM_INSTRUCTION_FINALIZATION } from './instructions.js';
 import {
   NO_THROTTLE_RESERVATION,
   type PassReservations,
-  cancelPass,
+  closePass,
   reservePass,
-  settleBilledPass,
   waitForTpm,
 } from './ledger.js';
 import { type UsageCounts, thinkingSummaryOf, usageCounts } from './response.js';
@@ -289,16 +288,8 @@ async function attemptRescue(
   } catch (finalErr) {
     recordRescueFailure(run, finalErr, flight.apiCallSucceeded, outcome);
   } finally {
-    if (flight.apiCallSucceeded) {
-      settleBilledPass(run, flight, outcome.usage, 'ask_agentic finalization');
-    } else {
-      cancelPass(
-        run.ctx,
-        flight.reservationId,
-        flight.throttleReservationId,
-        'ask_agentic finalization',
-      );
-    }
+    const call = { completed: flight.apiCallSucceeded, usage: outcome.usage };
+    closePass(run, flight, call, 'ask_agentic finalization');
     finalizationTimeout.dispose();
   }
 }

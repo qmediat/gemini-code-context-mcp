@@ -279,7 +279,10 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T42. Billed work is booked on every failure path (the immediate next PR)
+## ~~T42.~~ ✅ SHIPPED 2026-11-17 — Billed work is booked on every failure path
+
+**Shipped as:** one rule for `ask`, `code` and `ask_agentic`, written in `docs/cost-model.md` ("What is booked when a call fails"): a request is billed once its model call completed (its stream reached its end, or the forced-finalization pass's `generateContent` returned); a stream that failed or was aborted before its end is booked 0, as `ask` already did. Every `ask_agentic` pass is closed once by `closePass` (`src/tools/agentic/ledger.ts`): the iteration marks its call completed the moment its stream ended, so a timeout in its tool batch or a throw while its response is read books it (the usage read, else the estimate) and releases its TPM reservation at that input; only a pass whose call did not complete is cancelled. `recordBilledCall` (`src/tools/shared/call-ledger.ts`) is best-effort for the three tools: a failed usage-row insert is logged like a failed finalize, and the paid answer of `ask` / `code` is returned. The probe scenario `iter-malformed` throws inside the stream collector, before the stream's end, so it stays cancelled under that rule. The scope below is the entry as written.
+
 
 **Source:** the last cross-model reading of PR #133 (2026-11-17), findings X1 and X2; both pre-date the split and are not fixed in it.
 

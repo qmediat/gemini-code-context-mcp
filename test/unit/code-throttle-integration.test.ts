@@ -18,6 +18,7 @@ import {
 } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { expectAnswerDespiteUnwrittenUsageRow } from '../helpers/answer-booking.js';
 import { GEMINI_3_PRO, GEMINI_4_ARGON, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
 import { INLINE_CONTEXT, ONE_FILE_SCAN } from '../helpers/workspace.js';
@@ -152,6 +153,17 @@ describe('code.tool.ts throttle call sequence (T22b regression)', () => {
     const { ctx, throttleSpy } = buildCtx();
     const result = await codeTool.execute({ task: 'refactor' }, ctx);
     expect(result.isError).toBeUndefined();
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'release']);
+  });
+
+  it('a usage row that cannot be written: the answer is returned and the failed write logged', async () => {
+    const { ctx, throttleSpy } = buildCtx();
+    await expectAnswerDespiteUnwrittenUsageRow(
+      'code',
+      ctx.manifest,
+      () => codeTool.execute({ task: 'refactor' }, ctx),
+      'ok',
+    );
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'release']);
   });
 

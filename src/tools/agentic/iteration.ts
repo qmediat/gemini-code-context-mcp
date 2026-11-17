@@ -15,6 +15,7 @@ import {
   dispatchToolCallsParallel,
   resolveToolExecutionConcurrency,
 } from './dispatch.js';
+import type { PassCall } from './ledger.js';
 import { type UsageCounts, thinkingSummaryOf, usageCounts } from './response.js';
 import { resolveInsideWorkspace } from './sandbox.js';
 
@@ -55,6 +56,8 @@ export interface IterationArgs {
   maxFilesRead: number;
   /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
   abortSignal: AbortSignal;
+  /** The pass's model call: marked completed once the stream ended (its work is billed), then given the usage read. */
+  call: PassCall;
   /** User glob filters (v1.9.0+). Honoured by all four agentic executors so
    * a fallback from `ask` (which already applies the same globs to its
    * eager scanner) preserves filter semantics — no privacy regression. */
@@ -324,7 +327,9 @@ function toolResponseTokensOf(finalResponseParts: Part[]): number {
  */
 export async function runAgenticIteration(args: IterationArgs): Promise<IterationResult> {
   const response = await streamIteration(args);
+  args.call.completed = true;
   const usage = usageCounts(response.usageMetadata);
+  args.call.usage = usage;
   const parts: Part[] = response.candidates?.[0]?.content?.parts ?? [];
   const functionCallParts = parts.filter((p): p is FunctionCallPart =>
     Boolean(p.functionCall && typeof p.functionCall.name === 'string'),
