@@ -14,7 +14,7 @@ import { logger } from '../utils/logger.js';
 import type { ProgressEmitter } from '../utils/progress.js';
 import type { KnobNames } from './agentic/run.js';
 import { type AskAgenticInput, runAskAgentic } from './ask-agentic.tool.js';
-import type { AskInput } from './ask.tool.js';
+import type { AskInput } from './ask/input.js';
 import type { TextToolResult, ToolContext } from './registry.js';
 import { TOOL_TIMEOUT_ENV, type TimeoutController } from './shared/abort-timeout.js';
 
