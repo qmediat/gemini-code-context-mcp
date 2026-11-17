@@ -423,6 +423,23 @@ manifest writes on `main` and the branch. The immediate next PR after T47.
 
 ---
 
+## T52. One mock of `indexer/workspace-validation` for the test suites
+
+**Source:** the review of PR #137 (2026-11-17). Opened 2026-11-17.
+
+**Why:** eight unit suites mock `src/indexer/workspace-validation.js` with a factory of their own. Six of the
+factories export the `WorkspaceValidationError` class the workspace refusal tests with `instanceof`
+(`src/tools/shared/workspace-refusal.ts`); two — `test/unit/ask-attachments.test.ts` and
+`test/unit/service-tier.test.ts` — export only `validateWorkspacePath`, so the first test there that makes the
+validation throw stops at the missing export instead of reaching the refusal. No test does so today. The factories
+are also a repeat the duplicate baseline holds: adding the class to the two would grow it.
+
+**Scope:** one factory in the test helpers (where the repository's test-helper exemplar keeps them), read by the
+eight suites through `vi.mock(path, factory)`; the repeated blocks leave `jscpd-baseline.json`. No production
+change.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.
