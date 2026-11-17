@@ -497,7 +497,10 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
     // Re-read the clock AFTER create returns — long uploads would otherwise
     // make our tracked `cacheExpiresAt` artificially earlier than Google's.
     const afterCreateMs = Date.now();
-    const cacheId = created.name ?? null;
+    // A create that names no cache built none a request can use: it takes the failed-create path below (the files
+    // inline), never a context with neither a cache nor its files.
+    if (!created.name) throw new Error('caches.create returned no cache name');
+    const cacheId = created.name;
     const cacheExpiresAt = afterCreateMs + ttlSeconds * 1000;
 
     manifest.upsertWorkspace({

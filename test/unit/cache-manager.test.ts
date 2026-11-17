@@ -50,7 +50,7 @@ function mkModel(): ResolvedModel {
 }
 
 function mkClient(opts: {
-  cachesCreate?: (params: unknown) => Promise<{ name: string }>;
+  cachesCreate?: (params: unknown) => Promise<{ name?: string }>;
   cachesDelete?: (params: unknown) => Promise<unknown>;
   filesUpload?: (params: unknown) => Promise<{ uri?: string; name?: string }>;
 }): GoogleGenAI {
@@ -778,6 +778,34 @@ describe('prepareContext', () => {
     expect(result.inlineContents.length).toBeGreaterThan(0);
     expect(result.inlineOnly).toBe(false); // distinguishes "fallback after upload" from "small workspace"
   });
+
+  it.each([
+    ['an empty name', { name: '' }],
+    ['no name', {}],
+  ])(
+    'a cache created with %s is no cache: the files go inline, the manifest holds none',
+    async (_, created) => {
+      const client = mkClient({ cachesCreate: async () => created });
+
+      const result = await prepareContext({
+        client,
+        manifest: db,
+        scan: mkScan([{ relpath: 'named.ts', size: 8_000 }]),
+        model: mkModel(),
+        systemPromptHash: 'sph-1',
+        ttlSeconds: 3600,
+        emitter: mkEmitter(),
+        allowCaching: true,
+      });
+
+      expect(result.cacheId).toBeNull();
+      expect(result.cacheExpiresAt).toBeNull();
+      expect(result.rebuilt).toBe(false);
+      expect(result.inlineOnly).toBe(false);
+      expect(result.inlineContents).toHaveLength(1);
+      expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+    },
+  );
 
   // v1.14.0 round-1 review fix (F1, Copilot HIGH): the in-flight coalescing
   // key MUST include `cachingMode`. Pre-fix, two concurrent prepareContext
