@@ -9,6 +9,7 @@ import {
   maxDecodeRequests,
   preflightModeFor,
   resolveOutputCap,
+  thinkingBudgetRefusal,
 } from '../../src/gemini/long-decode.js';
 import { estimateCostUsd, estimatePreCallCostUsd } from '../../src/utils/cost-estimator.js';
 
@@ -292,10 +293,29 @@ describe('boundByInputWindow', () => {
     expect(cut).toEqual({ from: 262_144, to: 1_048_576 - 920_000 - O, inputTokenLimit: 1_048_576 });
   });
 
-  it('never cuts below one request: the first request sends the prompt alone', () => {
+  it('never cuts below one request: the first request sends the prompt alone, under the cut value on the wire', () => {
     const { cap, cut } = boundByInputWindow(longDecode(262_144), 190_000, 200_000);
-    expect(cap).toMatchObject({ effective: 65_536, maxRequests: 1, wire: 262_144 });
+    expect(cap).toMatchObject({ effective: 65_536, maxRequests: 1, wire: 65_536 });
     expect(cut?.to).toBe(65_536);
+  });
+
+  it('a cut to one request at a per-request limit of 32 768: the wire holds what is reserved', () => {
+    const argon = resolveOutputCap({
+      ...GEMINI_4,
+      outputTokenLimit: 32_768,
+      requested: 262_144,
+      forceMax: false,
+      fallbackLimit: 65_536,
+    });
+    const { cap } = boundByInputWindow(argon, 1_015_553, 1_048_576);
+    expect(cap).toMatchObject({ wire: 32_768, effective: 32_768, maxRequests: 1 });
+    // one streaming request decodes up to 65 536 unless the wire holds it: the bound is the wire's
+    expect(decodedTokensBound(cap.effective, cap.perRequest)).toBe(cap.wire);
+  });
+
+  it('a cut that leaves several requests keeps the caller cap on the wire', () => {
+    const { cap } = boundByInputWindow(longDecode(262_144), 920_000, 1_048_576);
+    expect(cap.wire).toBe(262_144);
   });
 
   it('leaves a cap the window holds, a one-request cap, and a call without a count as they are', () => {
@@ -305,5 +325,20 @@ describe('boundByInputWindow', () => {
     expect(boundByInputWindow(one, 1_000_000, 1_048_576)).toEqual({ cap: one, cut: null });
     expect(boundByInputWindow(fits, undefined, 1_048_576).cut).toBeNull();
     expect(boundByInputWindow(fits, 920_000, null).cut).toBeNull();
+  });
+});
+
+describe('thinkingBudgetRefusal', () => {
+  it('refuses a positive budget that leaves less than the answer reserve under the caller cap, naming the least cap', () => {
+    expect(thinkingBudgetRefusal(60_000, 1_000, 1_000)).toBe(
+      'thinkingBudget (60000) + 1024-token answer reserve exceeds maxOutputTokens (1000). Raise `maxOutputTokens` to at least 61024, or lower `thinkingBudget`.',
+    );
+  });
+
+  it('lets a budget that fits, a budget without a caller cap, and a dynamic or zero budget through', () => {
+    expect(thinkingBudgetRefusal(31_744, 32_768, 32_768)).toBeNull();
+    expect(thinkingBudgetRefusal(60_000, undefined, 8_192)).toBeNull();
+    expect(thinkingBudgetRefusal(-1, 1_000, 1_000)).toBeNull();
+    expect(thinkingBudgetRefusal(0, 1_000, 1_000)).toBeNull();
   });
 });

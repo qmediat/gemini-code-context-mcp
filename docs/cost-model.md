@@ -156,6 +156,13 @@ output reserved = C, or min(R·M, C + M − 1) when R > 1   (+ the thinking rese
   per request would let the last request run up to one request's decode past `C`. The reservation counts that
   overshoot (`decodedTokensBound`): `C + M − 1` at most, never more than `R` requests of `M`. For a cap that is a
   multiple of `M` (262,144, 1,048,576 on Hydrogen) that is `C` itself.
+- Under a cap the model's input window cut (`outputCapCutByInputWindow`), `C` is the cut value. A cut that leaves
+  several requests keeps the caller's cap on the wire, above `C`, so the overshoot past `C` is certain and reserved as
+  above; a cut that leaves one request sends `C` itself as `maxOutputTokens`. The thinking reserve is sized from the cut
+  `C` too. The cut rests on a premise that is assumed, not measured: that the API refuses a continuation request
+  whose prompt plus decoded tokens pass the input window (`docs/FOLLOW-UP-PRS.md` T41).
+- A request that reports no usage is billed at the reservation's own input estimate — the larger of the heuristic and
+  the preflight's count — plus what was decoded before it, so the ledger keeps the daily cap a bound.
 - A request that makes no progress (it returns the token it was sent with, or decodes nothing) ends the decode, so
   a stuck stop is not re-billed up to `R` times.
 - A context cache that expires after a request of the decode completed ends the call with that request billed; the

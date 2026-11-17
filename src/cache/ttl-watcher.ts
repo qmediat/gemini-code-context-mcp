@@ -69,10 +69,10 @@ export class TtlWatcher {
    * keep-alive is best-effort: a failed refresh, or a manifest that cannot be read or written, is logged and leaves
    * the request to meet the cache as it is.
    *
-   * `signal` is the calling request's: an aborted signal starts no refresh, a refresh this call starts carries it into
-   * `caches.update`, and the wait ends with its abort reason the moment it fires — the only rejection of this method,
-   * so a slow or hanging refresh never holds a call past its timeout. A call that finds a refresh of the same cache
-   * running joins it under its own signal.
+   * `signal` is the calling request's: an aborted signal starts no refresh, and the wait ends with its abort reason the
+   * moment it fires — the only rejection of this method, so a slow or hanging refresh never holds a call past its
+   * timeout. The refresh itself carries no caller's signal: it is shared by every keep-alive of the cache and by the
+   * tick, so it runs to its end for the others when the call that started it leaves.
    */
   async keepAlive(
     workspaceRoot: string,
@@ -82,7 +82,7 @@ export class TtlWatcher {
   ): Promise<void> {
     throwIfAborted(signal);
     const entry = this.hotEntry(workspaceRoot, cacheId, ttlSeconds);
-    await abortable(this.refresh(entry, Date.now(), signal), signal);
+    await abortable(this.refresh(entry, Date.now()), signal);
   }
 
   private hotEntry(workspaceRoot: string, cacheId: string, ttlSeconds: number): HotEntry {
@@ -118,10 +118,10 @@ export class TtlWatcher {
    * The one refresh of the entry's cache: the running one when there is one, else a new one. It never rejects — a
    * failure of the refresh or of the manifest is logged here, for the tick and the keep-alive alike.
    */
-  private refresh(entry: HotEntry, now: number, signal?: AbortSignal): Promise<void> {
+  private refresh(entry: HotEntry, now: number): Promise<void> {
     const running = this.refreshing.get(entry.cacheId);
     if (running !== undefined) return running;
-    const started = this.refreshIfDue(entry, now, signal)
+    const started = this.refreshIfDue(entry, now)
       .catch((err: unknown) => {
         logger.warn(`ttl refresh failed for ${safeForLog(entry.cacheId)}: ${safeForLog(err)}`);
       })
@@ -131,7 +131,7 @@ export class TtlWatcher {
   }
 
   /** Extends the entry's cache when it expires within the refresh window; drops an entry whose cache is gone. */
-  private async refreshIfDue(entry: HotEntry, now: number, signal?: AbortSignal): Promise<void> {
+  private async refreshIfDue(entry: HotEntry, now: number): Promise<void> {
     const ws = this.manifest.getWorkspace(entry.workspaceRoot);
     if (!ws?.cacheId || ws.cacheId !== entry.cacheId) {
       this.hot.delete(entry.workspaceRoot);
@@ -144,10 +144,7 @@ export class TtlWatcher {
     try {
       answered = await this.client.caches.update({
         name: entry.cacheId,
-        config: {
-          ttl: `${entry.ttlSeconds}s`,
-          ...(signal !== undefined ? { abortSignal: signal } : {}),
-        },
+        config: { ttl: `${entry.ttlSeconds}s` },
       });
     } catch (err) {
       this.updateFailed(entry, err);

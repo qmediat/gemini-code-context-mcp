@@ -19,7 +19,7 @@ import { TtlWatcher } from '../../src/cache/ttl-watcher.js';
 import type { ManifestDb } from '../../src/manifest/db.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
-import { GEMINI_3_PRO, GEMINI_4_HYDROGEN } from '../helpers/models.js';
+import { GEMINI_3_PRO, GEMINI_4_ARGON, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { chunkedStream, midStreamFailure, singleChunkStream } from '../helpers/stream-mock.js';
 import { ONE_FILE_SCAN, oneFileScan } from '../helpers/workspace.js';
 
@@ -444,6 +444,48 @@ describe('ask — a long decode between its requests', () => {
     expect(result.structuredContent?.continuationHops).toBe(1);
   });
 
+  it('a cut that leaves one request at a per-request limit of 32 768: the cut value on the wire, the budget below it', async () => {
+    const { ctx, generateContentStream } = buildCtx();
+    // a 200 000-token window and a 171 000-token prompt leave 28 744: one request of Argon's 32 768
+    mocks.resolveModel.mockResolvedValue({ ...GEMINI_4_ARGON, inputTokenLimit: 200_000 });
+    (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 170_000 });
+    generateContentStream.mockImplementation(
+      chunkedStream([
+        {
+          candidates: [{ index: 0, finishReason: 'MAX_TOKENS' as never }],
+          usageMetadata: {
+            promptTokenCount: 171_000,
+            candidatesTokenCount: 0,
+            thoughtsTokenCount: 32_000,
+          },
+        },
+      ]),
+    );
+
+    const result = await askTool.execute(
+      { prompt: 'review', maxOutputTokens: 262_144, thinkingBudget: 50_000 },
+      ctx,
+    );
+
+    expect(generateContentStream).toHaveBeenCalledTimes(1);
+    const config = (generateContentStream.mock.calls[0]?.[0] as { config: Record<string, unknown> })
+      .config;
+    expect(config.maxOutputTokens).toBe(32_768);
+    expect(config.thinkingConfig).toMatchObject({ thinkingBudget: 32_768 - 1_024 });
+    expect(result.structuredContent?.outputCapCutByInputWindow).toEqual({
+      from: 262_144,
+      to: 32_768,
+      inputTokenLimit: 200_000,
+    });
+    // the empty answer names the window that cut the cap, not the model's limit
+    expect(result.structuredContent?.errorCode).toBe('OUTPUT_CAP');
+    expect(String(result.structuredContent?.responseText)).toContain(
+      "The model's 200,000-token input window left 32,768 output tokens for this prompt",
+    );
+  });
+
   it('the stall watchdog does not count the gap before a continuation request opens', async () => {
     const { ctx, generateContentStream } = buildCtx();
     generateContentStream
@@ -572,8 +614,11 @@ describe('ask — the ledger of a decode that fails', () => {
     });
   });
 
-  it('a request that reports no usage is billed at its input estimate, never at zero', async () => {
+  it("a request that reports no usage is billed at the reservation's own input: the preflight count above the heuristic", async () => {
     const { ctx, generateContentStream } = budgetedCtx();
+    (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 99_000 });
     generateContentStream.mockImplementationOnce(
       chunkedStream([
         {
@@ -593,11 +638,28 @@ describe('ask — the ledger of a decode that fails', () => {
 
     expect(result.isError).toBeFalsy();
     const settled = manifestOf(ctx).finalizeBudgetReservation.mock.calls[0]?.[1] as {
-      costUsdMicro: number;
       uncachedTokens: number;
     };
-    expect(settled.uncachedTokens).toBeGreaterThan(0);
-    expect(settled.costUsdMicro).toBeGreaterThan(0);
+    // the counted prompt (99 000 + the 1 000-token system reserve), far above the one small file's bytes/4
+    expect(settled.uncachedTokens).toBe(100_000);
+  });
+
+  it('a call whose cap the input window cut reserves what a call asking for the cut value reserves', async () => {
+    const reservedMicros = async (maxOutputTokens: number): Promise<number> => {
+      const { ctx, generateContentStream } = budgetedCtx();
+      mocks.resolveModel.mockResolvedValue({ ...GEMINI_4_HYDROGEN, inputTokenLimit: 200_000 });
+      (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+        .fn()
+        .mockResolvedValue({ totalTokens: 99_000 });
+      generateContentStream.mockImplementation(answering('The answer.', 'STOP', 100_000));
+      await askTool.execute({ prompt: 'review', maxOutputTokens, thinkingLevel: 'HIGH' }, ctx);
+      return (ctx.manifest.reserveBudget as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+        .estimatedCostMicros as number;
+    };
+    // 262 144 is cut to 200 000 − 100 000 − 256 = 99 744 by the window
+    const cut = 200_000 - 100_000 - 256;
+
+    expect(await reservedMicros(262_144)).toBe(await reservedMicros(cut));
   });
 
   it('a first request that fails releases the reservation whole and reports no usage', async () => {

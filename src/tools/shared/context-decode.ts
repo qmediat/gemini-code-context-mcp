@@ -22,6 +22,7 @@ import {
 import type { RanCachingMode } from '../../cache/caching-mode.js';
 import type { TtlWatcher } from '../../cache/ttl-watcher.js';
 import type { ManifestDb } from '../../manifest/db.js';
+import { requestInputTokens } from '../../utils/cost-estimator.js';
 import { logger } from '../../utils/logger.js';
 import { type TimeoutController, isTimeoutAbort } from './abort-timeout.js';
 import type { LedgerEntry } from './call-ledger.js';
@@ -74,8 +75,15 @@ export interface ContextDecodeCall {
   readonly completed: CompletedRequests;
   readonly tracking: DecodeTracking;
   readonly throttle: DispatchThrottle;
-  /** The first request's input estimate: what its throttle reservation holds. */
-  readonly estimatedInputTokens: number;
+  readonly inputTokens: FirstRequestInput;
+}
+
+/** What the first request's input is estimated at, before it reports its usage. */
+export interface FirstRequestInput {
+  /** The bytes/4 heuristic: what the request's throttle reservation holds. */
+  readonly estimated: number;
+  /** The preflight's count, when it ran. */
+  readonly counted: number | undefined;
 }
 
 export interface ContextDecode {
@@ -90,7 +98,7 @@ export async function decodeOnContext(
   call: ContextDecodeCall,
   initial: PreparedContext,
 ): Promise<ContextDecode> {
-  await call.throttle.reserve(call.booking.model, call.estimatedInputTokens);
+  await call.throttle.reserve(call.booking.model, call.inputTokens.estimated);
   let decoded: ContextDecode;
   try {
     const response = await decodeOn(call, initial, call.booking.toolName);
@@ -147,7 +155,8 @@ async function decodeOn(
     completed: call.completed,
     beforeReopen: () => call.throttle.renew(),
     hooks: {
-      firstRequestInput: call.estimatedInputTokens,
+      // a request that reports no usage is billed at the reservation's own input, so the ledger stays inside it
+      firstRequestInput: requestInputTokens(call.inputTokens.estimated, call.inputTokens.counted),
       afterRequest: (usage) => {
         call.timeout.pauseStall();
         call.throttle.settle(usage?.promptTokenCount);
@@ -194,7 +203,7 @@ async function retryOnFreshCache(
     markCacheStale({ manifest: call.cache.manifest, workspaceRoot: call.booking.workspaceRoot });
     const rebuilt = await call.cache.prepare();
     // A fresh reservation, stamped when the retry is sent.
-    await call.throttle.reserve(call.booking.model, call.estimatedInputTokens);
+    await call.throttle.reserve(call.booking.model, call.inputTokens.estimated);
     const response = await decodeOn(call, rebuilt, `${tool} (stale-cache retry)`);
     return { response, prep: rebuilt, retriedOnStaleCache: true };
   } catch (retryErr) {

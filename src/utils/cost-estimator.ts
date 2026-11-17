@@ -378,6 +378,14 @@ export interface PreCallEstimateInputs {
 }
 
 /**
+ * The input one request of a call is reserved at — and billed at when it reports no usage: the larger of the bytes/4
+ * heuristic and the preflight's count, when it ran (the heuristic undercounts dense text).
+ */
+export function requestInputTokens(heuristic: number, counted: number | undefined): number {
+  return Math.max(heuristic, counted ?? 0);
+}
+
+/**
  * Pre-call cost estimate used by the budget-reservation path. Charges
  * the workspace content at the UNCACHED rate on purpose — on the first
  * call a cache doesn't exist yet and the reservation must cover that
@@ -390,7 +398,7 @@ export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   const workspaceTokens = Math.ceil(Math.max(0, input.workspaceBytes) / 4);
   const promptTokens = Math.ceil(Math.max(0, input.promptChars) / 4);
   const heuristicInput = workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0);
-  const requestInput = Math.max(heuristicInput, input.countedInputTokens ?? 0);
+  const requestInput = requestInputTokens(heuristicInput, input.countedInputTokens);
   const outputCap = Math.max(0, input.expectedOutputTokens);
   const perRequest = input.perRequestOutputTokens;
   const continuationInput =

@@ -40,6 +40,7 @@ import type {
 } from '@google/genai';
 import { ApiError, FunctionCallingConfigMode, Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
+import { thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type MatchConfig, defaultMatchConfig } from '../indexer/globs.js';
@@ -634,24 +635,18 @@ async function executeAskAgenticBody(
       ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
     });
 
-    // Compatibility guard (mirror of ask.tool.ts): reject locally when
-    // thinkingBudget + answer-reserve > maxOutputTokens so the model
-    // never sees a 400 "thinking exceeds output budget" from Gemini.
-    // PR #24 review by GPT.
-    if (
-      typeof input.thinkingBudget === 'number' &&
-      input.thinkingBudget > 0 &&
-      typeof input.maxOutputTokens === 'number' &&
-      input.maxOutputTokens < input.thinkingBudget + 1024
-    ) {
-      return errorResult(
-        `ask_agentic: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${input.maxOutputTokens}). Raise maxOutputTokens to at least ${input.thinkingBudget + 1024}, or lower thinkingBudget.`,
-        {
-          errorCode: 'UNKNOWN',
-          retryable: false,
-          subReason: 'INVALID_THINKING_OUTPUT_COMBO',
-        },
-      );
+    // Refused locally, so the model never answers a 400 "thinking exceeds output budget".
+    const budgetRefusal = thinkingBudgetRefusal(
+      input.thinkingBudget,
+      input.maxOutputTokens,
+      input.maxOutputTokens ?? 0,
+    );
+    if (budgetRefusal !== null) {
+      return errorResult(`ask_agentic: ${budgetRefusal}`, {
+        errorCode: 'UNKNOWN',
+        retryable: false,
+        subReason: 'INVALID_THINKING_OUTPUT_COMBO',
+      });
     }
 
     const thinkingConfig: ThinkingConfig | undefined = (() => {

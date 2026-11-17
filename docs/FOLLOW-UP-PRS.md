@@ -247,6 +247,36 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
+## T39. Split `src/tools/ask-agentic.tool.ts` into modules — the next PR after #131
+
+**Source:** the reviews of PR #131 (2026-11-17).
+
+**Why:** the file is 107 KB, one tool in one module. It did not fit the review packets of two of the automated reviewers (Codex, Grok), so PR #131 was reviewed with their packet caps raised inside their model windows. A file a reviewer cannot read whole is reviewed in part or at a raised price.
+
+**Scope:** split it by concern (the loop, the sandboxed tools, the budget and throttle settlement, the result) into modules under `src/tools/agentic/` with the tool file as the entry; no behaviour change, the existing tests green unchanged. The immediate next PR after #131.
+
+---
+
+## T40. A reopened continuation request keeps its throttle place while the reopening falls inside its reservation's window
+
+**Source:** the reviews of PR #131 (2026-11-17); named as a limit in `docs/tools.md` (*Between requests*).
+
+**Why:** a continuation request refused at its opening with 429 or 503 gives up its TPM reservation and takes a new one (`DispatchThrottle.renew`, `src/tools/shared/dispatch-throttle.ts`). Behind another call's future-dated reservation the new one can wait a whole minute's window although Google asked for a second or two; the per-minute limit holds, the cost is latency under a `timeoutMs` that already holds a billed request. Measured on the build: two calls of 60 000-token continuations under a 100 000 limit, both refused with a 1 s hint, waited 123 s and 62 s.
+
+**Scope:** a rule in `dispatch-throttle.ts`: the reopening keeps the slot it holds while it falls inside that reservation's window, and takes a new one only past it. Its own PR, with a test of two calls refused at once.
+
+---
+
+## T41. Measure what the API answers to a continuation request whose input passes the model's input window
+
+**Source:** the reviews of PR #131 (2026-11-17).
+
+**Why:** `boundByInputWindow` (`src/gemini/long-decode.ts`) cuts a long decode's cap so that no continuation request's prompt plus decoded tokens pass the input window, on the premise that the API refuses such a request. The premise is assumed, not measured: the repository holds a measurement of what a continuation request bills, none of a refusal at the window. If the API continues past the window, the cut truncates answers it would have finished; if it refuses, the cut is right.
+
+**Scope:** one paid call whose prompt plus decoded tokens come near the model's input window, without the cut, recording what the continuation request answers (the error and its status, or a completed request and its billed input). Then keep the cut, or drop it, and say which in `docs/tools.md` and `docs/cost-model.md`.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.

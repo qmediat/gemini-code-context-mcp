@@ -19,10 +19,10 @@ import {
   cachingRan,
 } from '../cache/caching-mode.js';
 import {
-  boundByInputWindow,
-  describeInputWindowCut,
+  capThatRuns,
   preflightModeFor,
   resolveOutputCap,
+  thinkingBudgetRefusal,
 } from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
@@ -52,7 +52,7 @@ import {
 } from './shared/service-tier.js';
 import { settleAnswer, settleFailure } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVEL_FIELD, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
 
 /**
  * `code` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -431,8 +431,8 @@ async function executeCodeBody(
     // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
     // to pin every call at the model's full 65,536-token capacity.
     const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
-    // `effectiveOutputCap` (the wire cap, else the model's per-request limit) is the worst case the thinking clamp
-    // and the budget reservation use; a cap above the per-request limit on a long-decode model continues the decode.
+    // The caller's `thinkingBudget` is checked against `outputCap` (the wire cap, else the model's per-request limit);
+    // the clamp and the reservation use the cap that runs (`runCap`, after the input window's cut).
     const outputCap = resolveOutputCap({
       requested: input.maxOutputTokens,
       forceMax: ctx.config.forceMaxOutputTokens,
@@ -440,62 +440,15 @@ async function executeCodeBody(
       longDecodeTokenLimit: resolved.longDecodeTokenLimit,
       fallbackLimit: CODE_MAX_OUTPUT_TOKENS_FALLBACK,
     });
-    const wireMaxOutputTokens = outputCap.wire;
-    const effectiveOutputCap = outputCap.effective;
 
-    // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
-    // is carved out of the candidate-output allowance). The hard cap above
-    // may clamp maxOutputTokens as low as the model's `outputTokenLimit`
-    // (e.g. 8_192 on Flash-lite). Clamp the effective thinkingBudget so
-    // the generateContent call never 400s on this invariant; reserve at
-    // least 1_024 tokens for the actual completion.
-    //
-    // Only meaningful on the thinkingBudget path — when the caller uses
-    // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
-    // value is ignored by the thinkingConfig builder below.
-    //
-    // Early-reject when the caller's per-call `maxOutputTokens` can't fit
-    // an explicit positive `thinkingBudget` + 1024-token answer reserve.
-    // Silently clamping to 0 would make Gemini 3 Pro 400 on a
-    // "thinking disabled" error and obscure the real mismatch (PR #22
-    // round-3 review finding #C).
-    if (
-      input.thinkingBudget !== undefined &&
-      input.thinkingBudget > 0 &&
-      input.maxOutputTokens !== undefined &&
-      effectiveOutputCap < input.thinkingBudget + 1024
-    ) {
-      return errorResult(
-        `code: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
-      );
-    }
-    const effectiveThinkingBudget =
-      thinkingBudget !== undefined && thinkingBudget > 0
-        ? Math.max(0, Math.min(thinkingBudget, effectiveOutputCap - 1024))
-        : 0;
-
-    // Cost-estimate thinking-token reserve — tier-aware when the caller
-    // uses `thinkingLevel`, exact-on-the-budget when they use
-    // `thinkingBudget`. Mirror of `ask.tool.ts` logic; see
-    // `THINKING_LEVEL_RESERVE` in `shared/thinking.ts` for the rationale
-    // behind the per-tier numbers and why HIGH falls through to the
-    // dynamic cap.
-    //
-    // Defensive clamp: tier reserves (MINIMAL=512, LOW=2048, MEDIUM=4096)
-    // are fixed constants, but `maxOutputTokens` can be clamped down to a
-    // resolved model's `outputTokenLimit`. A future small-cap model (say
-    // `outputTokenLimit: 4000`) would let MEDIUM's 4096 exceed the
-    // available headroom and over-estimate the budget reservation. Clamp
-    // every tier's reserve against the dynamic headroom so the upper
-    // bound stays coherent across model rollouts (PR #17 self-review F2).
-    const thinkingHeadroom = Math.max(0, effectiveOutputCap - 1024);
-    const thinkingTokensForEstimate =
-      input.thinkingLevel !== undefined
-        ? Math.min(
-            THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? thinkingHeadroom,
-            thinkingHeadroom,
-          )
-        : effectiveThinkingBudget;
+    // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
+    // (`thinkingBudgetRefusal`); below, the budget on the wire is clamped under the cap that runs.
+    const budgetRefusal = thinkingBudgetRefusal(
+      input.thinkingBudget,
+      input.maxOutputTokens,
+      outputCap.effective,
+    );
+    if (budgetRefusal !== null) return errorResult(`code: ${budgetRefusal}`);
 
     // Shared input-token fingerprint for budget + TPM throttle (see
     // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
@@ -552,17 +505,26 @@ async function executeCodeBody(
       );
     }
 
-    // A long decode never sends a continuation request past the input window: the cap is cut to what it leaves.
-    const { cap: runCap, cut: inputWindowCut } = boundByInputWindow(
-      outputCap,
-      preflight?.effectiveTokens,
-      contextWindow,
+    const { cap: runCap, cut: inputWindowCut } = capThatRuns({
+      tool: 'code',
+      cap: outputCap,
+      promptTokens: preflight?.effectiveTokens,
+      inputTokenLimit: contextWindow,
+      emit: (message) => emitter.emit(message),
+    });
+
+    // The budget on the wire: clamped below the cap that runs, after the input window's cut — a cap cut to one
+    // request goes on the wire as its cut value, and `thinkingBudget < maxOutputTokens` holds there too.
+    const effectiveThinkingBudget =
+      thinkingBudget !== undefined && thinkingBudget > 0
+        ? thinkingBudgetUnder(runCap, thinkingBudget)
+        : 0;
+    // The thinking the budget reservation counts, from the cap that runs.
+    const thinkingTokensForEstimate = thinkingReserve(
+      input.thinkingLevel,
+      effectiveThinkingBudget,
+      runCap,
     );
-    if (inputWindowCut !== null) {
-      const note = `code: ${describeInputWindowCut(inputWindowCut)}`;
-      emitter.emit(note);
-      logger.warn(note);
-    }
 
     // Atomic budget reservation — see ask.tool.ts for the full rationale.
     // Estimate includes the thinking budget (billed as output tokens on Pro)
@@ -679,8 +641,7 @@ async function executeCodeBody(
     }
     const tierField = serviceTierConfig(serviceTier);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
-      const maxOutputField =
-        wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
+      const maxOutputField = runCap.wire !== undefined ? { maxOutputTokens: runCap.wire } : {};
       if (canUseCache(cacheId) && cacheId) {
         // With cache: system_instruction is baked in; thinkingConfig remains OK.
         // `maxOutputTokens` only emitted when the caller set it explicitly
@@ -734,7 +695,7 @@ async function executeCodeBody(
         completed,
         tracking,
         throttle: dispatch,
-        estimatedInputTokens,
+        inputTokens: { estimated: estimatedInputTokens, counted: preflight?.effectiveTokens },
       },
       ctxPrep,
     );

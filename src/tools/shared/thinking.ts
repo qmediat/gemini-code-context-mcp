@@ -10,6 +10,7 @@
  */
 
 import { z } from 'zod';
+import { ANSWER_RESERVE_TOKENS, type InputWindowCut } from '../../gemini/long-decode.js';
 
 /**
  * Accepted values for `thinkingLevel` on both `ask` and `code`. Uppercased
@@ -71,10 +72,9 @@ export type ThinkingLevelLiteral = (typeof THINKING_LEVELS)[number];
  * decides to spend); a subsequent call will see the larger measured cost
  * in the budget ledger.
  *
- * HIGH and XHIGH intentionally map to `null` → call sites substitute
- * `maxOutputTokens - 1024` so the value tracks each tool's actual output
- * cap (8_192 for `ask`, 32_768 for `code`) rather than a hard-coded
- * duplicate.
+ * HIGH and XHIGH intentionally map to `null` → `thinkingReserve`
+ * substitutes the cap that runs minus the answer reserve, so the value
+ * tracks each call's actual output cap rather than a hard-coded duplicate.
  */
 export const THINKING_LEVEL_RESERVE: Record<ThinkingLevelLiteral, number | null> = {
   MINIMAL: 512,
@@ -83,6 +83,11 @@ export const THINKING_LEVEL_RESERVE: Record<ThinkingLevelLiteral, number | null>
   HIGH: null,
   XHIGH: null,
 };
+
+/** A positive `thinkingBudget` clamped below the cap that runs, keeping the answer reserve beside it. */
+export function thinkingBudgetUnder(cap: CapThatRan, budget: number): number {
+  return Math.max(0, Math.min(budget, cap.effective - ANSWER_RESERVE_TOKENS));
+}
 
 /** The `errorCode` of a call that ended at the output cap with no answer. */
 export const OUTPUT_CAP_ERROR_CODE = 'OUTPUT_CAP';
@@ -101,6 +106,24 @@ export interface CapThatRan {
   readonly effective: number;
   readonly perRequest: number;
   readonly ceiling: number;
+}
+
+/**
+ * The thinking tokens a budget reservation counts for a call whose output runs under `cap` (the cap that runs, after
+ * the input window's cut, so a cut call reserves no more than it can decode): a `thinkingLevel`'s tier reserve, all
+ * the cap leaves beside the answer reserve for a dynamic or model-default budget (`-1` / `null`: Gemini 3 Pro and the
+ * Gemini 4 models think without being asked), else the budget itself. A tier reserve is clamped to that headroom, so a
+ * small-cap model never reserves more thinking than it can decode.
+ */
+export function thinkingReserve(
+  level: ThinkingLevelLiteral | undefined,
+  budget: number | null,
+  cap: CapThatRan,
+): number {
+  const headroom = Math.max(0, cap.effective - ANSWER_RESERVE_TOKENS);
+  if (level !== undefined) return Math.min(THINKING_LEVEL_RESERVE[level] ?? headroom, headroom);
+  if (budget === null || budget === -1) return headroom;
+  return budget;
 }
 
 /** How a call's answer ended: the last request's finish reason and whether the text was cut at the output cap. */
@@ -123,8 +146,14 @@ const LOWER_THE_THINKING =
 
 const tokenCount = (n: number): string => n.toLocaleString('en-US');
 
-/** What the caller can change after a stop at `cap`: raise the cap where the model allows more, else the thinking. */
-function capRemedy(cap: CapThatRan): string {
+/**
+ * What the caller can change after a stop at `cap`: raise the cap where the model allows more, else the thinking — and,
+ * under a cap the input window cut, the size of the prompt, which decides what that window leaves.
+ */
+function capRemedy(cap: CapThatRan, cut: InputWindowCut | null): string {
+  if (cut !== null) {
+    return `The model's ${tokenCount(cut.inputTokenLimit)}-token input window left ${tokenCount(cut.to)} output tokens for this prompt (the cap was cut from ${tokenCount(cut.from)}): ${LOWER_THE_THINKING}, or send a smaller workspace.`;
+  }
   if (cap.effective < cap.perRequest) {
     return `Raise \`maxOutputTokens\` (it was ${tokenCount(cap.effective)}; the model allows ${tokenCount(cap.perRequest)} per request), or ${LOWER_THE_THINKING}.`;
   }
@@ -141,15 +170,16 @@ function capRemedy(cap: CapThatRan): string {
  * A call that ended at the output cap with no answer: the model's thinking used the cap (thinking tokens count
  * against `maxOutputTokens`, and Gemini 4 Carbon / Hydrogen and the 3.x Pro models think without being asked), in
  * one request (`MAX_TOKENS`) or over a long decode stopped at its limits (`CONTINUATION`). The message names the
- * cause and the remedy that fits the cap that ran; `null` for any call that produced text or stopped for another
- * reason.
+ * cause and the remedy that fits the cap that ran and the cut the input window made to it (`null`: none); `null` for
+ * any call that produced text or stopped for another reason.
  */
 export function emptyAtOutputCap(
   response: FinishedResponse,
   thinkingTokens: number,
   cap: CapThatRan,
+  cut: InputWindowCut | null,
 ): string | null {
   const stopped = response.candidates?.[0]?.finishReason;
   if (response.text.trim() !== '' || !AT_OUTPUT_CAP.has(stopped)) return null;
-  return `the model stopped at the output cap before writing an answer (thinking used ${tokenCount(thinkingTokens)} tokens of it; the call was billed). ${capRemedy(cap)}`;
+  return `the model stopped at the output cap before writing an answer (thinking used ${tokenCount(thinkingTokens)} tokens of it; the call was billed). ${capRemedy(cap, cut)}`;
 }

@@ -37,10 +37,10 @@ import {
   cachingRan,
 } from '../cache/caching-mode.js';
 import {
-  boundByInputWindow,
-  describeInputWindowCut,
+  capThatRuns,
   preflightModeFor,
   resolveOutputCap,
+  thinkingBudgetRefusal,
 } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
@@ -69,7 +69,7 @@ import {
 } from './shared/service-tier.js';
 import { settleAnswer, settleFailure } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVEL_FIELD, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
+import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
 
 /**
  * `ask` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -484,8 +484,8 @@ async function executeAskBody(
     //      own default (its advertised `outputTokenLimit`), letting the model
     //      size the response to the query rather than reserving full capacity.
     //
-    // `effectiveOutputCap` is the worst case the thinking clamp and the
-    // budget reservation use: the wire cap, else the per-request limit.
+    // The caller's `thinkingBudget` is checked against `outputCap`; the
+    // clamp and the reservation use the cap that runs (`runCap`).
     const outputCap = resolveOutputCap({
       requested: input.maxOutputTokens,
       forceMax: ctx.config.forceMaxOutputTokens,
@@ -493,8 +493,6 @@ async function executeAskBody(
       longDecodeTokenLimit: resolved.longDecodeTokenLimit,
       fallbackLimit: ASK_MAX_OUTPUT_TOKENS_FALLBACK,
     });
-    const wireMaxOutputTokens = outputCap.wire;
-    const effectiveOutputCap = outputCap.effective;
 
     // Single source of truth for "is the caller driving reasoning via the
     // discrete-tier knob?". Three downstream call sites branch on this
@@ -503,68 +501,14 @@ async function executeAskBody(
     // to forget.
     const usingThinkingLevel = input.thinkingLevel !== undefined;
 
-    // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
-    // is carved out of the candidate-output allowance). Reject the call
-    // early when the caller's `maxOutputTokens` leaves no headroom for a
-    // positive `thinkingBudget`, rather than silently clamping to 0 —
-    // clamp-to-0 would make Gemini 3 Pro 400 ("thinking disabled"
-    // rejected) and mislead the caller about the actual cause (PR #22
-    // round-3 review finding #C). Minimum answer reserve: 1024 tokens.
-    if (
-      input.thinkingBudget !== undefined &&
-      input.thinkingBudget > 0 &&
-      input.maxOutputTokens !== undefined &&
-      effectiveOutputCap < input.thinkingBudget + 1024
-    ) {
-      return errorResult(
-        `ask: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
-      );
-    }
-
-    // Normalise thinkingBudget:
-    //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)
-    //   -1        → -1  (explicit legacy dynamic; kept for Gemini 2.5 and
-    //                    power-users who want to force the legacy path)
-    //    0        →  0  (thinking disabled; Gemini 3 Pro will 400 here)
-    //    N > 0    → clamp to [0, maxOutputTokens - 1024] — the thinking
-    //              pool is carved out of the candidate-output allowance,
-    //              so reserving ≥1024 tokens for the answer prevents 400s
-    //              when a caller passes N ≥ maxOutputTokens.
-    //
-    // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel`
-    // are never both set, so we handle them in two mutually-exclusive
-    // branches below.
-    const rawThinkingBudget = input.thinkingBudget;
-    const effectiveThinkingBudget: number | null =
-      rawThinkingBudget === undefined
-        ? THINKING_BUDGET_MODEL_DEFAULT
-        : rawThinkingBudget === -1
-          ? -1
-          : rawThinkingBudget > 0
-            ? Math.max(0, Math.min(rawThinkingBudget, effectiveOutputCap - 1024))
-            : 0;
-
-    // Cost-estimate thinking-token reserve — tier-aware when the caller
-    // uses `thinkingLevel`, worst-case when they use `thinkingBudget: -1`
-    // or omit both fields (Gemini 3 Pro always spends thinking tokens per
-    // Google's docs, so we reserve dynamic-thinking headroom there too).
-    // When the caller passes an explicit positive `thinkingBudget`, we
-    // reserve only that much. Keeps `GEMINI_DAILY_BUDGET_USD` a TRUE
-    // upper bound on completed spend without false-rejecting callers
-    // who legitimately use a low tier (see `THINKING_LEVEL_RESERVE`
-    // rationale above).
-    //
-    // We dereference `input.thinkingLevel` directly (rather than via
-    // `usingThinkingLevel`) so TypeScript narrows the type inside the
-    // ternary — `THINKING_LEVEL_RESERVE[undefined]` would be a compile
-    // error. The `?? worst-case` fallback handles the HIGH tier (which
-    // maps to `null` in the reserve table to mean "use the dynamic cap").
-    const thinkingTokensForEstimate =
-      input.thinkingLevel !== undefined
-        ? (THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? Math.max(0, effectiveOutputCap - 1024))
-        : effectiveThinkingBudget === null || effectiveThinkingBudget === -1
-          ? Math.max(0, effectiveOutputCap - 1024)
-          : effectiveThinkingBudget;
+    // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
+    // (`thinkingBudgetRefusal`); below, the budget on the wire is clamped under the cap that runs.
+    const budgetRefusal = thinkingBudgetRefusal(
+      input.thinkingBudget,
+      input.maxOutputTokens,
+      outputCap.effective,
+    );
+    if (budgetRefusal !== null) return errorResult(`ask: ${budgetRefusal}`);
 
     // Estimated input-token count drives both the daily-budget reservation
     // (dollars) and the TPM throttle reservation (rate). Hoisted here so
@@ -845,17 +789,44 @@ async function executeAskBody(
       );
     }
 
-    // A long decode never sends a continuation request past the input window: the cap is cut to what it leaves.
-    const { cap: runCap, cut: inputWindowCut } = boundByInputWindow(
-      outputCap,
-      preflight?.effectiveTokens,
-      contextWindow,
+    const { cap: runCap, cut: inputWindowCut } = capThatRuns({
+      tool: 'ask',
+      cap: outputCap,
+      promptTokens: preflight?.effectiveTokens,
+      inputTokenLimit: contextWindow,
+      emit: (message) => emitter.emit(message),
+    });
+
+    // Normalise thinkingBudget:
+    //   undefined → null (model-default path — `thinkingBudget` OMITTED on wire)
+    //   -1        → -1  (explicit legacy dynamic; kept for Gemini 2.5 and
+    //                    power-users who want to force the legacy path)
+    //    0        →  0  (thinking disabled; Gemini 3 Pro will 400 here)
+    //    N > 0    → clamp to [0, cap that runs - 1024] — the thinking
+    //              pool is carved out of the candidate-output allowance,
+    //              so reserving ≥1024 tokens for the answer prevents 400s
+    //              when a caller passes N ≥ maxOutputTokens, and under a
+    //              cap the input window cut to one request (its value on
+    //              the wire) the budget stays below it.
+    //
+    // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel`
+    // are never both set, so we handle them in two mutually-exclusive
+    // branches below.
+    const rawThinkingBudget = input.thinkingBudget;
+    const effectiveThinkingBudget: number | null =
+      rawThinkingBudget === undefined
+        ? THINKING_BUDGET_MODEL_DEFAULT
+        : rawThinkingBudget === -1
+          ? -1
+          : rawThinkingBudget > 0
+            ? thinkingBudgetUnder(runCap, rawThinkingBudget)
+            : 0;
+    // The thinking the budget reservation counts, from the cap that runs.
+    const thinkingTokensForEstimate = thinkingReserve(
+      input.thinkingLevel,
+      effectiveThinkingBudget,
+      runCap,
     );
-    if (inputWindowCut !== null) {
-      const note = `ask: ${describeInputWindowCut(inputWindowCut)}`;
-      emitter.emit(note);
-      logger.warn(note);
-    }
 
     // Atomic budget reservation. Happens AFTER scan (so the estimate is
     // accurate) but BEFORE any billable upload or generateContent call.
@@ -989,8 +960,7 @@ async function executeAskBody(
         : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
     const tierField = serviceTierConfig(serviceTier);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
-      const maxOutputField =
-        wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
+      const maxOutputField = runCap.wire !== undefined ? { maxOutputTokens: runCap.wire } : {};
       return cacheId
         ? { cachedContent: cacheId, thinkingConfig, ...maxOutputField, ...tierField }
         : {
@@ -1039,7 +1009,7 @@ async function executeAskBody(
         completed,
         tracking,
         throttle: dispatch,
-        estimatedInputTokens,
+        inputTokens: { estimated: estimatedInputTokens, counted: preflight?.effectiveTokens },
       },
       ctxPrep,
     );

@@ -8,6 +8,7 @@
  * its whole input again: the prompt plus everything decoded before it.
  */
 
+import { logger } from '../utils/logger.js';
 import { categorizeModel, isTextGenCategory } from './model-taxonomy.js';
 import type { PreflightInput } from './token-counter.js';
 
@@ -42,7 +43,10 @@ export const CONTINUATION_REQUEST_OVERHEAD_TOKENS = 256;
 
 /** The output cap of one call: what goes on the wire and how many requests the decode may take. */
 export interface OutputCap {
-  /** `maxOutputTokens` on the wire; `undefined` sends none and the model applies its own default. */
+  /**
+   * `maxOutputTokens` on the wire; `undefined` sends none and the model applies its own default. A cap the input window
+   * cut to one request sends the cut value (`boundByInputWindow`).
+   */
   readonly wire: number | undefined;
   /**
    * The most the call decodes: the wire cap, else the model's per-request limit (its default) — less when the
@@ -118,9 +122,15 @@ export interface BoundedOutputCap {
 /**
  * The cap of a long decode bounded by the model's input window W. Request k sends the prompt P again plus every token
  * decoded before it, and the client opens no further request once the decoded tokens reached the cap: under a cap of
- * at most W − P − O no request's input passes W. The cap is never cut below one request's limit — the first request
- * sends the prompt alone, which the preflight bounds — and `wire` stays the caller's: the client stops the decode at
- * `effective`, after `maxRequests`. Without a counted prompt or an advertised window nothing is cut.
+ * at most W − P − O no request's input passes W. The premise — the API refuses a continuation request whose prompt
+ * plus decoded tokens pass W — is assumed, not measured: the repository holds a measurement of what a continuation
+ * request bills, none of a refusal at the window (docs/FOLLOW-UP-PRS.md T41).
+ *
+ * The cap is never cut below one request's limit — the first request sends the prompt alone, which the preflight
+ * bounds. A cut that leaves several requests keeps the caller's `wire`: the client stops the decode at `effective`,
+ * after `maxRequests`. A cut that leaves one request sends the cut value as `maxOutputTokens`, so the server holds it
+ * (a stop at it is `MAX_TOKENS`) — one streaming request would otherwise decode past it. Without a counted prompt or
+ * an advertised window nothing is cut.
  */
 export function boundByInputWindow(
   cap: OutputCap,
@@ -133,12 +143,14 @@ export function boundByInputWindow(
   const room = inputTokenLimit - promptTokens - CONTINUATION_REQUEST_OVERHEAD_TOKENS;
   const most = Math.min(cap.ceiling, Math.max(room, cap.perRequest));
   if (cap.effective <= most) return { cap, cut: null };
+  const maxRequests = maxDecodeRequests(most, cap.perRequest);
   return {
     cap: {
-      ...cap,
+      wire: maxRequests === 1 ? most : cap.wire,
       effective: most,
+      perRequest: cap.perRequest,
       ceiling: most,
-      maxRequests: maxDecodeRequests(most, cap.perRequest),
+      maxRequests,
     },
     cut: { from: cap.effective, to: most, inputTokenLimit },
   };
@@ -148,6 +160,50 @@ export function boundByInputWindow(
 export function describeInputWindowCut(cut: InputWindowCut): string {
   const n = (v: number): string => v.toLocaleString('en-US');
   return `maxOutputTokens cut from ${n(cut.from)} to ${n(cut.to)}: each continuation request sends the prompt again plus everything decoded before it, and the model's ${n(cut.inputTokenLimit)}-token input window holds no more`;
+}
+
+/** What `capThatRuns` bounds: the cap a tool resolved, the prompt's count and the model's input window. */
+export interface CapToBound {
+  /** The tool's name, which prefixes the note of a cut. */
+  readonly tool: string;
+  readonly cap: OutputCap;
+  /** The preflight's count of the prompt, when it ran. */
+  readonly promptTokens: number | undefined;
+  readonly inputTokenLimit: number | null;
+  /** The call's progress channel. */
+  readonly emit: (message: string) => void;
+}
+
+/**
+ * The cap a call's decode runs under: a long decode never sends a continuation request past the model's input
+ * window (`boundByInputWindow`). A cut is said on the call's progress channel and in the log.
+ */
+export function capThatRuns(call: CapToBound): BoundedOutputCap {
+  const bounded = boundByInputWindow(call.cap, call.promptTokens, call.inputTokenLimit);
+  if (bounded.cut === null) return bounded;
+  const note = `${call.tool}: ${describeInputWindowCut(bounded.cut)}`;
+  call.emit(note);
+  logger.warn(note);
+  return bounded;
+}
+
+/** The answer the output cap keeps beside a thinking budget: Gemini requires `thinkingBudget < maxOutputTokens`. */
+export const ANSWER_RESERVE_TOKENS = 1_024;
+
+/**
+ * The refusal of a caller's positive `thinkingBudget` that leaves less than the answer reserve under the caller's own
+ * `maxOutputTokens` (`cap`: what that cap became under the model's limits) — refused, never clamped to 0, which
+ * Gemini 3 Pro answers with a 400 that hides the cause. `null` when it fits, or the caller set either one not.
+ */
+export function thinkingBudgetRefusal(
+  budget: number | undefined,
+  requestedCap: number | undefined,
+  cap: number,
+): string | null {
+  if (budget === undefined || budget <= 0 || requestedCap === undefined) return null;
+  const least = budget + ANSWER_RESERVE_TOKENS;
+  if (cap >= least) return null;
+  return `thinkingBudget (${budget}) + ${ANSWER_RESERVE_TOKENS}-token answer reserve exceeds maxOutputTokens (${cap}). Raise \`maxOutputTokens\` to at least ${least}, or lower \`thinkingBudget\`.`;
 }
 
 /** The preflight's count modes (`preflightMode` of `ask` and `code`). */

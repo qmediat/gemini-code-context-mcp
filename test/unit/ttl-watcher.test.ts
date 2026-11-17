@@ -17,6 +17,7 @@
  *   - Manifest cache_id changed externally → entry evicted (stale pointer).
  *   - 404 / NOT_FOUND from caches.update → entry dropped + manifest cacheId nulled.
  *   - Concurrent ticks (re-entrancy guard): second firing skips while first runs.
+ *   - A shared keep-alive refresh outlives the abort of the call that started it.
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -119,10 +120,38 @@ describe('TtlWatcher', () => {
     ]);
 
     expect(outcome).toBe(reason);
-    expect(client.caches.update).toHaveBeenCalledWith({
-      name: cacheId,
-      config: { ttl: '3600s', abortSignal: controller.signal },
-    });
+    expect(client.caches.update).toHaveBeenCalledWith({ name: cacheId, config: { ttl: '3600s' } });
+  });
+
+  it('the call that started a shared refresh aborts: it leaves with its reason, the other keep-alive gets the extended cache', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    const answer = deferred<unknown>();
+    const answeredExpiry = now + 3_600_000;
+    // the SDK rejects an update whose own abortSignal fires
+    vi.mocked(client.caches.update).mockImplementation(((params: {
+      config?: { abortSignal?: AbortSignal };
+    }) => {
+      const updateSignal = params.config?.abortSignal;
+      return new Promise((done, fail) => {
+        updateSignal?.addEventListener('abort', () => fail(updateSignal.reason));
+        void answer.promise.then(done);
+      });
+    }) as never);
+    const starter = new AbortController();
+    const reason = new DOMException('Timed out after 1000 ms (total wall-clock)', 'TimeoutError');
+
+    const first = watcher.keepAlive(ws, cacheId, 3600, starter.signal);
+    const second = watcher.keepAlive(ws, cacheId, 3600, new AbortController().signal);
+    await settleMicrotasks();
+    starter.abort(reason);
+    await expect(first).rejects.toBe(reason);
+    answer.resolve({ expireTime: new Date(answeredExpiry).toISOString() });
+    await expect(second).resolves.toBeUndefined();
+
+    expect(db.getWorkspace(ws)?.cacheExpiresAt).toBe(answeredExpiry);
+    expect(client.caches.update).toHaveBeenCalledTimes(1);
   });
 
   it('the background tick refreshes with no abort signal', async () => {

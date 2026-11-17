@@ -88,8 +88,8 @@ export interface DecodeCall {
 /** What runs between the requests of a decode. */
 export interface DecodeHooks {
   /**
-   * The input the decode's first request is estimated to send (its throttle reservation): a request that reports no
-   * usage is billed at it, plus the tokens decoded before the request (`billedInputTokens`).
+   * The input the decode's first request is estimated to send: a request that reports no usage is billed at it, plus
+   * the tokens decoded before the request (`billedInputTokens`).
    */
   readonly firstRequestInput?: number;
   /** The call's record of its requests: each one that streamed to its end goes in at once. */

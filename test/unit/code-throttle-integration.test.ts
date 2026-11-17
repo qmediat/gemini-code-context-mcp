@@ -449,6 +449,33 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
       expect(text).toContain(cutProse);
     });
 
+    it('a cut by the input window that leaves one request sends the cut value, the thinking budget below it', async () => {
+      // a 200 000-token window and a ~171 000-token prompt leave less than one request of 32 768
+      mocks.resolveModel.mockResolvedValueOnce({ ...GEMINI_4_ARGON, inputTokenLimit: 200_000 });
+      const { ctx } = buildCtx();
+      (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+        .fn()
+        .mockResolvedValue({ totalTokens: 170_000 });
+      const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+        typeof vi.fn
+      >;
+
+      const result = await codeTool.execute(
+        { task: 'refactor', maxOutputTokens: 262_144, thinkingBudget: 50_000 },
+        ctx,
+      );
+
+      expect(generateContent).toHaveBeenCalledTimes(1);
+      expect(lastGenerateContentCall(generateContent)).toMatchObject({
+        maxOutputTokens: 32_768,
+        thinkingConfig: { thinkingBudget: 32_768 - 1_024 },
+      });
+      expect(result.structuredContent?.outputCapCutByInputWindow).toMatchObject({
+        from: 262_144,
+        to: 32_768,
+      });
+    });
+
     it('a stop at the cap with no answer is OUTPUT_CAP with the fields ask returns for it', async () => {
       mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_ARGON);
       const { ctx } = buildCtx();

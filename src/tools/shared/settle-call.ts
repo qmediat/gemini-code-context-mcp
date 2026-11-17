@@ -68,7 +68,7 @@ export function settleAnswer(call: AnsweredCall): SettledAnswer {
   const usage = usageFields(billed, call.response.continuationHops);
   const finish = answerFinish(call.response);
   const cutFields = inputWindowCutFields(call.cut);
-  const starved = emptyAtOutputCap(call.response, billed.thinkingTokens, call.cap);
+  const starved = emptyAtOutputCap(call.response, billed.thinkingTokens, call.cap, call.cut);
   const outputCapStop =
     starved === null
       ? null
