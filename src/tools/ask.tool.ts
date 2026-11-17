@@ -7,11 +7,9 @@
  * 2026-04-22 on a 670 k-token workspace: first call ~125 s, repeats ~14 s).
  */
 
-import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
-import { prepareContext } from '../cache/cache-manager.js';
-import { cachingModeFor, cachingRan } from '../cache/caching-mode.js';
+import { cachingRan } from '../cache/caching-mode.js';
 import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { logger } from '../utils/logger.js';
@@ -25,6 +23,7 @@ import { type AskInput, askInputSchema } from './ask/input.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './ask/instruction.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { decodeOnContext } from './shared/context-decode.js';
+import { prepareCallContext } from './shared/eager-answer.js';
 import {
   type FailedEagerCall,
   type ModelReached,
@@ -306,41 +305,14 @@ async function executeAskBody(
       });
     }
 
-    const systemPromptHash = createHash('sha256')
-      .update(SYSTEM_INSTRUCTION_Q_AND_A)
-      .digest('hex')
-      .slice(0, 16);
-
-    // v1.14.0 — `cachingMode` default flipped to `'implicit'`: Gemini 2.5+/3
-    // Pro applies its automatic implicit caching to repeated workspace prefixes,
-    // eliminating the 60–180 s `caches.create` rebuild wait on the
-    // review→edit→review path. Per-call `input.cachingMode` always wins;
-    // env-level override `GEMINI_CODE_CONTEXT_CACHING_MODE` lets operators force
-    // `'explicit'` when they need predictable per-call billing more than
-    // warm-path speed. Telemetry on the actual mode (vs requested) is computed
-    // AFTER `prepareContext` returns from `activePrep.inlineOnly` — see FN2 fix.
-    const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
-    const requestedCachingMode = caching.mode;
-
-    // The context of the call: built here, and again by the stale-cache retry on a fresh cache.
-    const prepare = () =>
-      prepareContext({
-        client: ctx.client,
-        manifest: ctx.manifest,
-        scan,
-        model: resolved,
-        systemPromptHash,
-        systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
-        ttlSeconds: ctx.config.cacheTtlSeconds,
-        cacheMinTokens: ctx.config.cacheMinTokens,
-        emitter,
-        allowCaching: !input.noCache && scan.files.length > 0,
-        // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
-        signal: abortSignal,
-        // v1.13.0 — opt-in implicit caching path (skip caches.create).
-        cachingMode: requestedCachingMode,
-      });
-    const ctxPrep = await prepare();
+    const context = await prepareCallContext(call, ctx, {
+      scan,
+      resolved,
+      systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
+      allowCaching: !input.noCache && scan.files.length > 0,
+      requestedMode: input.cachingMode ?? ctx.config.cachingMode,
+    });
+    const { caching, prepare, prepared: ctxPrep } = context;
 
     emitter.emit(
       usingThinkingLevel

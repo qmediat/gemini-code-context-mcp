@@ -8,16 +8,10 @@
  *   - Structured output parser extracts code blocks and OLD/NEW diffs
  */
 
-import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
-import { prepareContext } from '../cache/cache-manager.js';
-import {
-  CACHING_MODE_FALLBACK_DESCRIPTION,
-  cachingModeFor,
-  cachingRan,
-} from '../cache/caching-mode.js';
+import { CACHING_MODE_FALLBACK_DESCRIPTION, cachingRan } from '../cache/caching-mode.js';
 import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
@@ -26,6 +20,7 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { decodeOnContext } from './shared/context-decode.js';
 import { LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
+import { prepareCallContext } from './shared/eager-answer.js';
 import {
   type FailedEagerCall,
   type ModelReached,
@@ -346,7 +341,6 @@ async function executeCodeBody(
   );
   const { emitter, completed, tracking, dispatch } = call;
   const timeoutController = call.timeout;
-  const abortSignal = timeoutController.signal;
   try {
     const refusal = workspaceRefusal('code', workspaceRoot);
     if (refusal !== null) return refusal;
@@ -481,42 +475,15 @@ async function executeCodeBody(
       });
     }
 
-    const systemPromptHash = createHash('sha256')
-      .update(SYSTEM_INSTRUCTION_CODE)
-      .digest('hex')
-      .slice(0, 16);
-
-    // v1.14.0 — `cachingMode` default flipped to `'implicit'` (resolved via
-    // `ctx.config.cachingMode`, env-driven). codeExecution still forces inline
-    // regardless because Gemini rejects `cachedContent` + `tools` together;
-    // telemetry records the ACTUAL mode (FN2 fix) so the mode flip + the
-    // codeExecution-forced-inline path stay distinguishable.
-    const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
-    const requestedCachingMode = caching.mode;
-
-    // The context of the call: built here, and again by the stale-cache retry on a fresh cache.
-    const prepare = () =>
-      prepareContext({
-        client: ctx.client,
-        manifest: ctx.manifest,
-        scan,
-        model: resolved,
-        systemPromptHash,
-        systemInstruction: SYSTEM_INSTRUCTION_CODE,
-        ttlSeconds: ctx.config.cacheTtlSeconds,
-        cacheMinTokens: ctx.config.cacheMinTokens,
-        emitter,
-        // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
-        // which Gemini rejects together with cachedContent. Force inline path
-        // when codeExecution is requested so we have actual inline file parts
-        // to embed alongside the prompt.
-        allowCaching: scan.files.length > 0 && !codeExecution,
-        // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
-        signal: abortSignal,
-        // v1.13.0 — opt-in implicit caching path (skip caches.create).
-        cachingMode: requestedCachingMode,
-      });
-    const ctxPrep = await prepare();
+    const context = await prepareCallContext(call, ctx, {
+      scan,
+      resolved,
+      systemInstruction: SYSTEM_INSTRUCTION_CODE,
+      // a cache cannot be combined with `tools` (codeExecution): the files go inline
+      allowCaching: scan.files.length > 0 && !codeExecution,
+      requestedMode: input.cachingMode ?? ctx.config.cachingMode,
+    });
+    const { caching, prepare, prepared: ctxPrep } = context;
 
     const userPrompt = expectEdits
       ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
