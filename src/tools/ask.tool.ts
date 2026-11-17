@@ -36,7 +36,12 @@ import {
   cachingModeFor,
   cachingRan,
 } from '../cache/caching-mode.js';
-import { preflightModeFor, resolveOutputCap } from '../gemini/long-decode.js';
+import {
+  boundByInputWindow,
+  describeInputWindowCut,
+  preflightModeFor,
+  resolveOutputCap,
+} from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
@@ -50,12 +55,6 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
-import {
-  billedUsage,
-  recordBilledCall,
-  settleFailedCall,
-  usageFields,
-} from './shared/call-ledger.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
@@ -68,15 +67,9 @@ import {
   statusOf,
   tierErrorMeta,
 } from './shared/service-tier.js';
+import { settleAnswer, settleFailure } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import {
-  OUTPUT_CAP_ERROR_CODE,
-  THINKING_LEVEL_FIELD,
-  THINKING_LEVEL_RESERVE,
-  answerFinish,
-  emptyAtOutputCap,
-} from './shared/thinking.js';
-import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
+import { THINKING_LEVEL_FIELD, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 
 /**
  * `ask` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -852,6 +845,18 @@ async function executeAskBody(
       );
     }
 
+    // A long decode never sends a continuation request past the input window: the cap is cut to what it leaves.
+    const { cap: runCap, cut: inputWindowCut } = boundByInputWindow(
+      outputCap,
+      preflight?.effectiveTokens,
+      contextWindow,
+    );
+    if (inputWindowCut !== null) {
+      const note = `ask: ${describeInputWindowCut(inputWindowCut)}`;
+      emitter.emit(note);
+      logger.warn(note);
+    }
+
     // Atomic budget reservation. Happens AFTER scan (so the estimate is
     // accurate) but BEFORE any billable upload or generateContent call.
     // Concurrent tool calls cannot all pass a pre-check and then
@@ -868,9 +873,9 @@ async function executeAskBody(
         // OR model's full limit) as `expectedOutputTokens` — a TRUE
         // upper bound, since Gemini's default stops at the model's
         // advertised `outputTokenLimit`.
-        expectedOutputTokens: effectiveOutputCap,
+        expectedOutputTokens: runCap.effective,
         // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
-        perRequestOutputTokens: outputCap.perRequest,
+        perRequestOutputTokens: runCap.perRequest,
         // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
         countedInputTokens: preflight?.effectiveTokens,
         thinkingTokens: thinkingTokensForEstimate,
@@ -964,9 +969,9 @@ async function executeAskBody(
     // `input.maxOutputTokens` — otherwise we omit it and Gemini uses
     // its model-default cap (per docs, = the model's advertised
     // `outputTokenLimit`, currently 65,536 for pro-tier 3.x/2.5). Budget
-    // reservation always uses `effectiveOutputCap` (= explicit cap OR
-    // model limit) as worst-case upper bound, so the daily cap stays a
-    // true ceiling regardless.
+    // reservation always uses the cap the decode runs under (explicit cap
+    // OR model limit, cut by the input window on a long decode) as the
+    // worst-case upper bound, so the daily cap stays a true ceiling.
     // Cast to `ThinkingLevel` rather than indexing the runtime enum object
     // (`ThinkingLevel[input.thinkingLevel]`). For string enums the value
     // IS the member name, so passing `"HIGH"` as `ThinkingLevel` is
@@ -1028,7 +1033,7 @@ async function executeAskBody(
           prepare,
         },
         openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
-        limits: { maxRequests: outputCap.maxRequests, cap: effectiveOutputCap },
+        limits: { maxRequests: runCap.maxRequests, cap: runCap.effective },
         timeout: timeoutController,
         emit: (message) => emitter.emit(message),
         completed,
@@ -1048,48 +1053,37 @@ async function executeAskBody(
     // emit (live progress) and post-call summary.
     const thinkingSummary = response.thoughtsSummary;
 
-    // What the API billed for the whole call: every request that completed, over a long decode and a stale-cache
-    // retry alike.
-    const billed = billedUsage(completed.usage(), resolved.resolved, serviceTier);
-
-    // What the call billed, on the answer and on a stop without one alike.
-    const billedFields = usageFields(billed, response.continuationHops);
-
     // Telemetry and the response record the mode that ran, not the one asked for.
     const ran = cachingRan(activePrep, caching);
     const effectiveCachingMode = ran.mode;
 
     const durationMs = Date.now() - started;
-    // Settled here, once: the outer catch then neither releases the reservation nor books the call again.
+    // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
+    // API billed is every request that completed, over a long decode and a stale-cache retry alike.
     const settledReservation = reservationId;
     reservationId = null;
     tracking.ledgerEntry = null;
-    recordBilledCall(
-      ctx.manifest,
-      settledReservation,
-      {
+    const settled = settleAnswer({
+      manifest: ctx.manifest,
+      reservationId: settledReservation,
+      entry: {
         workspaceRoot,
         toolName: 'ask',
         model: resolved.resolved,
         serviceTier,
         cachingMode: effectiveCachingMode,
       },
-      billed,
+      completed,
+      response,
+      cap: runCap,
+      cut: inputWindowCut,
       durationMs,
-    );
+    });
+    const finish = settled.finish;
 
     // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
-    const finish = answerFinish(response);
-    const starved = emptyAtOutputCap(response, billed.thinkingTokens, outputCap);
-    if (starved !== null) {
-      return errorResult(`ask: ${starved}`, {
-        errorCode: OUTPUT_CAP_ERROR_CODE,
-        retryable: false,
-        resolvedModel: resolved.resolved,
-        serviceTier,
-        finishReason: finish.finishReason,
-        ...billedFields,
-      });
+    if (settled.outputCapStop !== null) {
+      return errorResult(`ask: ${settled.outputCapStop.message}`, settled.outputCapStop.fields);
     }
 
     if (scan.truncated) {
@@ -1109,7 +1103,8 @@ async function executeAskBody(
       contextWindow: resolved.inputTokenLimit,
       thinkingBudget: effectiveThinkingBudget,
       thinkingLevel: input.thinkingLevel ?? null,
-      ...billedFields,
+      ...settled.usage,
+      ...settled.cutFields,
       // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
       finishReason: finish.finishReason,
       truncated: finish.truncated,
@@ -1152,40 +1147,23 @@ async function executeAskBody(
     return textResult(text, metadata);
   } catch (err) {
     logger.error(`ask failed: ${safeForLog(err)}`);
-    // T22a — extract Gemini's `retryInfo.retryDelay` from 429 bodies and
-    // seed the throttle's per-model hint before we release the
-    // reservation. Google's hint is typically shorter (2-16s) than our
-    // pure-window math would compute (up to 60s+) so honouring it
-    // shortens the next caller's wait.
-    //
-    // Gated on `isGemini429` BEFORE parsing. The predicate requires BOTH
-    // `err instanceof ApiError` (SDK-provenance marker — user-controlled
-    // content can't forge an ApiError prototype) AND `err.status === 429`
-    // (typed field from the HTTP response). The earlier v1.3.2 draft had
-    // a `RESOURCE_EXHAUSTED` substring fallback; GPT + Grok round-2
-    // review (PR #21) showed that path was user-influenceable — echoed
-    // prompt content re-opened the hint-poisoning class the gate was
-    // meant to close. Removing the fallback drops hint extraction for
-    // errors that lose the ApiError shape in transit, but production
-    // 429s always arrive as real ApiError instances.
-    const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
-    if (retryDelayMs !== null && resolvedModelKey !== null) {
-      ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
-    }
-    // The ledger keeps what the completed requests billed and releases the rest of the reservation (all of it when
-    // none completed); their usage goes into the error result.
-    const failedUsage = settleFailedCall(ctx.manifest, {
-      toolName: 'ask',
-      reservationId,
-      entry: tracking.ledgerEntry,
-      completed,
-      durationMs: Date.now() - started,
+    // A 429's retry hint seeds the throttle; the ledger keeps what the completed requests billed and releases the rest
+    // of the reservation (all of it when none completed); their usage goes into the error result.
+    const failedUsage = settleFailure({
+      manifest: ctx.manifest,
+      failed: {
+        toolName: 'ask',
+        reservationId,
+        entry: tracking.ledgerEntry,
+        completed,
+        durationMs: Date.now() - started,
+      },
+      err,
+      model: resolvedModelKey,
+      throttle: ctx.throttle,
+      dispatch,
     });
     reservationId = null;
-    // Drop the TPM reservation the failed request holds (the completed requests settled theirs). If Gemini consumed
-    // quota server-side before failing, the hint path above compensates via `recordRetryHint`; otherwise the
-    // window under-counts that one request, bounded.
-    dispatch.cancel();
     // Timeout-driven abort gets a dedicated errorCode so callers can
     // distinguish "Gemini was slow" from "schema invalid" / "auth failed".
     // v1.12.0 — `timeoutKind` ('total' | 'stall') distinguishes the

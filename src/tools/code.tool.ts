@@ -18,7 +18,12 @@ import {
   cachingModeFor,
   cachingRan,
 } from '../cache/caching-mode.js';
-import { preflightModeFor, resolveOutputCap } from '../gemini/long-decode.js';
+import {
+  boundByInputWindow,
+  describeInputWindowCut,
+  preflightModeFor,
+  resolveOutputCap,
+} from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
@@ -33,12 +38,6 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
-import {
-  billedUsage,
-  recordBilledCall,
-  settleFailedCall,
-  usageFields,
-} from './shared/call-ledger.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
@@ -51,15 +50,9 @@ import {
   statusOf,
   tierErrorMeta,
 } from './shared/service-tier.js';
+import { settleAnswer, settleFailure } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import {
-  OUTPUT_CAP_ERROR_CODE,
-  THINKING_LEVEL_FIELD,
-  THINKING_LEVEL_RESERVE,
-  answerFinish,
-  emptyAtOutputCap,
-} from './shared/thinking.js';
-import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
+import { THINKING_LEVEL_FIELD, THINKING_LEVEL_RESERVE } from './shared/thinking.js';
 
 /**
  * `code` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -209,9 +202,18 @@ export interface ParsedEdit {
   new: string;
 }
 
-/** Leads the text result of an answer cut at the output cap (`truncated: true`): its edit list is incomplete. */
+/** Leads the text result of an answer with edits (`expectEdits`) cut at the output cap: its edit list is incomplete. */
 export const TRUNCATED_EDITS_NOTE =
   '[truncated] The answer stopped at the output cap before the model finished it (see `finishReason`): the edit list below is cut — do not apply it as complete. Raise `maxOutputTokens` or lower the thinking, and ask again.';
+
+/** Leads the text result of a prose answer (`expectEdits: false`) cut at the output cap. */
+export const TRUNCATED_ANSWER_NOTE =
+  '[truncated] The answer stopped at the output cap before the model finished it (see `finishReason`): the answer below is cut. Raise `maxOutputTokens` or lower the thinking, and ask again.';
+
+/** The note that leads a truncated answer: about its edit list when edits were asked for, else about the prose. */
+export function truncatedNote(expectEdits: boolean): string {
+  return expectEdits ? TRUNCATED_EDITS_NOTE : TRUNCATED_ANSWER_NOTE;
+}
 
 const EDIT_REGEX =
   /\*\*FILE: (.+?)\*\*\s*\n```[^\n]*\n(?:OLD:\s*\n([\s\S]*?)\n)?NEW:\s*\n([\s\S]*?)\n```/g;
@@ -550,6 +552,18 @@ async function executeCodeBody(
       );
     }
 
+    // A long decode never sends a continuation request past the input window: the cap is cut to what it leaves.
+    const { cap: runCap, cut: inputWindowCut } = boundByInputWindow(
+      outputCap,
+      preflight?.effectiveTokens,
+      contextWindow,
+    );
+    if (inputWindowCut !== null) {
+      const note = `code: ${describeInputWindowCut(inputWindowCut)}`;
+      emitter.emit(note);
+      logger.warn(note);
+    }
+
     // Atomic budget reservation — see ask.tool.ts for the full rationale.
     // Estimate includes the thinking budget (billed as output tokens on Pro)
     // PLUS the candidate output cap.
@@ -559,9 +573,9 @@ async function executeCodeBody(
         serviceTier,
         workspaceBytes,
         promptChars: input.task.length,
-        expectedOutputTokens: effectiveOutputCap,
+        expectedOutputTokens: runCap.effective,
         // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
-        perRequestOutputTokens: outputCap.perRequest,
+        perRequestOutputTokens: runCap.perRequest,
         // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
         countedInputTokens: preflight?.effectiveTokens,
         thinkingTokens: thinkingTokensForEstimate,
@@ -714,7 +728,7 @@ async function executeCodeBody(
           prepare,
         },
         openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
-        limits: { maxRequests: outputCap.maxRequests, cap: effectiveOutputCap },
+        limits: { maxRequests: runCap.maxRequests, cap: runCap.effective },
         timeout: timeoutController,
         emit: (message) => emitter.emit(message),
         completed,
@@ -747,47 +761,40 @@ async function executeCodeBody(
     }
     const thinkingSummary = response.thoughtsSummary;
 
-    // What the API billed for the whole call: every request that completed, over a long decode and a stale-cache
-    // retry alike.
-    const billed = billedUsage(completed.usage(), resolved.resolved, serviceTier);
-
-    // What the call billed, on the answer and on a stop without one alike.
-    const billedFields = usageFields(billed, response.continuationHops);
-
     // Telemetry and the response record the mode that ran, not the one asked for
     // (`cachingRan`: a codeExecution call is forced inline and never builds a cache).
     const ran = cachingRan(activePrep, caching);
     const effectiveCachingMode = ran.mode;
 
     const durationMs = Date.now() - started;
-    // Settled here, once: the outer catch then neither releases the reservation nor books the call again.
+    // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
+    // API billed is every request that completed, over a long decode and a stale-cache retry alike.
     const settledReservation = reservationId;
     reservationId = null;
     tracking.ledgerEntry = null;
-    recordBilledCall(
-      ctx.manifest,
-      settledReservation,
-      {
+    const settled = settleAnswer({
+      manifest: ctx.manifest,
+      reservationId: settledReservation,
+      entry: {
         workspaceRoot,
         toolName: 'code',
         model: resolved.resolved,
         serviceTier,
         cachingMode: effectiveCachingMode,
       },
-      billed,
+      completed,
+      response,
+      cap: runCap,
+      cut: inputWindowCut,
       durationMs,
-    );
+    });
+    const finish = settled.finish;
 
     // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
-    const finish = answerFinish(response);
-    const starved = emptyAtOutputCap(response, billed.thinkingTokens, outputCap);
-    if (starved !== null) {
-      return errorResult(`code: ${starved}`, {
-        errorCode: OUTPUT_CAP_ERROR_CODE,
-        retryable: false,
+    if (settled.outputCapStop !== null) {
+      return errorResult(`code: ${settled.outputCapStop.message}`, {
         ...modelAudit,
-        finishReason: finish.finishReason,
-        ...billedFields,
+        ...settled.outputCapStop.fields,
       });
     }
 
@@ -816,7 +823,8 @@ async function executeCodeBody(
       cacheHit: activePrep.reused,
       cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
       retriedOnStaleCache,
-      ...billedFields,
+      ...settled.usage,
+      ...settled.cutFields,
       // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
       finishReason: finish.finishReason,
       truncated: finish.truncated,
@@ -855,28 +863,29 @@ async function executeCodeBody(
       ...(executionOutput.length > 0 ? { executionOutput } : {}),
     };
 
-    return textResult(finish.truncated ? `${TRUNCATED_EDITS_NOTE}\n\n${text}` : text, structured);
+    return textResult(
+      finish.truncated ? `${truncatedNote(expectEdits)}\n\n${text}` : text,
+      structured,
+    );
   } catch (err) {
     logger.error(`code failed: ${safeForLog(err)}`);
-    // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
-    // bodies, gated on `isGemini429` (ApiError instance + status===429)
-    // to prevent hint-poisoning. Mirror of ask.tool.ts — see there for
-    // full rationale.
-    const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
-    if (retryDelayMs !== null && resolvedModelKey !== null) {
-      ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
-    }
-    // The ledger keeps what the completed requests billed and releases the rest (all of it when none completed).
-    const failedUsage = settleFailedCall(ctx.manifest, {
-      toolName: 'code',
-      reservationId,
-      entry: tracking.ledgerEntry,
-      completed,
-      durationMs: Date.now() - started,
+    // A 429's retry hint seeds the throttle; the ledger keeps what the completed requests billed and releases the rest
+    // (all of it when none completed).
+    const failedUsage = settleFailure({
+      manifest: ctx.manifest,
+      failed: {
+        toolName: 'code',
+        reservationId,
+        entry: tracking.ledgerEntry,
+        completed,
+        durationMs: Date.now() - started,
+      },
+      err,
+      model: resolvedModelKey,
+      throttle: ctx.throttle,
+      dispatch,
     });
     reservationId = null;
-    // Drop the TPM reservation the failed request holds — see ask.tool.ts.
-    dispatch.cancel();
     // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
     if (isTimeoutAbort(err)) {
       const ms = timeoutController.timeoutMs;

@@ -149,7 +149,7 @@ export async function withNetworkRetry<T>(
 }
 
 /** Throws the signal's reason (or synthesised AbortError) if aborted. */
-function throwIfAborted(signal: AbortSignal | undefined): void {
+export function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throwAbortReason(signal);
 }
 

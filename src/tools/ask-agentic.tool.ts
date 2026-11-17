@@ -64,6 +64,7 @@ import {
   isTimeoutAbort,
   resolveTotalTimeoutMs,
 } from './shared/abort-timeout.js';
+import { billedInputTokens } from './shared/call-ledger.js';
 import { collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_AGENTIC } from './shared/system-instruction-safety.js';
 import { THINKING_LEVEL_FIELD } from './shared/thinking.js';
@@ -1480,10 +1481,10 @@ async function executeAskAgenticBody(
           // `finalizationEstimate` (correct) but throttle.release passed 0,
           // mutating the TPM window entry to 0 — under-throttling subsequent
           // calls. Sharing the same fallback keeps both releases symmetric.
-          const billedUncachedTokens =
-            finalizationUsage.promptTokenCount > 0
-              ? finalizationUsage.promptTokenCount
-              : finalizationEstimate;
+          const billedUncachedTokens = billedInputTokens(
+            finalizationUsage.promptTokenCount,
+            finalizationEstimate,
+          );
           if (finalizationReservationId !== null) {
             // If parse-after-await threw, finalizationUsage is still {0,0,0}.
             // Fall back to `finalizationEstimate` for billing — under-billing

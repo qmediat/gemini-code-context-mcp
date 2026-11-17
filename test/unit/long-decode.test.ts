@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   CONTINUATION_REQUEST_OVERHEAD_TOKENS,
   LONG_DECODE_TOTAL_TOKENS,
+  boundByInputWindow,
   continuationInputTokens,
   decodedTokensBound,
   longDecodeTokenLimitOf,
@@ -28,7 +29,7 @@ describe('longDecodeTokenLimitOf', () => {
       'gemini-4-carbon-preview',
       'gemini-4.1-argon',
     ]) {
-      expect(longDecodeTokenLimitOf(id), id).toBe(1_048_576);
+      expect(longDecodeTokenLimitOf(id, 'developer'), id).toBe(1_048_576);
     }
   });
 
@@ -38,20 +39,22 @@ describe('longDecodeTokenLimitOf', () => {
       'gemini-3.1-pro-preview',
       'gemini-4-carbon-computer-use-preview',
     ]) {
-      expect(longDecodeTokenLimitOf(id), id).toBeNull();
+      expect(longDecodeTokenLimitOf(id, 'developer'), id).toBeNull();
     }
   });
 
-  it('gives no long decode to a Vertex resource name: the cap is clamped there (a named limit)', () => {
-    expect(longDecodeTokenLimitOf('publishers/google/models/gemini-4-hydrogen')).toBeNull();
-    const cap = resolveOutputCap({
-      requested: 262_144,
-      forceMax: false,
-      fallbackLimit: 65_536,
-      outputTokenLimit: 65_536,
-      longDecodeTokenLimit: longDecodeTokenLimitOf('publishers/google/models/gemini-4-hydrogen'),
-    });
-    expect(cap).toMatchObject({ wire: 65_536, maxRequests: 1 });
+  it('gives no long decode on Vertex AI, whatever the shape of the id: the cap is clamped there', () => {
+    for (const id of ['gemini-4-hydrogen', 'publishers/google/models/gemini-4-hydrogen']) {
+      expect(longDecodeTokenLimitOf(id, 'vertex'), id).toBeNull();
+      const cap = resolveOutputCap({
+        requested: 262_144,
+        forceMax: false,
+        fallbackLimit: 65_536,
+        outputTokenLimit: 65_536,
+        longDecodeTokenLimit: longDecodeTokenLimitOf(id, 'vertex'),
+      });
+      expect(cap, id).toMatchObject({ wire: 65_536, maxRequests: 1 });
+    }
   });
 });
 
@@ -274,5 +277,33 @@ describe('continuation input bound', () => {
     expect(estimate(prompt)).toBeGreaterThanOrEqual(actual);
     // a count below the heuristic never lowers the reservation
     expect(estimate(1_000)).toBe(estimate(undefined));
+  });
+});
+
+describe('boundByInputWindow', () => {
+  const longDecode = (requested: number) =>
+    resolveOutputCap({ ...GEMINI_4, requested, forceMax: false, fallbackLimit: 65_536 });
+
+  it('cuts the cap so that prompt + everything decoded before the last request fits the window', () => {
+    // 920 000-token prompt, cap 262 144: request 3 would send 920 000 + 2 × 65 536 = 1 051 072
+    const { cap, cut } = boundByInputWindow(longDecode(262_144), 920_000, 1_048_576);
+    expect(cap.effective).toBe(1_048_576 - 920_000 - O);
+    expect(cap.maxRequests).toBe(2);
+    expect(cut).toEqual({ from: 262_144, to: 1_048_576 - 920_000 - O, inputTokenLimit: 1_048_576 });
+  });
+
+  it('never cuts below one request: the first request sends the prompt alone', () => {
+    const { cap, cut } = boundByInputWindow(longDecode(262_144), 190_000, 200_000);
+    expect(cap).toMatchObject({ effective: 65_536, maxRequests: 1, wire: 262_144 });
+    expect(cut?.to).toBe(65_536);
+  });
+
+  it('leaves a cap the window holds, a one-request cap, and a call without a count as they are', () => {
+    const fits = longDecode(262_144);
+    expect(boundByInputWindow(fits, 100_000, 1_048_576)).toEqual({ cap: fits, cut: null });
+    const one = longDecode(65_536);
+    expect(boundByInputWindow(one, 1_000_000, 1_048_576)).toEqual({ cap: one, cut: null });
+    expect(boundByInputWindow(fits, undefined, 1_048_576).cut).toBeNull();
+    expect(boundByInputWindow(fits, 920_000, null).cut).toBeNull();
   });
 });

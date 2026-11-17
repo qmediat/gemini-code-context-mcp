@@ -59,6 +59,15 @@ export interface FailedCall {
 
 const tokens = (n: number | undefined): number => (typeof n === 'number' ? n : 0);
 
+/**
+ * The input a request that went through is billed at: the prompt tokens it reported, else — a response that carried
+ * no usage — the input it was estimated to send. Under-billing a request the API completed is the worse error: the
+ * estimate keeps the daily cap and the per-minute window a bound.
+ */
+export function billedInputTokens(reported: number | undefined, estimate: number): number {
+  return typeof reported === 'number' && reported > 0 ? reported : estimate;
+}
+
 /** The tokens a (summed) usage reports and their cost: the one cost function of a settled call. */
 export function billedUsage(
   usage: DecodeUsage | undefined,

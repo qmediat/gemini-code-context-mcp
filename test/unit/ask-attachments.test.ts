@@ -28,6 +28,7 @@ import type { ScanResult } from '../../src/indexer/workspace-scanner.js';
 import { askInputSchema, askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import * as streams from '../helpers/stream-mock.js';
+import { oneFileScan } from '../helpers/workspace.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -177,26 +178,7 @@ const resolved = (supportsVision: boolean) => ({
 
 /** A scan of one 100-byte file, in the scanner's shape. */
 function scanOf(size = 100): ScanResult {
-  return {
-    workspaceRoot: dir,
-    filesHash: `files-${size}`,
-    files: [
-      {
-        relpath: 'a.ts',
-        absolutePath: join(dir, 'a.ts'),
-        size,
-        contentHash: 'h1',
-        mtimeMs: 1_700_000_000_000,
-        memoHit: false,
-      },
-    ],
-    skippedTooLarge: 0,
-    excludedDirs: [],
-    excludedDirsTotal: 0,
-    skippedNonSource: 0,
-    truncated: false,
-    memoHitCount: 0,
-  };
+  return oneFileScan({ root: dir, size, filesHash: `files-${size}` });
 }
 
 /** A prepared context in the cache manager's shape: inline, or a reused cache. */

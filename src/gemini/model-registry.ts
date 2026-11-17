@@ -7,7 +7,7 @@
 
 import type { GoogleGenAI, Model } from '@google/genai';
 import { logger } from '../utils/logger.js';
-import { longDecodeTokenLimitOf } from './long-decode.js';
+import { type ApiBackend, longDecodeTokenLimitOf } from './long-decode.js';
 import {
   type CapabilityFlags,
   type ModelCategory,
@@ -123,7 +123,7 @@ function normalizeId(raw: string | undefined): string {
   return raw.replace(/^models\//, '').trim();
 }
 
-function toModelInfo(model: Model): ModelInfo | null {
+function toModelInfo(model: Model, backend: ApiBackend): ModelInfo | null {
   const id = normalizeId(model.name);
   if (id.length === 0) return null;
 
@@ -136,7 +136,7 @@ function toModelInfo(model: Model): ModelInfo | null {
     displayName: model.displayName ?? id,
     inputTokenLimit: inputLimit,
     outputTokenLimit: outputLimit,
-    longDecodeTokenLimit: longDecodeTokenLimitOf(id),
+    longDecodeTokenLimit: longDecodeTokenLimitOf(id, backend),
     supportsThinking: model.thinking === true,
     supportsLongContext: inputLimit !== null && inputLimit >= 100_000,
     supportsCaching: model.supportedActions?.includes('createCachedContent') ?? true,
@@ -155,9 +155,10 @@ export async function listAvailableModels(
   if (!force && cached && now - cachedAt < TTL_MS) return cached;
 
   const pager = await client.models.list();
+  const backend: ApiBackend = client.vertexai === true ? 'vertex' : 'developer';
   const out: ModelInfo[] = [];
   for await (const model of pager) {
-    const info = toModelInfo(model);
+    const info = toModelInfo(model, backend);
     if (info) out.push(info);
   }
 

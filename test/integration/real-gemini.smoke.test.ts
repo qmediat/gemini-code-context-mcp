@@ -20,7 +20,7 @@
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { type GenerateContentResponse, ThinkingLevel } from '@google/genai';
+import { ApiError, ThinkingLevel } from '@google/genai';
 import { describe, expect, it } from 'vitest';
 import { prepareContext } from '../../src/cache/cache-manager.js';
 import { createGeminiClient } from '../../src/gemini/client.js';
@@ -331,28 +331,29 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
     expect(completed.usage()?.promptTokenCount ?? 0).toBeGreaterThan(0);
   }, 120_000);
 
-  it('a continuation token is a field the API reads (a stale one is refused as such, never as unknown)', async () => {
+  it('a continuation token is a field the API reads: a forged one is refused for what it is', async () => {
     const resolved = await resolveModel('gemini-4-hydrogen', client);
-    const attempt = async (): Promise<GenerateContentResponse | Error> => {
-      try {
-        return await client.models.generateContent({
-          model: resolved.resolved,
-          contents: 'Say the single word: pong.',
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            automaticContinuation: false,
-            continuationToken: 'smoke-test-not-a-continuation-token',
-          },
-        });
-      } catch (err) {
-        return err instanceof Error ? err : new Error(String(err));
-      }
-    };
-    const outcome = await attempt();
-    if (outcome instanceof Error) {
-      expect(outcome.message).not.toMatch(/unknown name|cannot find field|unknown field/i);
-    } else {
-      expect(outcome.usageMetadata).toBeDefined();
-    }
+    const refusal = await client.models
+      .generateContent({
+        model: resolved.resolved,
+        contents: 'Say the single word: pong.',
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          automaticContinuation: false,
+          continuationToken: 'smoke-test-not-a-continuation-token',
+        },
+      })
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    // an answer, a network failure or another API error is not the API reading the token: each fails here
+    expect(refusal).toBeInstanceOf(ApiError);
+    expect((refusal as ApiError).status).toBe(400);
+    expect((refusal as ApiError).message).toMatch(/continuation/i);
+    // an unknown field would mean the API does not read the token at all
+    expect((refusal as ApiError).message).not.toMatch(
+      /unknown name|cannot find field|unknown field/i,
+    );
   }, 60_000);
 });

@@ -13,13 +13,14 @@ interface FakeModel {
   supportedActions?: string[];
 }
 
-function fakeClient(models: FakeModel[]): GoogleGenAI {
+function fakeClient(models: FakeModel[], vertexai = false): GoogleGenAI {
   const asyncIterable = {
     async *[Symbol.asyncIterator]() {
       for (const m of models) yield m;
     },
   };
   return {
+    vertexai,
     models: {
       list: vi.fn().mockResolvedValue(asyncIterable),
     },
@@ -361,6 +362,21 @@ describe('model registry listing', () => {
     ]);
     const ids = (await listAvailableModels(client)).map((m) => m.id);
     expect(ids.slice(0, 2)).toEqual(['gemini-4-argon', 'gemini-3.8-flash']);
+  });
+
+  it('a Vertex client lists no Gemini 4 model with long decode, a plain id or a resource name', async () => {
+    const listed = [
+      { name: 'models/gemini-4-hydrogen' },
+      { name: 'publishers/google/models/gemini-4-argon' },
+    ];
+    const onVertex = await listAvailableModels(fakeClient(listed, true));
+    expect(onVertex.map((m) => m.longDecodeTokenLimit)).toEqual([null, null]);
+
+    invalidateModelCache();
+    const onDeveloperApi = await listAvailableModels(
+      fakeClient([{ name: 'models/gemini-4-hydrogen' }]),
+    );
+    expect(onDeveloperApi[0]?.longDecodeTokenLimit).toBe(1_048_576);
   });
 
   it('a model whose actions lack createCachedContent does not support caching', async () => {

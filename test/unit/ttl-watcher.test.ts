@@ -137,6 +137,94 @@ describe('TtlWatcher', () => {
     expect(params?.config).not.toHaveProperty('abortSignal');
   });
 
+  it('two concurrent keep-alives of one cache send one caches.update, and both wait for it', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    const answer = deferred<unknown>();
+    vi.mocked(client.caches.update).mockImplementation(() => answer.promise as never);
+
+    const first = watcher.keepAlive(ws, cacheId, 3600, new AbortController().signal);
+    const second = watcher.keepAlive(ws, cacheId, 3600, new AbortController().signal);
+    let secondDone = false;
+    void second.then(() => {
+      secondDone = true;
+    });
+    await settleMicrotasks();
+    expect(secondDone).toBe(false);
+    answer.resolve({});
+    await Promise.all([first, second]);
+
+    expect(client.caches.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('a tick while a keep-alive refreshes the same cache joins it: one caches.update', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    const answer = deferred<unknown>();
+    vi.mocked(client.caches.update).mockImplementation(() => answer.promise as never);
+
+    const keepAlive = watcher.keepAlive(ws, cacheId, 3600);
+    const tick = (watcher as unknown as PrivateTick).tick();
+    answer.resolve({});
+    await Promise.all([keepAlive, tick]);
+
+    expect(client.caches.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('stores the expiry the API answered, on the row as it stands after the round-trip', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    const answeredExpiry = now + 3_000_000;
+    vi.mocked(client.caches.update).mockImplementation(async () => {
+      // the row is rewritten while the refresh is on the wire
+      const row = db.getWorkspace(ws);
+      if (row) db.upsertWorkspace({ ...row, filesHash: 'rewritten' });
+      return { expireTime: new Date(answeredExpiry).toISOString() } as never;
+    });
+
+    await watcher.keepAlive(ws, cacheId, 3600);
+
+    const after = db.getWorkspace(ws);
+    expect(after?.cacheExpiresAt).toBe(answeredExpiry);
+    expect(after?.filesHash).toBe('rewritten');
+  });
+
+  it('keepAlive under a signal that already fired sends no caches.update and rejects with its reason', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    const controller = new AbortController();
+    const reason = new DOMException('Timed out', 'TimeoutError');
+    controller.abort(reason);
+
+    await expect(watcher.keepAlive(ws, cacheId, 3600, controller.signal)).rejects.toBe(reason);
+    expect(client.caches.update).not.toHaveBeenCalled();
+  });
+
+  it('a manifest that cannot be read fails neither the keep-alive nor the tick', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    vi.spyOn(db, 'getWorkspace').mockImplementation(() => {
+      throw new Error('SQLITE_BUSY: database is locked');
+    });
+
+    await expect(watcher.keepAlive(ws, cacheId, 3600)).resolves.toBeUndefined();
+    await expect((watcher as unknown as PrivateTick).tick()).resolves.toBeUndefined();
+  });
+
+  it('a manifest that cannot be written after the refresh fails no keep-alive', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    vi.spyOn(db, 'upsertWorkspace').mockImplementation(() => {
+      throw new Error('SQLITE_IOERR: disk I/O error');
+    });
+
+    await expect(watcher.keepAlive(ws, cacheId, 3600)).resolves.toBeUndefined();
+  });
+
   it('keepAlive leaves a cache with plenty of time as it is, and marks it hot', async () => {
     const now = Date.now();
     const watcher = seedHot({ now, ttlMs: 30 * 60 * 1000, ttlSeconds: 3600 });
@@ -302,3 +390,17 @@ describe('TtlWatcher', () => {
     expect(hot.size).toBe(0);
   });
 });
+
+/** A promise and the function that resolves it. */
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+/** Lets every queued microtask run. */
+async function settleMicrotasks(): Promise<void> {
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+}

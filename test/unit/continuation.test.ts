@@ -9,6 +9,8 @@ import {
   collectDecode,
   runDecode,
 } from '../../src/tools/shared/continuation.js';
+import { DispatchThrottle } from '../../src/tools/shared/dispatch-throttle.js';
+import { createTpmThrottle } from '../../src/tools/shared/throttle.js';
 import { chunkedStream } from '../helpers/stream-mock.js';
 
 /** One request's stream: a thought, the request's text (if any), and its end with the given finish reason. */
@@ -364,6 +366,70 @@ describe('runDecode — the openings of a long decode', () => {
       .mockRejectedValueOnce(quota());
     await expect(runDecode(decodeCall(flex, { openAttempts: 1 }))).rejects.toBeInstanceOf(ApiError);
     expect(flex).toHaveBeenCalledTimes(2);
+  });
+
+  it('network failures and refusals share one opening budget: at most openAttempts SDK calls per request', async () => {
+    vi.useFakeTimers();
+    try {
+      const overloaded = () => Object.assign(new Error('The model is overloaded'), { status: 503 });
+      const stream = vi.fn().mockImplementationOnce(chunkedStream(stop('tok-1')));
+      for (let i = 0; i < 4; i += 1) {
+        stream.mockRejectedValueOnce(new TypeError('fetch failed'));
+        stream.mockRejectedValueOnce(overloaded());
+      }
+      stream.mockImplementation(chunkedStream(answer));
+
+      const decoded = runDecode(decodeCall(stream, { openAttempts: 3 })).catch(
+        (err: unknown) => err,
+      );
+      await vi.runAllTimersAsync();
+
+      expect(await decoded).toBeInstanceOf(TypeError);
+      // the first request, then the continuation's three openings: fetch failed, 503, fetch failed
+      expect(stream).toHaveBeenCalledTimes(1 + 3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a reopening after a wait longer than the TPM window reserves again: a concurrent request waits', async () => {
+    vi.useFakeTimers();
+    try {
+      const limit = 100_000;
+      const input = 60_000;
+      const throttle = createTpmThrottle(limit);
+      const signal = new AbortController().signal;
+      const dispatch = new DispatchThrottle({ throttle, enabled: true, signal, emit: () => {} });
+      const longQuota = new ApiError({
+        message: '{"error":{"code":429,"details":[{"retryDelay":"61s"}]}}',
+        status: 429,
+      });
+      let concurrentDelayMs: number | undefined;
+      const stream = vi
+        .fn()
+        .mockImplementationOnce(chunkedStream(stop('tok-1')))
+        .mockRejectedValueOnce(longQuota)
+        .mockImplementationOnce(() => {
+          // the reopened continuation goes out now: a request of another call reserves beside it
+          concurrentDelayMs = throttle.reserve('gemini-4-hydrogen', input).delayMs;
+          return chunkedStream(answer)();
+        });
+      const call = decodeCall(stream, {
+        collector: { signal },
+        beforeReopen: () => dispatch.renew(),
+        hooks: { beforeContinuation: () => dispatch.reserve('gemini-4-hydrogen', input) },
+      });
+
+      const decoded = runDecode(call);
+      await vi.runAllTimersAsync();
+      await decoded;
+
+      // two 60 000-token inputs within one minute would pass the 100 000 limit: the second one waits
+      expect(stream).toHaveBeenCalledTimes(3);
+      expect(concurrentDelayMs).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('an abort between two requests sends no further request and counts none on the failed call', async () => {

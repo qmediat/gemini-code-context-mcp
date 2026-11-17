@@ -19,8 +19,9 @@ import { TtlWatcher } from '../../src/cache/ttl-watcher.js';
 import type { ManifestDb } from '../../src/manifest/db.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
-import { GEMINI_4_HYDROGEN } from '../helpers/models.js';
+import { GEMINI_3_PRO, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { chunkedStream, midStreamFailure, singleChunkStream } from '../helpers/stream-mock.js';
+import { ONE_FILE_SCAN, oneFileScan } from '../helpers/workspace.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -97,36 +98,11 @@ const CACHED_CONTEXT = {
   uploaded: { failedCount: 0, failures: [] },
 };
 
-/** The workspace every test scans unless it says otherwise: one 100-byte file. */
-const ONE_FILE_SCAN = {
-  workspaceRoot: '/fake',
-  filesHash: 'abc',
-  files: [{ relpath: 'a.ts', size: 100, contentHash: 'h', absolutePath: '/fake/a.ts' }],
-  skippedTooLarge: 0,
-  excludedDirs: [],
-  excludedDirsTotal: 0,
-  skippedNonSource: 0,
-  truncated: false,
-};
-
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.validateWorkspacePath.mockReturnValue(undefined);
   mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
-  mocks.resolveModel.mockResolvedValue({
-    requested: 'latest-pro',
-    resolved: 'gemini-3-pro-preview',
-    inputTokenLimit: 1_048_576,
-    outputTokenLimit: 65_536,
-    fallbackApplied: false,
-    category: 'text-reasoning',
-    capabilities: {
-      supportsThinking: true,
-      supportsVision: true,
-      supportsCodeExecution: true,
-      costTier: 'premium',
-    },
-  });
+  mocks.resolveModel.mockResolvedValue({ ...GEMINI_3_PRO });
   mocks.prepareContext.mockResolvedValue({
     ...CACHED_CONTEXT,
     cacheId: null,
@@ -371,6 +347,8 @@ describe('ask — long decode on a Gemini 4 model', () => {
       'Raise `maxOutputTokens` above 131,072 (up to 1,048,576)',
     );
     expect(result.structuredContent?.finishReason).toBe('CONTINUATION');
+    expect(result.structuredContent?.resolvedModel).toBe('gemini-4-hydrogen');
+    expect(result.structuredContent).toHaveProperty('serviceTier');
   });
 
   it('a default call that stops at MAX_TOKENS with no text carries the usage and OUTPUT_CAP', async () => {
@@ -436,6 +414,34 @@ describe('ask — a long decode between its requests', () => {
       truncated: true,
       continuationHops: 1,
     });
+  });
+
+  it('a long decode never sends a continuation request past the input window: the cap is cut and said', async () => {
+    const { ctx, generateContentStream } = buildCtx();
+    // a 200 000-token window and a 100 000-token prompt: request 3 would send 100 000 + 2 × 65 536 = 231 072
+    mocks.resolveModel.mockResolvedValue({ ...GEMINI_4_HYDROGEN, inputTokenLimit: 200_000 });
+    (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: 99_000 });
+    let sent = 0;
+    generateContentStream.mockImplementation(async () => {
+      sent += 1;
+      return continuationStop(`tok-${sent}`, 100_000 + (sent - 1) * 65_536)();
+    });
+
+    const result = await askTool.execute(
+      { prompt: 'review', maxOutputTokens: 262_144, thinkingLevel: 'LOW' },
+      ctx,
+    );
+
+    expect(generateContentStream).toHaveBeenCalledTimes(2);
+    // the counted prompt (99 000 + the 1 000-token system reserve) and the 256-token continuation overhead
+    expect(result.structuredContent?.outputCapCutByInputWindow).toEqual({
+      from: 262_144,
+      to: 200_000 - 100_000 - 256,
+      inputTokenLimit: 200_000,
+    });
+    expect(result.structuredContent?.continuationHops).toBe(1);
   });
 
   it('the stall watchdog does not count the gap before a continuation request opens', async () => {
@@ -566,6 +572,34 @@ describe('ask — the ledger of a decode that fails', () => {
     });
   });
 
+  it('a request that reports no usage is billed at its input estimate, never at zero', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    generateContentStream.mockImplementationOnce(
+      chunkedStream([
+        {
+          text: 'The answer.',
+          candidates: [
+            {
+              index: 0,
+              finishReason: 'STOP' as never,
+              content: { role: 'model', parts: [{ text: 'The answer.' }] },
+            },
+          ],
+        },
+      ]),
+    );
+
+    const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 262_144 }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    const settled = manifestOf(ctx).finalizeBudgetReservation.mock.calls[0]?.[1] as {
+      costUsdMicro: number;
+      uncachedTokens: number;
+    };
+    expect(settled.uncachedTokens).toBeGreaterThan(0);
+    expect(settled.costUsdMicro).toBeGreaterThan(0);
+  });
+
   it('a first request that fails releases the reservation whole and reports no usage', async () => {
     const { ctx, generateContentStream } = budgetedCtx();
     generateContentStream.mockImplementationOnce(
@@ -628,14 +662,11 @@ describe('ask — the ledger of a decode that fails', () => {
     );
   });
 
-  it('a 500 000-token prompt at a cap of 1 048 576 whose cache goes stale at request 16 bills within its reservation', async () => {
+  it('a 50 000-token prompt at a cap of 1 048 576 whose cache goes stale at request 16 bills within its reservation', async () => {
     const { ctx, generateContentStream } = budgetedCtx();
-    const prompt = 500_000;
-    mocks.scanWorkspace.mockResolvedValueOnce({
-      ...ONE_FILE_SCAN,
-      filesHash: 'big',
-      files: [{ relpath: 'a.ts', size: prompt * 4, contentHash: 'h', absolutePath: '/fake/a.ts' }],
-    });
+    // small enough for sixteen requests inside the 1 048 576-token input window (prompt + 15 × 65 536 decoded)
+    const prompt = 50_000;
+    mocks.scanWorkspace.mockResolvedValueOnce(oneFileScan({ size: prompt * 4, filesHash: 'big' }));
     (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
       .fn()
       .mockResolvedValue({ totalTokens: prompt });
@@ -763,6 +794,25 @@ describe('ask — the ledger of a decode that fails', () => {
       // the continuation request was never sent
       continuationHops: 0,
     });
+  });
+
+  it('a manifest the keep-alive cannot read leaves the request to go out and answer', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
+    const manifest = {
+      getWorkspace: () => {
+        throw new Error('SQLITE_BUSY: database is locked');
+      },
+      upsertWorkspace: vi.fn(),
+    } as unknown as ManifestDb;
+    const client = { caches: { update: vi.fn() } } as unknown as GoogleGenAI;
+    ctx.ttlWatcher = new TtlWatcher(client, manifest);
+    generateContentStream.mockImplementationOnce(answering('The answer.', 'STOP', 1_000));
+
+    const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 262_144 }, ctx);
+
+    expect(result.isError).toBeFalsy();
+    expect(generateContentStream).toHaveBeenCalledTimes(1);
   });
 });
 

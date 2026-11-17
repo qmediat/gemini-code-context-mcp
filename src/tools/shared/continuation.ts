@@ -24,6 +24,7 @@ import {
 } from '@google/genai';
 import { abortableSleep, withNetworkRetry } from '../../gemini/retry.js';
 import { logger } from '../../utils/logger.js';
+import { billedInputTokens } from './call-ledger.js';
 import { statusOf } from './service-tier.js';
 import {
   type CollectedResponse,
@@ -61,7 +62,10 @@ export interface DecodeCall {
   readonly contents: GenerateContentParameters['contents'];
   /** The request config; `automaticContinuation: false` is set on it here, the abort signal is the collector's. */
   readonly config: GenerateContentConfig;
-  /** Attempts to OPEN each request (a failure before any response); a stream that opened is never re-sent. */
+  /**
+   * SDK calls that OPEN each request (a failure before any response), network retries and reopenings after a refusal
+   * together; a stream that opened is never re-sent.
+   */
   readonly openAttempts: number;
   /** The log prefix of a retried opening (`ask`, `code (stale-cache retry)`). */
   readonly label: string;
@@ -74,10 +78,20 @@ export interface DecodeCall {
   readonly completed: CompletedRequests;
   /** What the caller does between the requests (`DecodeHooks`, its `completed` is the one above). */
   readonly hooks?: Omit<DecodeHooks, 'completed'>;
+  /**
+   * A refused continuation request is about to be reopened, its wait over: what the request holds for the window it
+   * is sent in (the per-minute reservation) is taken again. A rejection ends the decode before the reopening.
+   */
+  readonly beforeReopen?: () => Promise<void>;
 }
 
 /** What runs between the requests of a decode. */
 export interface DecodeHooks {
+  /**
+   * The input the decode's first request is estimated to send (its throttle reservation): a request that reports no
+   * usage is billed at it, plus the tokens decoded before the request (`billedInputTokens`).
+   */
+  readonly firstRequestInput?: number;
   /** The call's record of its requests: each one that streamed to its end goes in at once. */
   readonly completed?: CompletedRequests;
   /** A request streamed to its end, with the usage it reported. */
@@ -95,10 +109,11 @@ export type DecodeUsage = NonNullable<GenerateContentResponse['usageMetadata']>;
 /**
  * Every request of one call that streamed to its end. Each one is billed whatever becomes of the call — an answer,
  * a later request that fails, a stale-cache retry that starts a new decode — so the call settles its ledger from
- * here, never from the answer alone.
+ * here, never from the answer alone. A request that reported no input is billed at the input it was estimated to
+ * send (`billedInputTokens`).
  */
 export class CompletedRequests {
-  private readonly reported: DecodeUsage[] = [];
+  private readonly billed: DecodeUsage[] = [];
   private total = 0;
   private completedInDecode = 0;
   private sentInDecode = 0;
@@ -114,8 +129,10 @@ export class CompletedRequests {
     this.sentInDecode += 1;
   }
 
-  record(usage: DecodeUsage | undefined): void {
-    if (usage !== undefined) this.reported.push(usage);
+  /** A request streamed to its end with `usage`; `inputEstimate` is the input it was estimated to send. */
+  record(usage: DecodeUsage | undefined, inputEstimate: number): void {
+    const promptTokenCount = billedInputTokens(usage?.promptTokenCount, inputEstimate);
+    this.billed.push({ ...usage, promptTokenCount });
     this.total += 1;
     this.completedInDecode += 1;
   }
@@ -138,9 +155,9 @@ export class CompletedRequests {
     return Math.max(0, this.sentInDecode - 1);
   }
 
-  /** Each counter summed over the completed requests that reported it; `undefined` when none reported usage. */
+  /** Each counter summed over the completed requests that have it; `undefined` before any request completed. */
   usage(): DecodeUsage | undefined {
-    return sumUsage(this.reported);
+    return sumUsage(this.billed);
   }
 }
 
@@ -151,20 +168,16 @@ export class CompletedRequests {
  */
 export function runDecode(call: DecodeCall): Promise<DecodedResponse> {
   const open: OpenDecodeRequest = async (continuationToken) => {
-    // Counted once per request, however many attempts its opening took; a request never sent is not counted.
-    let sent = false;
-    const onSent = (): void => {
-      sent = true;
-    };
+    const budget = new OpeningBudget(call.openAttempts);
+    const send = (): Promise<DecodeStream> => sendRequest(call, continuationToken, budget);
     try {
       const stream =
-        continuationToken === undefined
-          ? await sendRequest(call, undefined, onSent)
-          : await reopenRefused(() => sendRequest(call, continuationToken, onSent), call);
+        continuationToken === undefined ? await send() : await reopenRefused(send, call, budget);
       call.onRequestOpened();
       return stream;
     } finally {
-      if (sent) call.completed.sent();
+      // Counted once per request, however many attempts its opening took; a request never sent is not counted.
+      if (budget.spent > 0) call.completed.sent();
     }
   };
   call.completed.beginDecode();
@@ -174,16 +187,38 @@ export function runDecode(call: DecodeCall): Promise<DecodedResponse> {
   });
 }
 
-/** Open one request; `onSent` runs each time an attempt goes to the SDK. */
+/**
+ * The SDK calls one request's opening may still make: the network retries of every attempt and the reopenings after a
+ * refusal draw on the same `openAttempts`.
+ */
+class OpeningBudget {
+  private used = 0;
+
+  constructor(private readonly attempts: number) {}
+
+  spend(): void {
+    this.used += 1;
+  }
+
+  get spent(): number {
+    return this.used;
+  }
+
+  get remaining(): number {
+    return Math.max(0, this.attempts - this.used);
+  }
+}
+
+/** Open one request with the calls `budget` has left; each call that goes to the SDK is spent from it. */
 function sendRequest(
   call: DecodeCall,
   continuationToken: string | undefined,
-  onSent: () => void,
+  budget: OpeningBudget,
 ): Promise<DecodeStream> {
   const signal = call.collector.signal;
   return withNetworkRetry(
     () => {
-      onSent();
+      budget.spend();
       return call.client.models.generateContentStream({
         model: call.model,
         contents: call.contents,
@@ -196,7 +231,7 @@ function sendRequest(
       });
     },
     {
-      attempts: call.openAttempts,
+      attempts: budget.remaining,
       signal,
       onRetry: (attempt, err) => logRetry(call.label, attempt, err),
     },
@@ -222,20 +257,22 @@ const REOPEN_BASE_WAIT_MS = 2_000;
 
 /**
  * Open a continuation request; a 429 or 503 at its opening (nothing of it billed yet) waits Google's retry hint, else
- * the base wait, and reopens with the same token — at most `openAttempts` openings, every wait abortable by the
+ * the base wait, takes its per-minute reservation again (`beforeReopen`) and reopens with the same token — while the
+ * request's opening budget lasts (`openAttempts` SDK calls, network retries included), every wait abortable by the
  * call's signal (`timeoutMs`). A refused first request is not reopened: nothing of the call is billed yet, and the
  * caller sees the 429 / 503 as before.
  */
 async function reopenRefused(
   send: () => Promise<DecodeStream>,
   call: DecodeCall,
+  budget: OpeningBudget,
 ): Promise<DecodeStream> {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await send();
     } catch (err) {
       const status = statusOf(err);
-      if (status === undefined || !REFUSED_AT_OPENING.has(status) || attempt >= call.openAttempts)
+      if (status === undefined || !REFUSED_AT_OPENING.has(status) || budget.remaining === 0)
         throw err;
       const waitMs =
         (isGemini429(err) ? parseRetryDelayMs(err.message) : null) ?? reopenWaitMs(attempt);
@@ -243,6 +280,7 @@ async function reopenRefused(
         `${call.label}: continuation request refused at its opening (HTTP ${status}); reopening with the same token in ${waitMs} ms (attempt ${attempt})`,
       );
       await abortableSleep(waitMs, call.collector.signal);
+      await call.beforeReopen?.();
     }
   }
 }
@@ -272,15 +310,18 @@ export async function collectDecode(
   hooks: DecodeHooks = {},
 ): Promise<DecodedResponse> {
   const requests: CollectedResponse[] = [];
+  const firstInput = hooks.firstRequestInput ?? 0;
+  let input = firstInput;
   let token: string | undefined;
   for (;;) {
     const collected = await collectStream(await open(token), opts);
-    hooks.completed?.record(collected.usageMetadata);
+    hooks.completed?.record(collected.usageMetadata, input);
     hooks.afterRequest?.(collected.usageMetadata);
     requests.push(collected);
     const next = nextContinuationToken(requests, token, limits);
     if (next === undefined) return mergeRequests(requests);
-    await hooks.beforeContinuation?.(continuationInput(requests));
+    input = continuationInput(requests, firstInput);
+    await hooks.beforeContinuation?.(input);
     token = next;
   }
 }
@@ -319,9 +360,13 @@ function madeProgress(request: CollectedResponse, openedWith: string | undefined
   return false;
 }
 
-/** The input a continuation request sends: the first request's prompt plus every token decoded so far. */
-function continuationInput(requests: readonly CollectedResponse[]): number {
-  return (requests[0]?.usageMetadata?.promptTokenCount ?? 0) + decodedTokens(requests);
+/**
+ * The input a continuation request sends: the first request's prompt (its estimate when it reported none) plus every
+ * token decoded so far.
+ */
+function continuationInput(requests: readonly CollectedResponse[], firstInput: number): number {
+  const prompt = billedInputTokens(requests[0]?.usageMetadata?.promptTokenCount, firstInput);
+  return prompt + decodedTokens(requests);
 }
 
 /** The tokens the requests decoded so far: thinking and answer. */

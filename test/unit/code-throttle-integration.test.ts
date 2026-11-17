@@ -10,11 +10,17 @@
 import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
-import { TRUNCATED_EDITS_NOTE, codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
+import {
+  TRUNCATED_ANSWER_NOTE,
+  TRUNCATED_EDITS_NOTE,
+  codeInputSchema,
+  codeTool,
+} from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
-import { GEMINI_4_ARGON, GEMINI_4_HYDROGEN } from '../helpers/models.js';
+import { GEMINI_3_PRO, GEMINI_4_ARGON, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
+import { INLINE_CONTEXT, ONE_FILE_SCAN } from '../helpers/workspace.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -128,45 +134,17 @@ function buildCtx(opts: BuildCtxOptions = {}): {
 
 const methodSequence = (spy: ThrottleSpy): string[] => spy.calls.map((c) => c.method);
 
-/** The workspace every test scans: one 100-byte file (a long decode's exact preflight count reads it). */
-const ONE_FILE_SCAN = {
-  workspaceRoot: '/fake',
-  filesHash: 'abc',
-  files: [{ relpath: 'a.ts', size: 100, contentHash: 'h1', absolutePath: '/fake/a.ts' }],
-  skippedTooLarge: 0,
-  excludedDirs: [],
-  excludedDirsTotal: 0,
-  skippedNonSource: 0,
-  truncated: false,
-};
-
 describe('code.tool.ts throttle call sequence (T22b regression)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.validateWorkspacePath.mockReturnValue(undefined);
     mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
     mocks.resolveModel.mockResolvedValue({
+      ...GEMINI_3_PRO,
       requested: 'latest-pro-thinking',
-      resolved: 'gemini-3-pro-preview',
       inputTokenLimit: 2_000_000,
-      outputTokenLimit: 65_536,
-      fallbackApplied: false,
-      category: 'text-reasoning',
-      capabilities: {
-        supportsThinking: true,
-        supportsVision: true,
-        supportsCodeExecution: true,
-        costTier: 'premium',
-      },
     });
-    mocks.prepareContext.mockResolvedValue({
-      cacheId: null,
-      inlineContents: [],
-      reused: false,
-      rebuilt: false,
-      inlineOnly: true,
-      uploaded: { failedCount: 0, failures: [] },
-    });
+    mocks.prepareContext.mockResolvedValue(INLINE_CONTEXT);
     mocks.isStaleCacheError.mockReturnValue(false);
   });
 
@@ -280,28 +258,8 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     vi.clearAllMocks();
     mocks.validateWorkspacePath.mockReturnValue(undefined);
     mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
-    mocks.resolveModel.mockResolvedValue({
-      requested: 'latest-pro-thinking',
-      resolved: 'gemini-3-pro-preview',
-      inputTokenLimit: 1_048_576,
-      outputTokenLimit: 65_536,
-      fallbackApplied: false,
-      category: 'text-reasoning',
-      capabilities: {
-        supportsThinking: true,
-        supportsVision: true,
-        supportsCodeExecution: true,
-        costTier: 'premium',
-      },
-    });
-    mocks.prepareContext.mockResolvedValue({
-      cacheId: null,
-      inlineContents: [],
-      reused: false,
-      rebuilt: false,
-      inlineOnly: true,
-      uploaded: { failedCount: 0, failures: [] },
-    });
+    mocks.resolveModel.mockResolvedValue({ ...GEMINI_3_PRO, requested: 'latest-pro-thinking' });
+    mocks.prepareContext.mockResolvedValue(INLINE_CONTEXT);
     mocks.isStaleCacheError.mockReturnValue(false);
   });
 
@@ -461,6 +419,65 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
       expect(text.startsWith(TRUNCATED_EDITS_NOTE)).toBe(true);
       expect(text).toContain(cutEdits);
     });
+
+    it('says a prose answer (expectEdits: false) cut at the request limit is cut, with no edit list named', async () => {
+      mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_ARGON);
+      const { ctx } = buildCtx();
+      const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      const cutProse = 'The module splits in two because';
+      generateContent.mockResolvedValueOnce(argonStop).mockResolvedValueOnce({
+        text: cutProse,
+        candidates: [{ index: 0, finishReason: 'CONTINUATION', continuationToken: 'tok-2' }],
+        usageMetadata: {
+          promptTokenCount: 33_893,
+          candidatesTokenCount: 32_768,
+          thoughtsTokenCount: 0,
+        },
+      });
+
+      const result = await codeTool.execute(
+        { task: 'explain', maxOutputTokens: 65_536, expectEdits: false },
+        ctx,
+      );
+
+      expect(result.structuredContent).toMatchObject({ truncated: true, editCount: 0 });
+      const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+      expect(text.startsWith(TRUNCATED_ANSWER_NOTE)).toBe(true);
+      expect(text).not.toContain('edit list');
+      expect(text).toContain(cutProse);
+    });
+
+    it('a stop at the cap with no answer is OUTPUT_CAP with the fields ask returns for it', async () => {
+      mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_ARGON);
+      const { ctx } = buildCtx();
+      const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      generateContent.mockResolvedValue(argonStop);
+
+      const result = await codeTool.execute({ task: 'refactor', maxOutputTokens: 32_768 }, ctx);
+
+      expect(result.isError).toBe(true);
+      for (const field of [
+        'errorCode',
+        'retryable',
+        'resolvedModel',
+        'serviceTier',
+        'finishReason',
+        'cachedTokens',
+        'uncachedTokens',
+        'outputTokens',
+        'thinkingTokens',
+        'costEstimateUsd',
+        'continuationHops',
+      ]) {
+        expect(result.structuredContent, field).toHaveProperty(field);
+      }
+      expect(result.structuredContent?.errorCode).toBe('OUTPUT_CAP');
+      expect(result.structuredContent?.resolvedModel).toBe('gemini-4-argon');
+    });
   });
 
   describe('the ledger of a decode that fails', () => {
@@ -561,14 +578,7 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
       return reasoning(requested, requested !== 'latest-pro-nothink');
     });
     // this suite's own context: nothing inherited from the sibling suites' beforeEach
-    mocks.prepareContext.mockResolvedValue({
-      cacheId: null,
-      inlineContents: [],
-      reused: false,
-      rebuilt: false,
-      inlineOnly: true,
-      uploaded: { failedCount: 0, failures: [] },
-    });
+    mocks.prepareContext.mockResolvedValue(INLINE_CONTEXT);
     mocks.isStaleCacheError.mockReturnValue(false);
   });
 

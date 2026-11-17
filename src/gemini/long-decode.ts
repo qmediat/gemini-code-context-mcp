@@ -20,12 +20,16 @@ export const LONG_DECODE_STREAM_REQUEST_TOKENS = 65_536;
 /** A text model of the Gemini 4 family (`gemini-4-<codename>`, `gemini-4.1-<codename>`, their `-preview` twins). */
 const GEMINI_4_ID = /^gemini-4(?:\.\d+)?-/i;
 
+/** The API a client was built for: the Gemini Developer API (an API key) or Vertex AI. */
+export type ApiBackend = 'developer' | 'vertex';
+
 /**
- * The total a decode of `modelId` may reach through continuation, or `null` for a model without long decode.
- * The model registry carries it beside the advertised input and output limits.
+ * The total a decode of `modelId` may reach through continuation, or `null` for a model without long decode. Long
+ * decode runs on the Gemini Developer API only: on Vertex AI every model is clamped to its per-request limit,
+ * whatever the shape of its id. The model registry carries it beside the advertised input and output limits.
  */
-export function longDecodeTokenLimitOf(modelId: string): number | null {
-  if (!GEMINI_4_ID.test(modelId)) return null;
+export function longDecodeTokenLimitOf(modelId: string, backend: ApiBackend): number | null {
+  if (backend !== 'developer' || !GEMINI_4_ID.test(modelId)) return null;
   return isTextGenCategory(categorizeModel(modelId)) ? LONG_DECODE_TOTAL_TOKENS : null;
 }
 
@@ -40,11 +44,17 @@ export const CONTINUATION_REQUEST_OVERHEAD_TOKENS = 256;
 export interface OutputCap {
   /** `maxOutputTokens` on the wire; `undefined` sends none and the model applies its own default. */
   readonly wire: number | undefined;
-  /** The most the call decodes: the wire cap, else the model's per-request limit (its default). */
+  /**
+   * The most the call decodes: the wire cap, else the model's per-request limit (its default) — less when the
+   * model's input window bounds a long decode (`boundByInputWindow`).
+   */
   readonly effective: number;
   /** The model's advertised per-request output limit. */
   readonly perRequest: number;
-  /** The most a caller may ask for: the long-decode total on a model with long decode, else `perRequest`. */
+  /**
+   * The most a caller may ask for: the long-decode total on a model with long decode, else `perRequest`; for a prompt
+   * the input window bounds, what that window leaves.
+   */
   readonly ceiling: number;
   /** The requests the decode may take: 1 unless the cap is above the per-request limit on a long-decode model. */
   readonly maxRequests: number;
@@ -87,6 +97,57 @@ export function resolveOutputCap(inputs: OutputCapInputs): OutputCap {
     ceiling,
     maxRequests: maxDecodeRequests(effective, perRequest),
   };
+}
+
+/** A long decode's cap cut so that no continuation request's input passes the model's input window. */
+export interface InputWindowCut {
+  /** The cap before the cut: the caller's, clamped to the model's limits. */
+  readonly from: number;
+  /** The cap the decode runs under. */
+  readonly to: number;
+  /** The model's input window that cut it. */
+  readonly inputTokenLimit: number;
+}
+
+/** The cap a decode runs under, and the cut the input window made to it (`null`: none). */
+export interface BoundedOutputCap {
+  readonly cap: OutputCap;
+  readonly cut: InputWindowCut | null;
+}
+
+/**
+ * The cap of a long decode bounded by the model's input window W. Request k sends the prompt P again plus every token
+ * decoded before it, and the client opens no further request once the decoded tokens reached the cap: under a cap of
+ * at most W − P − O no request's input passes W. The cap is never cut below one request's limit — the first request
+ * sends the prompt alone, which the preflight bounds — and `wire` stays the caller's: the client stops the decode at
+ * `effective`, after `maxRequests`. Without a counted prompt or an advertised window nothing is cut.
+ */
+export function boundByInputWindow(
+  cap: OutputCap,
+  promptTokens: number | undefined,
+  inputTokenLimit: number | null,
+): BoundedOutputCap {
+  if (cap.maxRequests <= 1 || promptTokens === undefined || inputTokenLimit === null) {
+    return { cap, cut: null };
+  }
+  const room = inputTokenLimit - promptTokens - CONTINUATION_REQUEST_OVERHEAD_TOKENS;
+  const most = Math.min(cap.ceiling, Math.max(room, cap.perRequest));
+  if (cap.effective <= most) return { cap, cut: null };
+  return {
+    cap: {
+      ...cap,
+      effective: most,
+      ceiling: most,
+      maxRequests: maxDecodeRequests(most, cap.perRequest),
+    },
+    cut: { from: cap.effective, to: most, inputTokenLimit },
+  };
+}
+
+/** The progress and log line of a cut cap. */
+export function describeInputWindowCut(cut: InputWindowCut): string {
+  const n = (v: number): string => v.toLocaleString('en-US');
+  return `maxOutputTokens cut from ${n(cut.from)} to ${n(cut.to)}: each continuation request sends the prompt again plus everything decoded before it, and the model's ${n(cut.inputTokenLimit)}-token input window holds no more`;
 }
 
 /** The preflight's count modes (`preflightMode` of `ask` and `code`). */

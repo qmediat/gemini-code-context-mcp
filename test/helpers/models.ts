@@ -35,3 +35,21 @@ export const GEMINI_4_ARGON: ResolvedModel = {
   category: 'text-reasoning',
   capabilities: { ...GEMINI_4_HYDROGEN.capabilities, costTier: 'premium' },
 };
+
+/** Gemini 3 Pro (preview): a reasoning model without long decode, the model the older tool suites resolve to. */
+export const GEMINI_3_PRO: ResolvedModel = {
+  requested: 'latest-pro',
+  resolved: 'gemini-3-pro-preview',
+  inputTokenLimit: 1_048_576,
+  outputTokenLimit: 65_536,
+  longDecodeTokenLimit: null,
+  fallbackApplied: false,
+  category: 'text-reasoning',
+  capabilities: {
+    supportsThinking: true,
+    supportsVision: true,
+    supportsCodeExecution: true,
+    costTier: 'premium',
+  },
+  supportsCaching: true,
+};

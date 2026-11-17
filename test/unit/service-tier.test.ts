@@ -23,7 +23,9 @@ import {
   estimateCostUsd,
   estimatePreCallCostUsd,
 } from '../../src/utils/cost-estimator.js';
+import { GEMINI_3_PRO } from '../helpers/models.js';
 import { okStream } from '../helpers/stream-mock.js';
+import { INLINE_CONTEXT, oneFileScan } from '../helpers/workspace.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -112,51 +114,16 @@ function buildCtx(
   return { ctx, sent };
 }
 
-const resolved = {
-  requested: 'latest-pro',
-  resolved: 'gemini-3-pro-preview',
-  inputTokenLimit: 2_000_000,
-  outputTokenLimit: 65_536,
-  fallbackApplied: false,
-  supportsCaching: true,
-  category: 'text-reasoning' as const,
-  capabilities: {
-    supportsThinking: true,
-    supportsVision: true,
-    supportsCodeExecution: true,
-    costTier: 'premium',
-  },
-};
+const resolved = { ...GEMINI_3_PRO, inputTokenLimit: 2_000_000 };
 
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.validateWorkspacePath.mockReturnValue(undefined);
-  mocks.scanWorkspace.mockResolvedValue({
-    workspaceRoot: dir,
-    filesHash: 'abc',
-    files: [
-      {
-        relpath: 'a.ts',
-        absolutePath: join(dir, 'a.ts'),
-        size: 100,
-        contentHash: 'h1',
-        mtimeMs: 0,
-      },
-    ],
-    skippedTooLarge: 0,
-    excludedDirs: [],
-    excludedDirsTotal: 0,
-    skippedNonSource: 0,
-    truncated: false,
-  });
+  mocks.scanWorkspace.mockResolvedValue(oneFileScan({ root: dir }));
   mocks.resolveModel.mockResolvedValue(resolved);
   mocks.prepareContext.mockResolvedValue({
-    cacheId: null,
+    ...INLINE_CONTEXT,
     inlineContents: [{ role: 'user', parts: [{ text: 'workspace' }] }],
-    reused: false,
-    rebuilt: false,
-    inlineOnly: true,
-    uploaded: { failedCount: 0, failures: [] },
   });
   mocks.isStaleCacheError.mockReturnValue(false);
 });

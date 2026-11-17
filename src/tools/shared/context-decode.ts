@@ -145,7 +145,9 @@ async function decodeOn(
       call.tracking.streamOpened = true;
     },
     completed: call.completed,
+    beforeReopen: () => call.throttle.renew(),
     hooks: {
+      firstRequestInput: call.estimatedInputTokens,
       afterRequest: (usage) => {
         call.timeout.pauseStall();
         call.throttle.settle(usage?.promptTokenCount);

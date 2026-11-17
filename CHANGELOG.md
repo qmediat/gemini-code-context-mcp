@@ -18,10 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Measured on gemini-4-hydrogen at `XHIGH`: review prompts of 99,712 and 153,906 tokens that stopped at 65,533
   thinking tokens with no answer now answer in two requests (1.0485 and 1.3164 USD). Without `maxOutputTokens` a call
   is one request, as before. Named limits: `ask_agentic` (its own loop, one model call per iteration) and the Vertex AI
-  backend (the cap is clamped to the per-request limit there) are not covered. A request that makes no progress —
+  backend are not covered — on a Vertex client the cap is clamped to the per-request limit whatever the shape of the
+  model id (a plain `gemini-4-…` id included). Each continuation request sends the prompt again plus everything decoded
+  before it, so a long decode is bounded by the model's input window as well: when the counted prompt leaves less room
+  than the cap, the decode runs to what the window leaves (never below one request) and the result names the cut in
+  `outputCapCutByInputWindow` (`from`, `to`, `inputTokenLimit`). A request that makes no progress —
   it returns the continuation token it was sent with, or decodes nothing — ends the decode instead of being sent again
   up to the request limit. A continuation request refused at its opening with 429 or 503 (nothing of it billed) is
-  sent again with the same token after Google's retry hint, at most three openings on `standard`, none on `flex`.
+  sent again with the same token after Google's retry hint, once its TPM throttle reservation is taken again for the
+  minute it is sent in; one request's opening makes at most three SDK calls on `standard` (network retries and
+  reopenings together), one on `flex`.
   `timeoutMs` (30 minutes at most) fits about 7 to 9 requests at the measured pace; when it fires the completed
   requests are billed and reported. `stallMs` does not count the time before a continuation request's first chunk.
 - `finishReason` and `truncated` on every `ask` and `code` result: `truncated: true` when the answer has text but
@@ -55,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minutes, extended at once (the TTL watcher's own tick runs every 5 minutes).
 - `ask` / `code`: each request of a long decode holds its own TPM throttle reservation (the prompt plus what was
   decoded before it), settled at the input it reported.
+- `ask` / `code`: a request that completed but reported no usage is booked in the daily budget ledger at the input it
+  was estimated to send — the rule `ask_agentic` already applied — instead of at 0 USD, which released the whole
+  reservation for billed work.
 
 - Development only: `npm run check:supports` compares `server.json` (`version` and every `packages[].version`) and the
   root of `package-lock.json` (`version`, and `packages[""].version` where the lockfile has that map) with

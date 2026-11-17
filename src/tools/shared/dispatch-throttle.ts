@@ -8,6 +8,7 @@
  */
 
 import { abortableSleep } from '../../gemini/retry.js';
+import { billedInputTokens } from './call-ledger.js';
 import type { TpmThrottle } from './throttle.js';
 
 export interface DispatchThrottleOptions {
@@ -25,6 +26,7 @@ const NONE = -1;
 
 export class DispatchThrottle {
   private releaseId = NONE;
+  private heldModel = '';
   private heldTokens = 0;
 
   constructor(private readonly opts: DispatchThrottleOptions) {}
@@ -38,10 +40,20 @@ export class DispatchThrottle {
     this.cancel();
     const reservation = this.opts.throttle.reserve(model, inputTokens);
     this.releaseId = reservation.releaseId;
+    this.heldModel = model;
     this.heldTokens = inputTokens;
     if (reservation.delayMs <= 0) return;
     this.opts.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
     await abortableSleep(reservation.delayMs, this.opts.signal);
+  }
+
+  /**
+   * The request held is sent later than its reservation planned (a reopening after a refusal and its wait): it is
+   * reserved again for the window it is sent in now. Nothing is held: nothing to renew.
+   */
+  async renew(): Promise<void> {
+    if (this.releaseId === NONE) return;
+    await this.reserve(this.heldModel, this.heldTokens);
   }
 
   /**
@@ -50,7 +62,7 @@ export class DispatchThrottle {
    */
   settle(promptTokens: number | undefined): void {
     if (this.releaseId === NONE) return;
-    this.opts.throttle.release(this.releaseId, promptTokens ?? this.heldTokens);
+    this.opts.throttle.release(this.releaseId, billedInputTokens(promptTokens, this.heldTokens));
     this.releaseId = NONE;
   }
 
