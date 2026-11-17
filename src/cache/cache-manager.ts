@@ -484,6 +484,9 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   emitter.emit('building context cache…');
   const fileContents = buildContentFromUploaded(uploaded.files);
   const ttl = effectiveTtlSeconds(ttlSeconds);
+  // The cache Google created, once it has a name: a failure after that point (the manifest write) must not leave it
+  // alive and unrecorded.
+  let createdCacheId: string | null = null;
   try {
     const baseConfig = {
       contents: fileContents,
@@ -506,6 +509,7 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
     // inline), never a context with neither a cache nor its files.
     if (!created.name) throw new Error('caches.create returned no cache name');
     const cacheId = created.name;
+    createdCacheId = cacheId;
     const cacheExpiresAt = afterCreateMs + ttl * 1000;
 
     manifest.upsertWorkspace({
@@ -538,7 +542,14 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
       inlineOnly: false,
     };
   } catch (err) {
-    logger.warn(`cache build failed — falling back to inline parts: ${safeForLog(err)}`);
+    if (createdCacheId === null) {
+      logger.warn(`cache build failed — falling back to inline parts: ${safeForLog(err)}`);
+    } else {
+      logger.warn(
+        `recording cache ${safeForLog(createdCacheId)} in the manifest failed — deleting it, falling back to inline parts: ${safeForLog(err)}`,
+      );
+      void bestEffortDeleteCache(client, createdCacheId);
+    }
     manifest.upsertWorkspace({
       workspaceRoot: scan.workspaceRoot,
       filesHash: scan.filesHash,
@@ -564,7 +575,7 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
 
 /**
  * Best-effort async delete of a stale cache after a successful rebuild
- * (v1.13.0+). Retries 3× with exponential back-off (1 s, 3 s, 9 s) for
+ * (v1.13.0+), or of a new cache the manifest could not record. Retries 3× with exponential back-off (1 s, 3 s, 9 s) for
  * transient errors. Logs at warn on permanent failure — orphaned caches
  * auto-expire at Google's TTL so the worst case is bounded storage cost.
  *

@@ -25,6 +25,7 @@ import {
 import type { ScanResult } from '../../src/indexer/workspace-scanner.js';
 import { ManifestDb } from '../../src/manifest/db.js';
 import type { ResolvedModel } from '../../src/types.js';
+import { logger } from '../../src/utils/logger.js';
 import type { ProgressEmitter } from '../../src/utils/progress.js';
 
 function mkEmitter(): ProgressEmitter {
@@ -854,6 +855,61 @@ describe('prepareContext', () => {
       }
     },
   );
+
+  /** A rebuild whose create succeeds and whose manifest write of the new cache fails; the warnings recorded. */
+  async function prepareWithFailingCacheWrite() {
+    const createdAtMs = Date.now();
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash: 'fh-OLD',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-1',
+      cacheId: 'cachedContents/previous',
+      cacheExpiresAt: createdAtMs + 30 * 60 * 1000,
+      fileIds: [],
+      createdAt: createdAtMs,
+      updatedAt: createdAtMs,
+    });
+    const write = db.upsertWorkspace.bind(db);
+    vi.spyOn(db, 'upsertWorkspace').mockImplementation((row) => {
+      if (row.cacheId !== null) throw new Error('SQLITE_FULL: database or disk is full');
+      write(row);
+    });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const client = mkClient({ cachesCreate: async () => mkCreated(createdAtMs, 3600) });
+    try {
+      const result = await prepareContext({
+        client,
+        manifest: db,
+        scan: mkScan([{ relpath: 'kept.ts', size: 8_000 }]),
+        model: mkModel(),
+        systemPromptHash: 'sph-1',
+        ttlSeconds: 3600,
+        emitter: mkEmitter(),
+        allowCaching: true,
+      });
+      return { client, result, warnings: warn.mock.calls.map((call) => String(call[0])) };
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it('a manifest write that fails after the create deletes the new cache; the files go inline', async () => {
+    const { client, result } = await prepareWithFailingCacheWrite();
+
+    expect(client.caches.delete).toHaveBeenCalledWith({ name: 'cachedContents/created' });
+    expect(result.cacheId).toBeNull();
+    expect(result.inlineContents).toHaveLength(1);
+    expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+  });
+
+  it('a manifest write that fails after the create is warned as the manifest write, not the build', async () => {
+    const { warnings } = await prepareWithFailingCacheWrite();
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^recording cache cachedContents\/created in the manifest failed/);
+    expect(warnings[0]).toContain('SQLITE_FULL');
+  });
 
   // v1.14.0 round-1 review fix (F1, Copilot HIGH): the in-flight coalescing
   // key MUST include `cachingMode`. Pre-fix, two concurrent prepareContext
