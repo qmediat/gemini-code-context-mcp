@@ -123,17 +123,6 @@
       "count": 6
     }
   },
-  "src/tools/ask-agentic.tool.ts": {
-    "complexity": {
-      "count": 3
-    },
-    "max-depth": {
-      "count": 22
-    },
-    "max-lines-per-function": {
-      "count": 4
-    }
-  },
   "src/tools/ask.tool.ts": {
     "complexity": {
       "count": 1

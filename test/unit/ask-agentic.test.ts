@@ -17,9 +17,9 @@
  *   FAKE-TIMER HAZARD — READ BEFORE ADDING TESTS HERE
  * ─────────────────────────────────────────────────────────────────────────
  * Tests in this file MUST NOT call `vi.useFakeTimers()` before
- * `await askAgenticTool.execute(...)`. The production code path (line ~409
+ * `await askAgenticTool.execute(...)`. The production code path (`openWorkspace`
  * in `src/tools/ask-agentic.tool.ts`) calls `await resolveWorkspaceRoot(...)`
- * → `await fs.promises.realpath(...)` (sandbox.ts:155) — libuv thread-pool
+ * → `await fs.promises.realpath(...)` (`agentic/sandbox.ts`) — libuv thread-pool
  * I/O that fake timers CANNOT intercept. Sequence:
  *
  *   1. Test calls `vi.useFakeTimers()`
@@ -36,8 +36,8 @@
  *      (e.g. the F2 / F3 / end-to-end iteration-timeout tests) deadlocks
  *      its own `setTimeout` against the leaked fake-timer queue.
  *
- * v1.7.2 traced this race (CHANGELOG `[1.7.2]`) and rewrote `:592` (the
- * one offender at the time) to use real timers. The file-level `afterEach`
+ * v1.7.2 traced this race (CHANGELOG `[1.7.2]`) and rewrote the one
+ * offender at the time to use real timers. The file-level `afterEach`
  * below is defense-in-depth so a future regression of the same pattern is
  * contained to one test instead of cascading.
  *
@@ -69,8 +69,8 @@ const mocks = vi.hoisted(() => ({
   // F2: opt-in latency injection for `grepExecutor`. Default 0 = pass-through
   // for all existing tests. Per-test override (set in the test body, reset
   // in `beforeEach`) wraps the real executor with `setTimeout`-based delay
-  // so we can drive the post-dispatch abort check at
-  // `src/tools/ask-agentic.tool.ts:918-922` without faking timers.
+  // so we can drive the post-dispatch abort check (`throwIfIterationAborted`
+  // in `src/tools/agentic/iteration.ts`) without faking timers.
   grepExecutorDelayMs: 0,
 }));
 
@@ -1332,14 +1332,9 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
 });
 
 describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () => {
-  it('per-iteration 429: extracts retryDelay from ApiError + seeds throttle hint', async () => {
-    // Pre-Fix-4 ask_agentic discarded 429 retry hints — TPM throttle relied on
-    // pure-window math which over-estimates by 30s+ on real 429s. Post-Fix-4
-    // mirrors `ask.tool.ts:~1063`: gate on `isGemini429` (requires
-    // `err instanceof ApiError` + status===429), parse `retryInfo.retryDelay`
-    // from the body, and `throttle.recordRetryHint(model, delayMs)` to seed
-    // the cache. Future ask_agentic / ask / code calls honour the hint via
-    // `throttle.reserve`'s `activeHint` lookup.
+  it('per-iteration 429: seeds the throttle hint once, though the 429 also reaches the outer catch', async () => {
+    // The iteration's catch seeds the hint (gated on `isGemini429`: an ApiError with status 429) and
+    // re-throws; the outer catch meets the same error and must not seed it again.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
     const apiErr = new ApiError({
@@ -1347,22 +1342,14 @@ describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () =
       message: '{"error":{"code":429,"details":[{"retryDelay":"7s"}]}}',
     });
     const { ctx, throttle } = buildCtx({ script: [] });
-    // Override generateContent to throw the 429 on iter 1.
     (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
     (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
 
     const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
 
-    // Iter catch re-throws non-timeout errors, so the call ultimately errors
-    // out via the outer catch with errorCode='UNKNOWN'. The load-bearing
-    // assertion is that the retry hint WAS recorded BEFORE the re-throw.
     expect(result.isError).toBe(true);
-    // recordRetryHint may be called once (inner catch) or once more if the
-    // outer catch's safety-net hint extraction also fires (depends on whether
-    // the inner catch's `throw iterErr` path reaches the outer for the same
-    // 429). Either way the recorded model + delay must match. Pin BOTH the
-    // model (literal — `resolveModel` mock returns 'gemini-3-pro-preview') and
-    // the parsed delay (7s → 7000ms).
+    expect(result.structuredContent?.errorCode).toBe('UNKNOWN');
+    expect(throttle.recordRetryHint).toHaveBeenCalledTimes(1);
     expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 7_000);
   });
 
@@ -1393,45 +1380,26 @@ describe('ask_agentic loop — 429 retry-hint integration (v1.14.2 Fix 4)', () =
     expect(throttle.recordRetryHint).not.toHaveBeenCalled();
   });
 
-  it('outer-catch 429 from POST-resolution path seeds hint via hoisted resolved (v1.14.3)', async () => {
-    // The other v1.14.3 outer-catch case: resolveModel SUCCEEDS, then
-    // something downstream throws a 429 that escapes both inner catches.
-    // This is the path where the v1.14.3 hoist actually pays off — resolved
-    // is set, outer catch reads it, hint is recorded.
-    //
-    // Concretely: a 429 thrown from runAgenticIteration's setup
-    // (pre-generateContent — e.g., `validateWorkspacePath` or a programmer
-    // error in argument prep) reaches the outer catch with `resolved`
-    // already populated. Hint extraction fires.
+  it('outer-catch 429 from POST-resolution path, outside every inner catch, seeds the hint once', async () => {
+    // resolveModel succeeded, then a 429 is thrown where no inner catch runs: the TPM release that
+    // settles a completed iteration. Only the outer catch meets it, and it seeds the hint for the
+    // resolved model.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-'));
     writeFileSync(join(root, 'a.ts'), 'x');
     const apiErr = new ApiError({
       status: 429,
       message: '{"error":{"code":429,"details":[{"retryDelay":"22s"}]}}',
     });
-    // Force the iter catch to NOT match — by throwing a 429 from a path
-    // OUTSIDE the per-iter try block. Simplest reproducible path: throw on
-    // the FIRST generateContent (which IS inside the iter try — caught by
-    // iter catch). Hmm — cleanest synthetic: throw from buildCtx's
-    // throttle.reserve, which fires INSIDE the iter try but BEFORE
-    // generateContent. The iter catch would still catch this and re-throw
-    // since not isTimeoutAbort, propagating to outer catch.
-    //
-    // Inner iter catch ALSO extracts the hint (Fix 4). So this test pins
-    // the outer catch behaviour for the rare path where iter catch's hint
-    // extraction got bypassed (e.g., a future refactor that changes the
-    // catch shape). Asserting recordRetryHint was called AT LEAST once
-    // covers either iter-catch OR outer-catch firing.
-    const { ctx, throttle } = buildCtx({ script: [] });
-    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockReset();
-    (ctx.client.models.generateContent as ReturnType<typeof vi.fn>).mockRejectedValueOnce(apiErr);
+    const { ctx, throttle } = buildCtx({ script: [{ text: 'done' }], tpmThrottleLimit: 80_000 });
+    throttle.release.mockImplementationOnce(() => {
+      throw apiErr;
+    });
 
     const result = await askAgenticTool.execute({ prompt: 'q', workspace: root }, ctx);
 
     expect(result.isError).toBe(true);
-    // recordRetryHint fires (either inner iter catch — Fix 4 — or outer
-    // catch — v1.14.3 hoist; both paths record the SAME hint). Pin the
-    // resolved model + parsed delay regardless of which catch fired.
+    expect(throttle.cancel).not.toHaveBeenCalled();
+    expect(throttle.recordRetryHint).toHaveBeenCalledTimes(1);
     expect(throttle.recordRetryHint).toHaveBeenCalledWith('gemini-3-pro-preview', 22_000);
   });
 
@@ -2186,12 +2154,12 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
   });
 
   it('surfaces TIMEOUT when the iteration timer fires DURING the TPM throttle wait (F3)', async () => {
-    // Production guarantees (`src/tools/ask-agentic.tool.ts:528-531`) that
+    // Production guarantees (`runIteration` in `src/tools/agentic/loop.ts`) that
     // the iteration timer is created BEFORE `abortableSleep` so the throttle
     // wait itself is bounded by `iterationTimeoutMs`. The other tests in
     // this suite either disable the throttle (`tpmThrottleLimit: 0`) or
     // mock `throttle.reserve` with the default `delayMs: 0`, so the
-    // abortable-sleep branch at `:547` is never exercised. Without this
+    // abortable-sleep branch of `waitForTpm` is never exercised. Without this
     // test, swapping the timer/throttle order back to the original buggy
     // form (timer AFTER wait) would not fail any test.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-throttle-'));
@@ -2237,13 +2205,13 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
   });
 
   it('surfaces TIMEOUT when the iteration timer fires DURING tool execution (F2 — post-dispatch abort check)', async () => {
-    // Production guards against a slow tool overrunning the deadline at
-    // `src/tools/ask-agentic.tool.ts:918-922`: after `dispatchToolCallsParallel`
+    // Production guards against a slow tool overrunning the deadline in
+    // `throwIfIterationAborted` (`src/tools/agentic/iteration.ts`): after `dispatchToolCallsParallel`
     // returns, if the signal aborted during dispatch we re-throw
     // `signal.reason` so the catch path maps it to TIMEOUT. None of the
     // other tests reach the THROW arm of that branch — test 1 dispatches
     // a fast `read_file`, test 4 hangs on the SDK call before dispatch
-    // ever happens. Without this case, deleting lines 919-921 would not
+    // ever happens. Without this case, deleting that check would not
     // fail any test, silently uncapping per-iteration deadlines.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-tool-'));
     writeFileSync(join(root, 'a.ts'), 'export const x = 1;');
@@ -2258,7 +2226,7 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // before delegating to the real executor — long enough that the
     // 1 s iter timeout fires mid-dispatch. `setTimeout` here is NOT
     // wired to `abortSignal`, so the dispatch completes naturally; the
-    // post-dispatch `abortSignal.aborted` check (`:918`) is what triggers
+    // post-dispatch `abortSignal.aborted` check is what triggers
     // the throw.
     generateContent.mockResolvedValueOnce(
       buildResponse({ functionCalls: [{ id: 'g1', name: 'grep', args: { pattern: 'x' } }] }),

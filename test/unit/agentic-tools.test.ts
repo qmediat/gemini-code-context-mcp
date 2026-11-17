@@ -644,7 +644,7 @@ describe('agentic executors honour user excludeGlobs / includeGlobs (v1.9.0)', (
       // hardening, /6step Finding #2 — see the dedicated S2/S3 tests
       // further down in this describe block); the path-explicit signal
       // is preserved on `SandboxError.requestedPath` for ops debug logs
-      // only (see `dispatchToolCall` in `ask-agentic.tool.ts`). Caught
+      // only (see `dispatchToolCall` in `src/tools/agentic/dispatch.ts`). Caught
       // by Copilot review on PR #39 — the comment used to claim the
       // message cites the path, which was true pre-v1.9.0 only.
       expect((err as { code?: string }).code).toBe('EXCLUDED_FILE');

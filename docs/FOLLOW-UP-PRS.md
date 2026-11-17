@@ -247,7 +247,9 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T39. Split `src/tools/ask-agentic.tool.ts` into modules — the next PR after #131
+## ~~T39.~~ ✅ SHIPPED 2026-11-17 — Split `src/tools/ask-agentic.tool.ts` into modules
+
+**Shipped as:** the tool file is the entry (the input schema, the registration, the call); the loop, the iteration, the dispatcher, the forced-finalization pass, the ledger calls, the no-progress detector, the results and the instructions are modules under `src/tools/agentic/` (`docs/architecture.md`); the largest file of the tool is now `src/tools/agentic/workspace-tools.ts` (30 KB, unchanged), the entry is 18 KB. The split keeps the tool's behaviour apart from the fixes it carries, each in the CHANGELOG: a loop iteration's 429 seeds the throttle's retry hint once (the seeding is `seedRetryHint` in `src/tools/shared/throttle.ts`, the one rule of `ask`, `code` and `ask_agentic`), a pass whose response carries no usage is booked and released at its estimate, and a call without a daily budget writes a usage row per billed pass. Tests were added for the ledger, the tool batch and the call trace, and the two 429 tests of `test/unit/ask-agentic.test.ts` were adjusted to the hint seeded once; the published input schema is the fixture's, and the file's `eslint-suppressions.json` entry is gone — every unit is within the structure limits. The scope below is the entry as written.
 
 **Source:** the reviews of PR #131 (2026-11-17).
 
@@ -274,6 +276,16 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 **Why:** `boundByInputWindow` (`src/gemini/long-decode.ts`) cuts a long decode's cap so that no continuation request's prompt plus decoded tokens pass the input window, on the premise that the API refuses such a request. The premise is assumed, not measured: the repository holds a measurement of what a continuation request bills, none of a refusal at the window. If the API continues past the window, the cut truncates answers it would have finished; if it refuses, the cut is right.
 
 **Scope:** one paid call whose prompt plus decoded tokens come near the model's input window, without the cut, recording what the continuation request answers (the error and its status, or a completed request and its billed input). Then keep the cut, or drop it, and say which in `docs/tools.md` and `docs/cost-model.md`.
+
+---
+
+## T42. Billed work is booked on every failure path (the immediate next PR)
+
+**Source:** the last cross-model reading of PR #133 (2026-11-17), findings X1 and X2; both pre-date the split and are not fixed in it.
+
+**Why:** (1) an `ask_agentic` iteration whose model call completed and then timed out in its tool batch, or threw while its response was read, cancels both reservations: the billed spend is booked 0, where the forced-finalization pass books it (the reading's probe scenarios `iter-timeout-tools` and `iter-malformed`). (2) A failed usage-row insert is logged for `ask_agentic` but still throws out of `settleAnswer` for `ask` and `code`, so a paid answer is lost.
+
+**Scope:** one rule for the three tools. The completed call is settled through `settleBilledPass` on those exits (the flight is marked once the stream completed and keeps its usage; `iterationFailure` settles when marked, cancels otherwise); `recordBilledCall` treats the usage-row insert as best-effort after the answer exists (log and continue, as the finalize already does), with a test per tool and a test of a grep delayed past `iterationTimeoutMs` expecting the reported tokens finalised.
 
 ---
 
@@ -621,7 +633,7 @@ Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_F
 **Source:** Original v1.14.0 plan (split out for focused release pacing — v1.14.0 shipped the `cachingMode` default flip alone since the streaming migration is reliability-only and doesn't affect the user-perceived speed change that drove v1.14.0).
 
 **What shipped (v1.16.2)**:
-- `src/tools/ask-agentic.tool.ts` `runAgenticIteration()` — replaced per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
+- `runAgenticIteration()` (then in `src/tools/ask-agentic.tool.ts`, now `src/tools/agentic/iteration.ts`) — replaced per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
 - New schema field `stallMs` on `ask_agentic` (range `[1_000, 600_000]`, optional). Behaviour matches `ask`/`code`'s `stallMs`: per-iteration heartbeat reset on every chunk; fires only when the stream goes silent.
 - New env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` for operator-level default.
 - Existing `iterationTimeoutMs` stays orthogonal (wall-clock cap; both can be set, whichever fires first wins).
