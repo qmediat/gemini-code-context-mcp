@@ -4,11 +4,22 @@
  */
 
 import {
+  type OutputCap,
+  type PreflightMode,
+  preflightModeFor,
+  resolveOutputCap,
+} from '../../gemini/long-decode.js';
+import { type PreflightTokenResult, countForPreflight } from '../../gemini/token-counter.js';
+import { type ScanResult, buildScanMemo, scanWorkspace } from '../../indexer/workspace-scanner.js';
+import {
   WorkspaceValidationError,
   validateWorkspacePath,
 } from '../../indexer/workspace-validation.js';
-import { type TextToolResult, errorResult } from '../registry.js';
+import type { ResolvedModel } from '../../types.js';
+import { logger, safeForLog } from '../../utils/logger.js';
+import { type TextToolResult, type ToolContext, errorResult } from '../registry.js';
 import type { TimedTool } from './abort-timeout.js';
+import type { EagerCall, ModelReached } from './eager-call.js';
 
 /**
  * The refusal of a workspace path the validation rejects (`<tool>: <message>`, no fields), else `null`. Called inside
@@ -24,4 +35,133 @@ export function workspaceRefusal(tool: TimedTool, workspaceRoot: string): TextTo
     throw err;
   }
   return null;
+}
+
+/** The caller's narrowing of the workspace scan. */
+export interface ScanFilters {
+  readonly includeGlobs: readonly string[] | undefined;
+  readonly excludeGlobs: readonly string[] | undefined;
+  readonly forceRescan: boolean | undefined;
+}
+
+/**
+ * Scan the call's workspace. The scan memo, built from the stored file rows, lets the scanner skip re-hashing a file
+ * whose mtime and size are unchanged (a new workspace has none: every file hashes); `forceRescan` per call or by the
+ * operator bypasses it.
+ */
+export function scanForCall(
+  call: EagerCall<ModelReached>,
+  ctx: ToolContext,
+  filters: ScanFilters,
+): Promise<ScanResult> {
+  call.emitter.emit(`scanning workspace ${call.workspaceRoot}…`);
+  const scanMemo = buildScanMemo(ctx.manifest.getFiles(call.workspaceRoot));
+  return scanWorkspace(call.workspaceRoot, {
+    ...(filters.includeGlobs !== undefined ? { includeGlobs: filters.includeGlobs } : {}),
+    ...(filters.excludeGlobs !== undefined ? { excludeGlobs: filters.excludeGlobs } : {}),
+    maxFiles: ctx.config.maxFilesPerWorkspace,
+    maxFileSizeBytes: ctx.config.maxFileSizeBytes,
+    manifestMemo: scanMemo,
+    forceRescan: filters.forceRescan === true || ctx.config.forceRescan === true,
+  });
+}
+
+/** The output cap of a model that advertises no `outputTokenLimit`: the pro-tier ceiling, the model's full capacity. */
+export const EAGER_OUTPUT_FALLBACK_TOKENS = 65_536;
+
+/**
+ * The output cap, in three layers (`resolveOutputCap`): the caller's `maxOutputTokens` (clamped to the model's
+ * per-request limit, or on a long-decode model to its long-decode total), else the operator's `forceMaxOutputTokens`
+ * (the per-request limit on every call), else none on the wire — one request at the model's own default. A caller's
+ * `thinkingBudget` is checked against this cap; the clamp and the reservation use the cap that runs (`capThatRuns`).
+ */
+export function eagerOutputCap(
+  requested: number | undefined,
+  ctx: ToolContext,
+  resolved: ResolvedModel,
+): OutputCap {
+  return resolveOutputCap({
+    requested,
+    forceMax: ctx.config.forceMaxOutputTokens,
+    outputTokenLimit: resolved.outputTokenLimit,
+    longDecodeTokenLimit: resolved.longDecodeTokenLimit,
+    fallbackLimit: EAGER_OUTPUT_FALLBACK_TOKENS,
+  });
+}
+
+/** The call's input as the budget and the TPM throttle estimate it, before any count. */
+export interface InputEstimate {
+  readonly workspaceBytes: number;
+  /** bytes/4 of the workspace and the prompt, plus the extra tokens: what the TPM reservation holds. */
+  readonly tokens: number;
+}
+
+/** One estimate for both the budget reservation and the TPM reservation, so the two never drift apart. */
+export function estimateInput(
+  scan: ScanResult,
+  prompt: string,
+  extraTokens: number,
+): InputEstimate {
+  const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
+  return {
+    workspaceBytes,
+    tokens: Math.ceil(workspaceBytes / 4) + Math.ceil(prompt.length / 4) + extraTokens,
+  };
+}
+
+/** What the preflight counts. */
+export interface PreflightRequest {
+  readonly scan: ScanResult;
+  readonly prompt: string;
+  readonly resolved: ResolvedModel;
+  readonly mode: PreflightMode | undefined;
+  /** The cap asked for: a cap that may take more than one request takes the exact count (`preflightModeFor`). */
+  readonly cap: OutputCap;
+  /** Tokens beyond the files and the prompt, counted by Gemini (`ask`'s attachments; 0 for `code`). */
+  readonly extraTokens: number;
+}
+
+/** The preflight's count and the window it is held against. */
+export interface PreflightCount {
+  /** The count, the extra tokens included: the window must hold them whichever way the count was made. */
+  readonly preflight: PreflightTokenResult;
+  readonly contextWindow: number;
+  /** `contextWindow × workspaceGuardRatio`: a count above it is too large for the eager path. */
+  readonly threshold: number;
+}
+
+/**
+ * Count the call's input against the model's advertised input limit (`countForPreflight`: the bytes/4 heuristic well
+ * under the limit, Gemini's `countTokens` near it, under the call's signal so a timeout ends the count). `null` when
+ * the model advertises no limit: the guard is skipped with a warning, and the request may fail downstream.
+ */
+export async function countPreflight(
+  call: EagerCall<ModelReached>,
+  ctx: ToolContext,
+  req: PreflightRequest,
+): Promise<PreflightCount | null> {
+  const contextWindow = req.resolved.inputTokenLimit;
+  const preflightMode = preflightModeFor(req.mode, req.cap);
+  if (typeof contextWindow !== 'number' || contextWindow <= 0) {
+    logger.warn(
+      `${call.tool}: resolved model ${safeForLog(req.resolved.resolved)} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
+    );
+    return null;
+  }
+  const counted = await countForPreflight(ctx.client, {
+    files: req.scan.files,
+    prompt: req.prompt,
+    model: req.resolved.resolved,
+    // post-glob-filter: the hash already encodes the caller's include / exclude globs
+    filesHash: req.scan.filesHash,
+    ...(preflightMode !== undefined ? { preflightMode } : {}),
+    inputTokenLimit: contextWindow,
+    extraTokens: req.extraTokens, // weighs on the heuristic-vs-exact decision, added to the count below
+    signal: call.timeout.signal,
+  });
+  return {
+    preflight: { ...counted, effectiveTokens: counted.effectiveTokens + req.extraTokens },
+    contextWindow,
+    threshold: Math.floor(contextWindow * ctx.config.workspaceGuardRatio),
+  };
 }

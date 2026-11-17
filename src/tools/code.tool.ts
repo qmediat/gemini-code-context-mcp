@@ -18,16 +18,9 @@ import {
   cachingModeFor,
   cachingRan,
 } from '../cache/caching-mode.js';
-import {
-  capThatRuns,
-  preflightModeFor,
-  resolveOutputCap,
-  thinkingBudgetRefusal,
-} from '../gemini/long-decode.js';
+import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
-import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
-import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import type { ResolvedModel } from '../types.js';
 import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
@@ -41,7 +34,13 @@ import {
   openEagerCall,
   settleFailedEager,
 } from './shared/eager-call.js';
-import { workspaceRefusal } from './shared/eager-steps.js';
+import {
+  countPreflight,
+  eagerOutputCap,
+  estimateInput,
+  scanForCall,
+  workspaceRefusal,
+} from './shared/eager-steps.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
@@ -393,35 +392,12 @@ async function executeCodeBody(
       );
     }
 
-    emitter.emit(`scanning workspace ${workspaceRoot}…`);
-    // v1.13.0 — see ask.tool.ts for the scan-memo rationale. Same pattern.
-    const scanMemo = buildScanMemo(ctx.manifest.getFiles(workspaceRoot));
-    const scan = await scanWorkspace(workspaceRoot, {
-      ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
-      ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
-      maxFiles: ctx.config.maxFilesPerWorkspace,
-      maxFileSizeBytes: ctx.config.maxFileSizeBytes,
-      manifestMemo: scanMemo,
-      forceRescan: input.forceRescan === true || ctx.config.forceRescan === true,
+    const scan = await scanForCall(call, ctx, {
+      includeGlobs: input.includeGlobs,
+      excludeGlobs: input.excludeGlobs,
+      forceRescan: input.forceRescan,
     });
-
-    // Output-cap strategy (v1.4.0) — see ask.tool.ts for full rationale
-    // of the three-layer precedence. Summary: input.maxOutputTokens
-    // (per-call) > ctx.config.forceMaxOutputTokens (MCP-host env) >
-    // auto (omit from wire; Gemini uses model-default). Code review
-    // commonly produces long OLD/NEW diff blocks, so operators doing
-    // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
-    // to pin every call at the model's full 65,536-token capacity.
-    const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
-    // The caller's `thinkingBudget` is checked against `outputCap` (the wire cap, else the model's per-request limit);
-    // the clamp and the reservation use the cap that runs (`runCap`, after the input window's cut).
-    const outputCap = resolveOutputCap({
-      requested: input.maxOutputTokens,
-      forceMax: ctx.config.forceMaxOutputTokens,
-      outputTokenLimit: resolved.outputTokenLimit,
-      longDecodeTokenLimit: resolved.longDecodeTokenLimit,
-      fallbackLimit: CODE_MAX_OUTPUT_TOKENS_FALLBACK,
-    });
+    const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, resolved);
 
     // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
     // (`thinkingBudgetRefusal`); below, the budget on the wire is clamped under the cap that runs.
@@ -432,58 +408,37 @@ async function executeCodeBody(
     );
     if (budgetRefusal !== null) return errorResult(`code: ${budgetRefusal}`);
 
-    // Shared input-token fingerprint for budget + TPM throttle (see
-    // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
-    // used by `estimatePreCallCostUsd`). The PREFLIGHT against
-    // `inputTokenLimit` goes through the v1.10.0 two-tier `countForPreflight`
-    // (heuristic for small repos; real `countTokens` near the cliff). Closes
-    // T17 (`bytes/4` undercount on dense Unicode).
-    const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-    const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
+    const { workspaceBytes, tokens: estimatedInputTokens } = estimateInput(scan, input.task, 0);
 
-    // v1.5.0 preflight (rebuilt v1.10.0 atop countTokens) — mirror of
-    // ask.tool.ts guard. See there for rationale. Hoisted so the
-    // success-path metadata can surface preflight provenance.
-    let preflight: PreflightTokenResult | undefined;
-    const contextWindow = resolved.inputTokenLimit;
-    // A decode that may take more than one request takes the exact count: its prompt is billed per request.
-    const preflightMode = preflightModeFor(input.preflightMode, outputCap);
-    if (typeof contextWindow === 'number' && contextWindow > 0) {
-      preflight = await countForPreflight(ctx.client, {
-        files: scan.files,
-        prompt: input.task,
-        model: resolved.resolved,
-        // `filesHash` is post-glob-filter — no separate globsHash needed.
-        filesHash: scan.filesHash,
-        ...(preflightMode !== undefined ? { preflightMode } : {}),
-        inputTokenLimit: contextWindow,
-        // See ask.tool.ts for AbortSignal contract — abort propagates as
-        // `AbortError` to outer catch (mapped to `errorCode: 'TIMEOUT'`).
-        signal: abortSignal,
-      });
-      const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
-      if (preflight.effectiveTokens > threshold) {
-        const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
-        return errorResult(
-          `Workspace too large for eager \`code\`: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
-          {
-            errorCode: 'WORKSPACE_TOO_LARGE',
-            retryable: false,
-            estimatedInputTokens: preflight.effectiveTokens,
-            tokenCountMethod: preflight.method,
-            rawTokenCount: preflight.rawTokens,
-            tokenCountCacheHit: preflight.cacheHit,
-            contextWindowTokens: contextWindow,
-            thresholdTokens: threshold,
-            guardRatio: ctx.config.workspaceGuardRatio,
-            ...modelAudit,
-            filesIndexed: scan.files.length,
-          },
-        );
-      }
-    } else {
-      logger.warn(
-        `code: resolved model ${safeForLog(resolved.resolved)} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
+    // The preflight: the same guard as `ask`'s, with no fallback.
+    const count = await countPreflight(call, ctx, {
+      scan,
+      prompt: input.task,
+      resolved,
+      mode: input.preflightMode,
+      cap: outputCap,
+      extraTokens: 0,
+    });
+    const preflight = count?.preflight;
+    if (count !== null && count.preflight.effectiveTokens > count.threshold) {
+      const { threshold, contextWindow } = count;
+      const counted = count.preflight;
+      const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
+      return errorResult(
+        `Workspace too large for eager \`code\`: ~${counted.effectiveTokens.toLocaleString()} input tokens (${counted.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
+        {
+          errorCode: 'WORKSPACE_TOO_LARGE',
+          retryable: false,
+          estimatedInputTokens: counted.effectiveTokens,
+          tokenCountMethod: counted.method,
+          rawTokenCount: counted.rawTokens,
+          tokenCountCacheHit: counted.cacheHit,
+          contextWindowTokens: contextWindow,
+          thresholdTokens: threshold,
+          guardRatio: ctx.config.workspaceGuardRatio,
+          ...modelAudit,
+          filesIndexed: scan.files.length,
+        },
       );
     }
 
@@ -491,7 +446,7 @@ async function executeCodeBody(
       tool: 'code',
       cap: outputCap,
       promptTokens: preflight?.effectiveTokens,
-      inputTokenLimit: contextWindow,
+      inputTokenLimit: resolved.inputTokenLimit,
       emit: (message) => emitter.emit(message),
     });
 

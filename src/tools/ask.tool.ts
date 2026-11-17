@@ -12,17 +12,10 @@ import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { prepareContext } from '../cache/cache-manager.js';
 import { cachingModeFor, cachingRan } from '../cache/caching-mode.js';
-import {
-  capThatRuns,
-  preflightModeFor,
-  resolveOutputCap,
-  thinkingBudgetRefusal,
-} from '../gemini/long-decode.js';
+import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
-import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
-import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
-import { logger, safeForLog } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 import { fallBackToAgentic } from './ask-agentic-fallback.js';
 import {
   attachmentMetadata,
@@ -40,7 +33,13 @@ import {
   openEagerCall,
   settleFailedEager,
 } from './shared/eager-call.js';
-import { workspaceRefusal } from './shared/eager-steps.js';
+import {
+  countPreflight,
+  eagerOutputCap,
+  estimateInput,
+  scanForCall,
+  workspaceRefusal,
+} from './shared/eager-steps.js';
 import {
   ServiceTierError,
   networkAttempts,
@@ -49,17 +48,6 @@ import {
 } from './shared/service-tier.js';
 import { settleAnswer } from './shared/settle-call.js';
 import { thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
-
-/**
- * Fallback output cap used only when the resolved model doesn't advertise
- * an `outputTokenLimit` via `models.list()`. Set generously at the current
- * Gemini pro-tier ceiling so the default behaviour is "let the model use
- * its full trained capacity" — per v1.4.0 user feedback, arbitrary
- * internal caps below the model's advertised limit are unhelpful
- * self-limiting. Callers who want tighter caps for specific calls pass
- * `maxOutputTokens` explicitly in the tool input.
- */
-const ASK_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
 
 /**
  * Sentinel value in our internal normalisation for "user did not pass
@@ -161,42 +149,12 @@ async function executeAskBody(
     const attachments = attachmentsOutcome.prepared;
     const attachmentTokens = attachments.tokens;
 
-    emitter.emit(`scanning workspace ${workspaceRoot}…`);
-    // v1.13.0 — build the scan memo from previously-stored file rows so the
-    // scanner can skip re-hashing files whose mtime+size haven't changed.
-    // First-run on a new workspace produces an empty map (= every file
-    // hashes), which matches pre-v1.13 behaviour.
-    const scanMemo = buildScanMemo(ctx.manifest.getFiles(workspaceRoot));
-    const scan = await scanWorkspace(workspaceRoot, {
-      ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
-      ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
-      maxFiles: ctx.config.maxFilesPerWorkspace,
-      maxFileSizeBytes: ctx.config.maxFileSizeBytes,
-      manifestMemo: scanMemo,
-      forceRescan: input.forceRescan === true || ctx.config.forceRescan === true,
+    const scan = await scanForCall(call, ctx, {
+      includeGlobs: input.includeGlobs,
+      excludeGlobs: input.excludeGlobs,
+      forceRescan: input.forceRescan,
     });
-
-    // Output cap, three layers (`resolveOutputCap`):
-    //
-    //   1. `input.maxOutputTokens` (per-call, strongest) — clamped to the
-    //      model's per-request limit, or on a model with long decode
-    //      (Gemini 4) to its long-decode total: a cap above the per-request
-    //      limit continues the decode in further requests.
-    //   2. `ctx.config.forceMaxOutputTokens` (env override) — every call
-    //      sends the model's per-request limit.
-    //   3. Default — `maxOutputTokens` is omitted: one request, the model's
-    //      own default (its advertised `outputTokenLimit`), letting the model
-    //      size the response to the query rather than reserving full capacity.
-    //
-    // The caller's `thinkingBudget` is checked against `outputCap`; the
-    // clamp and the reservation use the cap that runs (`runCap`).
-    const outputCap = resolveOutputCap({
-      requested: input.maxOutputTokens,
-      forceMax: ctx.config.forceMaxOutputTokens,
-      outputTokenLimit: resolved.outputTokenLimit,
-      longDecodeTokenLimit: resolved.longDecodeTokenLimit,
-      fallbackLimit: ASK_MAX_OUTPUT_TOKENS_FALLBACK,
-    });
+    const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, resolved);
 
     // Single source of truth for "is the caller driving reasoning via the
     // discrete-tier knob?". Three downstream call sites branch on this
@@ -214,135 +172,84 @@ async function executeAskBody(
     );
     if (budgetRefusal !== null) return errorResult(`ask: ${budgetRefusal}`);
 
-    // Estimated input-token count drives both the daily-budget reservation
-    // (dollars) and the TPM throttle reservation (rate). Hoisted here so
-    // both consumers share one fingerprint — no drift between what the $
-    // ledger thinks we'll spend and what the rate-limiter thinks we'll
-    // send to Gemini. Budget reservation still uses the bytes/4 heuristic
-    // (cheap; `estimatePreCallCostUsd` already takes raw bytes), but the
-    // PREFLIGHT against `inputTokenLimit` now goes through the v1.10.0
-    // two-tier `countForPreflight` (Tier 1 = heuristic for small repos;
-    // Tier 2 = real `countTokens` call when near the cliff). Closes T17
-    // (`bytes/4` undercount on dense Unicode). See `src/gemini/token-counter.ts`.
-    const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-    const estimatedInputTokens =
-      Math.ceil(workspaceBytes / 4) + Math.ceil(input.prompt.length / 4) + attachmentTokens;
+    const { workspaceBytes, tokens: estimatedInputTokens } = estimateInput(
+      scan,
+      input.prompt,
+      attachmentTokens,
+    );
     const inlineRefusal = inlineRequestRefusal(attachments, scan.files, input.prompt, serviceTier);
     if (inlineRefusal !== undefined) return inlineRefusal;
 
-    // v1.5.0 preflight (rebuilt in v1.10.0 on top of `countTokens`) — refuse
-    // immediately if the estimated input doesn't fit under the model's
-    // advertised `inputTokenLimit * workspaceGuardRatio`. Before this
-    // guard we would dispatch the request, Gemini would reject with
-    // `400 INVALID_ARGUMENT "exceeds maximum ..."`, and the calling
-    // sub-agent would interpret the 400 as retryable (the error body is
-    // indistinguishable from transient quota errors at the string level)
-    // → unbounded retry storm. Cheap pre-flight with a structured
-    // `WORKSPACE_TOO_LARGE` errorCode + `retryable: false` signals to the
-    // orchestrator that this is not recoverable without user action.
-    //
-    // `inputTokenLimit` can be `null` when `models.list()` didn't advertise
-    // it (typically happens only on internal / preview model IDs we've never
-    // seen). In that case we fall through without blocking but warn —
-    // better to let the request hit the API and fail noisily than to
-    // block a legitimate call on missing metadata.
-    // Hoisted past the `if (contextWindow > 0)` block so the success-path
-    // metadata (lines below) can surface `tokenCountMethod` /
-    // `rawTokenCount` / `tokenCountCacheHit` regardless of whether the
-    // preflight actually ran. Stays `undefined` only when the resolved
-    // model has no advertised `inputTokenLimit`.
-    let preflight: PreflightTokenResult | undefined;
-    const contextWindow = resolved.inputTokenLimit;
-    // A decode that may take more than one request takes the exact count: its prompt is billed per request.
-    const preflightMode = preflightModeFor(input.preflightMode, outputCap);
-    if (typeof contextWindow === 'number' && contextWindow > 0) {
-      preflight = await countForPreflight(ctx.client, {
-        files: scan.files,
-        prompt: input.prompt,
-        model: resolved.resolved,
-        // `filesHash` is post-glob-filter (see `scanWorkspace`), so it
-        // already encodes user-supplied includeGlobs/excludeGlobs — no
-        // separate globsHash axis needed in the cache key.
-        filesHash: scan.filesHash,
-        ...(preflightMode !== undefined ? { preflightMode } : {}),
-        inputTokenLimit: contextWindow,
-        extraTokens: attachmentTokens, // weighs on the heuristic-vs-exact decision, added to the count below
-        // Thread the user's `timeoutMs` AbortSignal so a hung countTokens
-        // call doesn't bleed past the user's stated wall-clock budget. The
-        // SDK's `CountTokensConfig` accepts `abortSignal`; on cancellation
-        // the SDK throws `AbortError`, which `countForPreflight` re-throws
-        // (rather than swallowing as a fallback) so this outer try/catch
-        // maps it to `errorCode: 'TIMEOUT'` immediately.
-        signal: abortSignal,
-      });
-      // the attachments' tokens, counted by Gemini, join the count whichever way it was made: the window must hold them
-      preflight = { ...preflight, effectiveTokens: preflight.effectiveTokens + attachmentTokens };
-      const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
-      if (preflight.effectiveTokens > threshold) {
-        const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
+    // The preflight refuses a workspace the model's window cannot hold (`WORKSPACE_TOO_LARGE`, not retryable): sent,
+    // Gemini would answer 400 "exceeds maximum", which a caller cannot tell from a transient error.
+    const count = await countPreflight(call, ctx, {
+      scan,
+      prompt: input.prompt,
+      resolved,
+      mode: input.preflightMode,
+      cap: outputCap,
+      extraTokens: attachmentTokens,
+    });
+    const preflight = count?.preflight;
+    if (count !== null && count.preflight.effectiveTokens > count.threshold) {
+      const { threshold, contextWindow } = count;
+      const counted = count.preflight;
+      const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
 
-        // v1.11.0 — opt-in transparent fallback to `ask_agentic` when the
-        // caller explicitly asked for it via `onWorkspaceTooLarge:
-        // 'fallback-to-agentic'`. Default stays `'error'` so pre-v1.11.0
-        // callers see identical behaviour. The fallback re-uses this
-        // tool's resolved inputs (model / globs / thinking config /
-        // workspace) and forwards its resolved `timeoutMs` as `iterationTimeoutMs`
-        // (per-iteration cap; total wall-clock can be N × that) and `stallMs` as
-        // `stallMs` (`ask-agentic-fallback.ts`). Cost + timing shape genuinely
-        // changes — opt-in is the right default.
-        if (
-          input.onWorkspaceTooLarge === 'fallback-to-agentic' &&
-          attachments.attached.length > 0
-        ) {
-          return errorResult(
-            'ask: the workspace is too large for the eager path and `attachments` cannot follow the ask_agentic fallback (it sends no inline parts); drop the attachments or narrow the workspace',
-            {
-              errorCode: 'WORKSPACE_TOO_LARGE',
-              retryable: false,
-              serviceTier,
-              ...attachmentMetadata(attachments),
-            },
-          );
-        }
-        if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
-          return fallBackToAgentic({
-            input,
-            ctx,
-            emitter,
-            serviceTier,
-            preflight,
-            threshold,
-            timeout: timeoutController,
-          });
-        }
-
-        const attachmentsNote =
-          attachments.attached.length > 0
-            ? ' — it carries no attachments: drop them, or narrow the workspace and ask again'
-            : '';
-
+      // v1.11.0 — opt-in transparent fallback to `ask_agentic` when the
+      // caller explicitly asked for it via `onWorkspaceTooLarge:
+      // 'fallback-to-agentic'`. Default stays `'error'` so pre-v1.11.0
+      // callers see identical behaviour. The fallback re-uses this
+      // tool's resolved inputs (model / globs / thinking config /
+      // workspace) and forwards its resolved `timeoutMs` as `iterationTimeoutMs`
+      // (per-iteration cap; total wall-clock can be N × that) and `stallMs` as
+      // `stallMs` (`ask-agentic-fallback.ts`). Cost + timing shape genuinely
+      // changes — opt-in is the right default.
+      if (input.onWorkspaceTooLarge === 'fallback-to-agentic' && attachments.attached.length > 0) {
         return errorResult(
-          `Workspace too large: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload)${attachmentsNote}. Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
+          'ask: the workspace is too large for the eager path and `attachments` cannot follow the ask_agentic fallback (it sends no inline parts); drop the attachments or narrow the workspace',
           {
             errorCode: 'WORKSPACE_TOO_LARGE',
+            retryable: false,
             serviceTier,
             ...attachmentMetadata(attachments),
-            retryable: false,
-            estimatedInputTokens: preflight.effectiveTokens,
-            tokenCountMethod: preflight.method,
-            rawTokenCount: preflight.rawTokens,
-            tokenCountCacheHit: preflight.cacheHit,
-            contextWindowTokens: contextWindow,
-            thresholdTokens: threshold,
-            guardRatio: ctx.config.workspaceGuardRatio,
-            resolvedModel: resolved.resolved,
-            filesIndexed: scan.files.length,
           },
         );
       }
-    } else {
-      logger.warn(
-        `ask: resolved model ${safeForLog(resolved.resolved)} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
+      if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
+        return fallBackToAgentic({
+          input,
+          ctx,
+          emitter,
+          serviceTier,
+          preflight: counted,
+          threshold,
+          timeout: timeoutController,
+        });
+      }
+
+      const attachmentsNote =
+        attachments.attached.length > 0
+          ? ' — it carries no attachments: drop them, or narrow the workspace and ask again'
+          : '';
+
+      return errorResult(
+        `Workspace too large: ~${counted.effectiveTokens.toLocaleString()} input tokens (${counted.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload)${attachmentsNote}. Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
+        {
+          errorCode: 'WORKSPACE_TOO_LARGE',
+          serviceTier,
+          ...attachmentMetadata(attachments),
+          retryable: false,
+          estimatedInputTokens: counted.effectiveTokens,
+          tokenCountMethod: counted.method,
+          rawTokenCount: counted.rawTokens,
+          tokenCountCacheHit: counted.cacheHit,
+          contextWindowTokens: contextWindow,
+          thresholdTokens: threshold,
+          guardRatio: ctx.config.workspaceGuardRatio,
+          resolvedModel: resolved.resolved,
+          filesIndexed: scan.files.length,
+        },
       );
     }
 
@@ -350,7 +257,7 @@ async function executeAskBody(
       tool: 'ask',
       cap: outputCap,
       promptTokens: preflight?.effectiveTokens,
-      inputTokenLimit: contextWindow,
+      inputTokenLimit: resolved.inputTokenLimit,
       emit: (message) => emitter.emit(message),
     });
 
