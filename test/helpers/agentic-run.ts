@@ -37,6 +37,10 @@ export interface ScriptedTurn {
   readonly hang?: boolean;
   /** The call answers after this many ms. */
   readonly delayMs?: number;
+  /** The stream yields the response, then fails with this before its end (`generateContentStream` only). */
+  readonly failsMidStream?: unknown;
+  /** The stream yields the response, then sends nothing until its abort signal fires (`generateContentStream` only). */
+  readonly hangsMidStream?: boolean;
 }
 
 export type BudgetReserveAnswer = { id: number } | { rejected: true; spentMicros: number };
@@ -139,10 +143,17 @@ interface ModelParams {
   config?: Record<string, unknown> & { abortSignal?: AbortSignal };
 }
 
+/** A scripted turn as the model answers it: the response, and how its stream ends when it does not end cleanly. */
+interface Answer {
+  readonly response: unknown;
+  readonly failsMidStream?: unknown;
+  readonly hangsMidStream?: boolean;
+}
+
 /** The scripted model: each call takes the next turn, in order, whichever method made it. */
 function scriptedModel(script: readonly ScriptedTurn[], trace: TraceEvent[], calls: ModelCall[]) {
   let next = 0;
-  const answer = async (method: ModelCall['method'], params: ModelParams): Promise<unknown> => {
+  const answer = async (method: ModelCall['method'], params: ModelParams): Promise<Answer> => {
     const { abortSignal, ...config } = params.config ?? {};
     calls.push({ method, model: params.model, contents: structuredClone(params.contents), config });
     trace.push({ kind: 'model', name: method, args: [params.model] });
@@ -151,14 +162,24 @@ function scriptedModel(script: readonly ScriptedTurn[], trace: TraceEvent[], cal
     if (turn.hang) return untilAborted(abortSignal);
     if (turn.delayMs !== undefined) await new Promise((r) => setTimeout(r, turn.delayMs));
     if (turn.throws !== undefined) throw turn.throws;
-    return buildModelResponse(turn);
+    return {
+      response: buildModelResponse(turn),
+      failsMidStream: turn.failsMidStream,
+      hangsMidStream: turn.hangsMidStream,
+    };
   };
   return {
-    generateContent: (params: ModelParams) => answer('generateContent', params),
+    generateContent: async (params: ModelParams) =>
+      (await answer('generateContent', params)).response,
     generateContentStream: async (params: ModelParams) => {
-      const response = await answer('generateContentStream', params);
+      const { response, failsMidStream, hangsMidStream } = await answer(
+        'generateContentStream',
+        params,
+      );
       return (async function* stream() {
         yield response;
+        if (hangsMidStream) await untilAborted(params.config?.abortSignal);
+        if (failsMidStream !== undefined) throw failsMidStream;
       })();
     },
   };

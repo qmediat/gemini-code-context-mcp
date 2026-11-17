@@ -182,13 +182,67 @@ and reported in the error (token fields, `costEstimateUsd`, `continuationHops`).
 1. After the workspace is scanned and the model resolved, we compute a conservative cost estimate: `input_tokens × input_rate + maxOutputTokens × output_rate + thinkingBudget × output_rate`, where `input_tokens` is the larger of `workspace_bytes ÷ 4 + prompt_chars ÷ 4` and the preflight's count when it ran, plus the input every continuation request bills again on a Gemini 4 long decode ([above](#long-decode-on-gemini-4)).
 2. That estimate is inserted into the usage-metrics table inside a `BEGIN IMMEDIATE` SQLite transaction. Concurrent tool calls are serialised by SQLite's reserved lock — if the reservation would push cumulative spend over the cap, the transaction rolls back and the tool returns `Daily budget cap would be exceeded: spent $X + estimate $Y > cap $Z`.
 3. The `generateContent` call carries an explicit `maxOutputTokens` matching the estimate (every request of a long decode carries the same cap), so a runaway response cannot exceed what was reserved.
-4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back — unless one or more requests of the call had completed (`ask` / `code`: a long decode whose continuation request failed, met a stale cache or timed out): those were billed, so the row is settled at their measured cost and only the rest of the reservation comes back.
+4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back — unless one or more requests of the call had completed (`ask` / `code`: a long decode whose continuation request failed, met a stale cache or timed out): those were billed, so the row is settled at their measured cost and only the rest of the reservation comes back. An `ask_agentic` pass whose model call completed is booked the same way when the pass fails afterwards ([below](#what-is-booked-when-a-call-fails)).
 
-Result: N concurrent tool calls cannot collectively overshoot the cap. A single call cannot overshoot either, thanks to `maxOutputTokens`.
+Result: N concurrent tool calls cannot collectively overshoot the cap with what the ledger books, and a single `ask` / `code` call cannot either, thanks to `maxOutputTokens`. Two kinds of spend sit outside that bound: [what the daily budget does not bound](#what-the-daily-budget-does-not-bound).
 
 **Caveat:** the `bytes ÷ 4` token heuristic undercounts multibyte / CJK / emoji-dense content by ~1.3×–2×. The reservation uses the preflight's count instead whenever the preflight counted (`preflightMode: 'exact'`, `'auto'` near the input limit, and every Gemini 4 long decode); on other calls it rests on the heuristic. For accurate caps on those workloads, set `preflightMode: 'exact'`, or `GEMINI_DAILY_BUDGET_USD` ~2× lower than your true limit (see [FOLLOW-UP-PRS.md T17](./FOLLOW-UP-PRS.md)).
 
-**`status` cost breakdown:** `spentTodayUsd` keeps its conservative-upper-bound semantics (settled + in-flight reservations) so daily-budget enforcement stays a true cap. *(v1.7.0+)* `status` additionally exposes `spentTodaySettledUsd` and `inFlightReservedTodayUsd` (plus workspace-scoped equivalents `usage.settledCostUsd` / `usage.inFlightReservedUsd`), and the human-readable line shows `"(settled $X + $Y in-flight reserved)"` whenever in-flight ≠ 0. Streaming made the in-flight window much more observable on long HIGH-thinking calls (60–180 s) — the breakdown closes that perception gap.
+**`status` cost breakdown:** `spentTodayUsd` keeps its conservative-upper-bound semantics (settled + in-flight reservations), so a call is refused before what the ledger books could pass the cap ([what it does not bound](#what-the-daily-budget-does-not-bound)). *(v1.7.0+)* `status` additionally exposes `spentTodaySettledUsd` and `inFlightReservedTodayUsd` (plus workspace-scoped equivalents `usage.settledCostUsd` / `usage.inFlightReservedUsd`), and the human-readable line shows `"(settled $X + $Y in-flight reserved)"` whenever in-flight ≠ 0. Streaming made the in-flight window much more observable on long HIGH-thinking calls (60–180 s) — the breakdown closes that perception gap.
+
+## What is booked when a call fails
+
+One rule for `ask`, `code` and `ask_agentic`: **a request is billed once its model call completed** — its stream
+reached its end, or (the `ask_agentic` forced-finalization pass) `generateContent` returned. A completed request stays
+in the ledger whatever fails after it, at the usage it reported, or at the input it was estimated to send when it
+reported none; an `ask_agentic` pass whose usage could not be read (the read threw) is booked at its whole reservation —
+the input estimate and the reserved output and thinking tokens. A request that did not complete — refused, failed at its opening, failed or aborted mid-stream, even
+after chunks that carried usage — is booked at 0 and its reservations come back: Google reports usage on a stream's
+last chunk, and a stream is never re-sent. Whether Google bills a request aborted after its stream opened is not
+measured ([below](#what-the-daily-budget-does-not-bound)). Once an answer exists, writing its ledger row is
+best-effort: a failed write is logged (`finalizeBudgetReservation failed …` keeps the reservation's estimate;
+`insertUsageMetric failed …` leaves no row) and the answer is returned.
+
+An `ask_agentic` pass booked before it failed reports what it billed in the error result — `cachedTokens`,
+`uncachedTokens`, `outputTokens`, `thinkingTokens`, `costEstimateUsd` of that pass, as a failed `ask` / `code` call
+reports its completed requests'. The passes before it were booked when they ended; their input is in
+`cumulativeInputTokens` where the result carries it.
+
+`ask` and `code` count the requests of a call (a Gemini 4 long decode has several); an `ask_agentic` pass is one loop
+iteration or the forced-finalization pass, each with its own daily-budget and TPM reservation.
+
+`ask_agentic`'s forced-finalization pass ends the call as `subReason: 'AGENTIC_MAX_ITERATIONS'` (`errorCode:
+UNKNOWN`) whenever it gives no answer; the table names its `finalizationSkipReason` / `rescueErrorCode`.
+
+| Where the call ends | `ask` / `code`: ledger | `ask_agentic` pass: ledger and TPM | What the result carries |
+|---|---|---|---|
+| Daily budget refused the reservation | nothing reserved | nothing reserved | `BUDGET_REJECT`; forced pass: `finalizationSkipReason: 'daily-budget'` |
+| Timeout during the TPM wait | released, unless an earlier request of the call completed: then booked at what those billed | both reservations released | `TIMEOUT`, with the completed requests' usage fields (`ask` / `code`); loop iteration: `TIMEOUT`, its `apiCalls` not counting the pass; forced pass: `rescueErrorCode: 'TIMEOUT'`, `apiCalls` not counting it |
+| Refused or failed at the opening (429, 4xx, 5xx, network after retries) | as above | both released | the error, with the completed requests' usage fields (`ask` / `code`); loop iteration: `UNKNOWN`; forced pass: `rescueErrorCode` `'RATE_LIMIT'`, `'API_ERROR'` or `'NETWORK'` |
+| Failed or timed out before the call completed (mid-stream; the forced pass before `generateContent` returned) | as above: the request is not booked | both released | as above, or `TIMEOUT`; forced pass: its `rescueErrorCode` |
+| Call completed, then reading the response threw | booked | booked at the usage read; at the input estimate when the response reported none; at the whole reservation (input estimate, reserved output and thinking) when reading the usage threw; TPM released at the input booked | the error with the booked usage; loop iteration: `UNKNOWN` with the pass's fields; forced pass: `rescueErrorCode: 'INTERNAL'` with them |
+| Stream completed, then the iteration timed out in its tool batch (`iterationTimeoutMs` or `stallMs` fired while the batch ran; the call ends when the batch has returned, [FOLLOW-UP-PRS.md T44](./FOLLOW-UP-PRS.md)) | — | booked at the reported usage; TPM released at it | `TIMEOUT` for the iteration with the pass's fields, `apiCalls` counts it; the message says the pass is booked |
+| Forced pass answered with no text | — | booked; TPM released at the billed input | `rescueErrorCode: 'EMPTY_TEXT'` with the pass's fields |
+| Answer, ledger write failed | logged, answer returned | logged, answer returned | the answer |
+| Answer | booked; the rest of the reservation released | booked; TPM released at the billed input | the answer with its usage |
+
+## What the daily budget does not bound
+
+`GEMINI_DAILY_BUDGET_USD` and the TPM window bound what the ledger books. Two kinds of spend can sit outside them:
+
+- **A request aborted or failed after its stream opened** (a timeout, a stall, a reset mid-stream, in all three
+  tools). The server books it 0 and gives its reservations back. Whether Google bills such a request is not measured,
+  and Google does not document it as far as we found ([FOLLOW-UP-PRS.md T43](./FOLLOW-UP-PRS.md)). If it does, that
+  request is outside the budget and the TPM window: at most its whole input plus what it decoded before the abort —
+  for `ask` / `code`, no more than its reservation. A `TIMEOUT` result is `retryable: true`, so a retried call can
+  repeat it.
+- **An `ask_agentic` loop iteration larger than its estimate.** Each iteration reserves a fixed 50,000 input tokens
+  (and 4,096 output plus 4,096 thinking tokens that are not capped on the wire, T38), whatever the conversation's size.
+  An iteration that sends more can be settled above its reservation — on Gemini 3 Pro with the default output
+  reservation and little output, from about 87,000 prompt tokens — and one whose usage could not be read is booked
+  at its reservation, which can be below what it sent. The forced
+  pass reserves the last iteration's prompt plus the tool responses after it (plus 5,000), so its estimate follows the
+  conversation.
 
 ## Free tier
 

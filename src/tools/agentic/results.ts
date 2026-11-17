@@ -4,7 +4,12 @@
  */
 
 import { type TextToolResult, errorResult, textResult } from '../registry.js';
-import type { TimeoutController, TimeoutKind } from '../shared/abort-timeout.js';
+import {
+  ABORTED_REQUEST_NOTE,
+  type TimeoutController,
+  type TimeoutKind,
+} from '../shared/abort-timeout.js';
+import type { BilledFields } from '../shared/call-ledger.js';
 import type { NoProgress } from './no-progress.js';
 import type { RescueOutcome } from './rescue.js';
 import type { AgenticRun, LoopState } from './run.js';
@@ -100,6 +105,10 @@ export function budgetRejected(
   );
 }
 
+/** What the message of an iteration booked before it timed out says of its cost. */
+const BOOKED_ITERATION_NOTE =
+  "The iteration's model call had completed: it is booked at the token and cost fields this result reports.";
+
 /** How an iteration timed out: the controller that fired, which of its limits, and whether the call was dispatched. */
 export interface IterationTimeout {
   controller: TimeoutController;
@@ -107,6 +116,8 @@ export interface IterationTimeout {
   /** The limit that fired, in ms (`null` when not configured). */
   limitMs: number | null;
   dispatched: boolean;
+  /** The iteration's billed fields when its model call had completed and it was booked; `null` when it was not. */
+  billed: BilledFields | null;
 }
 
 /**
@@ -122,6 +133,9 @@ export interface IterationTimeout {
  * H2 fix: `dispatched` distinguishes timeout-during-throttle-wait (no dispatch) from
  * timeout-during-generateContent (dispatch happened). If it is false, the timeout fired during
  * abortableSleep and this iter never reached the API: subtract 1 to keep apiCalls authoritative.
+ * An iteration booked before it timed out (its stream had ended: the timeout fired in its tool batch)
+ * reports its billed fields, as a failed `ask` / `code` call reports its completed requests', and its message says
+ * so; the abort note is for an iteration whose call was cancelled (`billed: null`).
  */
 export function iterationTimedOut(iterations: number, timeout: IterationTimeout): TextToolResult {
   const { controller, kind, limitMs } = timeout;
@@ -129,8 +143,9 @@ export function iterationTimedOut(iterations: number, timeout: IterationTimeout)
     kind === 'stall'
       ? 'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.'
       : 'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.';
+  const costNote = timeout.billed === null ? ABORTED_REQUEST_NOTE : BOOKED_ITERATION_NOTE;
   return errorResult(
-    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} Note: AbortSignal is client-only — Gemini may still finish server-side and bill tokens for completed work.`,
+    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} ${costNote}`,
     {
       errorCode: 'TIMEOUT',
       timeoutMs: controller.timeoutMs,
@@ -140,6 +155,7 @@ export function iterationTimedOut(iterations: number, timeout: IterationTimeout)
       iterations,
       apiCalls: timeout.dispatched ? iterations : Math.max(0, iterations - 1),
       retryable: true,
+      ...(timeout.billed ?? {}),
     },
   );
 }
@@ -196,7 +212,7 @@ export function noProgressDetected(state: LoopState, stuck: NoProgress): TextToo
  * ARE billed even if its text came back empty, so both results report the post-pass totals.
  * `apiCalls` counts the pass from its explicit `attempted` flag (set IMMEDIATELY BEFORE the dispatch)
  * rather than from its usage — timeouts and pre-response network failures leave usageMetadata empty
- * even though the API attempt happened (and may have been billed server-side). Skipped paths
+ * even though the request was sent. Skipped paths
  * (daily-budget reject) leave `attempted` false so they report `apiCalls = iterations`. Operators can
  * branch on `apiCalls > iterations` to detect the forced pass without parsing `convergenceForced`.
  */
@@ -229,6 +245,8 @@ export function maxIterationsResult(
  * ran-but-failed; absent when it was skipped (daily budget). Wrappers can branch retry behaviour on
  * this without log scraping. P8 (v1.15.0): thinking tokens are part of the failure-path cumulative
  * telemetry too, so a rescue-attempted-but-failed call does not under-report its billing footprint.
+ * A pass booked before it failed (an empty text, a response that could not be read) reports its billed
+ * fields, as a failed loop iteration does.
  */
 function rescueFailed(
   run: AgenticRun,
@@ -254,5 +272,6 @@ function rescueFailed(
     cumulativeOutputTokens: totals.outputTokens,
     cumulativeThinkingTokens: totals.thinkingTokens,
     filesRead: state.filesReadSet.size,
+    ...(rescue.billed ?? {}),
   });
 }

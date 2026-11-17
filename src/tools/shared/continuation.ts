@@ -72,7 +72,7 @@ export interface DecodeCall {
   readonly limits: DecodeLimits;
   /** The abort signal (required: it reaches every request), the thought and chunk callbacks. */
   readonly collector: StreamCollectorOptions & { readonly signal: AbortSignal };
-  /** Called each time a request's stream opened: from then on its work is billed. */
+  /** Called each time a request's stream opened: from then on the request is never re-sent. */
   readonly onRequestOpened: () => void;
   /** The call's record of its requests, kept across its decodes and its failures. */
   readonly completed: CompletedRequests;

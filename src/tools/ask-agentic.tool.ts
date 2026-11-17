@@ -44,6 +44,7 @@ import { runRescue } from './agentic/rescue.js';
 import { maxIterationsResult } from './agentic/results.js';
 import {
   type AgenticRun,
+  type LoopState,
   type ResolvedModel,
   baseConfigOf,
   newLoopState,
@@ -91,9 +92,13 @@ interface AgenticCall {
   emitter: ProgressEmitter;
 }
 
-/** The model once resolved — read by the outer catch to key a 429's retry hint (`undefined` before resolution). */
-interface Resolution {
+/**
+ * What the outer catch reads: the model once resolved, to key a 429's retry hint, and the loop's state once the loop
+ * started, for the billed fields of a pass booked before the failure (`undefined` before each).
+ */
+interface CallProgress {
   resolved: ResolvedModel | undefined;
+  loop: LoopState | undefined;
 }
 
 /**
@@ -183,19 +188,20 @@ function startRun(
  * `maxIterations` without an answer — the forced-finalization pass. `resolveModel` either returns a
  * ResolvedModel or throws; the `undefined` check only narrows the type.
  */
-async function answerAgentic(call: AgenticCall, resolution: Resolution): Promise<TextToolResult> {
+async function answerAgentic(call: AgenticCall, progress: CallProgress): Promise<TextToolResult> {
   const workspace = await openWorkspace(call.rawWorkspaceRoot);
   if ('refused' in workspace) return workspace.refused;
   call.emitter.emit(`resolving model '${call.model}'…`);
-  resolution.resolved = await resolveModel(call.model, call.ctx.client, {
+  progress.resolved = await resolveModel(call.model, call.ctx.client, {
     requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
   });
-  const resolved = resolution.resolved;
+  const resolved = progress.resolved;
   if (!resolved) throw new Error('ask_agentic: resolveModel returned undefined (unreachable)');
   const start = startRun(call, resolved, workspace.root);
   if ('refused' in start) return start.refused;
   const { run } = start;
   const state = newLoopState(call.input.prompt);
+  progress.loop = state;
   const ended = await runLoop(run, state);
   if (ended !== null) return ended;
   const rescue = await runRescue(run, state);
@@ -209,18 +215,20 @@ async function answerAgentic(call: AgenticCall, resolution: Resolution): Promise
  * API-key rotation or quota reset) still DISCARD the hint: recording it against the unresolved alias
  * (e.g. 'latest-pro-thinking') would key the throttle hint to a string that future calls won't match
  * — they'd resolve to a literal model id, miss the alias-keyed hint, retry too soon. (Pinned by the
- * `outer-catch 429 from PRE-resolution path... does NOT seed hint` test.)
+ * `outer-catch 429 from PRE-resolution path... does NOT seed hint` test.) A loop iteration booked
+ * before it failed (its stream had ended) reports its billed fields.
  */
-function failedCall(err: unknown, ctx: ToolContext, resolved: ResolvedModel | undefined) {
+function failedCall(err: unknown, ctx: ToolContext, progress: CallProgress) {
   logger.error(`ask_agentic failed: ${safeForLog(err)}`);
   const httpStatus = (err as { status?: number }).status;
-  if (typeof resolved?.resolved === 'string') {
-    seedRetryHint(ctx.throttle, resolved.resolved, err);
+  if (typeof progress.resolved?.resolved === 'string') {
+    seedRetryHint(ctx.throttle, progress.resolved.resolved, err);
   }
   return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
     errorCode: 'UNKNOWN',
     retryable: false,
     ...(httpStatus !== undefined ? { httpStatus } : {}),
+    ...(progress.loop?.failedPassBilled ?? {}),
   });
 }
 
@@ -232,14 +240,11 @@ async function executeAskAgenticBody(
   started: number,
 ): Promise<TextToolResult> {
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
-  const resolution: Resolution = { resolved: undefined };
+  const progress: CallProgress = { resolved: undefined, loop: undefined };
   try {
-    return await answerAgentic(
-      { input, ctx, rawWorkspaceRoot, model, started, emitter },
-      resolution,
-    );
+    return await answerAgentic({ input, ctx, rawWorkspaceRoot, model, started, emitter }, progress);
   } catch (err) {
-    return failedCall(err, ctx, resolution.resolved);
+    return failedCall(err, ctx, progress);
   } finally {
     emitter.stop();
   }

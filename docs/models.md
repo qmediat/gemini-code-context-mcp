@@ -204,7 +204,7 @@ Per [Google's model docs](https://ai.google.dev/gemini-api/docs/models/gemini-2.
 | **MCP-host env override** | `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` | Every `ask` / `code` call explicitly sends `maxOutputTokens = modelOutputLimit` (65,536). Use for code-review workloads that routinely produce long OLD/NEW diff blocks. |
 | **Per-call override** | `code({ task, maxOutputTokens: 8192 })` | Tightest — caps ONE call. Overrides both default and env-force. Clamped to model's limit if larger — on Gemini 4 to 1,048,576: a cap above the per-request limit continues the decode in further requests ([tools.md](tools.md#long-decode-on-gemini-4-ask-code)). |
 
-Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` remains a true upper bound regardless of which layer applies.
+Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` bounds what a completed call books regardless of which layer applies ([what it does not bound](cost-model.md#what-the-daily-budget-does-not-bound)).
 
 ### Example: force max output for all code reviews
 

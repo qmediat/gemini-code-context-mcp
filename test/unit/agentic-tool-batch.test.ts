@@ -1,8 +1,8 @@
 /**
  * One iteration's tool batch in `ask_agentic`: the function responses go back to the model in call order with each
  * call's id, a `read_file` past `maxFilesRead` is refused in its place unless it re-reads a file already read, the
- * batch runs at most `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY` calls at once, and a sandbox refusal is logged at
- * debug level with the path asked for.
+ * batch runs at most `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY` calls at once, a timeout during or after the batch
+ * books the pass whose stream had ended, and a sandbox refusal is logged at debug level with the path asked for.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -134,6 +134,56 @@ describe('ask_agentic tool batch — concurrency', () => {
     });
 
     expect(executions.mostAtOnce).toBe(3);
+  });
+});
+
+describe('ask_agentic tool batch — a timeout', () => {
+  const GREP = { calls: [{ name: 'grep', args: { pattern: 'needle' } }] };
+
+  it('a batch that outlasts stallMs ends the call as a stall once it returned, the pass booked', async () => {
+    executions.delayMs = 2_000;
+
+    const startedAt = Date.now();
+    const { result, trace } = await runAgentic({
+      input: { stallMs: 1_000 },
+      script: [GREP, { text: 'done' }],
+    });
+
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1_950);
+    expect(result.structuredContent).toMatchObject({
+      errorCode: 'TIMEOUT',
+      timeoutKind: 'stall',
+      iteration: 1,
+      apiCalls: 1,
+      uncachedTokens: 1000,
+      outputTokens: 100,
+      thinkingTokens: 7,
+      responseText: expect.stringContaining('it is booked at the token and cost fields'),
+    });
+    expect(String(result.structuredContent?.responseText)).not.toContain('booked 0');
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([
+      [expect.objectContaining({ toolName: 'ask_agentic', uncachedTokens: 1000 })],
+    ]);
+  });
+
+  it('a stream that goes silent after its first chunk is aborted as a stall and booked 0', async () => {
+    const { result, trace } = await runAgentic({
+      input: { stallMs: 1_000 },
+      script: [{ ...GREP, hangsMidStream: true }],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      errorCode: 'TIMEOUT',
+      timeoutKind: 'stall',
+      iteration: 1,
+      responseText: expect.stringContaining(
+        'A request aborted after its stream opened is booked 0',
+      ),
+    });
+    expect(result.structuredContent).not.toHaveProperty('uncachedTokens');
+    expect(result.structuredContent).not.toHaveProperty('costEstimateUsd');
+    expect(executions.mostAtOnce).toBe(0);
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([]);
   });
 });
 

@@ -5,7 +5,8 @@
  * on the exits that end a pass before or after its dispatch.
  */
 
-import { describe, expect, it, vi } from 'vitest';
+import { ApiError } from '@google/genai';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   estimateCostUsd,
   estimateReservationUsd,
@@ -13,29 +14,62 @@ import {
 } from '../../src/utils/cost-estimator.js';
 import { callsTo, runAgentic } from '../helpers/agentic-run.js';
 
+/** How long the `grep` tool takes before it runs: a tool batch that outlasts the iteration's timeout. */
+const tools = vi.hoisted(() => ({ grepDelayMs: 0 }));
+
 vi.mock('../../src/gemini/models.js', () => ({ resolveModel: vi.fn() }));
 vi.mock('../../src/indexer/workspace-validation.js', () => ({
   validateWorkspacePath: vi.fn(),
   WorkspaceValidationError: class extends Error {},
 }));
+vi.mock('../../src/tools/agentic/workspace-tools.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/tools/agentic/workspace-tools.js')>(
+    '../../src/tools/agentic/workspace-tools.js',
+  );
+  const delayedGrep: typeof actual.grepExecutor = async (...args) => {
+    if (tools.grepDelayMs > 0) await new Promise((r) => setTimeout(r, tools.grepDelayMs));
+    return actual.grepExecutor(...args);
+  };
+  return { ...actual, grepExecutor: delayedGrep };
+});
+
+afterEach(() => {
+  tools.grepDelayMs = 0;
+});
 
 const MODEL = 'gemini-3-pro-preview';
 /** Daily budget and TPM limit that enforce both reservations without refusing one. */
 const ENFORCED = { dailyBudgetUsd: 10, tpmThrottleLimit: 1_000_000 } as const;
 const COVER_MS = 60_000;
 const READ_A = { calls: [{ name: 'read_file', args: { path: 'a.ts' } }] };
+/** The output and the thinking tokens a pass reserves for by default (`maxOutputTokens` unset). */
+const RESERVED_OUTPUT = 4096;
+
+/** The cost of a pass with these token counts, in USD. */
+function passCostUsd(uncached: number, output: number, thinking: number): number {
+  return estimateCostUsd({
+    model: MODEL,
+    uncachedInputTokens: uncached,
+    cachedInputTokens: 0,
+    outputTokens: output,
+    thinkingTokens: thinking,
+  });
+}
 
 /** The cost booked for a pass with these token counts. */
 function bookedMicros(uncached: number, output: number, thinking: number): number {
-  return toMicrosUsd(
-    estimateCostUsd({
-      model: MODEL,
-      uncachedInputTokens: uncached,
-      cachedInputTokens: 0,
-      outputTokens: output,
-      thinkingTokens: thinking,
-    }),
-  );
+  return toMicrosUsd(passCostUsd(uncached, output, thinking));
+}
+
+/** The token and cost fields an error result reports for a pass booked at these token counts. */
+function reportedFields(uncached: number, output: number, thinking: number) {
+  return {
+    cachedTokens: 0,
+    uncachedTokens: uncached,
+    outputTokens: output,
+    thinkingTokens: thinking,
+    costEstimateUsd: Math.round(passCostUsd(uncached, output, thinking) * 10000) / 10000,
+  };
 }
 
 describe('ask_agentic accounting — a loop iteration', () => {
@@ -248,7 +282,10 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
       script: [READ_A, { raw: response }],
     });
 
-    expect(result.structuredContent?.rescueErrorCode).toBe('INTERNAL');
+    expect(result.structuredContent).toMatchObject({
+      rescueErrorCode: 'INTERNAL',
+      ...reportedFields(4000, 9, 2),
+    });
     expect(callsTo(trace, 'throttle', 'release')[1]).toEqual([102, 4000]);
     expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')[1]).toEqual([
       2,
@@ -259,6 +296,27 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
         durationMs: expect.any(Number),
       },
     ]);
+  });
+
+  it('is booked at its whole reservation when reading its usage throws', async () => {
+    const response = {
+      candidates: [{ content: { parts: [{ text: 'x' }] } }],
+      get usageMetadata(): never {
+        throw new Error('usage unreadable');
+      },
+    };
+    const { result, trace } = await runAgentic({
+      ...ENFORCED,
+      input: { maxIterations: 1 },
+      script: [{ ...READ_A, usage: null }, { raw: response }],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      rescueErrorCode: 'INTERNAL',
+      ...reportedFields(50_000, RESERVED_OUTPUT, RESERVED_OUTPUT),
+    });
+    expect(callsTo(trace, 'throttle', 'release')[1]).toEqual([102, 50_000]);
+    expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([]);
   });
 
   it('adds its tokens, thinking included, to the loop totals of the forced answer', async () => {
@@ -390,4 +448,151 @@ describe('ask_agentic accounting — a ledger write that fails', () => {
       /^ask_agentic finalization: finalizeBudgetReservation failed for id=2/,
     );
   });
+});
+
+/** The reservation of pass 1 finalised at a pass's booked tokens. */
+function finalizedAt(uncached: number, output: number, thinking: number): unknown[][] {
+  return [
+    [
+      1,
+      {
+        cachedTokens: 0,
+        uncachedTokens: uncached,
+        costUsdMicro: bookedMicros(uncached, output, thinking),
+        durationMs: expect.any(Number),
+      },
+    ],
+  ];
+}
+
+const USAGE_3000 = { promptTokenCount: 3000, candidatesTokenCount: 200, thoughtsTokenCount: 50 };
+
+describe('ask_agentic accounting — an iteration that fails after its model call completed', () => {
+  it('books the call at its reported usage when the iteration times out in its tool batch', async () => {
+    tools.grepDelayMs = 1_500;
+    const { result, trace } = await runAgentic({
+      ...ENFORCED,
+      input: { iterationTimeoutMs: 1_000 },
+      script: [{ calls: [{ name: 'grep', args: { pattern: 'needle' } }], usage: USAGE_3000 }],
+    });
+
+    expect(result.structuredContent).toEqual({
+      errorCode: 'TIMEOUT',
+      timeoutMs: 1_000,
+      stallMs: null,
+      timeoutKind: 'total',
+      iteration: 1,
+      iterations: 1,
+      apiCalls: 1,
+      retryable: true,
+      responseText: expect.stringContaining('iteration 1 timed out (total) after 1000ms'),
+      ...reportedFields(3000, 200, 50),
+    });
+    const message = String(result.structuredContent?.responseText);
+    expect(message).not.toContain('booked 0');
+    expect(message).toContain(
+      "The iteration's model call had completed: it is booked at the token and cost fields this result reports.",
+    );
+    expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual(
+      finalizedAt(3000, 200, 50),
+    );
+    expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 3000]]);
+    expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([]);
+    expect(callsTo(trace, 'throttle', 'cancel')).toEqual([]);
+  });
+
+  it('books the call at its whole reservation when its usage could not be read: input, output and thinking', async () => {
+    const response = {
+      candidates: [{ content: { parts: [{ text: 'x' }] } }],
+      usageMetadata: {
+        get promptTokenCount(): never {
+          throw new Error('usage unreadable');
+        },
+      },
+    };
+    const { result, trace } = await runAgentic({ ...ENFORCED, script: [{ raw: response }] });
+
+    expect(result.isError).toBe(true);
+    expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual(
+      finalizedAt(50_000, RESERVED_OUTPUT, RESERVED_OUTPUT),
+    );
+    const [reserved] = callsTo(trace, 'ledger', 'reserveBudget')[0] as [
+      { estimatedCostMicros: number },
+    ];
+    const [, booked] = callsTo(trace, 'ledger', 'finalizeBudgetReservation')[0] as [
+      number,
+      { costUsdMicro: number },
+    ];
+    expect(booked.costUsdMicro).toBe(reserved.estimatedCostMicros);
+    expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 50_000]]);
+    expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([]);
+  });
+
+  it('books the call at its reported usage when its parts could not be read', async () => {
+    const response = {
+      candidates: [
+        {
+          content: {
+            parts: [
+              {
+                get functionCall(): never {
+                  throw new Error('part unreadable');
+                },
+              },
+            ],
+          },
+        },
+      ],
+      usageMetadata: USAGE_3000,
+    };
+    const { result, trace } = await runAgentic({ ...ENFORCED, script: [{ raw: response }] });
+
+    expect(result.isError).toBe(true);
+    expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual(
+      finalizedAt(3000, 200, 50),
+    );
+    expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 3000]]);
+  });
+
+  it('reports the booked tokens and cost in the error when its response could not be read', async () => {
+    const response = {
+      candidates: [{ content: { parts: [{ text: 'x' }] } }],
+      usageMetadata: {
+        get promptTokenCount(): never {
+          throw new Error('usage unreadable');
+        },
+      },
+    };
+    const { result } = await runAgentic({ ...ENFORCED, script: [{ raw: response }] });
+
+    expect(result.structuredContent).toEqual({
+      errorCode: 'UNKNOWN',
+      retryable: false,
+      responseText: 'ask_agentic failed: usage unreadable',
+      ...reportedFields(50_000, RESERVED_OUTPUT, RESERVED_OUTPUT),
+    });
+  });
+});
+
+describe('ask_agentic accounting — an iteration whose model call did not complete', () => {
+  it.each([
+    ['refused at its opening', { throws: new ApiError({ status: 429, message: 'quota' }) }],
+    ['failed at its opening', { throws: new ApiError({ status: 500, message: 'server' }) }],
+    [
+      'failed mid-stream after a chunk that carried usage',
+      { text: 'partial', usage: USAGE_3000, failsMidStream: new Error('stream reset') },
+    ],
+  ])(
+    'stays cancelled when %s: both reservations released, no token fields',
+    async (_case, turn) => {
+      const { result, trace } = await runAgentic({ ...ENFORCED, script: [turn] });
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).not.toHaveProperty('costEstimateUsd');
+      expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([[1]]);
+      expect(callsTo(trace, 'throttle', 'cancel')).toEqual([[101]]);
+      expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual([]);
+      expect(callsTo(trace, 'throttle', 'release')).toEqual([]);
+    },
+  );
 });

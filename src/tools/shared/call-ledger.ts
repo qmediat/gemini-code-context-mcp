@@ -2,9 +2,10 @@
  * The ledger side of an `ask` / `code` call: what its completed requests billed, and how the call settles its budget
  * reservation — on an answer, and on a failure.
  *
- * `GEMINI_DAILY_BUDGET_USD` bounds completed spend: every request that streamed to its end was billed, so its
- * reported usage, at list price, stays in the ledger whatever becomes of the call; only the unspent remainder of the
- * reservation is released. A call that fails before any request completed releases its reservation whole.
+ * The ledger books completed requests: every request that streamed to its end was billed, so its reported usage, at
+ * list price, stays in the ledger whatever becomes of the call; only the unspent remainder of the reservation is
+ * released. A call that fails before any request completed releases its reservation whole — whether Google bills a
+ * request aborted after its stream opened is not measured, and the ledger books it 0 (`docs/cost-model.md`).
  */
 
 import type { RanCachingMode } from '../../cache/caching-mode.js';
@@ -27,13 +28,17 @@ export interface BilledUsage {
   readonly costUsd: number;
 }
 
-/** The usage fields of a result: an answer, an `OUTPUT_CAP` stop, or a failure after completed requests. */
-export interface UsageFields {
+/** The token and cost fields of a result: what the requests they describe billed. */
+export interface BilledFields {
   readonly cachedTokens: number;
   readonly uncachedTokens: number;
   readonly outputTokens: number;
   readonly thinkingTokens: number;
   readonly costEstimateUsd: number;
+}
+
+/** The usage fields of a result: an answer, an `OUTPUT_CAP` stop, or a failure after completed requests. */
+export interface UsageFields extends BilledFields {
   readonly continuationHops: number;
 }
 
@@ -62,8 +67,9 @@ const tokens = (n: number | undefined): number => (typeof n === 'number' ? n : 0
 
 /**
  * The input a request that went through is billed at: the prompt tokens it reported, else — a response that carried
- * no usage — the input it was estimated to send. Under-billing a request the API completed is the worse error: the
- * estimate keeps the daily cap and the per-minute window a bound.
+ * no usage — the input it was estimated to send. Under-billing a request the API completed is the worse error, so it
+ * is booked at what its reservation covered, never 0. The estimate bounds the real input for `ask` / `code`; for an
+ * `ask_agentic` loop iteration it is a fixed 50,000 tokens and can be below it (`docs/cost-model.md`).
  */
 export function billedInputTokens(reported: number | undefined, estimate: number): number {
   return typeof reported === 'number' && reported > 0 ? reported : estimate;
@@ -98,21 +104,56 @@ export function billedUsage(
   };
 }
 
-export function usageFields(billed: BilledUsage, continuationHops: number): UsageFields {
+/** A billed usage as a result reports it, the cost rounded to 4 decimals. */
+export function billedFields(billed: BilledUsage): BilledFields {
   return {
     cachedTokens: billed.cachedTokens,
     uncachedTokens: billed.uncachedTokens,
     outputTokens: billed.outputTokens,
     thinkingTokens: billed.thinkingTokens,
     costEstimateUsd: Math.round(billed.costUsd * 10000) / 10000,
-    continuationHops,
   };
+}
+
+export function usageFields(billed: BilledUsage, continuationHops: number): UsageFields {
+  return { ...billedFields(billed), continuationHops };
+}
+
+/** The settled figures of a billed call, as the ledger row stores them. */
+type SettledRow = Parameters<ManifestDb['finalizeBudgetReservation']>[1];
+
+function settledRowOf(entry: LedgerEntry, billed: BilledUsage, durationMs: number): SettledRow {
+  return {
+    cachedTokens: billed.cachedTokens,
+    uncachedTokens: billed.uncachedTokens,
+    costUsdMicro: toMicrosUsd(billed.costUsd),
+    durationMs: Math.max(1, durationMs),
+    ...(entry.cachingMode === null
+      ? {}
+      : { cachingMode: entry.cachingMode, cachedContentTokenCount: billed.cachedTokens }),
+  };
+}
+
+/** What the log says of a booking that could not be written: what the ledger holds instead. */
+function unwrittenBookingLine(
+  label: string,
+  reservationId: number | null,
+  costUsdMicro: number,
+  err: unknown,
+): string {
+  const held =
+    reservationId === null
+      ? 'insertUsageMetric failed; no usage row was written'
+      : `finalizeBudgetReservation failed for id=${reservationId}; the row keeps its reserved estimate`;
+  return `${label}: ${held}, the billed ${costUsdMicro} micros were not written. Error: ${safeForLog(err)}`;
 }
 
 /**
  * Books a call at what it billed: its reservation finalised at that cost (the rest released), or — with no daily cap,
- * so no reservation — a usage row. A finalise that throws leaves the reservation's estimate booked, which stays a
- * bound; it is logged.
+ * so no reservation — a usage row. The booking is best-effort and never throws: it runs once the call's work is
+ * billed (an answer exists, or a request completed), and a failed write must not lose that answer nor replace the
+ * call's own error. A finalise that throws leaves the reservation's estimate booked; an insert that throws leaves no
+ * row. Either is logged.
  */
 export function recordBilledCall(
   manifest: ManifestDb,
@@ -122,31 +163,21 @@ export function recordBilledCall(
   durationMs: number,
   label: string = entry.toolName,
 ): void {
-  const settled = {
-    cachedTokens: billed.cachedTokens,
-    uncachedTokens: billed.uncachedTokens,
-    costUsdMicro: toMicrosUsd(billed.costUsd),
-    durationMs: Math.max(1, durationMs),
-    ...(entry.cachingMode === null
-      ? {}
-      : { cachingMode: entry.cachingMode, cachedContentTokenCount: billed.cachedTokens }),
-  };
-  if (reservationId === null) {
-    manifest.insertUsageMetric({
-      workspaceRoot: entry.workspaceRoot,
-      toolName: entry.toolName,
-      model: entry.model,
-      occurredAt: Date.now(),
-      ...settled,
-    });
-    return;
-  }
+  const settled = settledRowOf(entry, billed, durationMs);
   try {
-    manifest.finalizeBudgetReservation(reservationId, settled);
-  } catch (finalizeErr) {
-    logger.error(
-      `${label}: finalizeBudgetReservation failed for id=${reservationId}; the row keeps its reserved estimate, the billed ${settled.costUsdMicro} micros were not written. Error: ${safeForLog(finalizeErr)}`,
-    );
+    if (reservationId === null) {
+      manifest.insertUsageMetric({
+        workspaceRoot: entry.workspaceRoot,
+        toolName: entry.toolName,
+        model: entry.model,
+        occurredAt: Date.now(),
+        ...settled,
+      });
+    } else {
+      manifest.finalizeBudgetReservation(reservationId, settled);
+    }
+  } catch (writeErr) {
+    logger.error(unwrittenBookingLine(label, reservationId, settled.costUsdMicro, writeErr));
   }
 }
 
@@ -166,19 +197,17 @@ export function settleFailedCall(manifest: ManifestDb, failed: FailedCall): Usag
     failed.entry.model,
     failed.entry.serviceTier,
   );
-  try {
-    recordBilledCall(manifest, failed.reservationId, failed.entry, billed, failed.durationMs);
-  } catch (recordErr) {
-    logger.error(
-      `${failed.toolName}: the usage of ${failed.completed.count} completed request(s) could not be recorded. Error: ${safeForLog(recordErr)}`,
-    );
-  }
+  recordBilledCall(manifest, failed.reservationId, failed.entry, billed, failed.durationMs);
   return usageFields(billed, failed.completed.continuationHops());
 }
 
-function releaseReservation(
+/**
+ * Cancel a budget reservation (`null`: none was taken). A cancel that throws leaves the row at its estimate until the
+ * day ends; it is logged under `label`.
+ */
+export function releaseReservation(
   manifest: ManifestDb,
-  toolName: LedgerTool,
+  label: string,
   reservationId: number | null,
 ): void {
   if (reservationId === null) return;
@@ -186,7 +215,7 @@ function releaseReservation(
     manifest.cancelBudgetReservation(reservationId);
   } catch (cancelErr) {
     logger.error(
-      `${toolName}: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${safeForLog(cancelErr)}`,
+      `${label}: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${safeForLog(cancelErr)}`,
     );
   }
 }

@@ -38,6 +38,13 @@
  * pass it unconditionally and `recordChunk()` is a no-op.
  */
 
+/**
+ * What a timeout message says of the aborted request's cost, the same in the three tools: the abort stops the client
+ * only; the server books a request aborted after its stream opened at 0, and whether Google bills it is not measured.
+ */
+export const ABORTED_REQUEST_NOTE =
+  'Note: the abort stops the client only. A request aborted after its stream opened is booked 0 here; whether Google bills it is not measured (docs/cost-model.md).';
+
 const ABSOLUTE_MAX_MS = 1_800_000; // 30 min — conservative ceiling for total
 const ABSOLUTE_MIN_MS = 1_000; // 1 s — anything shorter is a unit-conversion bug
 const STALL_ABSOLUTE_MAX_MS = 600_000; // 10 min — a stall watchdog longer than this is just a slow total cap
@@ -311,6 +318,37 @@ export function isTimeoutAbort(err: unknown): boolean {
     current = (current as { cause?: unknown }).cause;
   }
   return false;
+}
+
+/** A timed-out `ask` / `code` call as its result reports it. */
+export interface TimedOutCall {
+  /** The limit that fired: `stall`, or `total` for every other timeout. */
+  readonly kind: TimeoutKind;
+  /** That limit in ms, `null` when it was not configured. */
+  readonly limitMs: number | null;
+  /** The error message: what fired, the knob that raises it, and what the abort means for the cost. */
+  readonly message: string;
+}
+
+/** What a timeout of an `ask` / `code` call reports: the limit that fired and the message naming its knob. */
+export function timedOutCall(
+  tool: 'ask' | 'code',
+  err: unknown,
+  controller: TimeoutController,
+): TimedOutCall {
+  const env = `GEMINI_CODE_CONTEXT_${tool.toUpperCase()}`;
+  if (getTimeoutKind(err) === 'stall') {
+    return {
+      kind: 'stall',
+      limitMs: controller.stallMs,
+      message: `${tool} timed out — no chunk received for ${controller.stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`${env}_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. ${ABORTED_REQUEST_NOTE}`,
+    };
+  }
+  return {
+    kind: 'total',
+    limitMs: controller.timeoutMs,
+    message: `${tool} timed out after ${controller.timeoutMs ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`${env}_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. ${ABORTED_REQUEST_NOTE}`,
+  };
 }
 
 /**

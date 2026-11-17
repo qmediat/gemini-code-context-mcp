@@ -133,7 +133,7 @@ A related but distinct race lives in `prepareContext` itself: if both instances 
 
 **Original source:** Self-review of v1.0.3 atomic-budget implementation, April 2026 (SR3).
 
-**Closed by D#7 in v1.7.0:** `status` now surfaces in-flight reservations as a separate field. `spentTodayUsd` and `usage.totalCostUsd` keep their conservative-upper-bound semantics (settled + in-flight, so daily-budget enforcement stays a true cap). New companion fields `spentTodaySettledUsd`, `inFlightReservedTodayUsd`, `usage.settledCostUsd`, and `usage.inFlightReservedUsd` give operators the breakdown. Human-readable output appends `"(settled $X + $Y in-flight reserved)"` only when in-flight is non-zero — no noise on the common path.
+**Closed by D#7 in v1.7.0:** `status` now surfaces in-flight reservations as a separate field. `spentTodayUsd` and `usage.totalCostUsd` keep their conservative-upper-bound semantics (settled + in-flight, so a call is refused before what the ledger books could pass the cap — [what it does not bound](./cost-model.md#what-the-daily-budget-does-not-bound)). New companion fields `spentTodaySettledUsd`, `inFlightReservedTodayUsd`, `usage.settledCostUsd`, and `usage.inFlightReservedUsd` give operators the breakdown. Human-readable output appends `"(settled $X + $Y in-flight reserved)"` only when in-flight is non-zero — no noise on the common path.
 
 The original "duration_ms = 0 conflates with sub-ms calls" objection is moot in practice: every call goes through `withNetworkRetry → generateContentStream` which guarantees a measurable wall-clock duration (the round-trip alone exceeds 1 ms by orders of magnitude). The flag stays load-bearing.
 

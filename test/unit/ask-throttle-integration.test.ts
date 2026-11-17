@@ -22,6 +22,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { expectAnswerDespiteUnwrittenUsageRow } from '../helpers/answer-booking.js';
 import { GEMINI_3_PRO, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
 import { INLINE_CONTEXT, ONE_FILE_SCAN } from '../helpers/workspace.js';
@@ -166,6 +167,17 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     const result = await askTool.execute({ prompt: 'q' }, ctx);
 
     expect(result.isError).toBeUndefined();
+    expect(methodSequence(throttleSpy)).toEqual(['reserve', 'release']);
+  });
+
+  it('a usage row that cannot be written: the answer is returned and the failed write logged', async () => {
+    const { ctx, throttleSpy } = buildCtx();
+    await expectAnswerDespiteUnwrittenUsageRow(
+      'ask',
+      ctx.manifest,
+      () => askTool.execute({ prompt: 'q' }, ctx),
+      'ok',
+    );
     expect(methodSequence(throttleSpy)).toEqual(['reserve', 'release']);
   });
 

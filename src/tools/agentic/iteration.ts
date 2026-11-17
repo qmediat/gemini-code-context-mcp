@@ -15,7 +15,8 @@ import {
   dispatchToolCallsParallel,
   resolveToolExecutionConcurrency,
 } from './dispatch.js';
-import { type UsageCounts, thinkingSummaryOf, usageCounts } from './response.js';
+import { type PassCall, completeCall } from './ledger.js';
+import { type UsageCounts, thinkingSummaryOf } from './response.js';
 import { resolveInsideWorkspace } from './sandbox.js';
 
 export interface IterationResult {
@@ -55,6 +56,8 @@ export interface IterationArgs {
   maxFilesRead: number;
   /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
   abortSignal: AbortSignal;
+  /** The pass's model call: marked completed once the stream ended, then given the usage read (`completeCall`). */
+  call: PassCall;
   /** User glob filters (v1.9.0+). Honoured by all four agentic executors so
    * a fallback from `ask` (which already applies the same globs to its
    * eager scanner) preserves filter semantics — no privacy regression. */
@@ -109,9 +112,9 @@ interface DispatchPlan {
  * assembled `CollectedResponse` is shape-identical to the previous
  * `GenerateContentResponse`, so all downstream extraction
  * (`response.candidates[0].content.parts`, `response.usageMetadata`) is
- * unchanged. The post-loop forced-finalization rescue keeps the v1.15.0
- * P3 non-streaming `apiCallSucceeded` contract unchanged — see the
- * rescue site for rationale.
+ * unchanged. The post-loop forced-finalization rescue does not stream
+ * (`generateContent`); both mark their call completed the same way
+ * (`completeCall`).
  */
 async function streamIteration(args: IterationArgs): Promise<CollectedResponse> {
   const { ctx, resolvedModel, conversation, baseConfig, abortSignal } = args;
@@ -324,7 +327,7 @@ function toolResponseTokensOf(finalResponseParts: Part[]): number {
  */
 export async function runAgenticIteration(args: IterationArgs): Promise<IterationResult> {
   const response = await streamIteration(args);
-  const usage = usageCounts(response.usageMetadata);
+  const usage = completeCall(args.call, response);
   const parts: Part[] = response.candidates?.[0]?.content?.parts ?? [];
   const functionCallParts = parts.filter((p): p is FunctionCallPart =>
     Boolean(p.functionCall && typeof p.functionCall.name === 'string'),

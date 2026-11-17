@@ -2,8 +2,9 @@
  * How an `ask` / `code` call settles — the one place both tools do it, so they book the same way and return the same
  * fields.
  *
- * - An answer: the ledger books every completed request at what it billed; a stop at the output cap with no text is
- *   an `OUTPUT_CAP` error with the usage, the model, the tier and the finish reason.
+ * - An answer: the ledger books every completed request at what it billed (best-effort: a failed write is logged, the
+ *   answer is returned); a stop at the output cap with no text is an `OUTPUT_CAP` error with the usage, the model,
+ *   the tier and the finish reason.
  * - A failure: a 429's retry hint seeds the per-minute throttle, the ledger keeps what the completed requests billed
  *   and releases the rest (all of it when none completed), and the request's per-minute reservation is dropped.
  */
@@ -61,7 +62,11 @@ export interface SettledAnswer {
   readonly outputCapStop: OutputCapStop | null;
 }
 
-/** Book the answered call at what its requests billed, and say whether it stopped at the cap with no answer. */
+/**
+ * Book the answered call at what its requests billed, and say whether it stopped at the cap with no answer. The booking
+ * is best-effort (`recordBilledCall` logs a failed write and never throws): the paid answer is returned whatever the
+ * ledger does.
+ */
 export function settleAnswer(call: AnsweredCall): SettledAnswer {
   const billed = billedUsage(call.completed.usage(), call.entry.model, call.entry.serviceTier);
   recordBilledCall(call.manifest, call.reservationId, call.entry, billed, call.durationMs);
@@ -104,8 +109,8 @@ export interface FailedCallSettlement {
 
 /**
  * Settle a failed call; its usage when completed requests were billed, else `null`. A 429's retry hint seeds the
- * throttle through `seedRetryHint`, once per error. A ledger write that throws is logged by `settleFailedCall` and
- * never replaces the call's own error.
+ * throttle through `seedRetryHint`, once per error. A ledger write that throws is logged by `recordBilledCall` /
+ * `settleFailedCall` and never replaces the call's own error.
  */
 export function settleFailure(settlement: FailedCallSettlement): UsageFields | null {
   const { err, model } = settlement;

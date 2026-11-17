@@ -2244,18 +2244,18 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
     expect(result.structuredContent?.timeoutMs).toBe(1_000);
     expect(result.structuredContent?.iteration).toBe(1);
-    // The SDK was called once (model issued the grep call); the slow
-    // executor ran (~1.5 s); the abort fired during dispatch.
+    // The SDK was called once (model issued the grep call); the abort fired during the ~1.5 s dispatch.
     expect(generateContent).toHaveBeenCalledTimes(1);
-    // Single iteration → single reservation → cancelled (not finalised)
-    // because the iteration threw on the post-dispatch abort check.
-    expect(manifest.cancelBudgetReservation).toHaveBeenCalledTimes(1);
-    expect(manifest.cancelBudgetReservation).toHaveBeenCalledWith(1);
+    // Single iteration → single reservation → finalised (not cancelled): the
+    // model call completed before the tool batch, so its work is billed even
+    // though the iteration threw on the post-dispatch abort check.
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(1);
+    expect(manifest.finalizeBudgetReservation).toHaveBeenCalledWith(1, expect.any(Object));
+    expect(manifest.cancelBudgetReservation).not.toHaveBeenCalled();
     // tpmEnforced=false here (no `tpmThrottleLimit` override → defaults to 0
     // in `buildCtx`), so `throttle.reserve` never ran and `throttle.cancel`
     // has nothing to release. F3 covers the throttle-cancel path.
     expect(throttle.cancel).not.toHaveBeenCalled();
-    expect(manifest.finalizeBudgetReservation).not.toHaveBeenCalled();
     // Timing sanity: must have actually waited for the slow executor
     // (≥ ~1.5 s). If this falls below 1.5 s the wrapper isn't being
     // invoked and the test is silently a no-op. Lower bound is 1450ms

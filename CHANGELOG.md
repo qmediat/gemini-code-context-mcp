@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and release its TPM reservation at 0 tokens, so later calls were throttled as if it had sent nothing.
 - `ask_agentic` without a daily budget (`GEMINI_DAILY_BUDGET_USD` unset) writes a usage row for each pass that
   reached the model, as `ask` and `code` do: `status` (`spentTodayUsd`) counted none of its spend.
+- `ask_agentic`: a loop iteration whose model call completed and which then failed — a timeout in its tool batch, a
+  response that could not be read — is booked at what it billed; it used to book nothing against the daily budget.
+  The error result of a pass booked before it failed (the loop iteration's `TIMEOUT` or `UNKNOWN`, the forced pass's
+  `AGENTIC_MAX_ITERATIONS`) carries that pass's `cachedTokens`, `uncachedTokens`, `outputTokens`, `thinkingTokens`
+  and `costEstimateUsd`.
+- `ask_agentic`: the message of an iteration `TIMEOUT` whose pass was booked says it is booked at the result's token
+  and cost fields; it used to say the request was booked 0 beside those fields.
+- `ask_agentic`: a pass whose usage could not be read (the read threw after its model call completed) is booked at
+  its whole reservation — the input estimate plus the reserved output and thinking tokens; it used to be booked at
+  the input estimate alone.
+- Docs and timeout messages: whether Google bills a request aborted after its stream opened is not measured; the server
+  books it 0, so for such a request the daily budget and the TPM window are not a bound. `docs/cost-model.md` names
+  this and the `ask_agentic` iteration's fixed 50,000-token estimate (*What the daily budget does not bound*); the
+  phrases "true upper bound" / "true cap" are gone.
+- `ask` and `code`: an answer whose usage row cannot be written (a busy or failing database) is returned, and the
+  failed write is logged; the paid answer used to be lost behind an error.
 
 ## [1.24.0] - 2026-11-17
 

@@ -10,9 +10,11 @@ import { estimateReservationUsd } from '../../utils/cost-estimator.js';
 import type { ProgressEmitter } from '../../utils/progress.js';
 import type { ToolContext } from '../registry.js';
 import { resolveTotalTimeoutMs } from '../shared/abort-timeout.js';
+import type { BilledFields } from '../shared/call-ledger.js';
 import type { AskAgenticInput } from './input.js';
 import { SYSTEM_INSTRUCTION_AGENTIC, buildFunctionDeclarations } from './instructions.js';
 import type { SignatureCounts } from './no-progress.js';
+import type { UsageCounts } from './response.js';
 
 export type ResolvedModel = Awaited<ReturnType<typeof resolveModel>>;
 
@@ -93,6 +95,9 @@ export interface LoopState {
    * produced a usage record (defensive — falls back to the static estimate
    * at the use site). */
   lastIterationPromptTokens: number;
+  /** The billed fields of the iteration that was booked and then failed with an error the loop does not shape;
+   * the outer catch puts them in its error result. `null` while no such failure happened. */
+  failedPassBilled: BilledFields | null;
 }
 
 export function runLimitsOf(input: AskAgenticInput): RunLimits {
@@ -138,18 +143,27 @@ export function passBudgetOf(input: AskAgenticInput, ctx: ToolContext): PassBudg
   };
 }
 
+/** The tokens one pass is reserved for: its input estimate, and `budget.outputTokens` of output and of thinking. */
+export function passReservedUsage(run: AgenticRun, inputTokens: number): UsageCounts {
+  return {
+    promptTokenCount: inputTokens,
+    candidatesTokenCount: run.budget.outputTokens,
+    thoughtsTokenCount: run.budget.outputTokens,
+  };
+}
+
 /** One pass's reservation for the resolved model, at the rates in force from now until its timeout. */
 export function passReservationUsd(run: AgenticRun, inputTokens: number): number {
-  const { budget } = run;
+  const reserved = passReservedUsage(run, inputTokens);
   return estimateReservationUsd(
     {
       model: run.resolved.resolved,
-      uncachedInputTokens: inputTokens,
+      uncachedInputTokens: reserved.promptTokenCount,
       cachedInputTokens: 0,
-      outputTokens: budget.outputTokens,
-      thinkingTokens: budget.outputTokens,
+      outputTokens: reserved.candidatesTokenCount,
+      thinkingTokens: reserved.thoughtsTokenCount,
     },
-    budget.coverMs,
+    run.budget.coverMs,
   );
 }
 
@@ -164,5 +178,6 @@ export function newLoopState(prompt: string): LoopState {
     lastToolResponseTokens: 0,
     iterations: 0,
     lastIterationPromptTokens: 0,
+    failedPassBilled: null,
   };
 }

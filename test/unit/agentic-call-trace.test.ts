@@ -229,7 +229,7 @@ describe('ask_agentic call trace — a finalization pass that gives no answer', 
 
     expect(traceLines(trace).slice(-3)).toEqual([
       'ledger cancelBudgetReservation [2]',
-      'log error ["ask_agentic finalization: cancelBudgetReservation failed: ledger down"]',
+      'log error ["ask_agentic finalization: cancelBudgetReservation failed for id=2; reservation row keeps the estimate. Error: ledger down"]',
       'throttle cancel [102]',
     ]);
   });
@@ -250,7 +250,7 @@ describe('ask_agentic call trace — a loop that ends without an answer', () => 
       tpmReserve(50_000),
       STREAM,
       'ledger cancelBudgetReservation [1]',
-      'log error ["ask_agentic: cancelBudgetReservation failed: ledger down"]',
+      'log error ["ask_agentic: cancelBudgetReservation failed for id=1; reservation row keeps the estimate. Error: ledger down"]',
       'throttle cancel [101]',
       'log error ["ask_agentic failed: plain"]',
     ]);
