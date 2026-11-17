@@ -65,6 +65,8 @@ export interface AgenticRunOptions {
   readonly env?: Readonly<Record<string, string>>;
   /** What the model resolves to. Default: Gemini 3 Pro (`gemini-3-pro-preview`). */
   readonly model?: ResolvedModel;
+  /** How the call is made. Default: `askAgenticTool.execute`. */
+  readonly run?: (input: AskAgenticInput, ctx: ToolContext) => Promise<TextToolResult>;
 }
 
 export type TraceKind = 'emit' | 'log' | 'ledger' | 'throttle' | 'model';
@@ -288,7 +290,8 @@ export async function runAgentic(opts: AgenticRunOptions): Promise<AgenticRunRec
   try {
     const ctx = contextOf(opts, trace, modelCalls);
     const input = { prompt: 'q', workspace, ...opts.input } as AskAgenticInput;
-    const result = await withEnv(opts.env ?? {}, () => askAgenticTool.execute(input, ctx));
+    const execute = opts.run ?? askAgenticTool.execute;
+    const result = await withEnv(opts.env ?? {}, () => execute(input, ctx));
     return { result, trace, modelCalls };
   } finally {
     for (const spy of spies) spy.mockRestore();

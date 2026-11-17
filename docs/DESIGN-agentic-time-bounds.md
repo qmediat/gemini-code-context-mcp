@@ -1,9 +1,10 @@
 # Design — the time bounds of an `ask_agentic` call
 
-Status: proposed, not implemented ([FOLLOW-UP-PRS.md T44](./FOLLOW-UP-PRS.md)). Three patches to these bounds inside
-PR #134 each moved a phase of the call from one bound to none, and the PR went back to the bounds of 1.24.0. This note
-writes the bounds as one table and one mechanism before any code changes, so that a reviewer can check the code
-against the table.
+Status: implemented ([FOLLOW-UP-PRS.md T44](./FOLLOW-UP-PRS.md), closed 2026-11-17); the open questions are
+[decisions](#decisions-on-the-open-questions). Three patches to these bounds inside PR #134 each moved a phase of the
+call from one bound to none, and the PR went back to the bounds of 1.24.0. This note writes the bounds as one table and
+one mechanism, so that a reviewer can check the code against the table. The sections "Today" and "The defects" describe
+1.24.0 + T42, the code this design replaced.
 
 ## Notation
 
@@ -118,15 +119,19 @@ interface PhaseDefaults {
   readonly toolSettleGraceMs: number; // 1_000
 }
 interface PassTimeout {            // what fired; read from the clock, never parsed from a message
-  readonly phase: PassPhase; readonly kind: TimeoutKind; readonly source: BoundSource; readonly limitMs: number;
+  readonly phase: PassPhase; readonly kind: TimeoutKind; readonly source: BoundSource;
+  readonly limitMs: number | null; // null only for a TimeoutError the clock did not raise, with no knob of its kind
 }
-interface PassClock extends TimeoutController {   // signal, dispose, recordChunk, timeoutMs, stallMs
+interface PassClock {              // not a TimeoutController: it has no pauseStall, the stall is phase-scoped
+  readonly signal: AbortSignal; readonly timeoutMs: number | null; readonly stallMs: number | null;
+  readonly phase: PassPhase; readonly timedOut: PassTimeout | null;
   enter(phase: PassPhase): void;   // clears the previous phase's timer, arms this phase's
-  readonly timedOut: PassTimeout | null;
+  recordChunk(): void;             // the first chunk enters `stream`; each chunk re-arms the gap timer
+  dispose(): void;
 }
-type ToolsOutcome =
-  | { readonly kind: 'done'; readonly results: DispatchedToolResult[] }
-  | { readonly kind: 'timed-out'; readonly running: number; readonly neverStarted: number };
+type IterationOutcome =            // what an iteration returns to the loop
+  | { readonly kind: 'done'; readonly iteration: IterationResult }
+  | { readonly kind: 'tools-timed-out'; readonly running: number; readonly neverStarted: number };
 ```
 
 The rules, in order: **`T` is the pass's wall clock** — armed at creation, over every phase; **`S` bounds the gaps of
@@ -147,7 +152,7 @@ N ms (total wall-clock)" / "(stall — no chunk received)") and adds `timeoutPha
 | `tpm-wait` | clock creation, before `waitForTpm` (as today) | `abortableSleep(delay, signal)` |
 | `opening` | before `generateContentStream` | the SDK's `abortSignal`, `withNetworkRetry({ signal })` |
 | `stream` | the first chunk (`recordChunk`) | the SDK's `abortSignal`, `collectStream` |
-| `tools` | where the call is marked completed (`completeCall`), before `planDispatch` | `planDispatch` and the batch raced as one promise (`abortable`, `retry.ts:167`); workers check the signal before taking a call; executors get the signal |
+| `tools` | where the call is marked completed (`completeCall`), before `planDispatch` | `planDispatch` and the batch raced as one promise (`abortable`, `retry.ts:167`); workers check the signal before taking a call; executors get the signal; after the bound, the work still running gets `toolSettleGraceMs` (the shared `abortableSleep`, cleared when the work settles) |
 | `finalization` | before the forced pass's unary call | the SDK's `abortSignal` |
 
 ### Target, direct `ask_agentic` call
@@ -157,7 +162,7 @@ Results: **Tt** / **Ts** now also carry `timeoutPhase` and `timeoutSource`; in `
 
 | Phase | none | only `S` | only `T` | both |
 |---|---|---|---|---|
-| Setup | ∞ — kept, [Q5](#open-questions-for-the-conductor) | ∞ | ∞ | ∞ |
+| Setup | ∞ — kept, [Q5](#decisions-on-the-open-questions) | ∞ | ∞ | ∞ |
 | TPM wait | the throttle's delay | the throttle's delay | `T` → Tt·tpm-wait | `T` → Tt·tpm-wait |
 | Opening, first chunk | **600 s → Tt·opening·default** | **600 s → Tt·opening·default** | `T` → Tt·opening | `T` → Tt·opening |
 | Gaps inside the stream | **600 s → Ts·stream·default** | `S` → Ts·stream | `T` → Tt·stream | first of `S`, `T` |
@@ -169,8 +174,9 @@ Results: **Tt** / **Ts** now also carry `timeoutPhase` and `timeoutSource`; in `
 ### Target, `ask` fallback
 
 The mapping: `ask` resolves its knobs once (per call, else `GEMINI_CODE_CONTEXT_ASK_*` — the values its own
-controller holds) and forwards **`timeoutMs` → `iterationTimeoutMs`** (unchanged, [Q3](#open-questions-for-the-conductor))
-and **`stallMs` → `stallMs`** (no longer a wall clock, no `min`). It disposes its own controller before the hand-off.
+controller holds) and forwards **`timeoutMs` → `iterationTimeoutMs`** (unchanged, [Q3](#decisions-on-the-open-questions))
+and **`stallMs` → `stallMs`** (no longer a wall clock, no `min`). It disposes its own controller before the hand-off
+(`src/tools/ask-agentic-fallback.ts`), and the agentic call's timeout messages name `ask`'s knobs.
 The result reports `iterTimeoutMs`, `iterTimeoutSource: 'timeoutMs'` and `stallMs`; the values `'stallMs'` and
 `'min(timeoutMs,stallMs)'` of `iterTimeoutSource` go (named in the CHANGELOG).
 
@@ -235,14 +241,15 @@ returned" changes to "… the call ends at the bound".
 
 | File | Change |
 |---|---|
-| `src/tools/shared/abort-timeout.ts` | `PassPhase`, `BoundSource`, `PassTimeout`, `createPassClock(knobs, defaults)`; the abort reason's `timeoutPhase` / `timeoutSource`; `createTimeoutController` unchanged |
-| `src/tools/agentic/phase-defaults.ts` (new, ~20 lines) | `PhaseDefaults` and its values, each with its reason |
-| `src/tools/agentic/run.ts` | `AgenticKnobs` resolved once; `coverMs` (the reservation's rate window) stays `T` |
+| `src/tools/shared/abort-timeout.ts` | `resolveStallTimeoutMs` beside `resolveTotalTimeoutMs`, `timeoutReason` (the abort reason, its message and extra properties) and `unrefTimer`, shared by `createTimeoutController` (behaviour unchanged, split into small units) and the clock; `STALL_ABSOLUTE_MAX_MS` exported |
+| `src/tools/agentic/pass-clock.ts` (new) | `PassPhase`, `BoundSource`, `AgenticKnobs`, `PassTimeout`, `PassClock`, `createPassClock(knobs, defaults)`, the phase-bound dispatch table. In `agentic/`, not in `shared/`: it reads `phase-defaults.ts`, and the shared module stays `ask` / `code`'s |
+| `src/tools/agentic/phase-defaults.ts` (new) | `PhaseDefaults` and its values, each with its reason |
+| `src/tools/agentic/run.ts` | `resolveAgenticKnobs` (once per call), `KnobNames` and `AGENTIC_KNOB_NAMES`; `coverMs` (the reservation's rate window) stays `T` |
 | `src/tools/agentic/loop.ts`, `rescue.ts` | one clock per pass; `iterationFailure` reads `clock.timedOut` |
-| `src/tools/agentic/iteration.ts` | `enter('tools')` at the stream's end; `runToolsPhase` returns a `ToolsOutcome`; `throwIfIterationAborted` goes |
-| `src/tools/agentic/dispatch.ts`, `workspace-tools.ts` | the signal to the workers and the executors |
-| `src/tools/agentic/results.ts` | `iterationTimedOut(PassTimeout, …)`; the hint table |
-| `src/tools/ask.tool.ts` | the mapping, the hand-off, the lift of the new fields, `ask`'s knob names in the hint |
+| `src/tools/agentic/iteration.ts` | `enter('tools')` once the call completed; `runToolsPhase` (path resolution and batch raced as one); the model and user turns appended only on the `done` path; `throwIfIterationAborted` gone |
+| `src/tools/agentic/dispatch.ts`, `workspace-tools.ts` | `startToolBatch` (the signal to the workers, the running count); the signal to the executors — `find_files` and `grep` share one walk that reads it |
+| `src/tools/agentic/results.ts` | `iterationTimedOut` with the `PassTimeout`; the hint table keyed by source and, for a default, by phase |
+| `src/tools/ask-agentic-fallback.ts` (new) | the fallback moved out of `ask.tool.ts`: the mapping, the hand-off, the lift of the new fields, `ask`'s knob names (`runAskAgentic(input, ctx, ASK_KNOB_NAMES)`) |
 | docs | `configuration.md` (`:41`, `:43`, `:64-65`), `tools.md`, `cost-model.md` (the row above), CHANGELOG, T44 closed |
 
 ## Error policy
@@ -256,12 +263,14 @@ returned" changes to "… the call ends at the bound".
 
 ## Test plan
 
-No test waits on a real bound: the tests mock `agentic/phase-defaults.ts` with bounds of tens of milliseconds, a hang
-is a promise that never settles, a slow executor is a deferred the test releases — never a `setTimeout` it races — and
-assertions name the phase, the source, the booking and the order of events, never an elapsed time against a bound (a
-runner two to three times slower changes nothing). Each test is red on `main` where its cell changes.
+No test waits on a default bound: the tests mock `agentic/phase-defaults.ts` with bounds of tens of milliseconds, a
+hang is a promise that never settles, and assertions name the phase, the source, the booking and the order of events,
+never an elapsed time against a bound (a runner two to three times slower changes nothing). A test of a knob's bound
+(`stallMs`, `iterationTimeoutMs`) keeps the knob's 1 s minimum, so it is red on `main` too; a slow executor there is
+a sleep longer than the knob. Each test is red on `main` where its cell changes.
 
-`test/unit/agentic-time-bounds.test.ts` (call level):
+`test/unit/agentic-time-bounds.test.ts` (call level: 1, 3–10, 13 for the agentic side) and
+`test/unit/preflight-guard.test.ts` (`ask`'s side of the fallback: 2, 11, 12, 13, and the hand-off's order):
 
 1. a batch longer than `stallMs` answers — direct and fallback (D1, D5; inverts `agentic-tool-batch.test.ts:143`);
 2. the fallback with only `stallMs` lets a stream run longer than `stallMs` (D5);
@@ -280,7 +289,7 @@ runner two to three times slower changes nothing). Each test is red on `main` wh
 13. the fallback's hint names `timeoutMs` / `stallMs`, never `iterationTimeoutMs` (D8).
 
 `ask-agentic.test.ts:2207` (F2) changes to end at the timer instead of after the slow executor.
-`test/unit/abort-timeout.test.ts` (the clock): at most two timers alive in any phase; the stall timer armed only between
+`test/unit/pass-clock.test.ts` (the clock, fake timers): at most two timers alive in any phase; the stall timer armed only between
 chunks of `stream`; `enter` clears the previous phase's timer; the reason carries phase and source; `dispose` after a
 fire is idempotent (D10 closes by construction: the stall is phase-scoped).
 
@@ -293,7 +302,7 @@ keeps its result shape and the abort's message). Changed by the added fields onl
 `retryable` and the booking identical): `iter-timeout-wait`, `iter-timeout-wait-2`, `iter-timeout-call`,
 `iter-timeout-call-nobudget`, `iter-timeout-env`, `iter-retry-timeout-in-backoff`, `stall-fires`, `iter-timeout-tools`
 (which also ends earlier — the probe's grep ignores the signal and settles inside the grace; the trace does not record
-time). Added: the sixteen scenarios of the run on `main` above (`open-*`, `gap-*`, `batch-*`, `tpm-stall`, `rescue-*-hang`,
+time); their messages also lose "; default disabled" (the hint table, D8). Added: the sixteen scenarios of the run on `main` above (`open-*`, `gap-*`, `batch-*`, `tpm-stall`, `rescue-*-hang`,
 `retry-backoff-stall`), each with a watch timer, so that every ∞ cell of today has a trace that changes.
 
 ## Performance budget
@@ -309,14 +318,19 @@ or file walked. No `AbortSignal.any`, no timer per chunk beyond the stall timer 
 - The setup phase's bound (Q5) and a whole-call bound for `ask_agentic` (Q3).
 - Streaming the forced pass so that a stall timer can watch it.
 - A time bound on the model's regex in `grep` (synchronous: no timer fires while it runs) and `grep`'s walk going on
-  past its match cap (`workspace-tools.ts:693-695`): their own entries.
+  past its match cap: [FOLLOW-UP-PRS.md T45](./FOLLOW-UP-PRS.md) (D12).
 
-## Open questions for the conductor
+## Decisions on the open questions
 
-| # | Question | Recommendation | The fact that would flip it |
+Each recommendation was accepted (2026-11-17); the fact that would flip it stays beside it.
+
+| # | Question | Decision and reason | The fact that would flip it |
 |---|---|---|---|
-| Q1 | The defaults: 120 s for `tools`, 600 s for the opening, a stream gap and the forced pass | take them | a measured `grep` / `find_files` batch over a large workspace — the tool's own use case — above 60 s, or a healthy first chunk later than 600 s |
-| Q2 | With only `stallMs`, bound the opening by a value derived from `S` (1.24.0's fallback ended it at `S`) instead of 600 s? | no: a stall is a gap between chunks; the opening holds the prefill of a conversation that grows every iteration, and `ask` / `code` exempt it too (`docs/tools.md:50`) | measured first-chunk latency of agentic iterations far under common `S` values (p99 < 15 s at 500 K prompt tokens) |
-| Q3 | The fallback's `timeoutMs`: keep it per iteration, or make it a deadline over the whole agentic call (its meaning in `ask`)? | keep in T44 — a public contract since 1.11.0 (`ask.tool.ts:213`); a whole-call deadline is its own entry | the operator wants `ask`'s total semantics on the fallback now |
-| Q4 | A `tools` timeout with an executor still running after the grace: `retryable: false`, or true with `toolCallsRunning`? | false: a retry stacks file-system calls on the same thread pool | a measurement that executors always settle within the grace once they read the signal |
-| Q5 | Bound the setup (workspace open, `resolveModel`)? | not in T44: no reservation is held, and `resolveModel` takes no signal and serves the three tools | a reported hang in model resolution |
+| Q1 | The defaults: 120 s for `tools`, 600 s for the opening, a stream gap and the forced pass | taken (`phase-defaults.ts`): 600 s is the longest `stallMs` the schema accepts — silence longer than any watchdog a caller may set is a hang; a healthy batch of at most ten parallel calls over a local file system ends in seconds. Each is set only through the existing knobs: no new env var | a measured `grep` / `find_files` batch over a large workspace — the tool's own use case — above 60 s, or a healthy first chunk later than 600 s |
+| Q2 | With only `stallMs`, bound the opening by a value derived from `S` (1.24.0's fallback ended it at `S`) instead of 600 s? | no: `stallMs` bounds a stream's gaps only. A stall is a gap between chunks; the opening holds the prefill of a conversation that grows every iteration, and `ask` / `code` exempt it too (`docs/tools.md:50`) | measured first-chunk latency of agentic iterations far under common `S` values (p99 < 15 s at 500 K prompt tokens) |
+| Q3 | The fallback's `timeoutMs`: keep it per iteration, or make it a deadline over the whole agentic call (its meaning in `ask`)? | kept per iteration — a public contract since 1.11.0 (`ask.tool.ts`'s `onWorkspaceTooLarge` description); a whole-call deadline is its own entry | the operator wants `ask`'s total semantics on the fallback now |
+| Q4 | A `tools` timeout with an executor still running after the grace: `retryable: false`, or true with `toolCallsRunning`? | `retryable: false` with `toolCallsRunning`: a retry stacks file-system calls on the same thread pool | a measurement that executors always settle within the grace once they read the signal |
+| Q5 | Bound the setup (workspace open, `resolveModel`)? | not bounded: no reservation is held there, and `resolveModel` takes no signal and serves the three tools; the docs say the setup has no bound (`docs/tools.md`) | a reported hang in model resolution |
+
+D11 (the fallback read only per-call knobs and left `ask`'s timer counting) is fixed as the fallback table says. D12
+(the model's regex in `grep` blocks the event loop) is not: [FOLLOW-UP-PRS.md T45](./FOLLOW-UP-PRS.md).

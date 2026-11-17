@@ -52,7 +52,7 @@ import {
 import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
-import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
+import { ASK_STALL_ENV, ASK_TIMEOUT_ENV, fallBackToAgentic } from './ask-agentic-fallback.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, isTimeoutAbort, timedOutCall } from './shared/abort-timeout.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
@@ -210,7 +210,7 @@ export const askInputSchema = z
       .enum(['error', 'fallback-to-agentic'])
       .optional()
       .describe(
-        "Behaviour when the v1.5.0 preflight detects the workspace exceeds the model's `inputTokenLimit × workspaceGuardRatio` (v1.11.0+). `'error'` (default — preserves v1.5.0 behaviour) returns a structured `errorCode: 'WORKSPACE_TOO_LARGE'` and lets the caller decide how to recover. `'fallback-to-agentic'` opt-in: the server transparently re-routes through `ask_agentic` (sandboxed file-access loop — no eager upload, scales to arbitrarily large repos), wraps the agentic result, and surfaces `fallbackApplied: 'ask_agentic'` in `structuredContent` so callers can audit the swap. **Semantic divergence:** `ask_agentic` runs as a multi-iteration loop, so `timeoutMs` (ask's wall-clock cap) translates to `iterationTimeoutMs` (per-iteration cap); total wall-clock can be N × timeoutMs. Cost shape also changes (multiple smaller calls vs one big eager call). Recommended setting for orchestrators that prioritise getting an answer over a single round-trip; default stays `'error'` so existing callers see no behaviour change. **`code` does NOT support this field** — `code`'s OLD/NEW edit format is load-bearing for Claude's Edit pipeline, and `ask_agentic` returns prose only.",
+        "Behaviour when the v1.5.0 preflight detects the workspace exceeds the model's `inputTokenLimit × workspaceGuardRatio` (v1.11.0+). `'error'` (default — preserves v1.5.0 behaviour) returns a structured `errorCode: 'WORKSPACE_TOO_LARGE'` and lets the caller decide how to recover. `'fallback-to-agentic'` opt-in: the server transparently re-routes through `ask_agentic` (sandboxed file-access loop — no eager upload, scales to arbitrarily large repos), wraps the agentic result, and surfaces `fallbackApplied: 'ask_agentic'` in `structuredContent` so callers can audit the swap. **Semantic divergence:** `ask_agentic` runs as a multi-iteration loop, so `timeoutMs` (ask's wall-clock cap, per call or `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`) translates to `iterationTimeoutMs` (per-iteration cap; total wall-clock can be N × timeoutMs) and `stallMs` (per call or `GEMINI_CODE_CONTEXT_ASK_STALL_MS`) to the loop's `stallMs` (a stream's silence only — a tool batch longer than `stallMs` answers); a phase neither bounds ends at `ask_agentic`'s default (600 s for a request's opening and a silent stream, 120 s for an iteration's tools). The result reports `iterTimeoutMs`, `iterTimeoutSource: 'timeoutMs'` and `stallMs`, and lifts `errorCode`, `retryable`, `timeoutKind`, `timeoutPhase` and `timeoutSource` of a failed agentic call. Cost shape also changes (multiple smaller calls vs one big eager call). Recommended setting for orchestrators that prioritise getting an answer over a single round-trip; default stays `'error'` so existing callers see no behaviour change. **`code` does NOT support this field** — `code`'s OLD/NEW edit format is load-bearing for Claude's Edit pipeline, and `ask_agentic` returns prose only.",
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
@@ -387,9 +387,9 @@ async function executeAskBody(
   // the stall watchdog on every chunk arrival.
   const timeoutController = createTimeoutController({
     ...(input.timeoutMs !== undefined ? { totalMs: input.timeoutMs } : {}),
-    totalEnvVar: 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+    totalEnvVar: ASK_TIMEOUT_ENV,
     ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
-    stallEnvVar: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
+    stallEnvVar: ASK_STALL_ENV,
   });
   const abortSignal = timeoutController.signal;
   // Each request of the decode holds its own TPM reservation; a failure drops the one held.
@@ -580,9 +580,10 @@ async function executeAskBody(
         // 'fallback-to-agentic'`. Default stays `'error'` so pre-v1.11.0
         // callers see identical behaviour. The fallback re-uses this
         // tool's resolved inputs (model / globs / thinking config /
-        // workspace) and re-translates `timeoutMs` to `iterationTimeoutMs`
-        // (per-iteration cap; total wall-clock can be N × that). Cost +
-        // timing shape genuinely changes — opt-in is the right default.
+        // workspace) and forwards its resolved `timeoutMs` as `iterationTimeoutMs`
+        // (per-iteration cap; total wall-clock can be N × that) and `stallMs` as
+        // `stallMs` (`ask-agentic-fallback.ts`). Cost + timing shape genuinely
+        // changes — opt-in is the right default.
         if (
           input.onWorkspaceTooLarge === 'fallback-to-agentic' &&
           attachments.attached.length > 0
@@ -598,163 +599,15 @@ async function executeAskBody(
           );
         }
         if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
-          if (serviceTier === 'flex') {
-            const note =
-              'ask: the ask_agentic fallback has no service tier — this call runs standard, not flex';
-            emitter.emit(note);
-            logger.warn(note);
-          }
-          logger.warn(
-            `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
-          );
-          // Translate `timeoutMs` AND `stallMs` to the agentic per-iteration
-          // wall-clock cap (`iterationTimeoutMs`). Pre-v1.12.1 only `timeoutMs`
-          // was forwarded — a user who set `stallMs: 60000` (the v1.12.0
-          // recommended liveness watchdog) saw it silently dropped on the
-          // fallback path. The agentic loop uses non-streaming
-          // `generateContent`, so there's no chunk stream to reset on; we
-          // collapse both knobs onto the per-iteration cap and use the
-          // TIGHTER of the two as the bound. The CHANGELOG documents the
-          // semantic divergence on `timeoutMs` (total → per-iteration).
-          //
-          // v1.12.2 — `iterTimeoutSource` is surfaced in metadata AND emitted
-          // in the warn-log so users can see WHICH knob bound their call
-          // (one of: 'timeoutMs', 'stallMs', or 'min(timeoutMs,stallMs)').
-          // Pre-v1.12.2 the log only fired when stallMs was set alone; the
-          // both-set case had no signal explaining the pick.
-          const iterTimeoutPick = ((): {
-            cap: number | undefined;
-            source: 'timeoutMs' | 'stallMs' | 'min(timeoutMs,stallMs)' | 'none';
-          } => {
-            const a = input.timeoutMs;
-            const b = input.stallMs;
-            if (a !== undefined && b !== undefined) {
-              const cap = Math.min(a, b);
-              return { cap, source: 'min(timeoutMs,stallMs)' };
-            }
-            if (a !== undefined) return { cap: a, source: 'timeoutMs' };
-            if (b !== undefined) return { cap: b, source: 'stallMs' };
-            return { cap: undefined, source: 'none' };
-          })();
-          const tightestPerIterCap = iterTimeoutPick.cap;
-          if (iterTimeoutPick.source !== 'none') {
-            logger.warn(
-              `ask: fallback to ask_agentic — \`iterationTimeoutMs\` set to ${tightestPerIterCap}ms (source: ${iterTimeoutPick.source}). The agentic loop uses non-streaming \`generateContent\` so there's no chunk stream to reset on; \`stallMs\` (when set) is treated as a per-iteration wall-clock cap, the same way \`timeoutMs\` is. Total wall-clock for the agentic call can reach \`maxIterations × iterationTimeoutMs\`.`,
-            );
-          }
-          const agenticInput: AskAgenticInput = {
-            prompt: input.prompt,
-            ...(input.workspace !== undefined ? { workspace: input.workspace } : {}),
-            ...(input.model !== undefined ? { model: input.model } : {}),
-            ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
-            ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
-            ...(input.thinkingBudget !== undefined ? { thinkingBudget: input.thinkingBudget } : {}),
-            ...(input.thinkingLevel !== undefined ? { thinkingLevel: input.thinkingLevel } : {}),
-            ...(input.maxOutputTokens !== undefined
-              ? { maxOutputTokens: input.maxOutputTokens }
-              : {}),
-            // `timeoutMs` (ask wall-clock cap) → `iterationTimeoutMs`
-            // (ask_agentic per-iteration cap). Total wall-clock for the
-            // agentic call can be `maxIterations × iterationTimeoutMs`.
-            // v1.12.1 fix: also collapses `stallMs` onto this cap (using
-            // the TIGHTER of the two when both are set), so the fallback
-            // path doesn't silently drop the user's stall watchdog.
-            ...(tightestPerIterCap !== undefined ? { iterationTimeoutMs: tightestPerIterCap } : {}),
-          };
-          const agenticResult = await askAgenticTool.execute(agenticInput, ctx);
-
-          // Wrap the agentic result so callers can audit the swap.
-          // The text content (`content[0].text`) is the agentic prose
-          // verbatim — same shape any direct `ask_agentic` caller would
-          // see. The structuredContent is enriched with fallback-trail
-          // metadata so orchestrators can distinguish a fallback-served
-          // response from a direct one.
-          //
-          // Two load-bearing contracts the wrapper must preserve:
-          //   1. `structuredContent.responseText` — the T23 wire-format
-          //      invariant (`textResult` / `errorResult` always write it
-          //      LAST; sub-agent orchestrators extract from this key
-          //      ONLY). We pull it from the agentic result's
-          //      `structuredContent.responseText` (or the prose text from
-          //      `content[0].text` as a fallback) and write it LAST so
-          //      it can't be clobbered.
-          //   2. Top-level `errorCode` / `retryable` — orchestrator retry
-          //      policies switch on these. When the agentic call itself
-          //      fails (e.g. iteration budget exhausted), the failure
-          //      code lives in `agenticResult.structuredContent.errorCode`;
-          //      we lift it to the top level of `wrappedStructured` so
-          //      consumer policies see it without descending into nested
-          //      `agenticResult.errorCode` (which they wouldn't know
-          //      about pre-v1.11.0).
-          const agenticStructured =
-            (agenticResult.structuredContent as Record<string, unknown> | undefined) ?? {};
-          const promptResponseText =
-            typeof agenticStructured.responseText === 'string'
-              ? agenticStructured.responseText
-              : agenticResult.content?.[0]?.type === 'text'
-                ? agenticResult.content[0].text
-                : '';
-
-          const wrappedStructured: Record<string, unknown> = {
-            fallbackApplied: 'ask_agentic',
-            serviceTier: 'standard', // ask_agentic has no tier: the fallback runs standard whatever was asked
-            ...(serviceTier === 'flex' ? { serviceTierDowngraded: 'flex' } : {}),
-            fallbackReason: 'WORKSPACE_TOO_LARGE',
-            preflightEstimate: {
-              tokens: preflight.effectiveTokens,
-              threshold,
-              source: preflight.method,
-              cacheHit: preflight.cacheHit,
-              rawTokens: preflight.rawTokens,
-            },
-            // v1.12.2 — surface the per-iteration cap selection so callers
-            // can audit which knob bound the fallback call. Useful when the
-            // user passed both `timeoutMs` and `stallMs` (we use the tighter
-            // of the two — `iterTimeoutSource: 'min(timeoutMs,stallMs)'`).
-            // Omitted when neither knob was set (`source: 'none'`).
-            ...(iterTimeoutPick.source !== 'none'
-              ? {
-                  iterTimeoutMs: tightestPerIterCap,
-                  iterTimeoutSource: iterTimeoutPick.source,
-                }
-              : {}),
-            // Lift top-level error metadata from the agentic call's
-            // structuredContent so orchestrator policies (e.g. retry on
-            // BUDGET_EXHAUSTED, retry on stall but not total) keep working
-            // without descending into `.agenticResult.errorCode`. v1.12.1
-            // adds `timeoutKind` to the lift set — Phase 4 introduced
-            // `timeoutKind` as a top-level field on direct-path TIMEOUT
-            // errors; the fallback wrapper now mirrors that on the
-            // fallback-served TIMEOUT path so the contract is uniform.
-            ...(agenticResult.isError && typeof agenticStructured.errorCode === 'string'
-              ? { errorCode: agenticStructured.errorCode }
-              : {}),
-            ...(agenticResult.isError && typeof agenticStructured.retryable === 'boolean'
-              ? { retryable: agenticStructured.retryable }
-              : {}),
-            ...(agenticResult.isError &&
-            (agenticStructured.timeoutKind === 'total' || agenticStructured.timeoutKind === 'stall')
-              ? { timeoutKind: agenticStructured.timeoutKind }
-              : {}),
-            ...(Object.keys(agenticStructured).length > 0
-              ? { agenticResult: agenticStructured }
-              : {}),
-            // T23 wire-format invariant — `responseText` is written LAST
-            // so any caller-supplied / nested key with the same name is
-            // intentionally clobbered by the canonical value. Sub-agent
-            // orchestrators read the prose from this exact key.
-            responseText: promptResponseText,
-          };
-
-          // `isError` lives at the ROOT of the MCP CallToolResult per spec
-          // (sibling to `structuredContent`, not nested inside it). The
-          // spread on the return statement carries the agentic root-level
-          // `isError` automatically — no need to mirror it inside
-          // `structuredContent`.
-          return {
-            ...agenticResult,
-            structuredContent: wrappedStructured,
-          };
+          return fallBackToAgentic({
+            input,
+            ctx,
+            emitter,
+            serviceTier,
+            preflight,
+            threshold,
+            timeout: timeoutController,
+          });
         }
 
         const attachmentsNote =

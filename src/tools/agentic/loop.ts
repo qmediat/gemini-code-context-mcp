@@ -1,17 +1,12 @@
 /**
- * The `ask_agentic` iteration loop and its budgets: per iteration a daily-budget reservation, a timeout (wall-clock
- * and stall), a TPM reservation, one model call with its tool batch, the settlement, and the three guards that end the
- * loop early — the answer, the cumulative input-token budget and the no-progress detector.
+ * The `ask_agentic` iteration loop and its budgets: per iteration a daily-budget reservation, a clock (`PassClock`:
+ * every phase's bound), a TPM reservation, one model call with its tool batch, the settlement, and the three guards
+ * that end the loop early — the answer, the cumulative input-token budget and the no-progress detector.
  */
 
 import type { TextToolResult } from '../registry.js';
-import {
-  type TimeoutController,
-  createTimeoutController,
-  getTimeoutKind,
-  isTimeoutAbort,
-} from '../shared/abort-timeout.js';
-import { type IterationResult, runAgenticIteration } from './iteration.js';
+import { getTimeoutKind, isTimeoutAbort } from '../shared/abort-timeout.js';
+import { type IterationOutcome, type IterationResult, runAgenticIteration } from './iteration.js';
 import {
   NO_THROTTLE_RESERVATION,
   type PassCall,
@@ -22,6 +17,7 @@ import {
   waitForTpm,
 } from './ledger.js';
 import { detectNoProgress } from './no-progress.js';
+import { type PassClock, type PassTimeout, createPassClock } from './pass-clock.js';
 import {
   budgetRejected,
   inputBudgetExceeded,
@@ -31,7 +27,6 @@ import {
 } from './results.js';
 import {
   type AgenticRun,
-  ITERATION_TIMEOUT_ENV,
   type LoopState,
   PER_ITERATION_INPUT_TOKENS,
   passReservationUsd,
@@ -69,43 +64,27 @@ function reserveIteration(
 }
 
 /**
- * Per-iteration timeout — created BEFORE the throttle wait so the wait itself is bounded by the
- * iteration timeout. (If iterTimeout is created after the wait, a 60s throttle delay can blow past a
- * 10s iterationTimeoutMs without ever firing.) v1.16.2 (T33 TRIM): the loop streams, so `recordChunk()`
- * resets the stall watchdog on every text/thought chunk. The TPM throttle wait has no chunks to
- * record — `stallMs` only governs the stream itself; the wall-clock `totalMs` still bounds the
- * throttle wait. The composite signal fires on whichever cap hits first.
- */
-function iterationTimeoutOf(run: AgenticRun): TimeoutController {
-  const { input } = run;
-  return createTimeoutController({
-    ...(input.iterationTimeoutMs !== undefined ? { totalMs: input.iterationTimeoutMs } : {}),
-    totalEnvVar: ITERATION_TIMEOUT_ENV,
-    ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
-    stallEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS',
-  });
-}
-
-/**
- * The TPM throttle reservation and the iteration call. `onThoughtChunk` mirrors the ask/code
- * streaming UX so operators see model reasoning progress live instead of waiting for the 30-120s
- * iteration to complete.
+ * The TPM throttle reservation and the iteration call. The clock is created BEFORE the throttle wait (phase
+ * `tpm-wait`), so `iterationTimeoutMs` bounds the wait too; the request's opening is entered once the wait is over.
+ * `onThoughtChunk` mirrors the ask/code streaming UX so operators see model reasoning progress live instead of waiting
+ * for the 30-120s iteration to complete.
  */
 async function throttledIteration(
   run: AgenticRun,
   state: LoopState,
-  iterTimeout: TimeoutController,
+  clock: PassClock,
   flight: IterationFlight,
-): Promise<IterationResult> {
+): Promise<IterationOutcome> {
   if (run.budget.tpmEnforced) {
     await waitForTpm(
       run,
       flight,
       flight.estimate,
-      iterTimeout.signal,
+      clock.signal,
       (seconds) => `throttle: waiting ${seconds}s for TPM window…`,
     );
   }
+  clock.enter('opening');
   flight.dispatched = true;
   return runAgenticIteration({
     ctx: run.ctx,
@@ -115,10 +94,9 @@ async function throttledIteration(
     workspaceRoot: run.workspaceRoot,
     filesReadSet: state.filesReadSet,
     maxFilesRead: run.limits.maxFilesRead,
-    abortSignal: iterTimeout.signal,
+    clock,
     call: flight.call,
     matchConfig: run.matchConfig,
-    recordChunk: () => iterTimeout.recordChunk(),
     onThoughtChunk: (text) => {
       const trimmed = text.trim().slice(0, 80);
       if (trimmed.length > 0) run.emitter.emit(`thinking: ${trimmed}…`);
@@ -127,59 +105,87 @@ async function throttledIteration(
 }
 
 /**
- * A failed iteration is closed (`closePass`): booked at what it billed when its model call had completed — a timeout
- * in its tool batch, a throw while its response was read — and both reservations released when the call had not (the
- * 429 retry hint is seeded once, by the call's own catch). A timeout becomes the structured TIMEOUT result naming the
- * iteration (`timeoutKind` says whether the stall or the total cap fired) with the booked
- * pass's billed fields; any other failure gives `null`, for the caller to re-throw, the billed fields left in `state`
- * for the outer catch.
+ * What fired, for a `TimeoutError` the clock did not raise itself (an SDK's own): its kind, the phase the pass was in,
+ * and the knob that bounds that kind — `default` when none does.
+ */
+function foreignTimeout(err: unknown, clock: PassClock): PassTimeout {
+  const kind = getTimeoutKind(err) ?? 'total';
+  const knobMs = kind === 'stall' ? clock.stallMs : clock.timeoutMs;
+  const knob = kind === 'stall' ? 'stallMs' : 'iterationTimeoutMs';
+  return { kind, phase: clock.phase, source: knobMs === null ? 'default' : knob, limitMs: knobMs };
+}
+
+/**
+ * A timed-out iteration is closed (`closePass`) — booked at what it billed when its model call had completed (the
+ * bound fired in its tools phase), both reservations released when it had not — and becomes the structured TIMEOUT
+ * result naming the iteration, the phase and the bound that fired, with the booked pass's billed fields.
+ * `toolCallsRunning` is the work of its tools phase still running after the grace.
+ */
+function timedOutIteration(
+  run: AgenticRun,
+  state: LoopState,
+  timeout: PassTimeout,
+  flight: IterationFlight,
+  toolCallsRunning: number,
+): TextToolResult {
+  const billed = closePass(run, flight, flight.call);
+  run.emitter.emit(
+    `ask_agentic: iteration ${state.iterations} aborted after ${timeout.limitMs ?? '?'}ms (${timeout.kind})`,
+  );
+  return iterationTimedOut(state.iterations, {
+    timeout,
+    timeoutMs: run.knobs.iterationMs,
+    stallMs: run.knobs.stallMs,
+    knobNames: run.knobNames,
+    dispatched: flight.dispatched,
+    billed,
+    toolCallsRunning,
+  });
+}
+
+/**
+ * A failed iteration: a timeout becomes the TIMEOUT result (`timedOutIteration`); any other failure closes the pass and
+ * gives `null`, for the caller to re-throw, the billed fields left in `state` for the outer catch (the 429 retry hint
+ * is seeded once, by the call's own catch).
  */
 function iterationFailure(
   run: AgenticRun,
   state: LoopState,
   iterErr: unknown,
-  iterTimeout: TimeoutController,
+  clock: PassClock,
   flight: IterationFlight,
 ): TextToolResult | null {
-  const billed = closePass(run, flight, flight.call);
-  if (!isTimeoutAbort(iterErr)) {
-    state.failedPassBilled = billed;
-    return null;
+  if (isTimeoutAbort(iterErr)) {
+    const timeout = clock.timedOut ?? foreignTimeout(iterErr, clock);
+    return timedOutIteration(run, state, timeout, flight, 0);
   }
-  const kind = getTimeoutKind(iterErr) ?? 'total';
-  const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
-  run.emitter.emit(
-    `ask_agentic: iteration ${state.iterations} aborted after ${limitMs ?? '?'}ms (${kind})`,
-  );
-  return iterationTimedOut(state.iterations, {
-    controller: iterTimeout,
-    kind,
-    limitMs,
-    dispatched: flight.dispatched,
-    billed,
-  });
+  state.failedPassBilled = closePass(run, flight, flight.call);
+  return null;
 }
 
 /**
- * The TPM wait and the iteration call run INSIDE the same try/catch, so a timeout firing during the
- * throttle wait flows through the same close/TIMEOUT path as a timeout firing during the SDK call or the
- * tool batch — neither reservation leaks. The iteration timeout is disposed whatever happens.
+ * The TPM wait and the iteration call run INSIDE the same try/catch, so a bound firing during the throttle wait flows
+ * through the same close/TIMEOUT path as one firing during the request or the tool batch — neither reservation leaks.
+ * The clock is disposed whatever happens.
  */
 async function attemptIteration(
   run: AgenticRun,
   state: LoopState,
-  iterTimeout: TimeoutController,
+  clock: PassClock,
   flight: IterationFlight,
 ): Promise<IterationAttempt> {
   try {
-    const iteration = await throttledIteration(run, state, iterTimeout, flight);
-    return { kind: 'completed', iteration };
+    const outcome = await throttledIteration(run, state, clock, flight);
+    if (outcome.kind === 'done') return { kind: 'completed', iteration: outcome.iteration };
+    const timeout = clock.timedOut ?? foreignTimeout(undefined, clock);
+    const result = timedOutIteration(run, state, timeout, flight, outcome.running);
+    return { kind: 'timed-out', result };
   } catch (iterErr) {
-    const timedOut = iterationFailure(run, state, iterErr, iterTimeout, flight);
+    const timedOut = iterationFailure(run, state, iterErr, clock, flight);
     if (timedOut === null) throw iterErr;
     return { kind: 'timed-out', result: timedOut };
   } finally {
-    iterTimeout.dispose();
+    clock.dispose();
   }
 }
 
@@ -228,7 +234,7 @@ async function runIteration(run: AgenticRun, state: LoopState): Promise<TextTool
   const estimate = PER_ITERATION_INPUT_TOKENS;
   const reservation = reserveIteration(run, state, passReservationUsd(run, estimate));
   if ('refused' in reservation) return reservation.refused;
-  const iterTimeout = iterationTimeoutOf(run);
+  const clock = createPassClock(run.knobs);
   const flight: IterationFlight = {
     reservationId: reservation.id,
     throttleReservationId: NO_THROTTLE_RESERVATION,
@@ -237,7 +243,7 @@ async function runIteration(run: AgenticRun, state: LoopState): Promise<TextTool
     call: callNotMade(),
     startedAt: Date.now(),
   };
-  const attempt = await attemptIteration(run, state, iterTimeout, flight);
+  const attempt = await attemptIteration(run, state, clock, flight);
   if (attempt.kind === 'timed-out') return attempt.result;
   const { iteration } = attempt;
   closePass(run, flight, flight.call);

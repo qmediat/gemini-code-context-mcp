@@ -13,6 +13,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ASK_KNOB_NAMES, fallBackToAgentic } from '../../src/tools/ask-agentic-fallback.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
@@ -55,6 +56,7 @@ vi.mock('../../src/cache/cache-manager.js', () => ({
 }));
 vi.mock('../../src/tools/ask-agentic.tool.js', () => ({
   askAgenticTool: { execute: mocks.askAgenticExecute },
+  runAskAgentic: mocks.askAgenticExecute,
 }));
 
 function buildCtx(opts: {
@@ -433,6 +435,126 @@ describe('ask preflight workspace guard (v1.5.0)', () => {
   // `result.structuredContent?.isError === true`, which contradicts the
   // MCP spec convention (`isError` at the root, not nested) and pinned a
   // bug rather than a behaviour.
+});
+
+describe('ask → ask_agentic fallback: the knobs it forwards and the timeouts it lifts', () => {
+  const TOO_LARGE = { prompt: 'q', onWorkspaceTooLarge: 'fallback-to-agentic' } as const;
+  const ASK_ENV = ['GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS', 'GEMINI_CODE_CONTEXT_ASK_STALL_MS'];
+
+  beforeEach(() => {
+    mockScanOfBytes(4_000_000);
+    mockModelWithLimit(1_048_576);
+  });
+  afterEach(() => {
+    for (const name of ASK_ENV) delete process.env[name];
+  });
+
+  /** The agentic input and knob names the fallback passed on, and its wrapped result. */
+  async function fallBack(input: Record<string, unknown>, agentic?: Record<string, unknown>) {
+    mocks.askAgenticExecute.mockResolvedValueOnce({
+      content: [{ type: 'text', text: 'agentic' }],
+      structuredContent: { responseText: 'agentic', ...agentic },
+      ...(agentic?.errorCode !== undefined ? { isError: true } : {}),
+    });
+    const result = await askTool.execute({ ...TOO_LARGE, ...input }, buildCtx({}).ctx);
+    const [agenticInput, , knobNames] = mocks.askAgenticExecute.mock.calls[0] ?? [];
+    return { agenticInput, knobNames, structured: result.structuredContent ?? {} };
+  }
+
+  it('forwards stallMs as stallMs, never as an iteration wall clock, and reports it', async () => {
+    const { agenticInput, structured } = await fallBack({ stallMs: 30_000 });
+
+    expect(agenticInput.stallMs).toBe(30_000);
+    expect(agenticInput).not.toHaveProperty('iterationTimeoutMs');
+    expect(structured.stallMs).toBe(30_000);
+    expect(structured).not.toHaveProperty('iterTimeoutMs');
+    expect(structured).not.toHaveProperty('iterTimeoutSource');
+  });
+
+  it('forwards timeoutMs as iterationTimeoutMs and stallMs as stallMs when both are set (no min)', async () => {
+    const { agenticInput, structured } = await fallBack({ timeoutMs: 90_000, stallMs: 30_000 });
+
+    expect(agenticInput).toMatchObject({ iterationTimeoutMs: 90_000, stallMs: 30_000 });
+    expect(structured).toMatchObject({
+      iterTimeoutMs: 90_000,
+      iterTimeoutSource: 'timeoutMs',
+      stallMs: 30_000,
+    });
+  });
+
+  it('forwards the values ask resolved from its env vars when the call sets none', async () => {
+    process.env.GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS = '120000';
+    process.env.GEMINI_CODE_CONTEXT_ASK_STALL_MS = '45000';
+
+    const { agenticInput, structured } = await fallBack({});
+
+    expect(agenticInput).toMatchObject({ iterationTimeoutMs: 120_000, stallMs: 45_000 });
+    expect(structured).toMatchObject({ iterTimeoutMs: 120_000, stallMs: 45_000 });
+  });
+
+  it("names ask's knobs in the agentic call's timeout messages", async () => {
+    const { knobNames } = await fallBack({ timeoutMs: 60_000 });
+
+    expect(knobNames).toBe(ASK_KNOB_NAMES);
+    expect(knobNames).toMatchObject({ totalMs: 'timeoutMs', stallMs: 'stallMs' });
+  });
+
+  it.each([
+    ['tpm-wait', 'total', 'timeoutMs'],
+    ['opening', 'total', 'default'],
+    ['stream', 'stall', 'stallMs'],
+    ['tools', 'total', 'default'],
+  ])(
+    'lifts the kind, the phase and the source of a timeout in its %s phase',
+    async (phase, kind, source) => {
+      const { structured } = await fallBack(
+        {},
+        {
+          errorCode: 'TIMEOUT',
+          retryable: true,
+          timeoutKind: kind,
+          timeoutPhase: phase,
+          timeoutSource: source,
+        },
+      );
+
+      expect(structured).toMatchObject({
+        errorCode: 'TIMEOUT',
+        retryable: true,
+        timeoutKind: kind,
+        timeoutPhase: phase,
+        timeoutSource: source,
+      });
+    },
+  );
+
+  it("stops ask's own controller before the agentic call starts", async () => {
+    const order: string[] = [];
+    mocks.askAgenticExecute.mockImplementationOnce(async () => {
+      order.push('agentic call');
+      return { content: [{ type: 'text', text: 'ok' }], structuredContent: { responseText: 'ok' } };
+    });
+    const timeout = {
+      signal: new AbortController().signal,
+      timeoutMs: 60_000,
+      stallMs: null,
+      recordChunk: () => undefined,
+      pauseStall: () => undefined,
+      dispose: () => order.push('ask controller disposed'),
+    };
+
+    await fallBackToAgentic({
+      input: { prompt: 'q' },
+      ctx: buildCtx({}).ctx,
+      emitter: { emit: () => undefined, stop: () => undefined },
+      serviceTier: 'standard',
+      preflight: { effectiveTokens: 2, method: 'heuristic', rawTokens: 1, cacheHit: false },
+      threshold: 1,
+      timeout,
+    });
+
+    expect(order).toEqual(['ask controller disposed', 'agentic call']);
+  });
 });
 
 describe('code preflight workspace guard (v1.5.0)', () => {

@@ -115,20 +115,12 @@
       "count": 1
     }
   },
-  "src/tools/agentic/workspace-tools.ts": {
-    "complexity": {
-      "count": 5
-    },
-    "max-lines-per-function": {
-      "count": 6
-    }
-  },
   "src/tools/ask.tool.ts": {
     "complexity": {
       "count": 1
     },
     "max-depth": {
-      "count": 4
+      "count": 2
     },
     "max-lines-per-function": {
       "count": 1
@@ -146,14 +138,6 @@
     }
   },
   "src/tools/reindex.tool.ts": {
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
-  "src/tools/shared/abort-timeout.ts": {
-    "complexity": {
-      "count": 1
-    },
     "max-lines-per-function": {
       "count": 1
     }

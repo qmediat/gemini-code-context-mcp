@@ -481,6 +481,8 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
       timeoutMs: 1_000,
       stallMs: null,
       timeoutKind: 'total',
+      timeoutPhase: 'tools',
+      timeoutSource: 'iterationTimeoutMs',
       iteration: 1,
       iterations: 1,
       apiCalls: 1,

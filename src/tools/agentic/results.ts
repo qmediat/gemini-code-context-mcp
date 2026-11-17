@@ -4,15 +4,12 @@
  */
 
 import { type TextToolResult, errorResult, textResult } from '../registry.js';
-import {
-  ABORTED_REQUEST_NOTE,
-  type TimeoutController,
-  type TimeoutKind,
-} from '../shared/abort-timeout.js';
+import { ABORTED_REQUEST_NOTE } from '../shared/abort-timeout.js';
 import type { BilledFields } from '../shared/call-ledger.js';
 import type { NoProgress } from './no-progress.js';
+import type { PassPhase, PassTimeout } from './pass-clock.js';
 import type { RescueOutcome } from './rescue.js';
-import type { AgenticRun, LoopState } from './run.js';
+import type { AgenticRun, KnobNames, LoopState } from './run.js';
 
 /** The figures an answer reports that differ between the organic and the forced answer. */
 interface AnswerTotals {
@@ -109,53 +106,79 @@ export function budgetRejected(
 const BOOKED_ITERATION_NOTE =
   "The iteration's model call had completed: it is booked at the token and cost fields this result reports.";
 
-/** How an iteration timed out: the controller that fired, which of its limits, and whether the call was dispatched. */
+/** How an iteration timed out: what fired, the knobs, and how far the pass had got. */
 export interface IterationTimeout {
-  controller: TimeoutController;
-  kind: TimeoutKind;
-  /** The limit that fired, in ms (`null` when not configured). */
-  limitMs: number | null;
+  timeout: PassTimeout;
+  /** The configured knobs (`null` when unset), reported whichever fired. */
+  timeoutMs: number | null;
+  stallMs: number | null;
+  /** The knob names the message gives: the caller's. */
+  knobNames: KnobNames;
   dispatched: boolean;
   /** The iteration's billed fields when its model call had completed and it was booked; `null` when it was not. */
   billed: BilledFields | null;
+  /** The work of its tools phase still running after the grace; 0 outside the tools phase. */
+  toolCallsRunning: number;
+}
+
+type Hint = (names: KnobNames, limitMs: number | null) => string;
+
+/** The default a bound reports when no knob bounded its phase, by phase (`phase-defaults.ts`). */
+const DEFAULT_HINTS: Readonly<Record<PassPhase, Hint>> = {
+  'tpm-wait': (n) => `Set \`${n.totalMs}\` per call or \`${n.totalEnv}\` to bound each iteration.`,
+  opening: (n, ms) =>
+    `No chunk arrived within the ${ms} ms default for a request's opening. Set \`${n.totalMs}\` per call or \`${n.totalEnv}\` to bound each iteration yourself.`,
+  stream: (n, ms) =>
+    `The stream sent nothing for the ${ms} ms default. Set \`${n.stallMs}\` per call or \`${n.stallEnv}\` to bound a stream's silence yourself.`,
+  tools: (n, ms) =>
+    `The iteration's tool calls ran past the ${ms} ms default for its tools. Set \`${n.totalMs}\` per call or \`${n.totalEnv}\` to bound each iteration yourself.`,
+  finalization: (n, ms) =>
+    `The forced-finalization pass ran past the ${ms} ms default. Set \`${n.totalMs}\` per call or \`${n.totalEnv}\` to bound it yourself.`,
+};
+
+/** The knob that raises a bound a caller set. */
+const KNOB_HINTS: Readonly<Record<'iterationTimeoutMs' | 'stallMs', Hint>> = {
+  iterationTimeoutMs: (n) => `Increase \`${n.totalMs}\` per call or set \`${n.totalEnv}\` higher.`,
+  stallMs: (n) =>
+    `Increase \`${n.stallMs}\` per call or set \`${n.stallEnv}\` higher. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.`,
+};
+
+/** What a timeout message tells the caller to change: the knob that fired, or the default of the phase and its knob. */
+export function timeoutHint(timeout: PassTimeout, names: KnobNames): string {
+  const hint =
+    timeout.source === 'default' ? DEFAULT_HINTS[timeout.phase] : KNOB_HINTS[timeout.source];
+  return hint(names, timeout.limitMs);
 }
 
 /**
- * The whole agentic call fails on an iteration timeout — the failed iteration's function-call results
- * never came back, so the conversation is structurally incomplete.
+ * The whole agentic call fails on an iteration timeout — the failed iteration's function-call results never came back,
+ * so the conversation is structurally incomplete.
  *
- * The structuredContent payload mirrors `ask.tool.ts` exactly: `timeoutMs` always reports the
- * configured TOTAL wall-clock cap (or null if disabled), `stallMs` reports the configured stall
- * watchdog. The `timeoutKind` field is the discriminator. Pre-fix (v1.16.2 PR-Round-1) this collapsed
- * to "the limit that fired" — diverged from ask/code; flagged by gemini Round-1 as a contract
- * regression. Reverted to ask/code parity.
- *
- * H2 fix: `dispatched` distinguishes timeout-during-throttle-wait (no dispatch) from
- * timeout-during-generateContent (dispatch happened). If it is false, the timeout fired during
- * abortableSleep and this iter never reached the API: subtract 1 to keep apiCalls authoritative.
- * An iteration booked before it timed out (its stream had ended: the timeout fired in its tool batch)
- * reports its billed fields, as a failed `ask` / `code` call reports its completed requests', and its message says
- * so; the abort note is for an iteration whose call was cancelled (`billed: null`).
+ * `timeoutMs` / `stallMs` report the configured knobs (as `ask` / `code` do); `timeoutKind` says which kind fired
+ * (`stall` for a stream's gap only), `timeoutPhase` where, `timeoutSource` which bound. `dispatched` false means the
+ * bound fired in the TPM wait and this iteration never reached the API: `apiCalls` leaves it out. An iteration booked
+ * before it timed out (the bound fired in its tools phase) reports its billed fields and its message says so; the abort
+ * note is for an iteration whose call was cancelled (`billed: null`). A TIMEOUT is retryable unless tool calls of the
+ * iteration still run (`toolCallsRunning`): a retry would stack file-system work on the same thread pool.
  */
-export function iterationTimedOut(iterations: number, timeout: IterationTimeout): TextToolResult {
-  const { controller, kind, limitMs } = timeout;
-  const knobHint =
-    kind === 'stall'
-      ? 'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.'
-      : 'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.';
-  const costNote = timeout.billed === null ? ABORTED_REQUEST_NOTE : BOOKED_ITERATION_NOTE;
+export function iterationTimedOut(iterations: number, t: IterationTimeout): TextToolResult {
+  const { timeout } = t;
+  const costNote = t.billed === null ? ABORTED_REQUEST_NOTE : BOOKED_ITERATION_NOTE;
   return errorResult(
-    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} ${costNote}`,
+    `ask_agentic: iteration ${iterations} timed out (${timeout.kind}) after ${timeout.limitMs ?? '?'}ms. ${timeoutHint(timeout, t.knobNames)} ${costNote}`,
     {
       errorCode: 'TIMEOUT',
-      timeoutMs: controller.timeoutMs,
-      stallMs: controller.stallMs,
-      timeoutKind: kind,
+      timeoutMs: t.timeoutMs,
+      stallMs: t.stallMs,
+      timeoutKind: timeout.kind,
+      timeoutPhase: timeout.phase,
+      timeoutSource: timeout.source,
       iteration: iterations,
       iterations,
-      apiCalls: timeout.dispatched ? iterations : Math.max(0, iterations - 1),
-      retryable: true,
-      ...(timeout.billed ?? {}),
+      apiCalls: t.dispatched ? iterations : Math.max(0, iterations - 1),
+      retryable: t.toolCallsRunning === 0,
+      ...(t.toolCallsRunning > 0 ? { toolCallsRunning: t.toolCallsRunning } : {}),
+      ...(t.billed ?? {}),
     },
   );
 }

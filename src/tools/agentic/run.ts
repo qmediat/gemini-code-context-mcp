@@ -9,11 +9,12 @@ import type { MatchConfig } from '../../indexer/globs.js';
 import { estimateReservationUsd } from '../../utils/cost-estimator.js';
 import type { ProgressEmitter } from '../../utils/progress.js';
 import type { ToolContext } from '../registry.js';
-import { resolveTotalTimeoutMs } from '../shared/abort-timeout.js';
+import { resolveStallTimeoutMs, resolveTotalTimeoutMs } from '../shared/abort-timeout.js';
 import type { BilledFields } from '../shared/call-ledger.js';
 import type { AskAgenticInput } from './input.js';
 import { SYSTEM_INSTRUCTION_AGENTIC, buildFunctionDeclarations } from './instructions.js';
 import type { SignatureCounts } from './no-progress.js';
+import type { AgenticKnobs } from './pass-clock.js';
 import type { UsageCounts } from './response.js';
 
 export type ResolvedModel = Awaited<ReturnType<typeof resolveModel>>;
@@ -34,6 +35,32 @@ export const PER_ITERATION_INPUT_TOKENS = 50_000;
 
 /** The env var that bounds an iteration (and the finalization pass) when the call sets no `iterationTimeoutMs`. */
 export const ITERATION_TIMEOUT_ENV = 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS';
+/** The env var that bounds a stream's gaps when the call sets no `stallMs`. */
+export const AGENTIC_STALL_ENV = 'GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS';
+
+/** The names a timeout message gives the two knobs and their env vars: the caller's — `ask_agentic`'s or `ask`'s. */
+export interface KnobNames {
+  readonly totalMs: string;
+  readonly totalEnv: string;
+  readonly stallMs: string;
+  readonly stallEnv: string;
+}
+
+/** The knobs of a direct `ask_agentic` call. */
+export const AGENTIC_KNOB_NAMES: KnobNames = Object.freeze({
+  totalMs: 'iterationTimeoutMs',
+  totalEnv: ITERATION_TIMEOUT_ENV,
+  stallMs: 'stallMs',
+  stallEnv: AGENTIC_STALL_ENV,
+});
+
+/** The call's knobs, resolved once: per call, else the env var, clamped as every timeout knob is. */
+export function resolveAgenticKnobs(input: AskAgenticInput): AgenticKnobs {
+  return {
+    iterationMs: resolveTotalTimeoutMs(input.iterationTimeoutMs, ITERATION_TIMEOUT_ENV),
+    stallMs: resolveStallTimeoutMs(input.stallMs, AGENTIC_STALL_ENV),
+  };
+}
 
 export interface RunLimits {
   maxIterations: number;
@@ -66,6 +93,10 @@ export interface AgenticRun {
   matchConfig: MatchConfig;
   baseConfig: GenerateContentConfig;
   budget: PassBudget;
+  /** The knobs every pass's clock is built from. */
+  knobs: AgenticKnobs;
+  /** The knob names a timeout message gives: `ask`'s when the call is its fallback. */
+  knobNames: KnobNames;
 }
 
 /** What the loop accumulates across iterations. */
@@ -134,10 +165,14 @@ export function baseConfigOf(input: AskAgenticInput): GenerateContentConfig {
   };
 }
 
-export function passBudgetOf(input: AskAgenticInput, ctx: ToolContext): PassBudget {
+export function passBudgetOf(
+  input: AskAgenticInput,
+  ctx: ToolContext,
+  knobs: AgenticKnobs,
+): PassBudget {
   return {
     outputTokens: typeof input.maxOutputTokens === 'number' ? input.maxOutputTokens : 4096,
-    coverMs: resolveTotalTimeoutMs(input.iterationTimeoutMs, ITERATION_TIMEOUT_ENV),
+    coverMs: knobs.iterationMs,
     dailyBudgetEnforced: Number.isFinite(ctx.config.dailyBudgetUsd),
     tpmEnforced: ctx.config.tpmThrottleLimit > 0,
   };
