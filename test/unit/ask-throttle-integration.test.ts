@@ -258,6 +258,23 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     expect(hintCall?.args[1]).toBe(7_000);
   });
 
+  it('a 429 after the model resolved, before any reservation, seeds the hint for that model', async () => {
+    mocks.scanWorkspace.mockRejectedValueOnce(
+      new ApiError({
+        status: 429,
+        message: '{"error":{"code":429,"details":[{"retryDelay":"9s"}]}}',
+      }),
+    );
+    const { ctx, throttleSpy } = buildCtx();
+
+    const result = await askTool.execute({ prompt: 'q' }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(throttleSpy.calls).toEqual([
+      { method: 'recordRetryHint', args: ['gemini-3-pro-preview', 9_000, undefined] },
+    ]);
+  });
+
   it('plain Error with RESOURCE_EXHAUSTED substring: NO hint seeded (v1.3.2 tightening)', async () => {
     // The earlier v1.3.2 draft had a `/RESOURCE_EXHAUSTED/` substring
     // fallback that was user-influenceable (echoed prompt content → open

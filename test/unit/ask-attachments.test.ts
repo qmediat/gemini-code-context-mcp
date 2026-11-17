@@ -406,6 +406,27 @@ describe('ask attachments: what is refused, before any reservation', () => {
     expect(sent).toHaveLength(0);
   });
 
+  it('a thinking budget the cap cannot hold is refused before the inline request size', async () => {
+    const large = pngOfSize('large.png', 10 * 1024 * 1024);
+    const second = pngOfSize('second.png', 4 * 1024 * 1024 - 1024);
+    mocks.scanWorkspace.mockResolvedValue(scanOf(2_000_000));
+    const { ctx, sent } = buildCtx();
+    const result = await askTool.execute(
+      {
+        prompt: 'q',
+        workspace: dir,
+        attachments: [large, second],
+        thinkingBudget: 8_000,
+        maxOutputTokens: 8_000,
+      },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(String(result.content[0]?.text)).toMatch(/^ask: thinkingBudget \(8000\)/);
+    expect(result.structuredContent?.errorCode).not.toBe('REQUEST_TOO_LARGE');
+    expect(sent).toHaveLength(0);
+  });
+
   const failed: Array<[string, number, string, boolean]> = [
     ['a 503', 503, 'ATTACHMENT_TOKENS_UNCOUNTED', true],
     ['a 403', 403, 'ATTACHMENT_TOKENS_UNCOUNTED', false],
@@ -468,6 +489,20 @@ describe('ask attachments: the count Gemini gives', () => {
         }
       ).estimatedCostMicros;
     expect(micros(withIt)).toBeGreaterThan(micros(without));
+  });
+
+  it('with no preflight count (a model advertising no input limit) the reservation still charges the counted tokens', async () => {
+    mocks.resolveModel.mockResolvedValue({ ...resolved(true), inputTokenLimit: null });
+    const reserved = async (attachments: string[]): Promise<number> => {
+      const h = buildCtx({ dailyBudgetUsd: 10 });
+      const result = await askTool.execute({ prompt: 'q', workspace: dir, attachments }, h.ctx);
+      expect(result.isError, String(result.content[0]?.text)).not.toBe(true);
+      const [request] = first(reservationMocks(h.ctx).reserveBudget.mock.calls) as [
+        { estimatedCostMicros: number },
+      ];
+      return request.estimatedCostMicros;
+    };
+    expect(await reserved([shot])).toBeGreaterThan(await reserved([]));
   });
 
   it('the counted tokens weigh on the heuristic-vs-exact decision: a small workspace with heavy attachments is counted exactly', async () => {
