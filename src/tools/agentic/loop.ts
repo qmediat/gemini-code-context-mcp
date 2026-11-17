@@ -39,11 +39,9 @@ import {
 
 /** One iteration's reservations and how far it got. */
 interface IterationFlight extends PassReservations {
-  /** H2 fix: whether this iteration's `generateContent` was actually dispatched. The iter timeout can
-   * fire DURING `abortableSleep` (TPM throttle wait, BEFORE runAgenticIteration is called) — in that
-   * case no API call happened for this iter and `apiCalls` must subtract it. Set true immediately
-   * before runAgenticIteration so any throw after that point counts the dispatched call (Gemini may
-   * bill server-side even on aborted-mid-flight calls). */
+  /** Whether this iteration's model call was sent: `apiCalls` counts the requests sent, whatever became of them. The
+   * iteration timeout can fire during the TPM wait, before the call; then `apiCalls` does not count it. Set
+   * immediately before runAgenticIteration, so any throw after that point counts the call. */
   dispatched: boolean;
   /** The model call: marked completed by the iteration the moment its stream ended, so every exit after that books it. */
   call: PassCall;
@@ -121,6 +119,7 @@ async function throttledIteration(
     call: flight.call,
     matchConfig: run.matchConfig,
     recordChunk: () => iterTimeout.recordChunk(),
+    pauseStall: () => iterTimeout.pauseStall(),
     onThoughtChunk: (text) => {
       const trimmed = text.trim().slice(0, 80);
       if (trimmed.length > 0) run.emitter.emit(`thinking: ${trimmed}…`);
@@ -132,8 +131,8 @@ async function throttledIteration(
  * A failed iteration is closed (`closePass`): booked at what it billed when its model call had completed — a timeout
  * in its tool batch, a throw while its response was read — and both reservations released when the call had not (the
  * 429 retry hint is seeded once, by the call's own catch). A timeout becomes the structured TIMEOUT result naming the
- * iteration (`timeoutKind` says whether the stall or the total cap fired); any other failure gives `null`, for the
- * caller to re-throw.
+ * iteration (`timeoutKind` says whether the stall or the total cap fired) with the booked pass's billed fields; any
+ * other failure gives `null`, for the caller to re-throw, the billed fields left in `state` for the outer catch.
  */
 function iterationFailure(
   run: AgenticRun,
@@ -142,8 +141,11 @@ function iterationFailure(
   iterTimeout: TimeoutController,
   flight: IterationFlight,
 ): TextToolResult | null {
-  closePass(run, flight, flight.call);
-  if (!isTimeoutAbort(iterErr)) return null;
+  const billed = closePass(run, flight, flight.call);
+  if (!isTimeoutAbort(iterErr)) {
+    state.failedPassBilled = billed;
+    return null;
+  }
   const kind = getTimeoutKind(iterErr) ?? 'total';
   const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
   run.emitter.emit(
@@ -154,6 +156,7 @@ function iterationFailure(
     kind,
     limitMs,
     dispatched: flight.dispatched,
+    billed,
   });
 }
 
@@ -217,8 +220,9 @@ function endOfIteration(
 
 /**
  * One iteration, priced per iteration at the rates in force until its timeout: a loop that crosses a
- * price change reserves at the new rate, so each reservation stays an upper bound of what its
- * settlement books. Returns the result that ends the call, or `null` to go on.
+ * price change reserves at the new rate. The reservation is for a fixed `PER_ITERATION_INPUT_TOKENS`
+ * input, so an iteration that sends more is settled above it (`docs/cost-model.md`). Returns the
+ * result that ends the call, or `null` to go on.
  */
 async function runIteration(run: AgenticRun, state: LoopState): Promise<TextToolResult | null> {
   const estimate = PER_ITERATION_INPUT_TOKENS;

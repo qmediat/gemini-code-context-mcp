@@ -43,17 +43,31 @@ const ENFORCED = { dailyBudgetUsd: 10, tpmThrottleLimit: 1_000_000 } as const;
 const COVER_MS = 60_000;
 const READ_A = { calls: [{ name: 'read_file', args: { path: 'a.ts' } }] };
 
+/** The cost of a pass with these token counts, in USD. */
+function passCostUsd(uncached: number, output: number, thinking: number): number {
+  return estimateCostUsd({
+    model: MODEL,
+    uncachedInputTokens: uncached,
+    cachedInputTokens: 0,
+    outputTokens: output,
+    thinkingTokens: thinking,
+  });
+}
+
 /** The cost booked for a pass with these token counts. */
 function bookedMicros(uncached: number, output: number, thinking: number): number {
-  return toMicrosUsd(
-    estimateCostUsd({
-      model: MODEL,
-      uncachedInputTokens: uncached,
-      cachedInputTokens: 0,
-      outputTokens: output,
-      thinkingTokens: thinking,
-    }),
-  );
+  return toMicrosUsd(passCostUsd(uncached, output, thinking));
+}
+
+/** The token and cost fields an error result reports for a pass booked at these token counts. */
+function reportedFields(uncached: number, output: number, thinking: number) {
+  return {
+    cachedTokens: 0,
+    uncachedTokens: uncached,
+    outputTokens: output,
+    thinkingTokens: thinking,
+    costEstimateUsd: Math.round(passCostUsd(uncached, output, thinking) * 10000) / 10000,
+  };
 }
 
 describe('ask_agentic accounting — a loop iteration', () => {
@@ -266,7 +280,10 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
       script: [READ_A, { raw: response }],
     });
 
-    expect(result.structuredContent?.rescueErrorCode).toBe('INTERNAL');
+    expect(result.structuredContent).toMatchObject({
+      rescueErrorCode: 'INTERNAL',
+      ...reportedFields(4000, 9, 2),
+    });
     expect(callsTo(trace, 'throttle', 'release')[1]).toEqual([102, 4000]);
     expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')[1]).toEqual([
       2,
@@ -446,6 +463,7 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
       apiCalls: 1,
       retryable: true,
       responseText: expect.stringContaining('iteration 1 timed out (total) after 1000ms'),
+      ...reportedFields(3000, 200, 50),
     });
     expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual(
       finalizedAt(3000, 200, 50),
@@ -499,6 +517,25 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
     );
     expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 3000]]);
   });
+
+  it('reports the booked tokens and cost in the error when its response could not be read', async () => {
+    const response = {
+      candidates: [{ content: { parts: [{ text: 'x' }] } }],
+      usageMetadata: {
+        get promptTokenCount(): never {
+          throw new Error('usage unreadable');
+        },
+      },
+    };
+    const { result } = await runAgentic({ ...ENFORCED, script: [{ raw: response }] });
+
+    expect(result.structuredContent).toEqual({
+      errorCode: 'UNKNOWN',
+      retryable: false,
+      responseText: 'ask_agentic failed: usage unreadable',
+      ...reportedFields(50_000, 0, 0),
+    });
+  });
 });
 
 describe('ask_agentic accounting — an iteration whose model call did not complete', () => {
@@ -509,13 +546,17 @@ describe('ask_agentic accounting — an iteration whose model call did not compl
       'failed mid-stream after a chunk that carried usage',
       { text: 'partial', usage: USAGE_3000, failsMidStream: new Error('stream reset') },
     ],
-  ])('cancels both reservations when %s', async (_case, turn) => {
-    const { result, trace } = await runAgentic({ ...ENFORCED, script: [turn] });
+  ])(
+    'stays cancelled when %s: both reservations released, no token fields',
+    async (_case, turn) => {
+      const { result, trace } = await runAgentic({ ...ENFORCED, script: [turn] });
 
-    expect(result.isError).toBe(true);
-    expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([[1]]);
-    expect(callsTo(trace, 'throttle', 'cancel')).toEqual([[101]]);
-    expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual([]);
-    expect(callsTo(trace, 'throttle', 'release')).toEqual([]);
-  });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).not.toHaveProperty('costEstimateUsd');
+      expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([[1]]);
+      expect(callsTo(trace, 'throttle', 'cancel')).toEqual([[101]]);
+      expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual([]);
+      expect(callsTo(trace, 'throttle', 'release')).toEqual([]);
+    },
+  );
 });

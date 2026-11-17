@@ -1,8 +1,8 @@
 /**
  * One iteration's tool batch in `ask_agentic`: the function responses go back to the model in call order with each
  * call's id, a `read_file` past `maxFilesRead` is refused in its place unless it re-reads a file already read, the
- * batch runs at most `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY` calls at once, and a sandbox refusal is logged at
- * debug level with the path asked for.
+ * batch runs at most `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY` calls at once, the stall watchdog does not count
+ * it, and a sandbox refusal is logged at debug level with the path asked for.
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -134,6 +134,58 @@ describe('ask_agentic tool batch — concurrency', () => {
     });
 
     expect(executions.mostAtOnce).toBe(3);
+  });
+});
+
+describe('ask_agentic tool batch — the stall watchdog', () => {
+  const GREP = { calls: [{ name: 'grep', args: { pattern: 'needle' } }] };
+
+  it('goes on when the tool batch outlasts stallMs: the stream had ended', async () => {
+    executions.delayMs = 2_500;
+
+    const { result } = await runAgentic({
+      input: { stallMs: 1_000 },
+      script: [GREP, { text: 'done' }],
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({ iterations: 2, apiCalls: 2 });
+  });
+
+  it('still aborts a stream that goes silent after its first chunk', async () => {
+    const { result, trace } = await runAgentic({
+      input: { stallMs: 1_000 },
+      script: [{ ...GREP, hangsMidStream: true }],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      errorCode: 'TIMEOUT',
+      timeoutKind: 'stall',
+      iteration: 1,
+    });
+    expect(executions.mostAtOnce).toBe(0);
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([]);
+  });
+
+  it('ends the call as TIMEOUT when the total timeout fires in the batch, the pass booked', async () => {
+    executions.delayMs = 2_500;
+
+    const { result, trace } = await runAgentic({
+      input: { stallMs: 1_000, iterationTimeoutMs: 1_500 },
+      script: [GREP],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      errorCode: 'TIMEOUT',
+      timeoutKind: 'total',
+      iteration: 1,
+      uncachedTokens: 1000,
+      outputTokens: 100,
+      thinkingTokens: 7,
+    });
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([
+      [expect.objectContaining({ toolName: 'ask_agentic', uncachedTokens: 1000 })],
+    ]);
   });
 });
 

@@ -74,7 +74,7 @@ export const askAgenticInputSchema = z
       .max(600_000)
       .optional()
       .describe(
-        'Per-iteration HEARTBEAT-AWARE stall watchdog in ms (1s–10min). Resets on every chunk yielded by `generateContentStream` (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Right knob for "kill dead sockets quickly without penalising deep reasoning." Recommended: `60_000` (60s). Falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`, then disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `iterationTimeoutMs` — both can be set; whichever fires first wins. **Loop iterations only — the post-loop forced-finalization rescue pass keeps the v1.15.0 `apiCallSucceeded` non-streaming contract.**',
+        'Per-iteration HEARTBEAT-AWARE stall watchdog in ms (1s–10min). Resets on every chunk yielded by `generateContentStream` (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Right knob for "kill dead sockets quickly without penalising deep reasoning." Recommended: `60_000` (60s). Falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`, then disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `iterationTimeoutMs` — both can be set; whichever fires first wins. The tool batch that runs after the stream ended is not counted: `iterationTimeoutMs` bounds it. **Loop iterations only — the post-loop forced-finalization rescue pass does not stream and has no stall watchdog.**',
       ),
   })
   .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {

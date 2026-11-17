@@ -54,7 +54,7 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import { createTimeoutController, isTimeoutAbort, timedOutCall } from './shared/abort-timeout.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
@@ -159,7 +159,7 @@ export const askInputSchema = z
       .optional()
       .describe(
         [
-          "Per-call opt-in cap on response length (tokens). OMIT for the default 'auto' behaviour — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value when you want a bounded response (e.g. strict summary length, tighter budget per call). On any other model a value larger than the resolved model's limit is clamped down to it. Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` stays a true upper bound.",
+          "Per-call opt-in cap on response length (tokens). OMIT for the default 'auto' behaviour — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value when you want a bounded response (e.g. strict summary length, tighter budget per call). On any other model a value larger than the resolved model's limit is clamped down to it. Budget reservation always uses the effective cap (explicit OR model limit) as worst-case, so `GEMINI_DAILY_BUDGET_USD` bounds what a completed call books (a request aborted mid-stream is booked 0: docs/cost-model.md).",
           LONG_DECODE_CAP_DESCRIPTION,
         ].join(' '),
       ),
@@ -170,7 +170,7 @@ export const askInputSchema = z
       .max(1_800_000)
       .optional()
       .describe(
-        'Per-call wall-clock TOTAL timeout in ms (1s–30min). The cost ceiling — aborts the in-flight `generateContent` request even if it is actively streaming. Gemini still finishes server-side and bills tokens for completed work. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled. v1.12.0 RECOMMENDATION: prefer `stallMs` for liveness — `timeoutMs` is the cost cap, `stallMs` is the heartbeat-aware liveness watchdog that does NOT fire while the model is actively thinking. Both can be set simultaneously. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "total"` on abort.',
+        'Per-call wall-clock TOTAL timeout in ms (1s–30min). The cost ceiling — aborts the in-flight `generateContent` request even if it is actively streaming. A request aborted after its stream opened is booked 0; whether Google bills it is not measured (docs/cost-model.md). When omitted, falls back to env var `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS`, then to disabled. v1.12.0 RECOMMENDATION: prefer `stallMs` for liveness — `timeoutMs` is the cost cap, `stallMs` is the heartbeat-aware liveness watchdog that does NOT fire while the model is actively thinking. Both can be set simultaneously. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "total"` on abort.',
       ),
     stallMs: z
       .number()
@@ -940,7 +940,7 @@ async function executeAskBody(
     // `outputTokenLimit`, currently 65,536 for pro-tier 3.x/2.5). Budget
     // reservation always uses the cap the decode runs under (explicit cap
     // OR model limit, cut by the input window on a long decode) as the
-    // worst-case upper bound, so the daily cap stays a true ceiling.
+    // worst-case upper bound of what a completed request bills.
     // Cast to `ThinkingLevel` rather than indexing the runtime enum object
     // (`ThinkingLevel[input.thinkingLevel]`). For string enums the value
     // IS the member name, so passing `"HIGH"` as `ThinkingLevel` is
@@ -1138,20 +1138,13 @@ async function executeAskBody(
     // wall-clock cap from the heartbeat-aware stall watchdog so callers
     // can apply different policies (e.g. retry on stall but not on total).
     if (isTimeoutAbort(err)) {
-      const ms = timeoutController.timeoutMs;
-      const stallMs = timeoutController.stallMs;
-      const kind = getTimeoutKind(err);
-      const limitMs = kind === 'stall' ? stallMs : ms;
-      emitter.emit(`ask: aborted after ${limitMs ?? '?'}ms ${kind ?? 'timeout'}`);
-      const message =
-        kind === 'stall'
-          ? `ask timed out — no chunk received for ${stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`GEMINI_CODE_CONTEXT_ASK_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. Note: AbortSignal is client-only — Gemini still finishes server-side and bills for completed work.`
-          : `ask timed out after ${ms ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. Note: AbortSignal is client-only — Gemini still finishes server-side and bills for completed work.`;
-      return errorResult(message, {
+      const timedOut = timedOutCall('ask', err, timeoutController);
+      emitter.emit(`ask: aborted after ${timedOut.limitMs ?? '?'}ms ${timedOut.kind ?? 'timeout'}`);
+      return errorResult(timedOut.message, {
         errorCode: 'TIMEOUT',
-        timeoutKind: kind ?? 'total',
-        timeoutMs: ms,
-        stallMs,
+        timeoutKind: timedOut.kind ?? 'total',
+        timeoutMs: timeoutController.timeoutMs,
+        stallMs: timeoutController.stallMs,
         retryable: true,
         serviceTier: reportedTier(),
         ...failedUsage,

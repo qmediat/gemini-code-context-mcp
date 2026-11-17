@@ -1,10 +1,10 @@
 {
-  "duplicatedLines": 2713,
+  "duplicatedLines": 2705,
   "files": {
     "src/cache/cache-manager.ts": 58,
     "src/tools/agentic/workspace-tools.ts": 72,
-    "src/tools/ask.tool.ts": 218,
-    "src/tools/code.tool.ts": 176,
+    "src/tools/ask.tool.ts": 214,
+    "src/tools/code.tool.ts": 172,
     "test/integration/v1.7.0-srogi-extras.test.ts": 29,
     "test/integration/v1.7.0-streaming-srogi.test.ts": 37,
     "test/unit/abort-timeout.test.ts": 30,

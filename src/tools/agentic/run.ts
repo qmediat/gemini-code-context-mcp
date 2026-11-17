@@ -10,6 +10,7 @@ import { estimateReservationUsd } from '../../utils/cost-estimator.js';
 import type { ProgressEmitter } from '../../utils/progress.js';
 import type { ToolContext } from '../registry.js';
 import { resolveTotalTimeoutMs } from '../shared/abort-timeout.js';
+import type { BilledFields } from '../shared/call-ledger.js';
 import type { AskAgenticInput } from './input.js';
 import { SYSTEM_INSTRUCTION_AGENTIC, buildFunctionDeclarations } from './instructions.js';
 import type { SignatureCounts } from './no-progress.js';
@@ -93,6 +94,9 @@ export interface LoopState {
    * produced a usage record (defensive — falls back to the static estimate
    * at the use site). */
   lastIterationPromptTokens: number;
+  /** The billed fields of the iteration that was booked and then failed with an error the loop does not shape;
+   * the outer catch puts them in its error result. `null` while no such failure happened. */
+  failedPassBilled: BilledFields | null;
 }
 
 export function runLimitsOf(input: AskAgenticInput): RunLimits {
@@ -164,5 +168,6 @@ export function newLoopState(prompt: string): LoopState {
     lastToolResponseTokens: 0,
     iterations: 0,
     lastIterationPromptTokens: 0,
+    failedPassBilled: null,
   };
 }

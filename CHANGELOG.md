@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reached the model, as `ask` and `code` do: `status` (`spentTodayUsd`) counted none of its spend.
 - `ask_agentic`: a loop iteration whose model call completed and which then failed — a timeout in its tool batch, a
   response that could not be read — is booked at what it billed; it used to book nothing against the daily budget.
+  The error result of a pass booked before it failed (the loop iteration's `TIMEOUT` or `UNKNOWN`, the forced pass's
+  `AGENTIC_MAX_ITERATIONS`) carries that pass's `cachedTokens`, `uncachedTokens`, `outputTokens`, `thinkingTokens`
+  and `costEstimateUsd`.
+- `ask_agentic`: the stall watchdog (`stallMs`) stops when an iteration's stream ended; a tool batch longer than
+  `stallMs` used to fail the whole call as a stall. `iterationTimeoutMs` still bounds the batch.
+- Docs and timeout messages: whether Google bills a request aborted after its stream opened is not measured; the server
+  books it 0, so for such a request the daily budget and the TPM window are not a bound. `docs/cost-model.md` names
+  this and the `ask_agentic` iteration's fixed 50,000-token estimate (*What the daily budget does not bound*); the
+  phrases "true upper bound" / "true cap" are gone.
 - `ask` and `code`: an answer whose usage row cannot be written (a busy or failing database) is returned, and the
   failed write is logged; the paid answer used to be lost behind an error.
 
