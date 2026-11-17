@@ -15,7 +15,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { GoogleGenAI } from '@google/genai';
+import type { CachedContent, GoogleGenAI } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   isStaleCacheError,
@@ -68,6 +68,20 @@ function mkClient(opts: {
       ),
     },
   } as unknown as GoogleGenAI;
+}
+
+/** A created cache as `caches.create` answers it, living `ttlSeconds` from `createdAtMs`. */
+function mkCreated(createdAtMs: number, ttlSeconds: number): CachedContent {
+  const createTime = new Date(createdAtMs).toISOString();
+  return {
+    name: 'cachedContents/created',
+    displayName: 'gcctx-created',
+    model: 'models/gemini-3-pro-preview',
+    createTime,
+    updateTime: createTime,
+    expireTime: new Date(createdAtMs + ttlSeconds * 1000).toISOString(),
+    usageMetadata: { totalTokenCount: 2_000 },
+  };
 }
 
 describe('prepareContext', () => {
@@ -804,6 +818,40 @@ describe('prepareContext', () => {
       expect(result.inlineOnly).toBe(false);
       expect(result.inlineContents).toHaveLength(1);
       expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+    },
+  );
+
+  it.each([
+    [30, 60],
+    [90.7, 90],
+  ])(
+    'a TTL of %s s is stored as the cache lives: %s s, the TTL the create request sent',
+    async (requested, lives) => {
+      const createdAtMs = Date.parse('2026-11-17T12:00:00.000Z');
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(createdAtMs);
+      try {
+        const client = mkClient({ cachesCreate: async () => mkCreated(createdAtMs, lives) });
+
+        const result = await prepareContext({
+          client,
+          manifest: db,
+          scan: mkScan([{ relpath: 'ttl.ts', size: 8_000 }]),
+          model: mkModel(),
+          systemPromptHash: 'sph-1',
+          ttlSeconds: requested,
+          emitter: mkEmitter(),
+          allowCaching: true,
+        });
+
+        const expiresAt = createdAtMs + lives * 1000;
+        expect(client.caches.create).toHaveBeenCalledWith(
+          expect.objectContaining({ config: expect.objectContaining({ ttl: `${lives}s` }) }),
+        );
+        expect(result.cacheExpiresAt).toBe(expiresAt);
+        expect(db.getWorkspace(workspaceRoot)?.cacheExpiresAt).toBe(expiresAt);
+      } finally {
+        clock.mockRestore();
+      }
     },
   );
 

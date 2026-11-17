@@ -106,8 +106,12 @@ export interface BuildOptions {
   cachingMode?: 'explicit' | 'implicit';
 }
 
-function ttlString(seconds: number): string {
-  return `${Math.max(60, Math.floor(seconds))}s`;
+/**
+ * The TTL a cache we create lives for: whole seconds, at least 60. The create request and the expiry stored in the
+ * manifest both read this one value, so a stored expiry never outlives the cache on Google's side.
+ */
+function effectiveTtlSeconds(requested: number): number {
+  return Math.max(60, Math.floor(requested));
 }
 
 /**
@@ -479,10 +483,11 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
   // 7) Build a new cache.
   emitter.emit('building context cache…');
   const fileContents = buildContentFromUploaded(uploaded.files);
+  const ttl = effectiveTtlSeconds(ttlSeconds);
   try {
     const baseConfig = {
       contents: fileContents,
-      ttl: ttlString(ttlSeconds),
+      ttl: `${ttl}s`,
       displayName: `gcctx-${scan.workspaceRoot.slice(-40)}`,
     };
     const cacheConfig =
@@ -501,7 +506,7 @@ async function doPrepareContext(opts: BuildOptions): Promise<PreparedContext> {
     // inline), never a context with neither a cache nor its files.
     if (!created.name) throw new Error('caches.create returned no cache name');
     const cacheId = created.name;
-    const cacheExpiresAt = afterCreateMs + ttlSeconds * 1000;
+    const cacheExpiresAt = afterCreateMs + ttl * 1000;
 
     manifest.upsertWorkspace({
       workspaceRoot: scan.workspaceRoot,

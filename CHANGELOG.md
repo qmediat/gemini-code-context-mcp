@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ask` and `code` with `cachingMode: 'explicit'`: when Gemini created a Context Cache without a name, the question went
   with neither the cache nor the workspace files; the files now go inline, as after any failed cache build.
+- `ask` and `code` with `cachingMode: 'explicit'`: with `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` below 60, the Context
+  Cache was created for 60 s but recorded as expiring at the shorter TTL, so the next call rebuilt a cache that was
+  still alive; the recorded expiry is now the TTL the cache was created with.
 
 ## [1.25.0] - 2026-11-17
 
