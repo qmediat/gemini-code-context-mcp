@@ -7,6 +7,7 @@
  */
 
 import type { GoogleGenAI } from '@google/genai';
+import { abortable } from '../gemini/retry.js';
 import type { ManifestDb } from '../manifest/db.js';
 import { logger, safeForLog } from '../utils/logger.js';
 
@@ -69,11 +70,20 @@ export class TtlWatcher {
    * (15 minutes), extend it now instead of at the next tick — so a decode of many requests, each opened through here,
    * never sends one on a cache that expires before the request ends (a request of a decode lasts minutes). A failed
    * refresh is logged and leaves the request to meet the cache as it is.
+   *
+   * `signal` is the calling request's: the refresh's `caches.update` carries it, and the wait ends with its abort
+   * reason the moment it fires — a slow or hanging refresh never holds a call past its timeout.
    */
-  async keepAlive(workspaceRoot: string, cacheId: string, ttlSeconds: number): Promise<void> {
+  async keepAlive(
+    workspaceRoot: string,
+    cacheId: string,
+    ttlSeconds: number,
+    signal?: AbortSignal,
+  ): Promise<void> {
     this.markHot(workspaceRoot, cacheId, ttlSeconds);
     const entry = this.hot.get(workspaceRoot);
-    if (entry !== undefined) await this.refreshIfDue(entry, Date.now());
+    if (entry === undefined) return;
+    await abortable(this.refreshIfDue(entry, Date.now(), signal), signal);
   }
 
   private async tick(): Promise<void> {
@@ -100,7 +110,7 @@ export class TtlWatcher {
   }
 
   /** Extends the entry's cache when it expires within the refresh window; drops an entry whose cache is gone. */
-  private async refreshIfDue(entry: HotEntry, now: number): Promise<void> {
+  private async refreshIfDue(entry: HotEntry, now: number, signal?: AbortSignal): Promise<void> {
     const ws = this.manifest.getWorkspace(entry.workspaceRoot);
     if (!ws?.cacheId || ws.cacheId !== entry.cacheId) {
       this.hot.delete(entry.workspaceRoot);
@@ -112,7 +122,10 @@ export class TtlWatcher {
     try {
       await this.client.caches.update({
         name: entry.cacheId,
-        config: { ttl: `${entry.ttlSeconds}s` },
+        config: {
+          ttl: `${entry.ttlSeconds}s`,
+          ...(signal !== undefined ? { abortSignal: signal } : {}),
+        },
       });
       const newExpires = now + entry.ttlSeconds * 1000;
       this.manifest.upsertWorkspace({ ...ws, cacheExpiresAt: newExpires, updatedAt: now });

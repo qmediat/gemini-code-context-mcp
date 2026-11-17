@@ -100,6 +100,43 @@ describe('TtlWatcher', () => {
     expect(db.getWorkspace(ws)?.cacheExpiresAt).toBeGreaterThan(now + 3_500_000);
   });
 
+  it('keepAlive under a signal: a refresh that never settles releases the caller at the abort, with its reason', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    vi.mocked(client.caches.update).mockImplementation(() => new Promise(() => undefined));
+    const controller = new AbortController();
+    const reason = new DOMException('Timed out after 1000 ms (total wall-clock)', 'TimeoutError');
+
+    const pending = watcher.keepAlive(ws, cacheId, 3600, controller.signal);
+    controller.abort(reason);
+    const outcome = await Promise.race([
+      pending.then(
+        () => 'resolved',
+        (err: unknown) => err,
+      ),
+      new Promise((done) => setTimeout(() => done('still waiting'), 1_000)),
+    ]);
+
+    expect(outcome).toBe(reason);
+    expect(client.caches.update).toHaveBeenCalledWith({
+      name: cacheId,
+      config: { ttl: '3600s', abortSignal: controller.signal },
+    });
+  });
+
+  it('the background tick refreshes with no abort signal', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 5 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+
+    await (watcher as unknown as PrivateTick).tick();
+
+    const params = vi.mocked(client.caches.update).mock.calls[0]?.[0];
+    expect(params?.config).toEqual({ ttl: '3600s' });
+    expect(params?.config).not.toHaveProperty('abortSignal');
+  });
+
   it('keepAlive leaves a cache with plenty of time as it is, and marks it hot', async () => {
     const now = Date.now();
     const watcher = seedHot({ now, ttlMs: 30 * 60 * 1000, ttlSeconds: 3600 });

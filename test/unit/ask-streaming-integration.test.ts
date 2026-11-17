@@ -13,7 +13,10 @@
  *   3. Stream opening (pre-response) DOES retry on transient errors.
  */
 
+import type { GoogleGenAI } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { TtlWatcher } from '../../src/cache/ttl-watcher.js';
+import type { ManifestDb } from '../../src/manifest/db.js';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import { GEMINI_4_HYDROGEN } from '../helpers/models.js';
@@ -689,6 +692,7 @@ describe('ask — the ledger of a decode that fails', () => {
       expect.any(String),
       'cachedContents/old',
       3_600,
+      expect.any(AbortSignal),
     );
   });
 
@@ -712,4 +716,90 @@ describe('ask — the ledger of a decode that fails', () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.continuationHops).toBe(1);
   });
+
+  it('a cache refresh that hangs before request 1 ends the call as a TIMEOUT: no request opened, the reservation released whole', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
+    ctx.ttlWatcher = watcherRefreshingWith(pendingUntilAborted);
+
+    const result = await withinMs(
+      5_000,
+      askTool.execute({ prompt: 'review', maxOutputTokens: 262_144, timeoutMs: 1_000 }, ctx),
+    );
+
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(generateContentStream).not.toHaveBeenCalled();
+    expect(manifestOf(ctx).cancelBudgetReservation).toHaveBeenCalledWith(1);
+    expect(manifestOf(ctx).finalizeBudgetReservation).not.toHaveBeenCalled();
+  });
+
+  it('a cache refresh that hangs before request 2 ends the call as a TIMEOUT with the completed request billed', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
+    let refreshes = 0;
+    ctx.ttlWatcher = watcherRefreshingWith((params) => {
+      refreshes += 1;
+      return refreshes === 1 ? Promise.resolve({}) : pendingUntilAborted(params);
+    });
+    generateContentStream
+      .mockImplementationOnce(firstRequest)
+      .mockImplementation(answering('never sent', 'STOP', 165_661));
+
+    const result = await withinMs(
+      5_000,
+      askTool.execute({ prompt: 'review', maxOutputTokens: 262_144, timeoutMs: 1_000 }, ctx),
+    );
+
+    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
+    expect(generateContentStream).toHaveBeenCalledTimes(1);
+    expect(manifestOf(ctx).cancelBudgetReservation).not.toHaveBeenCalled();
+    expect(manifestOf(ctx).finalizeBudgetReservation).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ costUsdMicro: FIRST_REQUEST_MICROS, uncachedTokens: 100_000 }),
+    );
+    expect(result.structuredContent).toMatchObject({
+      uncachedTokens: 100_000,
+      thinkingTokens: 65_533,
+      // the continuation request was never sent
+      continuationHops: 0,
+    });
+  });
 });
+
+type CacheUpdate = (params: { config?: { abortSignal?: AbortSignal } }) => Promise<unknown>;
+
+/** A real watcher whose cache expires within the refresh window at every request, refreshed through `update`. */
+function watcherRefreshingWith(update: CacheUpdate): ToolContext['ttlWatcher'] {
+  const row = {
+    workspaceRoot: '/fake',
+    filesHash: 'abc',
+    model: 'm',
+    systemPromptHash: '',
+    cacheId: CACHED_CONTEXT.cacheId,
+    cacheExpiresAt: Date.now() + 60_000,
+    fileIds: [],
+    createdAt: 0,
+    updatedAt: 0,
+  };
+  const manifest = { getWorkspace: () => row, upsertWorkspace: vi.fn() } as unknown as ManifestDb;
+  const client = { caches: { update: vi.fn(update) } } as unknown as GoogleGenAI;
+  return new TtlWatcher(client, manifest);
+}
+
+/** A `caches.update` that stays pending until its request's signal aborts it, then rejects as an aborted fetch. */
+const pendingUntilAborted: CacheUpdate = (params) =>
+  new Promise((_resolve, reject) => {
+    params.config?.abortSignal?.addEventListener(
+      'abort',
+      () => reject(new DOMException('This operation was aborted', 'AbortError')),
+      { once: true },
+    );
+  });
+
+/** `work`'s value, or a failure when it has not settled within `ms` of real time. */
+async function withinMs<T>(ms: number, work: Promise<T>): Promise<T> {
+  const late = Symbol('late');
+  const outcome = await Promise.race([work, waitMs(ms).then(() => late)]);
+  if (outcome === late) throw new Error(`still waiting after ${ms} ms`);
+  return outcome as T;
+}

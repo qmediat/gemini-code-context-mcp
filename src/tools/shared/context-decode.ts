@@ -110,13 +110,17 @@ export async function decodeOnContext(
   return decoded;
 }
 
-/** A request is about to be sent on `prep`: its cache, if it reads one, is kept alive for it. */
+/**
+ * A request is about to be sent on `prep`: its cache, if it reads one, is kept alive for it — under the call's
+ * signal, so a timeout during the refresh ends the call as a timeout before the request is opened.
+ */
 async function keepAlive(call: ContextDecodeCall, prep: PreparedContext): Promise<void> {
   if (!prep.cacheId) return;
   await call.cache.ttlWatcher.keepAlive(
     call.booking.workspaceRoot,
     prep.cacheId,
     call.cache.ttlSeconds,
+    call.timeout.signal,
   );
 }
 
