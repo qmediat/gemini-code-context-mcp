@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.0] - 2026-11-17
+
 ### Changed
 
 - `ask_agentic`: every phase of a pass now has a bound. A phase that could hang forever now ends with `TIMEOUT` after
@@ -84,6 +86,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ask_agentic`, `list_directory` listed such files with their sizes, `find_files` listed those its source rules admit
   (`credentials.json`, `secrets.json`, `secrets.yaml`, …), and `grep` returned their matching lines. The three tools and
   `read_file` now read one denylist.
+
+### Notes
+
+- Minor release. `errorCode`, `timeoutKind` and every result field that existed keep their values and meaning. What an
+  existing caller can observe: an `ask_agentic` call that hung with no knob set now ends with `TIMEOUT` at a default; a
+  `TIMEOUT` can be `retryable: false` (tool calls of the iteration still run); on `ask`'s fallback `stallMs` no longer
+  ends a healthy iteration, and `iterTimeoutSource` no longer takes the values `'stallMs'` and
+  `'min(timeoutMs,stallMs)'`; `list_directory`, `find_files` and `grep` no longer show a file on the secret denylist.
 
 ## [1.24.0] - 2026-11-17
 
@@ -1946,7 +1956,8 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.24.0...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.25.0...HEAD
+[1.25.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.24.0...v1.25.0
 [1.24.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.1...v1.24.0
 [1.23.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.0...v1.23.1
 [1.23.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.22.1...v1.23.0

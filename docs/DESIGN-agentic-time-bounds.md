@@ -3,7 +3,7 @@
 Status: implemented ([FOLLOW-UP-PRS.md T44](./FOLLOW-UP-PRS.md), closed 2026-11-17); the open questions are
 [decisions](#decisions-on-the-open-questions). Three patches to these bounds inside PR #134 each moved a phase of the
 call from one bound to none, and the PR went back to the bounds of 1.24.0. This note writes the bounds as one table and
-one mechanism, so that a reviewer can check the code against the table. The sections "Today" and "The defects" describe
+one mechanism, so that a reviewer can check the code against the table. The sections "Before" and "The defects" describe
 1.24.0 + T42, the code this design replaced.
 
 ## Notation
@@ -19,7 +19,7 @@ one mechanism, so that a reviewer can check the code against the table. The sect
 | ✓ | confirmed: a test of the repository, a scenario of the differential probe used on PR #134, or `[name]` — a one-off run of that probe's harness on `main` at `fbccfaf` (2026-11-17) with a 3–3.5 s watch timer |
 | (r) | read from the code, not run |
 
-## Today, measured from the code (`main`, 1.24.0 + T42)
+## Before, measured from the code (1.24.0 + T42)
 
 One `TimeoutController` per pass (`src/tools/shared/abort-timeout.ts:145-264`), created before the TPM wait
 (`src/tools/agentic/loop.ts:79-87`, `:231`), disposed when the pass ends (`loop.ts:181-183`). Its stall timer arms at the
@@ -42,7 +42,7 @@ a stall timer (`src/tools/agentic/rescue.ts:281-287`).
 | Forced pass: TPM wait | `rescue.ts:253-263` | the throttle's delay (r) | the throttle's delay (r) | `T` → Rt b0 (r) | `T` → Rt b0 ✓ probe `rescue-timeout-wait` |
 | Forced pass: the unary call, retries included | `rescue.ts:144-172`, `:266` | ∞ ✓ `[rescue-none-hang]` | ∞ — no stall on this pass ✓ `[rescue-stall-hang]` | `T` → Rt b0 ✓ probe `rescue-timeout-call`, `ask-agentic.test.ts:1470` | `T` → Rt b0 (r) |
 
-**Unbounded today: 19 of 40 cells** (15 of 36 without the setup row). Every ∞ after the TPM wait holds the pass's
+**Unbounded before: 19 of 40 cells** (15 of 36 without the setup row). Every ∞ after the TPM wait holds the pass's
 daily-budget and TPM reservations in flight: the runs above show `finalizeBudget` and `cancelBudget` uncalled at the
 watch timer. The throttle's delay is finite and known when the wait starts (`throttle.ts:273-345`); it grows with
 concurrent waiters.
@@ -69,7 +69,7 @@ returns (`:1160-1161`) (r). The mapping of `timeoutMs` is ✓ `preflight-guard.t
 | Forced pass: TPM wait | the throttle's delay | `S` → Rt b0 | → Rt b0 | min → Rt b0 |
 | Forced pass: the call | ∞ | `S` → Rt b0 | → Rt b0 | min → Rt b0 |
 
-**Unbounded today: 16 of 40 cells.** `ask` lifts `errorCode`, `retryable` and a `timeoutKind` of `total | stall`
+**Unbounded before: 16 of 40 cells.** `ask` lifts `errorCode`, `retryable` and a `timeoutKind` of `total | stall`
 (`ask.tool.ts:729-738`); the message it passes on names `iterationTimeoutMs` (`results.ts:143-145`), a knob `ask` does
 not take; `iterTimeoutSource` says which knob was mapped (`ask.tool.ts:715-720`).
 
@@ -96,7 +96,7 @@ not take; `iterTimeoutSource` says which knob was mapped (`ask.tool.ts:715-720`)
 One `PassClock` per pass — the iteration's `TimeoutController` extended with a phase — rather than a `Deadline`
 object per phase combined with `AbortSignal.any`. One clock keeps one `AbortController`, one abort reason that says
 which phase and which bound fired, and at most two live timers (the pass deadline and the current phase's timer), the
-same count as today's total + stall. Per-phase deadlines would need a controller per phase, a merge of their reasons,
+same count as the previous total + stall. Per-phase deadlines would need a controller per phase, a merge of their reasons,
 and a second place that knows the phase order — the second mechanism T44 forbids. The forced pass uses the same clock
 (phase `finalization`) instead of its own controller. `ask` / `code` keep `createTimeoutController` unchanged.
 
@@ -160,7 +160,7 @@ after it runs under the default of the request that failed. `toolsIdleMs` = 120 
 on the batch's length: the executors bound what they return (200 KB per read, 100 grep matches, 200 entries, walk depth
 20; `workspace-tools.ts`), not how long they run, and a healthy `grep` batch over a large workspace runs for minutes
 ([Q1](#decisions-on-the-open-questions)) while it passes a checkpoint at every directory and file. Under `T` there is
-no tools timer: progress extends nothing, and the deadline stays a wall clock. The abort reason keeps today's messages
+no tools timer: progress extends nothing, and the deadline stays a wall clock. The abort reason keeps the previous messages
 ("Timed out after N ms (total wall-clock)" / "(stall — no chunk received)") and adds `timeoutPhase` / `timeoutSource`
 as properties, so `getTimeoutKind` and every reader of the message stay as they are.
 
@@ -168,7 +168,7 @@ as properties, so `getTimeoutKind` and every reader of the message stay as they 
 
 | Phase | Enter | Observed by |
 |---|---|---|
-| `tpm-wait` | clock creation, before `waitForTpm` (as today) | `abortableSleep(delay, signal)` |
+| `tpm-wait` | clock creation, before `waitForTpm` (as before) | `abortableSleep(delay, signal)` |
 | `opening` | by each request, inside the function `withNetworkRetry` calls, before `generateContentStream`, and by its `onRetry`, before the backoff | the SDK's `abortSignal`, `withNetworkRetry({ signal })` |
 | `stream` | the first chunk (`recordChunk`) | the SDK's `abortSignal`, `collectStream` |
 | `tools` | where the call is marked completed (`completeCall`), before `planDispatch` | `planDispatch` and the batch raced as one promise (`abortable`, `retry.ts:167`); workers check the signal before taking a call; the executors and `planDispatch` get a `ToolWatch` and pass `checkpoint(watch)` wherever they read the signal — the walk at every directory and before every entry, `list_directory` before each entry, `read_file` before and after its read (the read itself takes the signal), `grep` after each file's read, `planDispatch` after each path resolution — each checkpoint is progress (`recordProgress`); after the bound, the work still running gets `toolSettleGraceMs` (the shared `abortableSleep`, cleared when the work settles) |
@@ -353,11 +353,11 @@ added fields only (`errorCode`, `timeoutKind`,
 `iter-timeout-call-nobudget`, `iter-timeout-env`, `iter-retry-timeout-in-backoff`, `stall-fires`, `iter-timeout-tools`
 (which also ends earlier — the probe's grep ignores the signal and settles inside the grace; the trace does not record
 time); their messages also lose "; default disabled" (the hint table, D8). Added: the sixteen scenarios of the run on `main` above (`open-*`, `gap-*`, `batch-*`, `tpm-stall`, `rescue-*-hang`,
-`retry-backoff-stall`), each with a watch timer, so that every ∞ cell of today has a trace that changes.
+`retry-backoff-stall`), each with a watch timer, so that every ∞ cell of the tables above has a trace that changes.
 
 ## Performance budget
 
-At most two timers per pass at any moment (today: two); per chunk one `clearTimeout` + `setTimeout`, as today; one
+At most two timers per pass at any moment (before: two); per chunk one `clearTimeout` + `setTimeout`, as before; one
 `enter` per phase and two more per network retry of a request (its announcement and the request); one abort listener per `tools` phase; per checkpoint
 (each tool call taken, each directory and entry walked, each read, each path resolution) one boolean read and, in
 `tools` with its default armed, one `performance.now()` written — never a timer: the tools timer is re-armed only when
