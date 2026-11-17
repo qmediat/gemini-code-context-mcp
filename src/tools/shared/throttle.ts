@@ -532,6 +532,28 @@ export function isGemini429(err: unknown): err is ApiError {
   return err.status === 429;
 }
 
+/** The 429s whose retry hint has seeded a throttle: one error can reach more than one catch of a call. */
+const seededRetryHints = new WeakSet<object>();
+
+/**
+ * The retry delay a Gemini 429 carries (`retryInfo.retryDelay`), or `null` for any other failure or a 429 without
+ * one. The first time an error is met its delay seeds `throttle`'s hint for `model`, which later calls honour through
+ * `reserve`; meeting the same error again seeds nothing. Only a real `ApiError` with status 429 (`isGemini429`) is
+ * read: text a prompt can echo never reaches the throttle.
+ */
+export function seedRetryHint(
+  throttle: Pick<TpmThrottle, 'recordRetryHint'>,
+  model: string,
+  err: unknown,
+): number | null {
+  if (!isGemini429(err)) return null;
+  const delayMs = parseRetryDelayMs(err.message);
+  if (delayMs === null || seededRetryHints.has(err)) return delayMs;
+  seededRetryHints.add(err);
+  throttle.recordRetryHint(model, delayMs);
+  return delayMs;
+}
+
 /**
  * Insert `entry` into `entries` at the position that keeps the array
  * sorted ascending by `tsMs`. Binary-search for the insertion point;

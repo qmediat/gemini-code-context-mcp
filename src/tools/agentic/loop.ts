@@ -11,13 +11,14 @@ import {
   getTimeoutKind,
   isTimeoutAbort,
 } from '../shared/abort-timeout.js';
+import { seedRetryHint } from '../shared/throttle.js';
 import { type IterationResult, runAgenticIteration } from './iteration.js';
 import {
   NO_THROTTLE_RESERVATION,
+  type PassReservations,
   cancelPass,
   reservePass,
-  seedRetryHint,
-  settleIteration,
+  settleBilledPass,
   waitForTpm,
 } from './ledger.js';
 import { detectNoProgress } from './no-progress.js';
@@ -37,16 +38,13 @@ import {
 } from './run.js';
 
 /** One iteration's reservations and how far it got. */
-interface IterationFlight {
-  reservationId: number | null;
-  throttleReservationId: number;
+interface IterationFlight extends PassReservations {
   /** H2 fix: whether this iteration's `generateContent` was actually dispatched. The iter timeout can
    * fire DURING `abortableSleep` (TPM throttle wait, BEFORE runAgenticIteration is called) — in that
    * case no API call happened for this iter and `apiCalls` must subtract it. Set true immediately
    * before runAgenticIteration so any throw after that point counts the dispatched call (Gemini may
    * bill server-side even on aborted-mid-flight calls). */
   dispatched: boolean;
-  startedAt: number;
 }
 
 type IterationAttempt =
@@ -103,7 +101,7 @@ async function throttledIteration(
     await waitForTpm(
       run,
       flight,
-      PER_ITERATION_INPUT_TOKENS,
+      flight.estimate,
       iterTimeout.signal,
       (seconds) => `throttle: waiting ${seconds}s for TPM window…`,
     );
@@ -140,7 +138,7 @@ function iterationFailure(
   flight: IterationFlight,
 ): TextToolResult | null {
   cancelPass(run.ctx, flight.reservationId, flight.throttleReservationId, 'ask_agentic');
-  seedRetryHint(run.ctx, run.resolved.resolved, iterErr);
+  seedRetryHint(run.ctx.throttle, run.resolved.resolved, iterErr);
   if (!isTimeoutAbort(iterErr)) return null;
   const kind = getTimeoutKind(iterErr) ?? 'total';
   const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
@@ -226,20 +224,14 @@ async function runIteration(run: AgenticRun, state: LoopState): Promise<TextTool
   const flight: IterationFlight = {
     reservationId: reservation.id,
     throttleReservationId: NO_THROTTLE_RESERVATION,
+    estimate: PER_ITERATION_INPUT_TOKENS,
     dispatched: false,
     startedAt: Date.now(),
   };
   const attempt = await attemptIteration(run, state, iterTimeout, flight);
   if (attempt.kind === 'timed-out') return attempt.result;
   const { iteration } = attempt;
-  const iterDurationMs = Date.now() - flight.startedAt;
-  settleIteration(
-    run,
-    flight.reservationId,
-    flight.throttleReservationId,
-    iteration.usage,
-    iterDurationMs,
-  );
+  settleBilledPass(run, flight, iteration.usage);
   absorbIteration(state, iteration);
   run.emitter.emit(
     `iter ${state.iterations}/${run.limits.maxIterations}: ${iteration.functionCallCount} tool calls, ${state.cumulativeInputTokens} in-tokens so far`,

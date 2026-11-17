@@ -1,7 +1,8 @@
 /**
  * What `ask_agentic` books: each pass's daily-budget reservation and its settlement (the tokens and cost booked, or
- * the reservation cancelled), each pass's TPM reservation and the input it is released at, and `apiCalls` — the
- * authoritative count of `generateContent` calls — on the exits that end a pass before or after its dispatch.
+ * the reservation cancelled), the usage row each billed pass writes when no daily budget is set, each pass's TPM
+ * reservation and the input it is released at, and `apiCalls` — the authoritative count of `generateContent` calls —
+ * on the exits that end a pass before or after its dispatch.
  */
 
 import { describe, expect, it, vi } from 'vitest';
@@ -109,6 +110,98 @@ describe('ask_agentic accounting — a loop iteration', () => {
     expect(callsTo(trace, 'throttle', 'reserve')).toEqual([[MODEL, 50_000]]);
     expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 3000]]);
   });
+
+  it('is booked and released at the per-iteration estimate when its response reported no usage', async () => {
+    const { trace } = await runAgentic({
+      ...ENFORCED,
+      script: [{ text: 'done', usage: null }],
+    });
+
+    expect(bookedMicros(50_000, 0, 0)).toBeGreaterThan(0);
+    expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual([
+      [
+        1,
+        {
+          cachedTokens: 0,
+          uncachedTokens: 50_000,
+          costUsdMicro: bookedMicros(50_000, 0, 0),
+          durationMs: expect.any(Number),
+        },
+      ],
+    ]);
+    expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 50_000]]);
+  });
+
+  it('writes no usage row of its own under a daily budget: the reservation is the row', async () => {
+    const { trace } = await runAgentic({
+      ...ENFORCED,
+      script: [READ_A, { text: 'done' }],
+    });
+
+    expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toHaveLength(2);
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([]);
+  });
+});
+
+/** The usage row a pass without a daily budget writes. */
+function usageRow(uncached: number, output: number, thinking: number): unknown[] {
+  return [
+    {
+      workspaceRoot: expect.any(String),
+      toolName: 'ask_agentic',
+      model: MODEL,
+      occurredAt: expect.any(Number),
+      cachedTokens: 0,
+      uncachedTokens: uncached,
+      costUsdMicro: bookedMicros(uncached, output, thinking),
+      durationMs: expect.any(Number),
+    },
+  ];
+}
+
+describe('ask_agentic accounting — without a daily budget', () => {
+  it('writes one usage row per loop iteration, at the tokens it reported', async () => {
+    const { trace } = await runAgentic({
+      script: [
+        {
+          ...READ_A,
+          usage: { promptTokenCount: 3000, candidatesTokenCount: 5, thoughtsTokenCount: 6 },
+        },
+        {
+          text: 'done',
+          usage: { promptTokenCount: 4000, candidatesTokenCount: 9, thoughtsTokenCount: 2 },
+        },
+      ],
+    });
+
+    expect(callsTo(trace, 'ledger', 'reserveBudget')).toEqual([]);
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([
+      usageRow(3000, 5, 6),
+      usageRow(4000, 9, 2),
+    ]);
+  });
+
+  it('writes a usage row for the forced-finalization pass, at its estimate when it reported no usage', async () => {
+    const { result, trace } = await runAgentic({
+      tpmThrottleLimit: 1_000_000,
+      input: { maxIterations: 1 },
+      script: [
+        {
+          ...READ_A,
+          usage: { promptTokenCount: 3000, candidatesTokenCount: 5, thoughtsTokenCount: 6 },
+        },
+        { text: 'forced', usage: null },
+      ],
+    });
+
+    expect(result.structuredContent?.convergenceForced).toBe(true);
+    const rescueEstimate = callsTo(trace, 'throttle', 'reserve')[1]?.[1];
+    expect(rescueEstimate).toBeGreaterThanOrEqual(3000 + 5_000);
+    expect(callsTo(trace, 'ledger', 'insertUsageMetric')).toEqual([
+      usageRow(3000, 5, 6),
+      usageRow(rescueEstimate as number, 0, 0),
+    ]);
+  });
 });
 
 describe('ask_agentic accounting — the forced-finalization pass', () => {
@@ -128,7 +221,7 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
       [MODEL, 50_000],
     ]);
     expect(callsTo(trace, 'throttle', 'release')).toEqual([
-      [101, 0],
+      [101, 50_000],
       [102, 50_000],
     ]);
     expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')[1]).toEqual([

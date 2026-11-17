@@ -10,11 +10,11 @@
 import type { RanCachingMode } from '../../cache/caching-mode.js';
 import type { ManifestDb } from '../../manifest/db.js';
 import { estimateCostUsd, toMicrosUsd } from '../../utils/cost-estimator.js';
-import { logger } from '../../utils/logger.js';
+import { logger, safeForLog } from '../../utils/logger.js';
 import type { CompletedRequests, DecodeUsage } from './continuation.js';
 
 /** The tool a ledger row belongs to. */
-export type LedgerTool = 'ask' | 'code';
+export type LedgerTool = 'ask' | 'code' | 'ask_agentic';
 
 /** What the completed requests of a call billed: their reported tokens and their cost at list price. */
 export interface BilledUsage {
@@ -43,7 +43,8 @@ export interface LedgerEntry {
   readonly toolName: LedgerTool;
   readonly model: string;
   readonly serviceTier: 'standard' | 'flex' | undefined;
-  readonly cachingMode: RanCachingMode;
+  /** The caching mode that ran; `null` for a tool that sends no cached content (`ask_agentic`): no mode is booked. */
+  readonly cachingMode: RanCachingMode | null;
 }
 
 /** A call that failed, as its ledger sees it. */
@@ -125,8 +126,9 @@ export function recordBilledCall(
     uncachedTokens: billed.uncachedTokens,
     costUsdMicro: toMicrosUsd(billed.costUsd),
     durationMs,
-    cachingMode: entry.cachingMode,
-    cachedContentTokenCount: billed.cachedTokens,
+    ...(entry.cachingMode === null
+      ? {}
+      : { cachingMode: entry.cachingMode, cachedContentTokenCount: billed.cachedTokens }),
   };
   if (reservationId === null) {
     manifest.insertUsageMetric({
@@ -142,7 +144,7 @@ export function recordBilledCall(
     manifest.finalizeBudgetReservation(reservationId, settled);
   } catch (finalizeErr) {
     logger.error(
-      `${entry.toolName}: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${settled.costUsdMicro} micros). Error: ${String(finalizeErr)}`,
+      `${entry.toolName}: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${settled.costUsdMicro} micros). Error: ${safeForLog(finalizeErr)}`,
     );
   }
 }
@@ -167,7 +169,7 @@ export function settleFailedCall(manifest: ManifestDb, failed: FailedCall): Usag
     recordBilledCall(manifest, failed.reservationId, failed.entry, billed, failed.durationMs);
   } catch (recordErr) {
     logger.error(
-      `${failed.toolName}: the usage of ${failed.completed.count} completed request(s) could not be recorded. Error: ${String(recordErr)}`,
+      `${failed.toolName}: the usage of ${failed.completed.count} completed request(s) could not be recorded. Error: ${safeForLog(recordErr)}`,
     );
   }
   return usageFields(billed, failed.completed.continuationHops());
@@ -183,7 +185,7 @@ function releaseReservation(
     manifest.cancelBudgetReservation(reservationId);
   } catch (cancelErr) {
     logger.error(
-      `${toolName}: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
+      `${toolName}: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${safeForLog(cancelErr)}`,
     );
   }
 }

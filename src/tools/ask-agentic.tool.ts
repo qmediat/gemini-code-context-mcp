@@ -39,7 +39,6 @@ import {
 import { logger, safeForLog } from '../utils/logger.js';
 import { type ProgressEmitter, createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticInputSchema } from './agentic/input.js';
-import { seedRetryHint } from './agentic/ledger.js';
 import { runLoop } from './agentic/loop.js';
 import { runRescue } from './agentic/rescue.js';
 import { maxIterationsResult } from './agentic/results.js';
@@ -58,6 +57,7 @@ import {
   type ToolDefinition,
   errorResult,
 } from './registry.js';
+import { seedRetryHint } from './shared/throttle.js';
 
 export { resolveToolExecutionConcurrency } from './agentic/dispatch.js';
 export { type AskAgenticInput, askAgenticInputSchema } from './agentic/input.js';
@@ -215,7 +215,7 @@ function failedCall(err: unknown, ctx: ToolContext, resolved: ResolvedModel | un
   logger.error(`ask_agentic failed: ${safeForLog(err)}`);
   const httpStatus = (err as { status?: number }).status;
   if (typeof resolved?.resolved === 'string') {
-    seedRetryHint(ctx, resolved.resolved, err);
+    seedRetryHint(ctx.throttle, resolved.resolved, err);
   }
   return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
     errorCode: 'UNKNOWN',

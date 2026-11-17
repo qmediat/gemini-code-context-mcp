@@ -28,7 +28,7 @@ import {
   answerFinish,
   emptyAtOutputCap,
 } from './thinking.js';
-import { type TpmThrottle, isGemini429, parseRetryDelayMs } from './throttle.js';
+import { type TpmThrottle, seedRetryHint } from './throttle.js';
 
 /** A call whose decode answered. */
 export interface AnsweredCall {
@@ -103,15 +103,14 @@ export interface FailedCallSettlement {
 }
 
 /**
- * Settle a failed call; its usage when completed requests were billed, else `null`. The retry hint is read only from
- * a real `ApiError` with status 429 (`isGemini429`): text a prompt can echo never reaches the throttle. A ledger write
- * that throws is logged by `settleFailedCall` and never replaces the call's own error.
+ * Settle a failed call; its usage when completed requests were billed, else `null`. A 429's retry hint seeds the
+ * throttle through `seedRetryHint`, once per error. A ledger write that throws is logged by `settleFailedCall` and
+ * never replaces the call's own error.
  */
 export function settleFailure(settlement: FailedCallSettlement): UsageFields | null {
   const { err, model } = settlement;
-  const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
-  if (retryDelayMs !== null && model !== null) {
-    settlement.throttle.recordRetryHint(model, retryDelayMs);
+  if (model !== null) {
+    seedRetryHint(settlement.throttle, model, err);
   }
   const usage = settleFailedCall(settlement.manifest, settlement.failed);
   settlement.dispatch.cancel();

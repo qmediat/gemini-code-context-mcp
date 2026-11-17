@@ -1,17 +1,21 @@
 /**
  * The budget ledger and TPM throttle calls of `ask_agentic`. Each pass (a loop iteration or the forced-finalization
- * pass) is an independent `generateContent` billable, so each gets its own reservation and settles it: a pass that
- * reached Google is booked at what it billed and its TPM reservation released at the input it sent; a pass that never
- * did has both reservations cancelled. A ledger failure while settling is logged, never thrown. A Gemini 429's retry
- * hint seeds the throttle once per error, whichever catch meets it first.
+ * pass) is an independent `generateContent` billable, so each is reserved and settled on its own: a pass that reached
+ * Google is booked at what it billed (`recordBilledCall`, the rule of `ask` / `code` — its reservation finalised under
+ * a daily cap, a usage row without one) and its TPM reservation released at the input it billed; a pass that never
+ * did has both reservations cancelled. A ledger failure while settling is logged, never thrown.
  */
 
 import { abortableSleep } from '../../gemini/retry.js';
-import { estimateCostUsd, toMicrosUsd } from '../../utils/cost-estimator.js';
+import { toMicrosUsd } from '../../utils/cost-estimator.js';
 import { logger, safeForLog } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
-import { billedInputTokens } from '../shared/call-ledger.js';
-import { isGemini429, parseRetryDelayMs } from '../shared/throttle.js';
+import {
+  type LedgerEntry,
+  billedInputTokens,
+  billedUsage,
+  recordBilledCall,
+} from '../shared/call-ledger.js';
 import type { UsageCounts } from './response.js';
 import type { AgenticRun } from './run.js';
 
@@ -20,21 +24,14 @@ export type BudgetReservation = ReturnType<ToolContext['manifest']['reserveBudge
 /** A TPM reservation id that was never taken. */
 export const NO_THROTTLE_RESERVATION = -1;
 
-/** The 429s whose retry hint has seeded the throttle: an iteration's 429 reaches the call's outer catch too. */
-const seededRetryHints = new WeakSet<object>();
-
-/**
- * The retry delay a Gemini 429 carries (`retryInfo.retryDelay`), or `null` for any other failure or a 429 without
- * one. The first time an error is met its delay seeds the throttle's hint for `model`, which later calls honour
- * through `throttle.reserve`; meeting the same error again seeds nothing.
- */
-export function seedRetryHint(ctx: ToolContext, model: string, err: unknown): number | null {
-  if (!isGemini429(err)) return null;
-  const delayMs = parseRetryDelayMs(err.message);
-  if (delayMs === null || seededRetryHints.has(err)) return delayMs;
-  seededRetryHints.add(err);
-  ctx.throttle.recordRetryHint(model, delayMs);
-  return delayMs;
+/** A pass's reservations and when it started. */
+export interface PassReservations {
+  /** The daily-budget reservation; `null` without a daily cap. */
+  reservationId: number | null;
+  throttleReservationId: number;
+  /** The input-token estimate both reservations were taken for. */
+  estimate: number;
+  startedAt: number;
 }
 
 /** Reserve one pass's estimated cost against the daily budget cap. */
@@ -89,103 +86,53 @@ export function cancelPass(
   }
 }
 
-/**
- * Finalise an iteration's budget reservation with actual cost from usage metadata. `durationMs` is
- * per-iteration wall time (matching `ask`/`code`), so the manifest row reflects real latency — agentic
- * loops used to write `0` here, breaking usage-analytics queries (PR #24 round-4, Copilot P1).
- */
-function bookIteration(
-  run: AgenticRun,
-  reservationId: number,
-  usage: UsageCounts,
-  durationMs: number,
-): void {
-  const actualCost = estimateCostUsd({
+/** Where an `ask_agentic` pass is booked: it sends no cached content, so no caching mode is recorded. */
+function ledgerEntryOf(run: AgenticRun): LedgerEntry {
+  return {
+    workspaceRoot: run.workspaceRoot,
+    toolName: 'ask_agentic',
     model: run.resolved.resolved,
-    uncachedInputTokens: usage.promptTokenCount,
-    cachedInputTokens: 0,
-    outputTokens: usage.candidatesTokenCount,
-    thinkingTokens: usage.thoughtsTokenCount,
-  });
+    serviceTier: undefined,
+    cachingMode: null,
+  };
+}
+
+/**
+ * Settle a pass whose API call returned (its tokens were billed, even when reading the response threw afterwards).
+ * The input it billed is the prompt tokens it reported, else — a response without usage, or a read that threw before
+ * the usage — the pass's estimate (`billedInputTokens`): under-billing a completed call is the worse error, and the
+ * estimate keeps the daily cap and the TPM window a bound. The booking and the TPM release use that one figure; the
+ * booking's `durationMs` is the pass's wall time.
+ */
+export function settleBilledPass(
+  run: AgenticRun,
+  pass: PassReservations,
+  usage: UsageCounts,
+): void {
+  const billedInput = billedInputTokens(usage.promptTokenCount, pass.estimate);
+  const billed = billedUsage(
+    {
+      promptTokenCount: billedInput,
+      candidatesTokenCount: usage.candidatesTokenCount,
+      thoughtsTokenCount: usage.thoughtsTokenCount,
+    },
+    run.resolved.resolved,
+    undefined,
+  );
   try {
-    run.ctx.manifest.finalizeBudgetReservation(reservationId, {
-      cachedTokens: 0,
-      uncachedTokens: usage.promptTokenCount,
-      costUsdMicro: toMicrosUsd(actualCost),
-      durationMs,
-    });
-  } catch (finalizeErr) {
+    recordBilledCall(
+      run.ctx.manifest,
+      pass.reservationId,
+      ledgerEntryOf(run),
+      billed,
+      Date.now() - pass.startedAt,
+    );
+  } catch (recordErr) {
     logger.error(
-      `ask_agentic: finalizeBudgetReservation failed for id=${reservationId}: ${String(finalizeErr)}`,
+      `ask_agentic: the usage of a billed pass could not be recorded: ${safeForLog(recordErr)}`,
     );
   }
-}
-
-/** Settle a completed iteration: book its cost, release its TPM reservation with the actual input tokens. */
-export function settleIteration(
-  run: AgenticRun,
-  reservationId: number | null,
-  throttleReservationId: number,
-  usage: UsageCounts,
-  durationMs: number,
-): void {
-  if (reservationId !== null) {
-    bookIteration(run, reservationId, usage, durationMs);
-  }
-  if (throttleReservationId !== NO_THROTTLE_RESERVATION) {
-    run.ctx.throttle.release(throttleReservationId, usage.promptTokenCount);
-  }
-}
-
-/** The finalization pass's reservations and when it started. */
-export interface RescueReservations {
-  reservationId: number | null;
-  throttleReservationId: number;
-  /** The input-token estimate both reservations were taken for. */
-  estimate: number;
-  startedAt: number;
-}
-
-/**
- * Settle a finalization pass whose API call returned (its tokens were billed, even when parsing the
- * response threw afterwards). If parse-after-await threw, `usage` is still {0,0,0}: the billed input
- * falls back to the estimate — under-billing a known-completed API call is a worse failure mode than
- * over-billing on a parse-error edge case (the operator's dailyBudget cap stays a true upper bound
- * either way).
- *
- * CC2 fix (v1.15.0 PR-Round-1, Copilot): the budget finalize and the throttle release share ONE
- * `billedUncachedTokens`. Pre-fix the asymmetry meant when Google's response omitted usageMetadata,
- * budget finalize used the estimate (correct) but throttle.release passed 0, mutating the TPM window
- * entry to 0 — under-throttling subsequent calls.
- */
-export function settleBilledRescue(
-  run: AgenticRun,
-  reservations: RescueReservations,
-  usage: UsageCounts,
-): void {
-  const billedUncachedTokens = billedInputTokens(usage.promptTokenCount, reservations.estimate);
-  if (reservations.reservationId !== null) {
-    const actualCost = estimateCostUsd({
-      model: run.resolved.resolved,
-      uncachedInputTokens: billedUncachedTokens,
-      cachedInputTokens: 0,
-      outputTokens: usage.candidatesTokenCount,
-      thinkingTokens: usage.thoughtsTokenCount,
-    });
-    try {
-      run.ctx.manifest.finalizeBudgetReservation(reservations.reservationId, {
-        cachedTokens: 0,
-        uncachedTokens: billedUncachedTokens,
-        costUsdMicro: toMicrosUsd(actualCost),
-        durationMs: Date.now() - reservations.startedAt,
-      });
-    } catch (finalizeErr) {
-      logger.error(
-        `ask_agentic finalization: finalize reservation failed: ${safeForLog(finalizeErr)}`,
-      );
-    }
-  }
-  if (reservations.throttleReservationId !== NO_THROTTLE_RESERVATION) {
-    run.ctx.throttle.release(reservations.throttleReservationId, billedUncachedTokens);
+  if (pass.throttleReservationId !== NO_THROTTLE_RESERVATION) {
+    run.ctx.throttle.release(pass.throttleReservationId, billedInput);
   }
 }

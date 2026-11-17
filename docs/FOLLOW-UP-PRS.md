@@ -249,7 +249,7 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ## ~~T39.~~ ✅ SHIPPED 2026-11-17 — Split `src/tools/ask-agentic.tool.ts` into modules
 
-**Shipped as:** the tool file is the entry (the input schema, the registration, the call); the loop, the iteration, the dispatcher, the forced-finalization pass, the ledger calls, the no-progress detector, the results and the instructions are modules under `src/tools/agentic/` (`docs/architecture.md`); the largest file of the tool is now `src/tools/agentic/workspace-tools.ts` (30 KB, unchanged), the entry is 18 KB. No behaviour change: the tests are unchanged, the published input schema is the fixture's, and the file's `eslint-suppressions.json` entry is gone — every unit is within the structure limits. The scope below is the entry as written.
+**Shipped as:** the tool file is the entry (the input schema, the registration, the call); the loop, the iteration, the dispatcher, the forced-finalization pass, the ledger calls, the no-progress detector, the results and the instructions are modules under `src/tools/agentic/` (`docs/architecture.md`); the largest file of the tool is now `src/tools/agentic/workspace-tools.ts` (30 KB, unchanged), the entry is 18 KB. The split keeps the tool's behaviour apart from the fixes it carries, each in the CHANGELOG: a loop iteration's 429 seeds the throttle's retry hint once (the seeding is `seedRetryHint` in `src/tools/shared/throttle.ts`, the one rule of `ask`, `code` and `ask_agentic`), a pass whose response carries no usage is booked and released at its estimate, and a call without a daily budget writes a usage row per billed pass. Tests were added for the ledger, the tool batch and the call trace, and the two 429 tests of `test/unit/ask-agentic.test.ts` were adjusted to the hint seeded once; the published input schema is the fixture's, and the file's `eslint-suppressions.json` entry is gone — every unit is within the structure limits. The scope below is the entry as written.
 
 **Source:** the reviews of PR #131 (2026-11-17).
 
@@ -623,7 +623,7 @@ Until then, the per-call `forceRescan: true` and env-wide `GEMINI_CODE_CONTEXT_F
 **Source:** Original v1.14.0 plan (split out for focused release pacing — v1.14.0 shipped the `cachingMode` default flip alone since the streaming migration is reliability-only and doesn't affect the user-perceived speed change that drove v1.14.0).
 
 **What shipped (v1.16.2)**:
-- `src/tools/ask-agentic.tool.ts` `runAgenticIteration()` — replaced per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
+- `runAgenticIteration()` (then in `src/tools/ask-agentic.tool.ts`, now `src/tools/agentic/iteration.ts`) — replaced per-iteration `generateContent(...)` with `generateContentStream(...)` + `collectStream` (the existing utility from `src/tools/shared/stream-collector.ts`).
 - New schema field `stallMs` on `ask_agentic` (range `[1_000, 600_000]`, optional). Behaviour matches `ask`/`code`'s `stallMs`: per-iteration heartbeat reset on every chunk; fires only when the stream goes silent.
 - New env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` for operator-level default.
 - Existing `iterationTimeoutMs` stays orthogonal (wall-clock cap; both can be set, whichever fires first wins).

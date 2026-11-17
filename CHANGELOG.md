@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `ask_agentic`: a 429 on a loop iteration seeds the throttle's retry hint once, not twice.
+- `ask_agentic`: a 429 on a loop iteration seeds the throttle's retry hint once, not twice. `ask`, `code` and
+  `ask_agentic` seed the hint through one function, once per error.
+- `ask_agentic`: a loop iteration whose response carries no `usageMetadata` is booked and released at its estimate
+  (50,000 input tokens), as the forced-finalization pass already was: it used to book 0 USD against the daily budget
+  and release its TPM reservation at 0 tokens, so later calls were throttled as if it had sent nothing.
+- `ask_agentic` without a daily budget (`GEMINI_DAILY_BUDGET_USD` unset) writes a usage row for each pass that
+  reached the model, as `ask` and `code` do: `status` (`spentTodayUsd`) counted none of its spend.
 
 ## [1.24.0] - 2026-11-17
 

@@ -21,15 +21,14 @@ import { ApiError, FunctionCallingConfigMode } from '@google/genai';
 import { withNetworkRetry } from '../../gemini/retry.js';
 import { logger } from '../../utils/logger.js';
 import { createTimeoutController, isTimeoutAbort } from '../shared/abort-timeout.js';
-import { isGemini429 } from '../shared/throttle.js';
+import { isGemini429, seedRetryHint } from '../shared/throttle.js';
 import { SYSTEM_INSTRUCTION_FINALIZATION } from './instructions.js';
 import {
   NO_THROTTLE_RESERVATION,
-  type RescueReservations,
+  type PassReservations,
   cancelPass,
   reservePass,
-  seedRetryHint,
-  settleBilledRescue,
+  settleBilledPass,
   waitForTpm,
 } from './ledger.js';
 import { type UsageCounts, thinkingSummaryOf, usageCounts } from './response.js';
@@ -89,7 +88,7 @@ export interface RescueOutcome {
 }
 
 /** The parts of the finalization call that outlive its `try`: whether the API call returned. */
-interface RescueFlight extends RescueReservations {
+interface RescueFlight extends PassReservations {
   /** P3 (v1.15.0): set IMMEDIATELY after the API call returns, before any post-await processing could
    * throw. Cleanup is routed by it, not by the try/catch boundary: a parse error after a successful
    * API call still finalizes the budget (the tokens were billed). */
@@ -228,7 +227,7 @@ function recordRescueFailure(
   apiCallSucceeded: boolean,
   outcome: RescueOutcome,
 ): void {
-  const finalRetryDelayMs = seedRetryHint(run.ctx, run.resolved.resolved, finalErr);
+  const finalRetryDelayMs = seedRetryHint(run.ctx.throttle, run.resolved.resolved, finalErr);
   outcome.errorCode = rescueFailureCode(finalErr, finalRetryDelayMs, apiCallSucceeded);
   outcome.errorMessage =
     finalErr instanceof Error ? finalErr.message.slice(0, 500) : String(finalErr).slice(0, 500);
@@ -291,7 +290,7 @@ async function attemptRescue(
     recordRescueFailure(run, finalErr, flight.apiCallSucceeded, outcome);
   } finally {
     if (flight.apiCallSucceeded) {
-      settleBilledRescue(run, flight, outcome.usage);
+      settleBilledPass(run, flight, outcome.usage);
     } else {
       cancelPass(
         run.ctx,

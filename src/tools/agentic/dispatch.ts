@@ -71,11 +71,10 @@ export interface ToolCall {
 
 export interface DispatchedToolResult {
   name: string;
+  /** What the model receives as the call's `functionResponse.response`: the executor's answer, or `{ error }`. */
   response: Record<string, unknown>;
-  /** Duration of the executor call (for tracing). */
-  durationMs: number;
-  /** `true` when the executor threw a recoverable error — useful for the
-   * no-progress detector so we treat repeated error'd calls as a loop. */
+  /** `true` when the call failed (an unknown tool, or an executor that threw): a failed `read_file` is never
+   * recorded as a file read (`recordRead`). */
   isError: boolean;
 }
 
@@ -165,26 +164,23 @@ export async function dispatchToolCall(
   args: Record<string, unknown>,
   matchConfig: MatchConfig,
 ): Promise<DispatchedToolResult> {
-  const started = Date.now();
   try {
     const executor = EXECUTORS.get(name);
     if (executor === undefined) {
       return {
         name,
         response: { error: `unknown tool: ${name}` },
-        durationMs: Date.now() - started,
         isError: true,
       };
     }
     const response = await executor(workspaceRoot, args, matchConfig);
-    return { name, response, durationMs: Date.now() - started, isError: false };
+    return { name, response, isError: false };
   } catch (err) {
     const message = failureMessage(err);
     logSandboxRefusal(name, err);
     return {
       name,
       response: { error: message },
-      durationMs: Date.now() - started,
       isError: true,
     };
   }
