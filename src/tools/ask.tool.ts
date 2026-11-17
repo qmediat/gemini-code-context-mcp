@@ -21,13 +21,8 @@ import {
 import { resolveModel } from '../gemini/models.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
-import {
-  WorkspaceValidationError,
-  validateWorkspacePath,
-} from '../indexer/workspace-validation.js';
 import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
-import { createProgressEmitter } from '../utils/progress.js';
 import { fallBackToAgentic } from './ask-agentic-fallback.js';
 import {
   attachmentMetadata,
@@ -36,20 +31,23 @@ import {
 } from './ask/attachments.js';
 import { type AskInput, askInputSchema } from './ask/input.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './ask/instruction.js';
-import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { isTimeoutAbort, timedOutCall, toolTimeoutController } from './shared/abort-timeout.js';
-import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
-import { CompletedRequests } from './shared/continuation.js';
-import { DispatchThrottle } from './shared/dispatch-throttle.js';
+import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
+import { decodeOnContext } from './shared/context-decode.js';
+import {
+  type FailedEagerCall,
+  type ModelReached,
+  closeEagerCall,
+  openEagerCall,
+  settleFailedEager,
+} from './shared/eager-call.js';
+import { workspaceRefusal } from './shared/eager-steps.js';
 import {
   ServiceTierError,
   networkAttempts,
   resolveServiceTier,
   serviceTierConfig,
-  statusOf,
-  tierErrorMeta,
 } from './shared/service-tier.js';
-import { settleAnswer, settleFailure } from './shared/settle-call.js';
+import { settleAnswer } from './shared/settle-call.js';
 import { thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
 
 /**
@@ -105,52 +103,22 @@ async function executeAskBody(
   model: string,
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
-  let reservationId: number | null = null;
-  // Canonical resolved-model string, captured once after `resolveModel`
-  // so the outer catch can feed retry hints into the same throttle bucket
-  // `reserve` used. `model` at the top of execute is the request alias
-  // ("latest-pro-thinking") — different key, different bucket.
-  let resolvedModelKey: string | null = null;
-  // every request that completed is billed: the ledger settles from these, on an answer and on a failure alike
-  const completed = new CompletedRequests();
-  // the running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent)
-  const tracking: DecodeTracking = { ledgerEntry: null, streamOpened: false };
-  // the tier this call runs on once resolved (Vertex may force standard); before that, the requested one is reported
-  let serviceTier: 'standard' | 'flex' | undefined;
-  const reportedTier = (): 'standard' | 'flex' =>
-    serviceTier ?? input.serviceTier ?? ctx.config.serviceTier;
-  const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
-  // Composite timeout controller — wall-clock-bound (`timeoutMs`) AND/OR
-  // heartbeat-aware stall watchdog (`stallMs`, v1.12.0). Set up before any
-  // await so a `timeoutMs: 1000` against a slow scan still fires. The
-  // unified signal threads into both `withNetworkRetry({signal})` and the
-  // SDK's `config.abortSignal` — whichever timer fires first aborts both
-  // layers cleanly. `recordChunk()` is wired into `collectStream` to reset
-  // the stall watchdog on every chunk arrival.
-  const timeoutController = toolTimeoutController('ask', input);
+  const call = openEagerCall<ModelReached>(
+    {
+      tool: 'ask',
+      knobs: input,
+      requestedTier: input.serviceTier ?? ctx.config.serviceTier,
+      workspaceRoot,
+      started,
+    },
+    ctx,
+  );
+  const { emitter, completed, tracking, dispatch } = call;
+  const timeoutController = call.timeout;
   const abortSignal = timeoutController.signal;
-  // Each request of the decode holds its own TPM reservation; a failure drops the one held.
-  const dispatch = new DispatchThrottle({
-    throttle: ctx.throttle,
-    enabled: ctx.config.tpmThrottleLimit > 0,
-    signal: abortSignal,
-    emit: (message) => emitter.emit(message),
-  });
   try {
-    // Workspace path validation lives INSIDE the try so a
-    // `WorkspaceValidationError` is reported as a regular tool error
-    // (errorResult, "ask failed: …") rather than an unhandled tool
-    // exception logged by the server-level handler. Both arrive at the
-    // user as text, but only the inside-try path keeps logs tidy and the
-    // user-facing prefix consistent with other validation failures.
-    try {
-      validateWorkspacePath(workspaceRoot);
-    } catch (err) {
-      if (err instanceof WorkspaceValidationError) {
-        return errorResult(`ask: ${err.message}`);
-      }
-      throw err;
-    }
+    const refusal = workspaceRefusal('ask', workspaceRoot);
+    if (refusal !== null) return refusal;
 
     emitter.emit(`resolving model '${model}'…`);
     // `ask` accepts all three text-gen tiers — caller picks via alias
@@ -161,7 +129,7 @@ async function executeAskBody(
     const resolved = await resolveModel(model, ctx.client, {
       requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
     });
-    resolvedModelKey = resolved.resolved;
+    let serviceTier: 'standard' | 'flex';
     try {
       serviceTier = resolveServiceTier(
         input.serviceTier,
@@ -177,6 +145,7 @@ async function executeAskBody(
         resolvedModel: resolved.resolved,
       });
     }
+    call.trail.model = { resolvedModel: resolved.resolved, serviceTier };
 
     // Attachments ride with the prompt as inline parts. Inspected, read and counted here — before the scan, the
     // preflight, the budget reservation and the throttle: a bad file costs nothing.
@@ -455,7 +424,7 @@ async function executeAskBody(
           { errorCode: 'BUDGET_REJECT', retryable: false, serviceTier },
         );
       }
-      reservationId = reserve.id;
+      call.trail.reservationId = reserve.id;
     }
 
     const systemPromptHash = createHash('sha256')
@@ -618,8 +587,8 @@ async function executeAskBody(
     const durationMs = Date.now() - started;
     // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
     // API billed is every request that completed, over a long decode and a stale-cache retry alike.
-    const settledReservation = reservationId;
-    reservationId = null;
+    const settledReservation = call.trail.reservationId;
+    call.trail.reservationId = null;
     tracking.ledgerEntry = null;
     const settled = settleAnswer({
       manifest: ctx.manifest,
@@ -704,51 +673,35 @@ async function executeAskBody(
 
     return textResult(text, metadata);
   } catch (err) {
-    logger.error(`ask failed: ${safeForLog(err)}`);
-    // A 429's retry hint seeds the throttle; the ledger keeps what the completed requests billed and releases the rest
-    // of the reservation (all of it when none completed); their usage goes into the error result.
-    const failedUsage = settleFailure({
-      manifest: ctx.manifest,
-      failed: {
-        toolName: 'ask',
-        reservationId,
-        entry: tracking.ledgerEntry,
-        completed,
-        durationMs: Date.now() - started,
-      },
-      err,
-      model: resolvedModelKey,
-      throttle: ctx.throttle,
-      dispatch,
-    });
-    reservationId = null;
-    // Timeout-driven abort gets a dedicated errorCode so callers can
-    // distinguish "Gemini was slow" from "schema invalid" / "auth failed".
-    // v1.12.0 — `timeoutKind` ('total' | 'stall') distinguishes the
-    // wall-clock cap from the heartbeat-aware stall watchdog so callers
-    // can apply different policies (e.g. retry on stall but not on total).
-    if (isTimeoutAbort(err)) {
-      const timedOut = timedOutCall('ask', err, timeoutController);
-      emitter.emit(`ask: aborted after ${timedOut.limitMs ?? '?'}ms ${timedOut.kind}`);
-      return errorResult(timedOut.message, {
-        errorCode: 'TIMEOUT',
-        timeoutKind: timedOut.kind,
-        timeoutMs: timeoutController.timeoutMs,
-        stallMs: timeoutController.stallMs,
-        retryable: true,
-        serviceTier: reportedTier(),
-        ...failedUsage,
-      });
-    }
-    const httpStatus = statusOf(err);
-    return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err, tracking.streamOpened),
-      serviceTier: reportedTier(),
-      ...(httpStatus !== undefined ? { httpStatus } : {}),
-      ...failedUsage,
-    });
+    return askFailedResult(settleFailedEager(call, ctx, err));
   } finally {
-    timeoutController.dispose();
-    emitter.stop();
+    closeEagerCall(call);
   }
+}
+
+/** `ask`'s result of a failed call: the resolved tier, else the one requested. */
+function askFailedResult(failure: FailedEagerCall<ModelReached>): TextToolResult {
+  const serviceTier = failure.model?.serviceTier ?? failure.requestedTier;
+  // Timeout-driven abort gets a dedicated errorCode so callers can
+  // distinguish "Gemini was slow" from "schema invalid" / "auth failed".
+  // `timeoutKind` ('total' | 'stall') distinguishes the
+  // wall-clock cap from the heartbeat-aware stall watchdog so callers
+  // can apply different policies (e.g. retry on stall but not on total).
+  if (failure.kind === 'timeout') {
+    return errorResult(failure.timedOut.message, {
+      errorCode: 'TIMEOUT',
+      timeoutKind: failure.timedOut.kind,
+      timeoutMs: failure.timeoutMs,
+      stallMs: failure.stallMs,
+      retryable: true,
+      serviceTier,
+      ...failure.usage,
+    });
+  }
+  return errorResult(failure.message, {
+    ...failure.tierMeta,
+    serviceTier,
+    ...(failure.httpStatus !== undefined ? { httpStatus: failure.httpStatus } : {}),
+    ...failure.usage,
+  });
 }

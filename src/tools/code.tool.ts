@@ -28,29 +28,28 @@ import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
-import {
-  WorkspaceValidationError,
-  validateWorkspacePath,
-} from '../indexer/workspace-validation.js';
 import type { ResolvedModel } from '../types.js';
 import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
-import { createProgressEmitter } from '../utils/progress.js';
-import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { isTimeoutAbort, timedOutCall, toolTimeoutController } from './shared/abort-timeout.js';
-import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
-import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
-import { DispatchThrottle } from './shared/dispatch-throttle.js';
+import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
+import { decodeOnContext } from './shared/context-decode.js';
+import { LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
+import {
+  type FailedEagerCall,
+  type ModelReached,
+  closeEagerCall,
+  openEagerCall,
+  settleFailedEager,
+} from './shared/eager-call.js';
+import { workspaceRefusal } from './shared/eager-steps.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
   networkAttempts,
   resolveServiceTier,
   serviceTierConfig,
-  statusOf,
-  tierErrorMeta,
 } from './shared/service-tier.js';
-import { settleAnswer, settleFailure } from './shared/settle-call.js';
+import { settleAnswer } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
 
@@ -267,6 +266,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
 const CODE_FALLBACK_MODEL = 'latest-pro-thinking';
 const CODE_CATEGORY: readonly ['text-reasoning'] = ['text-reasoning'];
 
+/** `code`'s model audit, created in this field order: the results spread it. */
+interface CodeModelReached extends ModelReached {
+  readonly configuredModelReplaced: string | null;
+}
+
 interface CodeModelChoice {
   resolved: ResolvedModel;
   /** The configured default this call did not use, when `code` fell back to the alias; absent otherwise. */
@@ -331,39 +335,22 @@ async function executeCodeBody(
   // undefined and we take the level branch below.
   const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
 
-  let reservationId: number | null = null;
-  // Canonical resolved-model string for retry-hint seeding (T22a).
-  // See ask.tool.ts for rationale.
-  let resolvedModelKey: string | null = null;
-  // every request that completed is billed: the ledger settles from these, on an answer and on a failure alike
-  const completed = new CompletedRequests();
-  // the running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent)
-  const tracking: DecodeTracking = { ledgerEntry: null, streamOpened: false };
-  let modelAudit: Record<string, unknown> = {};
-  const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
-  // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
-  // See ask.tool.ts for rationale; same shape here.
-  const timeoutController = toolTimeoutController('code', input);
+  const call = openEagerCall<CodeModelReached>(
+    {
+      tool: 'code',
+      knobs: input,
+      requestedTier: input.serviceTier ?? ctx.config.serviceTier,
+      workspaceRoot,
+      started,
+    },
+    ctx,
+  );
+  const { emitter, completed, tracking, dispatch } = call;
+  const timeoutController = call.timeout;
   const abortSignal = timeoutController.signal;
-  // Each request of the decode holds its own TPM reservation; a failure drops the one held.
-  const dispatch = new DispatchThrottle({
-    throttle: ctx.throttle,
-    enabled: ctx.config.tpmThrottleLimit > 0,
-    signal: abortSignal,
-    emit: (message) => emitter.emit(message),
-  });
   try {
-    // Workspace validation inside try → reported as a regular tool error
-    // (errorResult, "code failed: …") rather than an unhandled exception
-    // surfaced by the server-level handler.
-    try {
-      validateWorkspacePath(workspaceRoot);
-    } catch (err) {
-      if (err instanceof WorkspaceValidationError) {
-        return errorResult(`code: ${err.message}`);
-      }
-      throw err;
-    }
+    const refusal = workspaceRefusal('code', workspaceRoot);
+    if (refusal !== null) return refusal;
 
     emitter.emit(`resolving model '${modelRequest}'…`);
     // `code` is strictly text-reasoning — coding tasks genuinely benefit
@@ -394,17 +381,17 @@ async function executeCodeBody(
         configuredModelReplaced: choice.replacedDefault ?? null,
       });
     }
-    modelAudit = {
+    const modelAudit: CodeModelReached = {
       resolvedModel: resolved.resolved,
       configuredModelReplaced: choice.replacedDefault ?? null,
       serviceTier,
     };
+    call.trail.model = modelAudit;
     if (choice.replacedDefault !== undefined) {
       emitter.emit(
         `configured default model ${safeForLog(choice.replacedDefault)} replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
       );
     }
-    resolvedModelKey = resolved.resolved;
 
     emitter.emit(`scanning workspace ${workspaceRoot}…`);
     // v1.13.0 — see ask.tool.ts for the scan-memo rationale. Same pattern.
@@ -553,7 +540,7 @@ async function executeCodeBody(
           { errorCode: 'BUDGET_REJECT', retryable: false, ...modelAudit },
         );
       }
-      reservationId = reserve.id;
+      call.trail.reservationId = reserve.id;
     }
 
     const systemPromptHash = createHash('sha256')
@@ -725,8 +712,8 @@ async function executeCodeBody(
     const durationMs = Date.now() - started;
     // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
     // API billed is every request that completed, over a long decode and a stale-cache retry alike.
-    const settledReservation = reservationId;
-    reservationId = null;
+    const settledReservation = call.trail.reservationId;
+    call.trail.reservationId = null;
     tracking.ledgerEntry = null;
     const settled = settleAnswer({
       manifest: ctx.manifest,
@@ -824,48 +811,33 @@ async function executeCodeBody(
       structured,
     );
   } catch (err) {
-    logger.error(`code failed: ${safeForLog(err)}`);
-    // A 429's retry hint seeds the throttle; the ledger keeps what the completed requests billed and releases the rest
-    // (all of it when none completed).
-    const failedUsage = settleFailure({
-      manifest: ctx.manifest,
-      failed: {
-        toolName: 'code',
-        reservationId,
-        entry: tracking.ledgerEntry,
-        completed,
-        durationMs: Date.now() - started,
-      },
-      err,
-      model: resolvedModelKey,
-      throttle: ctx.throttle,
-      dispatch,
-    });
-    reservationId = null;
-    // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
-    if (isTimeoutAbort(err)) {
-      const timedOut = timedOutCall('code', err, timeoutController);
-      emitter.emit(`code: aborted after ${timedOut.limitMs ?? '?'}ms ${timedOut.kind}`);
-      return errorResult(timedOut.message, {
-        errorCode: 'TIMEOUT',
-        timeoutKind: timedOut.kind,
-        timeoutMs: timeoutController.timeoutMs,
-        stallMs: timeoutController.stallMs,
-        retryable: true,
-        ...modelAudit,
-        ...failedUsage,
-      });
-    }
-    const httpStatus = statusOf(err);
-    return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err, tracking.streamOpened),
-      ...(httpStatus !== undefined ? { httpStatus } : {}),
-      serviceTier: input.serviceTier ?? ctx.config.serviceTier, // before the model is resolved: the requested tier
-      ...modelAudit,
-      ...failedUsage,
-    });
+    return codeFailedResult(settleFailedEager(call, ctx, err));
   } finally {
-    timeoutController.dispose();
-    emitter.stop();
+    closeEagerCall(call);
   }
+}
+
+/**
+ * `code`'s result of a failed call: its model audit once the model resolved, none before — a timeout then carries no
+ * tier, any other failure the requested one.
+ */
+function codeFailedResult(failure: FailedEagerCall<CodeModelReached>): TextToolResult {
+  if (failure.kind === 'timeout') {
+    return errorResult(failure.timedOut.message, {
+      errorCode: 'TIMEOUT',
+      timeoutKind: failure.timedOut.kind,
+      timeoutMs: failure.timeoutMs,
+      stallMs: failure.stallMs,
+      retryable: true,
+      ...failure.model,
+      ...failure.usage,
+    });
+  }
+  return errorResult(failure.message, {
+    ...failure.tierMeta,
+    ...(failure.httpStatus !== undefined ? { httpStatus: failure.httpStatus } : {}),
+    serviceTier: failure.requestedTier, // the audit's tier replaces it once the model resolved
+    ...failure.model,
+    ...failure.usage,
+  });
 }
