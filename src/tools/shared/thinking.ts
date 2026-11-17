@@ -9,6 +9,7 @@
  * call sites (and any future reasoning-capable tool we add).
  */
 
+import type { ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
 import { ANSWER_RESERVE_TOKENS, type InputWindowCut } from '../../gemini/long-decode.js';
 
@@ -52,6 +53,17 @@ export const THINKING_LEVEL_FIELD = z
  * one place.
  */
 export type ThinkingLevelLiteral = (typeof THINKING_LEVELS)[number];
+
+/**
+ * The `thinkingConfig` of a request driven by a `thinkingLevel` (`ask`, `code`, `ask_agentic`). The level is cast to
+ * `ThinkingLevel` rather than looked up in the runtime enum object: for a string enum the value IS the member name, so
+ * the cast is the same at runtime — and after an SDK rename the literal reaches Gemini, which answers 400 with a clear
+ * message, instead of silently becoming `undefined` at the lookup. `includeThoughts: true` always, so the answer
+ * carries Gemini's reasoning digest.
+ */
+export function levelThinkingConfig(level: ThinkingLevelLiteral): ThinkingConfig {
+  return { thinkingLevel: level as ThinkingLevel, includeThoughts: true };
+}
 
 /**
  * Conservative per-tier thinking-token reservations for cost estimation.

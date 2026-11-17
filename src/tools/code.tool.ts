@@ -8,51 +8,76 @@
  *   - Structured output parser extracts code blocks and OLD/NEW diffs
  */
 
-import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
-import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
+import type { GenerateContentConfig, ThinkingConfig } from '@google/genai';
 import { z } from 'zod';
-import { prepareContext } from '../cache/cache-manager.js';
+import type { PreparedContext } from '../cache/cache-manager.js';
+import { CACHING_MODE_FALLBACK_DESCRIPTION, type RanCaching } from '../cache/caching-mode.js';
 import {
-  CACHING_MODE_FALLBACK_DESCRIPTION,
-  cachingModeFor,
-  cachingRan,
-} from '../cache/caching-mode.js';
-import {
+  type BoundedOutputCap,
+  type OutputCap,
   capThatRuns,
-  preflightModeFor,
-  resolveOutputCap,
   thinkingBudgetRefusal,
 } from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
-import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
-import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
-import {
-  WorkspaceValidationError,
-  validateWorkspacePath,
-} from '../indexer/workspace-validation.js';
+import type { ScanResult } from '../indexer/workspace-scanner.js';
 import type { ResolvedModel } from '../types.js';
-import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
-import { createProgressEmitter } from '../utils/progress.js';
-import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { isTimeoutAbort, timedOutCall, toolTimeoutController } from './shared/abort-timeout.js';
-import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
-import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
-import { DispatchThrottle } from './shared/dispatch-throttle.js';
+import {
+  type TextToolResult,
+  type ToolContext,
+  type ToolDefinition,
+  errorResult,
+  textResult,
+} from './registry.js';
+import type { ContextDecode } from './shared/context-decode.js';
+import { type DecodedResponse, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
+import {
+  type RequestBuilder,
+  type SettledDecode,
+  decodeEagerCall,
+  prepareCallContext,
+  scanFields,
+  settleDecoded,
+  warnTruncatedScan,
+} from './shared/eager-answer.js';
+import {
+  type EagerCall,
+  type FailedEagerCall,
+  type ModelReached,
+  type StepOutcome,
+  closeEagerCall,
+  openEagerCall,
+  settleFailedEager,
+} from './shared/eager-call.js';
+import {
+  type InputEstimate,
+  type OverWindow,
+  type PreflightCount,
+  countPreflight,
+  eagerOutputCap,
+  estimateInput,
+  overWindow,
+  preflightFields,
+  reserveCallBudget,
+  scanForCall,
+} from './shared/eager-steps.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
-  networkAttempts,
-  resolveServiceTier,
+  type ServiceTierName,
   serviceTierConfig,
-  statusOf,
-  tierErrorMeta,
+  serviceTierOrRefusal,
 } from './shared/service-tier.js';
-import { settleAnswer, settleFailure } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
+import {
+  THINKING_LEVEL_FIELD,
+  levelThinkingConfig,
+  thinkingBudgetUnder,
+  thinkingReserve,
+} from './shared/thinking.js';
+import { workspaceRefusal } from './shared/workspace-refusal.js';
 
 /**
  * `code` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -267,6 +292,11 @@ export const codeTool: ToolDefinition<CodeInput> = {
 const CODE_FALLBACK_MODEL = 'latest-pro-thinking';
 const CODE_CATEGORY: readonly ['text-reasoning'] = ['text-reasoning'];
 
+/** `code`'s model audit, created in this field order: the results spread it. */
+interface CodeModelReached extends ModelReached {
+  readonly configuredModelReplaced: string | null;
+}
+
 interface CodeModelChoice {
   resolved: ResolvedModel;
   /** The configured default this call did not use, when `code` fell back to the alias; absent otherwise. */
@@ -304,568 +334,479 @@ async function resolveCodeModel(
   return { resolved, replacedDefault: requested };
 }
 
+/** One `code` call: its input with the two defaults read once, its context, its machinery. */
+interface CodeCall {
+  readonly input: CodeInput;
+  readonly ctx: ToolContext;
+  readonly eager: EagerCall<CodeModelReached>;
+  /** OLD/NEW diff blocks asked for (default `true`). */
+  readonly expectEdits: boolean;
+  /** Gemini's Code Execution tool on (default `false`). */
+  readonly codeExecution: boolean;
+}
+
+/** The model and the tier resolved, and the audit every later result carries. */
+interface CodeResolved extends CodeCall {
+  readonly resolved: ResolvedModel;
+  readonly serviceTier: ServiceTierName;
+  readonly audit: CodeModelReached;
+}
+
+/** The workspace scanned, the output cap asked for, the input estimated and counted; no refusal over them. */
+interface CodeCounted extends CodeResolved {
+  readonly scan: ScanResult;
+  readonly outputCap: OutputCap;
+  readonly estimate: InputEstimate;
+  readonly count: PreflightCount | null;
+}
+
+/** The cap that runs and the budget under it: the call as the reservation, the decode and the settlement read it. */
+interface CodeSized extends CodeCounted {
+  readonly bounded: BoundedOutputCap;
+  /** The `thinkingBudget` sent on the budget path, clamped under the cap that runs; `0` on the level path, where
+   * none is sent. */
+  readonly thinkingBudget: number;
+}
+
+/** What the answer carries besides its text: the edits, the code blocks, the Code Execution tool's parts. */
+interface CodeArtifacts {
+  readonly edits: ParsedEdit[];
+  readonly codeBlocks: Array<{ lang: string; content: string }>;
+  readonly executedCode: string[];
+  readonly executionOutput: string[];
+}
+
+/** `code`'s default thinking budget: strong reasoning for coding out of the box, which coding tasks benefit from. */
+const CODE_DEFAULT_THINKING_BUDGET = 16_384;
+
+/**
+ * One `code` call: opened before its first await, its steps run in order — each goes on with the next stage or ends
+ * the call — and closed on every path. Every throw of a step reaches the one failure path.
+ */
 async function executeCodeBody(
   input: CodeInput,
-  ctx: Parameters<typeof codeTool.execute>[1],
+  ctx: ToolContext,
   workspaceRoot: string,
   started: number,
-): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
-  // The configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile, then the alias — loadConfig always
-  // sets it), as ask and ask_agentic read it. `resolveCodeModel` keeps `code` on a thinking reasoning model when the
-  // configured default is not one, and the response names the replaced default.
-  const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL; // the last ?? as ask_agentic has it
+): Promise<TextToolResult> {
+  const eager = openEagerCall<CodeModelReached>(
+    {
+      tool: 'code',
+      knobs: input,
+      requestedTier: input.serviceTier ?? ctx.config.serviceTier,
+      workspaceRoot,
+      started,
+    },
+    ctx,
+  );
   const expectEdits = input.expectEdits ?? true;
   const codeExecution = input.codeExecution ?? false;
-
-  // Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel` are
-  // never both set. `usingThinkingLevel` is a single source of truth for
-  // the "is the caller driving reasoning via the discrete-tier knob?"
-  // predicate — used by the cost estimate, the emitter message, and the
-  // thinkingConfig shape below.
-  const usingThinkingLevel = input.thinkingLevel !== undefined;
-
-  // `code` keeps its pre-existing default of 16_384 for the `thinkingBudget`
-  // path (strong reasoning for coding out of the box — coding tasks
-  // genuinely benefit from it and callers rarely want to disable thinking).
-  // When the caller uses `thinkingLevel` instead, `thinkingBudget` stays
-  // undefined and we take the level branch below.
-  const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
-
-  let reservationId: number | null = null;
-  // Canonical resolved-model string for retry-hint seeding (T22a).
-  // See ask.tool.ts for rationale.
-  let resolvedModelKey: string | null = null;
-  // every request that completed is billed: the ledger settles from these, on an answer and on a failure alike
-  const completed = new CompletedRequests();
-  // the running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent)
-  const tracking: DecodeTracking = { ledgerEntry: null, streamOpened: false };
-  let modelAudit: Record<string, unknown> = {};
-  const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
-  // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
-  // See ask.tool.ts for rationale; same shape here.
-  const timeoutController = toolTimeoutController('code', input);
-  const abortSignal = timeoutController.signal;
-  // Each request of the decode holds its own TPM reservation; a failure drops the one held.
-  const dispatch = new DispatchThrottle({
-    throttle: ctx.throttle,
-    enabled: ctx.config.tpmThrottleLimit > 0,
-    signal: abortSignal,
-    emit: (message) => emitter.emit(message),
-  });
   try {
-    // Workspace validation inside try → reported as a regular tool error
-    // (errorResult, "code failed: …") rather than an unhandled exception
-    // surfaced by the server-level handler.
-    try {
-      validateWorkspacePath(workspaceRoot);
-    } catch (err) {
-      if (err instanceof WorkspaceValidationError) {
-        return errorResult(`code: ${err.message}`);
-      }
-      throw err;
-    }
+    const refusal = workspaceRefusal('code', workspaceRoot);
+    if (refusal !== null) return refusal;
+    const resolved = await resolveCode({ input, ctx, eager, expectEdits, codeExecution });
+    if ('end' in resolved) return resolved.end;
+    const counted = await guardCode(resolved.next);
+    if ('end' in counted) return counted.end;
+    const sized = sizeCode(counted.next);
+    if ('end' in sized) return sized.end;
+    return await answerCode(sized.next);
+  } catch (err) {
+    return codeFailedResult(settleFailedEager(eager, ctx, err));
+  } finally {
+    closeEagerCall(eager);
+  }
+}
 
-    emitter.emit(`resolving model '${modelRequest}'…`);
-    // `code` is strictly text-reasoning — coding tasks genuinely benefit
-    // from reasoning tokens, and dispatching to fast/lite tiers would
-    // degrade output quality without meaningful cost savings. Crucially:
-    // this category gate prevents image-gen / audio-gen / agent models
-    // (which may share `pro` tokens with text models in Google's registry)
-    // from reaching `generateContent` with a code-review prompt — the
-    // primary motivation for the v1.4.0 taxonomy work.
-    const choice = await resolveCodeModel(modelRequest, input.model == null, ctx.client);
-    const resolved = choice.resolved;
-    // The same two fields on every result after this point, error results included: an audit of a failed call
-    // can still tell a fallback from a caller's choice.
-    let serviceTier: 'standard' | 'flex';
-    try {
-      serviceTier = resolveServiceTier(
-        input.serviceTier,
-        ctx.config.serviceTier,
-        ctx.config.vertex,
-      );
-    } catch (err) {
-      if (!(err instanceof ServiceTierError)) throw err;
-      return errorResult(`code: ${err.message}`, {
-        errorCode: err.code,
+/**
+ * Resolve the model and the tier. The model asked for is the caller's, else the configured default
+ * (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the profile, then the alias — loadConfig always sets it), as `ask` and
+ * `ask_agentic` read it; `resolveCodeModel` keeps `code` on a thinking reasoning model when the configured default is
+ * not one, and the results name the replaced default. `code` is strictly text-reasoning: the category gate keeps an
+ * image, audio or agent model (which may share `pro` tokens with text models in Google's registry) from reaching
+ * `generateContent` with a coding prompt. From here every result, error results included, carries the audit, so an
+ * audit of a failed call can still tell a fallback from a caller's choice.
+ */
+async function resolveCode(call: CodeCall): Promise<StepOutcome<CodeResolved>> {
+  const { input, ctx, eager } = call;
+  const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL; // the last ?? as ask_agentic has it
+  eager.emitter.emit(`resolving model '${modelRequest}'…`);
+  const choice = await resolveCodeModel(modelRequest, input.model == null, ctx.client);
+  const { resolved } = choice;
+  const configuredModelReplaced = choice.replacedDefault ?? null;
+  const serviceTier = serviceTierOrRefusal(input.serviceTier, ctx.config);
+  if (serviceTier instanceof ServiceTierError) {
+    return {
+      end: errorResult(`code: ${serviceTier.message}`, {
+        errorCode: serviceTier.code,
         retryable: false,
         serviceTier: 'flex',
         resolvedModel: resolved.resolved,
-        configuredModelReplaced: choice.replacedDefault ?? null,
-      });
-    }
-    modelAudit = {
-      resolvedModel: resolved.resolved,
-      configuredModelReplaced: choice.replacedDefault ?? null,
-      serviceTier,
+        configuredModelReplaced,
+      }),
     };
-    if (choice.replacedDefault !== undefined) {
-      emitter.emit(
-        `configured default model ${safeForLog(choice.replacedDefault)} replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
-      );
-    }
-    resolvedModelKey = resolved.resolved;
-
-    emitter.emit(`scanning workspace ${workspaceRoot}…`);
-    // v1.13.0 — see ask.tool.ts for the scan-memo rationale. Same pattern.
-    const scanMemo = buildScanMemo(ctx.manifest.getFiles(workspaceRoot));
-    const scan = await scanWorkspace(workspaceRoot, {
-      ...(input.includeGlobs !== undefined ? { includeGlobs: input.includeGlobs } : {}),
-      ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
-      maxFiles: ctx.config.maxFilesPerWorkspace,
-      maxFileSizeBytes: ctx.config.maxFileSizeBytes,
-      manifestMemo: scanMemo,
-      forceRescan: input.forceRescan === true || ctx.config.forceRescan === true,
-    });
-
-    // Output-cap strategy (v1.4.0) — see ask.tool.ts for full rationale
-    // of the three-layer precedence. Summary: input.maxOutputTokens
-    // (per-call) > ctx.config.forceMaxOutputTokens (MCP-host env) >
-    // auto (omit from wire; Gemini uses model-default). Code review
-    // commonly produces long OLD/NEW diff blocks, so operators doing
-    // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
-    // to pin every call at the model's full 65,536-token capacity.
-    const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
-    // The caller's `thinkingBudget` is checked against `outputCap` (the wire cap, else the model's per-request limit);
-    // the clamp and the reservation use the cap that runs (`runCap`, after the input window's cut).
-    const outputCap = resolveOutputCap({
-      requested: input.maxOutputTokens,
-      forceMax: ctx.config.forceMaxOutputTokens,
-      outputTokenLimit: resolved.outputTokenLimit,
-      longDecodeTokenLimit: resolved.longDecodeTokenLimit,
-      fallbackLimit: CODE_MAX_OUTPUT_TOKENS_FALLBACK,
-    });
-
-    // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
-    // (`thinkingBudgetRefusal`); below, the budget on the wire is clamped under the cap that runs.
-    const budgetRefusal = thinkingBudgetRefusal(
-      input.thinkingBudget,
-      input.maxOutputTokens,
-      outputCap.effective,
+  }
+  const audit: CodeModelReached = {
+    resolvedModel: resolved.resolved,
+    configuredModelReplaced,
+    serviceTier,
+  };
+  eager.trail.model = audit;
+  if (choice.replacedDefault !== undefined) {
+    eager.emitter.emit(
+      `configured default model ${safeForLog(choice.replacedDefault)} replaced by ${CODE_FALLBACK_MODEL} for this call (code needs a thinking reasoning model)`,
     );
-    if (budgetRefusal !== null) return errorResult(`code: ${budgetRefusal}`);
+  }
+  return { next: { ...call, resolved, serviceTier, audit } };
+}
 
-    // Shared input-token fingerprint for budget + TPM throttle (see
-    // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
-    // used by `estimatePreCallCostUsd`). The PREFLIGHT against
-    // `inputTokenLimit` goes through the v1.10.0 two-tier `countForPreflight`
-    // (heuristic for small repos; real `countTokens` near the cliff). Closes
-    // T17 (`bytes/4` undercount on dense Unicode).
-    const workspaceBytes = scan.files.reduce((sum, f) => sum + f.size, 0);
-    const estimatedInputTokens = Math.ceil(workspaceBytes / 4) + Math.ceil(input.task.length / 4);
+/**
+ * Scan the workspace and hold the call against the model's window — the same guard as `ask`'s, with no fallback. A
+ * positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused first
+ * (`thinkingBudgetRefusal`; the budget on the wire is clamped under the cap that runs later).
+ */
+async function guardCode(call: CodeResolved): Promise<StepOutcome<CodeCounted>> {
+  const { input, ctx, eager, resolved } = call;
+  const scan = await scanForCall(eager, ctx, input);
+  const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, resolved);
+  const budgetRefusal = thinkingBudgetRefusal(
+    input.thinkingBudget,
+    input.maxOutputTokens,
+    outputCap.effective,
+  );
+  if (budgetRefusal !== null) return { end: errorResult(`code: ${budgetRefusal}`) };
+  const estimate = estimateInput(scan, input.task, 0);
+  const count = await countPreflight(eager, ctx, {
+    scan,
+    prompt: input.task,
+    resolved,
+    mode: input.preflightMode,
+    cap: outputCap,
+    extraTokens: 0,
+  });
+  const counted: CodeCounted = { ...call, scan, outputCap, estimate, count };
+  const over = overWindow(count, ctx);
+  if (over !== null) return { end: codeTooLargeResult(counted, over) };
+  return { next: counted };
+}
 
-    // v1.5.0 preflight (rebuilt v1.10.0 atop countTokens) — mirror of
-    // ask.tool.ts guard. See there for rationale. Hoisted so the
-    // success-path metadata can surface preflight provenance.
-    let preflight: PreflightTokenResult | undefined;
-    const contextWindow = resolved.inputTokenLimit;
-    // A decode that may take more than one request takes the exact count: its prompt is billed per request.
-    const preflightMode = preflightModeFor(input.preflightMode, outputCap);
-    if (typeof contextWindow === 'number' && contextWindow > 0) {
-      preflight = await countForPreflight(ctx.client, {
-        files: scan.files,
-        prompt: input.task,
-        model: resolved.resolved,
-        // `filesHash` is post-glob-filter — no separate globsHash needed.
-        filesHash: scan.filesHash,
-        ...(preflightMode !== undefined ? { preflightMode } : {}),
-        inputTokenLimit: contextWindow,
-        // See ask.tool.ts for AbortSignal contract — abort propagates as
-        // `AbortError` to outer catch (mapped to `errorCode: 'TIMEOUT'`).
-        signal: abortSignal,
-      });
-      const threshold = Math.floor(contextWindow * ctx.config.workspaceGuardRatio);
-      if (preflight.effectiveTokens > threshold) {
-        const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
-        return errorResult(
-          `Workspace too large for eager \`code\`: ~${preflight.effectiveTokens.toLocaleString()} input tokens (${preflight.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
-          {
-            errorCode: 'WORKSPACE_TOO_LARGE',
-            retryable: false,
-            estimatedInputTokens: preflight.effectiveTokens,
-            tokenCountMethod: preflight.method,
-            rawTokenCount: preflight.rawTokens,
-            tokenCountCacheHit: preflight.cacheHit,
-            contextWindowTokens: contextWindow,
-            thresholdTokens: threshold,
-            guardRatio: ctx.config.workspaceGuardRatio,
-            ...modelAudit,
-            filesIndexed: scan.files.length,
-          },
-        );
-      }
-    } else {
-      logger.warn(
-        `code: resolved model ${safeForLog(resolved.resolved)} has no advertised inputTokenLimit — workspace size guard skipped. Request may fail downstream if the workspace exceeds the model's context window.`,
-      );
-    }
+/** The refusal of a workspace over the window, with the ways out. */
+function codeTooLargeResult(call: CodeCounted, over: OverWindow): TextToolResult {
+  const { counted, threshold, contextWindow } = over;
+  return errorResult(
+    `Workspace too large for eager \`code\`: ~${counted.effectiveTokens.toLocaleString()} input tokens (${counted.method} count) exceeds ${threshold.toLocaleString()} (${over.pctDisplay}% of ${call.resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
+    {
+      errorCode: 'WORKSPACE_TOO_LARGE',
+      retryable: false,
+      estimatedInputTokens: counted.effectiveTokens,
+      tokenCountMethod: counted.method,
+      rawTokenCount: counted.rawTokens,
+      tokenCountCacheHit: counted.cacheHit,
+      contextWindowTokens: contextWindow,
+      thresholdTokens: threshold,
+      guardRatio: call.ctx.config.workspaceGuardRatio,
+      ...call.audit,
+      filesIndexed: call.scan.files.length,
+    },
+  );
+}
 
-    const { cap: runCap, cut: inputWindowCut } = capThatRuns({
-      tool: 'code',
-      cap: outputCap,
-      promptTokens: preflight?.effectiveTokens,
-      inputTokenLimit: contextWindow,
-      emit: (message) => emitter.emit(message),
-    });
-
-    // The budget on the wire: clamped below the cap that runs, after the input window's cut — a cap cut to one
-    // request goes on the wire as its cut value, and `thinkingBudget < maxOutputTokens` holds there too.
-    const effectiveThinkingBudget =
-      thinkingBudget !== undefined && thinkingBudget > 0
-        ? thinkingBudgetUnder(runCap, thinkingBudget)
-        : 0;
-    // The thinking the budget reservation counts, from the cap that runs.
-    const thinkingTokensForEstimate = thinkingReserve(
-      input.thinkingLevel,
-      effectiveThinkingBudget,
-      runCap,
-    );
-
-    // Atomic budget reservation — see ask.tool.ts for the full rationale.
-    // Estimate includes the thinking budget (billed as output tokens on Pro)
-    // PLUS the candidate output cap.
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const estimateUsd = estimatePreCallCostUsd({
-        model: resolved.resolved,
-        serviceTier,
-        workspaceBytes,
-        promptChars: input.task.length,
-        expectedOutputTokens: runCap.effective,
-        // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
-        perRequestOutputTokens: runCap.perRequest,
-        // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
-        countedInputTokens: preflight?.effectiveTokens,
-        thinkingTokens: thinkingTokensForEstimate,
-        coverMs: timeoutController.timeoutMs,
-      });
-      const reserve = ctx.manifest.reserveBudget({
-        workspaceRoot,
-        toolName: 'code',
-        model: resolved.resolved,
-        estimatedCostMicros: toMicrosUsd(estimateUsd),
-        dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
-        nowMs: Date.now(),
-      });
-      if ('rejected' in reserve) {
-        const spentUsd = reserve.spentMicros / 1_000_000;
-        return errorResult(
-          `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false, ...modelAudit },
-        );
-      }
-      reservationId = reserve.id;
-    }
-
-    const systemPromptHash = createHash('sha256')
-      .update(SYSTEM_INSTRUCTION_CODE)
-      .digest('hex')
-      .slice(0, 16);
-
-    // v1.14.0 — `cachingMode` default flipped to `'implicit'` (resolved via
-    // `ctx.config.cachingMode`, env-driven). codeExecution still forces inline
-    // regardless because Gemini rejects `cachedContent` + `tools` together;
-    // telemetry records the ACTUAL mode (FN2 fix) so the mode flip + the
-    // codeExecution-forced-inline path stay distinguishable.
-    const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
-    const requestedCachingMode = caching.mode;
-
-    // The context of the call: built here, and again by the stale-cache retry on a fresh cache.
-    const prepare = () =>
-      prepareContext({
-        client: ctx.client,
-        manifest: ctx.manifest,
-        scan,
-        model: resolved,
-        systemPromptHash,
-        systemInstruction: SYSTEM_INSTRUCTION_CODE,
-        ttlSeconds: ctx.config.cacheTtlSeconds,
-        cacheMinTokens: ctx.config.cacheMinTokens,
-        emitter,
-        // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
-        // which Gemini rejects together with cachedContent. Force inline path
-        // when codeExecution is requested so we have actual inline file parts
-        // to embed alongside the prompt.
-        allowCaching: scan.files.length > 0 && !codeExecution,
-        // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
-        signal: abortSignal,
-        // v1.13.0 — opt-in implicit caching path (skip caches.create).
-        cachingMode: requestedCachingMode,
-      });
-    const ctxPrep = await prepare();
-
-    const userPrompt = expectEdits
-      ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
-      : input.task;
-
-    const thinkingDescription = usingThinkingLevel
-      ? `thinking-level=${input.thinkingLevel}`
-      : `thinking=${effectiveThinkingBudget}`;
-    emitter.emit(
-      codeExecution
-        ? `generating with ${thinkingDescription} + codeExecution…`
-        : `generating with ${thinkingDescription}…`,
-    );
-
-    // Two mutually-exclusive reasoning-control paths (enforced by schema
-    // `.refine()`):
-    //   a) `thinkingLevel` set → cast to the SDK enum and pass through.
-    //      Google's recommended path on Gemini 3. Rejected by Gemini 2.5.
-    //      Cast rather than runtime enum-object lookup so a future SDK
-    //      rename surfaces as a Gemini 400, not a silent `undefined`.
-    //   b) `thinkingBudget` path (default 16_384, clamped above) → pass
-    //      `thinkingBudget` as before.
-    // `includeThoughts: true` is unconditional so `thinkingSummary`
-    // extraction below always has material to find.
-    const thinkingConfig: ThinkingConfig = usingThinkingLevel
-      ? {
-          thinkingLevel: input.thinkingLevel as ThinkingLevel,
-          includeThoughts: true,
-        }
-      : { thinkingBudget: effectiveThinkingBudget, includeThoughts: true };
-
-    // Gemini rejects generateContent({cachedContent, system_instruction|tools|tool_config})
-    // with 400. System instruction is baked into the cache at build time; tools
-    // (codeExecution) cannot be combined with a cache built without them. When
-    // codeExecution is requested AND a cache is active, we can't use both — in that
-    // case we bypass the cache so the user's explicit codeExecution request wins.
-    const canUseCache = (cacheId: string | null): boolean => cacheId !== null && !codeExecution;
-    if (ctxPrep.cacheId && codeExecution) {
-      logger.warn(
-        'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
-      );
-    }
-    const tierField = serviceTierConfig(serviceTier);
-    const buildConfig = (cacheId: string | null): GenerateContentConfig => {
-      const maxOutputField = runCap.wire !== undefined ? { maxOutputTokens: runCap.wire } : {};
-      if (canUseCache(cacheId) && cacheId) {
-        // With cache: system_instruction is baked in; thinkingConfig remains OK.
-        // `maxOutputTokens` only emitted when the caller set it explicitly
-        // or `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` — otherwise omit
-        // and Gemini uses its model-default.
-        return {
-          cachedContent: cacheId,
-          thinkingConfig,
-          ...maxOutputField,
-          ...tierField,
-        };
-      }
-      // Without cache (or cache bypassed for codeExecution): pass full config.
-      return {
-        systemInstruction: SYSTEM_INSTRUCTION_CODE,
-        thinkingConfig,
-        ...tierField,
-        ...maxOutputField,
-        ...(codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
-      };
+/**
+ * Size the call: the output cap bounded by the model's input window (a cut is said on the progress channel and the
+ * log), the budget clamped under it, then the reservation — the thinking it counts from the cap that runs.
+ */
+function sizeCode(call: CodeCounted): StepOutcome<CodeSized> {
+  const { input, eager } = call;
+  const bounded = capThatRuns({
+    tool: 'code',
+    cap: call.outputCap,
+    promptTokens: call.count?.preflight.effectiveTokens,
+    inputTokenLimit: call.resolved.inputTokenLimit,
+    emit: (message) => eager.emitter.emit(message),
+  });
+  const thinkingBudget = codeThinkingBudget(input, bounded.cap);
+  const sized: CodeSized = { ...call, bounded, thinkingBudget };
+  const refusal = reserveCallBudget(eager, call.ctx, sized, {
+    promptChars: input.task.length,
+    extraInputTokens: 0,
+    thinkingTokens: thinkingReserve(input.thinkingLevel, thinkingBudget, bounded.cap),
+  });
+  if (refusal !== null) {
+    return {
+      end: errorResult(refusal, {
+        errorCode: 'BUDGET_REJECT',
+        retryable: false,
+        ...call.audit,
+      }),
     };
-    const buildContents = (
-      cacheId: string | null,
-      inline: typeof ctxPrep.inlineContents,
-    ): string | Content[] =>
-      canUseCache(cacheId)
-        ? userPrompt
-        : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
+  }
+  return { next: sized };
+}
 
-    // The decode and its one stale-cache retry — the shared path of `ask` and `code` (see ask.tool.ts).
-    const decoded = await decodeOnContext(
-      {
-        client: ctx.client,
-        booking: { workspaceRoot, toolName: 'code', model: resolved.resolved, serviceTier },
-        // `cachingRan`: a codeExecution call is forced inline and never builds a cache.
-        cachingMode: (prep) => cachingRan(prep, caching).mode,
-        request: (prep) => ({
-          contents: buildContents(prep.cacheId, prep.inlineContents),
-          config: buildConfig(prep.cacheId),
-        }),
-        cache: {
-          ttlWatcher: ctx.ttlWatcher,
-          manifest: ctx.manifest,
-          ttlSeconds: ctx.config.cacheTtlSeconds,
-          prepare,
-        },
-        openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
-        limits: { maxRequests: runCap.maxRequests, cap: runCap.effective },
-        timeout: timeoutController,
-        emit: (message) => emitter.emit(message),
-        completed,
-        tracking,
-        throttle: dispatch,
-        inputTokens: { estimated: estimatedInputTokens, counted: preflight?.effectiveTokens },
-      },
-      ctxPrep,
+/**
+ * The budget on the wire: the caller's `thinkingBudget`, else `code`'s default, clamped below the cap that runs —
+ * after the input window's cut, so under a cap cut to one request `thinkingBudget < maxOutputTokens` holds too. `0` on
+ * the `thinkingLevel` path (schema `.refine()` guarantees the two are never both set) and for a budget of `0`.
+ */
+function codeThinkingBudget(input: CodeInput, cap: OutputCap): number {
+  if (input.thinkingLevel !== undefined) return 0;
+  const budget = input.thinkingBudget ?? CODE_DEFAULT_THINKING_BUDGET;
+  return budget > 0 ? thinkingBudgetUnder(cap, budget) : 0;
+}
+
+/**
+ * Prepare the context — a cache only with files and without `codeExecution` (a cache cannot be combined with `tools`:
+ * the files go inline) —, decode, parse the artefacts, then book the answer once. The artefacts are parsed BEFORE the
+ * settlement: a failure there is booked at the completed requests and reports their usage. The stop at the output cap
+ * is returned before the truncated-scan warning.
+ */
+async function answerCode(call: CodeSized): Promise<TextToolResult> {
+  const { input, ctx, eager, scan } = call;
+  const context = await prepareCallContext(eager, ctx, {
+    scan,
+    resolved: call.resolved,
+    systemInstruction: SYSTEM_INSTRUCTION_CODE,
+    allowCaching: scan.files.length > 0 && !call.codeExecution,
+    requestedMode: input.cachingMode ?? ctx.config.cachingMode,
+  });
+  eager.emitter.emit(codeGeneratingLine(call));
+  const decoded = await decodeEagerCall(
+    eager,
+    ctx,
+    call,
+    codeRequest(call, context.prepared),
+    context,
+  );
+  const artifacts = codeArtifacts(decoded.response, call.expectEdits);
+  const settledDecode = settleDecoded(eager, ctx, decoded, call, context.caching);
+  const stop = settledDecode.settled.outputCapStop;
+  // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
+  if (stop !== null) return errorResult(`code: ${stop.message}`, { ...call.audit, ...stop.fields });
+  warnTruncatedScan(eager, ctx, scan);
+  return codeAnswerResult(call, decoded, settledDecode, artifacts);
+}
+
+/** The progress line that opens the decode. */
+function codeGeneratingLine(call: CodeSized): string {
+  const level = call.input.thinkingLevel;
+  const thinking =
+    level !== undefined ? `thinking-level=${level}` : `thinking=${call.thinkingBudget}`;
+  return call.codeExecution
+    ? `generating with ${thinking} + codeExecution…`
+    : `generating with ${thinking}…`;
+}
+
+/**
+ * The request builder of one call; what a cached context forbids is `RequestBuilder`'s rule
+ * (`./shared/eager-answer.ts`). `tools` (`codeExecution`) are among it, so with `codeExecution` an active cache is
+ * bypassed (said in the log) and the caller's explicit request wins. The user prompt asks for OLD/NEW blocks when
+ * edits are expected.
+ */
+function codeRequest(call: CodeSized, prepared: PreparedContext): RequestBuilder {
+  const { codeExecution } = call;
+  const userPrompt = call.expectEdits
+    ? `${call.input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
+    : call.input.task;
+  const canUseCache = (cacheId: string | null): boolean => cacheId !== null && !codeExecution;
+  if (prepared.cacheId && codeExecution) {
+    logger.warn(
+      'code({ codeExecution: true }) is incompatible with an active cache; bypassing cache for this call.',
     );
-    const { response, prep: activePrep, retriedOnStaleCache } = decoded;
+  }
+  const config = codeConfig(call, canUseCache);
+  return (prep) => ({
+    contents: canUseCache(prep.cacheId)
+      ? userPrompt
+      : [...prep.inlineContents, { role: 'user', parts: [{ text: userPrompt }] }],
+    config: config(prep.cacheId),
+  });
+}
 
-    const text = response.text;
-    const edits = expectEdits ? parseEdits(text) : [];
-    const codeBlocks = parseCodeBlocks(text);
-
-    // Extract code_execution tool artifacts. Thought summary now comes from
-    // `collectStream` (T20) — `response.thoughtsSummary` is already capped
-    // and matches the live progress emit. We still iterate candidates here
-    // for executableCode / codeExecutionResult parts (those aren't
-    // accumulated by collectStream — they're full per-chunk artefacts).
-    const executedCode: string[] = [];
-    const executionOutput: string[] = [];
-    const candidates = response.candidates ?? [];
-    for (const cand of candidates) {
-      const parts = cand.content?.parts ?? [];
-      for (const part of parts) {
-        if (part.executableCode?.code) executedCode.push(part.executableCode.code);
-        if (part.codeExecutionResult?.output) executionOutput.push(part.codeExecutionResult.output);
-      }
+/**
+ * The `config` of every request. With a cache, `cachedContent` and `thinkingConfig`; without one — or with the cache
+ * bypassed for `codeExecution` — the full config, `tools` with `codeExecution`. `maxOutputTokens` goes on the wire only when the cap has a wire value (the caller's
+ * `maxOutputTokens`, `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`, or a cap the input window cut); otherwise Gemini
+ * applies the model's default.
+ */
+function codeConfig(
+  call: CodeSized,
+  canUseCache: (cacheId: string | null) => boolean,
+): (cacheId: string | null) => GenerateContentConfig {
+  const thinkingConfig = codeThinkingConfig(call);
+  const tierField = serviceTierConfig(call.serviceTier);
+  const cap = call.bounded.cap;
+  return (cacheId) => {
+    const maxOutputField = cap.wire !== undefined ? { maxOutputTokens: cap.wire } : {};
+    if (canUseCache(cacheId) && cacheId) {
+      return { cachedContent: cacheId, thinkingConfig, ...maxOutputField, ...tierField };
     }
-    const thinkingSummary = response.thoughtsSummary;
+    return {
+      systemInstruction: SYSTEM_INSTRUCTION_CODE,
+      thinkingConfig,
+      ...tierField,
+      ...maxOutputField,
+      ...(call.codeExecution ? { tools: [{ codeExecution: {} }] } : {}),
+    };
+  };
+}
 
-    // Telemetry and the response record the mode that ran, not the one asked for
-    // (`cachingRan`: a codeExecution call is forced inline and never builds a cache).
-    const ran = cachingRan(activePrep, caching);
-    const effectiveCachingMode = ran.mode;
+/**
+ * The `thinkingConfig` of every request: the caller's `thinkingLevel` (`levelThinkingConfig`), else the budget.
+ * `includeThoughts: true` always, so the answer has a thought summary to report.
+ */
+function codeThinkingConfig(call: CodeSized): ThinkingConfig {
+  const level = call.input.thinkingLevel;
+  return level !== undefined
+    ? levelThinkingConfig(level)
+    : { thinkingBudget: call.thinkingBudget, includeThoughts: true };
+}
 
-    const durationMs = Date.now() - started;
-    // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
-    // API billed is every request that completed, over a long decode and a stale-cache retry alike.
-    const settledReservation = reservationId;
-    reservationId = null;
-    tracking.ledgerEntry = null;
-    const settled = settleAnswer({
-      manifest: ctx.manifest,
-      reservationId: settledReservation,
-      entry: {
-        workspaceRoot,
-        toolName: 'code',
-        model: resolved.resolved,
-        serviceTier,
-        cachingMode: effectiveCachingMode,
-      },
-      completed,
-      response,
-      cap: runCap,
-      cut: inputWindowCut,
-      durationMs,
-    });
-    const finish = settled.finish;
+/**
+ * The answer's artefacts: the OLD/NEW edits (when asked for), the code blocks, and the Code Execution tool's
+ * `executableCode` / `codeExecutionResult` parts, which the stream collector does not accumulate — they are whole
+ * per-chunk artefacts, read from the candidates.
+ */
+function codeArtifacts(response: DecodedResponse, expectEdits: boolean): CodeArtifacts {
+  const { text } = response;
+  const edits = expectEdits ? parseEdits(text) : [];
+  const codeBlocks = parseCodeBlocks(text);
+  return { edits, codeBlocks, ...executionParts(response) };
+}
 
-    // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
-    if (settled.outputCapStop !== null) {
-      return errorResult(`code: ${settled.outputCapStop.message}`, {
-        ...modelAudit,
-        ...settled.outputCapStop.fields,
-      });
+/** The Code Execution tool's parts of every candidate, in their order. */
+function executionParts(
+  response: DecodedResponse,
+): Pick<CodeArtifacts, 'executedCode' | 'executionOutput'> {
+  const executedCode: string[] = [];
+  const executionOutput: string[] = [];
+  for (const cand of response.candidates ?? []) {
+    for (const part of cand.content?.parts ?? []) {
+      if (part.executableCode?.code) executedCode.push(part.executableCode.code);
+      if (part.codeExecutionResult?.output) executionOutput.push(part.codeExecutionResult.output);
     }
+  }
+  return { executedCode, executionOutput };
+}
 
-    if (scan.truncated) {
-      logger.warn(
-        `workspace ${workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,
-      );
-    }
-
-    const structured: Record<string, unknown> = {
-      ...modelAudit,
-      requestedModel: resolved.requested,
-      modelCategory: resolved.category,
-      modelCostTier: resolved.capabilities.costTier,
-      contextWindow: resolved.inputTokenLimit,
-      // `thinkingBudget` echoes the clamped value actually sent on the
-      // wire; it's only meaningful on the budget path. On the
-      // `thinkingLevel` path nothing is sent for `thinkingBudget`, so we
-      // emit `null` (not `0`) — `0` is the wire sentinel for "thinking
-      // disabled" and reporting it here for a level-path call would lie
-      // to downstream audit / dashboard consumers (PR #17 self-review F1,
-      // 3-reviewer consensus: GPT + Copilot + Self). Matches `ask.tool.ts`.
-      thinkingBudget: usingThinkingLevel ? null : effectiveThinkingBudget,
-      thinkingLevel: input.thinkingLevel ?? null,
-      codeExecutionUsed: codeExecution,
-      cacheHit: activePrep.reused,
-      cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
-      retriedOnStaleCache,
-      ...settled.usage,
-      ...settled.cutFields,
-      // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
-      finishReason: finish.finishReason,
-      truncated: finish.truncated,
-      durationMs,
-      edits: edits.map((e) => ({
-        file: e.file,
-        oldPreview: e.old.slice(0, 120),
-        newPreview: e.new.slice(0, 120),
-      })),
-      editCount: edits.length,
-      codeBlocks: codeBlocks.map((b) => ({ lang: b.lang, length: b.content.length })),
-      workspaceTruncated: scan.truncated,
-      maxFilesCap: ctx.config.maxFilesPerWorkspace,
-      filesIndexed: scan.files.length,
-      excludedDirs: scan.excludedDirs,
-      excludedDirsTotal: scan.excludedDirsTotal,
-      filesSkippedNonSource: scan.skippedNonSource,
-      filesUploadFailed: activePrep.uploaded.failedCount,
-      ...(activePrep.uploaded.failedCount > 0
-        ? { uploadFailures: activePrep.uploaded.failures.slice(0, 5) }
-        : {}),
-      inlineOnly: activePrep.inlineOnly,
-      cachingMode: effectiveCachingMode,
-      ...(ran.note !== null ? { cachingModeNote: ran.note } : {}),
-      // Preflight token-count provenance — surfaces on every successful
-      // call. See ask.tool.ts for the contract; same fields apply here.
-      ...(preflight !== undefined
-        ? {
-            tokenCountMethod: preflight.method,
-            rawTokenCount: preflight.rawTokens,
-            tokenCountCacheHit: preflight.cacheHit,
-          }
-        : {}),
+/** The answer: its text, led by the truncation note when it was cut, and what the call ran on and produced. */
+function codeAnswerResult(
+  call: CodeSized,
+  decoded: ContextDecode,
+  settledDecode: SettledDecode,
+  artifacts: CodeArtifacts,
+): TextToolResult {
+  const { response } = decoded;
+  const { finish } = settledDecode.settled;
+  const { executedCode, executionOutput } = artifacts;
+  // the thought summary as the stream collector capped it, the same the progress channel showed
+  const thinkingSummary = response.thoughtsSummary;
+  return textResult(
+    finish.truncated ? `${truncatedNote(call.expectEdits)}\n\n${response.text}` : response.text,
+    {
+      ...codeModelFields(call),
+      ...codeDecodeFields(decoded, settledDecode),
+      ...artifactFields(artifacts),
+      ...codeWorkspaceFields(call, decoded.prep, settledDecode.ran),
+      ...preflightFields(call.count),
       ...(thinkingSummary ? { thinkingSummary } : {}),
       ...(executedCode.length > 0 ? { executedCode } : {}),
       ...(executionOutput.length > 0 ? { executionOutput } : {}),
-    };
+    },
+  );
+}
 
-    return textResult(
-      finish.truncated ? `${truncatedNote(expectEdits)}\n\n${text}` : text,
-      structured,
-    );
-  } catch (err) {
-    logger.error(`code failed: ${safeForLog(err)}`);
-    // A 429's retry hint seeds the throttle; the ledger keeps what the completed requests billed and releases the rest
-    // (all of it when none completed).
-    const failedUsage = settleFailure({
-      manifest: ctx.manifest,
-      failed: {
-        toolName: 'code',
-        reservationId,
-        entry: tracking.ledgerEntry,
-        completed,
-        durationMs: Date.now() - started,
-      },
-      err,
-      model: resolvedModelKey,
-      throttle: ctx.throttle,
-      dispatch,
+/**
+ * The audit, the model and the thinking the call ran with. `thinkingBudget` is the clamped value sent on the wire;
+ * on the `thinkingLevel` path nothing is sent, so it is `null`, never `0` — the wire's "thinking disabled" — as
+ * `ask` reports it.
+ */
+function codeModelFields(call: CodeSized): Record<string, unknown> {
+  const { resolved, input } = call;
+  return {
+    ...call.audit,
+    requestedModel: resolved.requested,
+    modelCategory: resolved.category,
+    modelCostTier: resolved.capabilities.costTier,
+    contextWindow: resolved.inputTokenLimit,
+    thinkingBudget: input.thinkingLevel !== undefined ? null : call.thinkingBudget,
+    thinkingLevel: input.thinkingLevel ?? null,
+    codeExecutionUsed: call.codeExecution,
+  };
+}
+
+/** The context the decode ran on, what it billed and how it ended. */
+function codeDecodeFields(
+  decoded: ContextDecode,
+  settledDecode: SettledDecode,
+): Record<string, unknown> {
+  const { prep, retriedOnStaleCache } = decoded;
+  const { settled, durationMs } = settledDecode;
+  return {
+    cacheHit: prep.reused,
+    cacheRebuilt: prep.rebuilt || retriedOnStaleCache,
+    retriedOnStaleCache,
+    ...settled.usage,
+    ...settled.cutFields,
+    // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
+    finishReason: settled.finish.finishReason,
+    truncated: settled.finish.truncated,
+    durationMs,
+  };
+}
+
+/** The edits as previews, the code blocks as their lengths. */
+function artifactFields(artifacts: CodeArtifacts): Record<string, unknown> {
+  const { edits, codeBlocks } = artifacts;
+  return {
+    edits: edits.map((e) => ({
+      file: e.file,
+      oldPreview: e.old.slice(0, 120),
+      newPreview: e.new.slice(0, 120),
+    })),
+    editCount: edits.length,
+    codeBlocks: codeBlocks.map((b) => ({ lang: b.lang, length: b.content.length })),
+  };
+}
+
+/** What the scan indexed and dropped, what the upload could not send, and the caching mode that ran. */
+function codeWorkspaceFields(
+  call: CodeSized,
+  prep: PreparedContext,
+  ran: RanCaching,
+): Record<string, unknown> {
+  const { scan } = call;
+  return {
+    workspaceTruncated: scan.truncated,
+    maxFilesCap: call.ctx.config.maxFilesPerWorkspace,
+    filesIndexed: scan.files.length,
+    ...scanFields(scan, prep),
+    inlineOnly: prep.inlineOnly,
+    cachingMode: ran.mode,
+    ...(ran.note !== null ? { cachingModeNote: ran.note } : {}),
+  };
+}
+
+/**
+ * `code`'s result of a failed call: its model audit once the model resolved, none before — a timeout then carries no
+ * tier, any other failure the requested one.
+ */
+function codeFailedResult(failure: FailedEagerCall<CodeModelReached>): TextToolResult {
+  if (failure.kind === 'timeout') {
+    return errorResult(failure.timedOut.message, {
+      errorCode: 'TIMEOUT',
+      timeoutKind: failure.timedOut.kind,
+      timeoutMs: failure.timeoutMs,
+      stallMs: failure.stallMs,
+      retryable: true,
+      ...failure.model,
+      ...failure.usage,
     });
-    reservationId = null;
-    // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
-    if (isTimeoutAbort(err)) {
-      const timedOut = timedOutCall('code', err, timeoutController);
-      emitter.emit(`code: aborted after ${timedOut.limitMs ?? '?'}ms ${timedOut.kind}`);
-      return errorResult(timedOut.message, {
-        errorCode: 'TIMEOUT',
-        timeoutKind: timedOut.kind,
-        timeoutMs: timeoutController.timeoutMs,
-        stallMs: timeoutController.stallMs,
-        retryable: true,
-        ...modelAudit,
-        ...failedUsage,
-      });
-    }
-    const httpStatus = statusOf(err);
-    return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err, tracking.streamOpened),
-      ...(httpStatus !== undefined ? { httpStatus } : {}),
-      serviceTier: input.serviceTier ?? ctx.config.serviceTier, // before the model is resolved: the requested tier
-      ...modelAudit,
-      ...failedUsage,
-    });
-  } finally {
-    timeoutController.dispose();
-    emitter.stop();
   }
+  return errorResult(failure.message, {
+    ...failure.tierMeta,
+    ...(failure.httpStatus !== undefined ? { httpStatus: failure.httpStatus } : {}),
+    serviceTier: failure.requestedTier, // the audit's tier replaces it once the model resolved
+    ...failure.model,
+    ...failure.usage,
+  });
 }

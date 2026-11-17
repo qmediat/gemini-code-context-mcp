@@ -11,6 +11,7 @@ import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
 import {
+  type CodeInput,
   TRUNCATED_ANSWER_NOTE,
   TRUNCATED_EDITS_NOTE,
   codeInputSchema,
@@ -486,6 +487,25 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
         from: 262_144,
         to: 32_768,
       });
+    });
+
+    it('under a cap the input window cut, a HIGH level reserves the thinking the cut cap leaves', async () => {
+      // a HIGH level reserves the cap's headroom: under the cut cap it equals a budget at that headroom
+      const reserved = async (thinking: Partial<CodeInput>): Promise<unknown> => {
+        mocks.resolveModel.mockResolvedValueOnce({ ...GEMINI_4_ARGON, inputTokenLimit: 200_000 });
+        const { ctx } = buildCtx();
+        (ctx.config as { dailyBudgetUsd: number }).dailyBudgetUsd = 10;
+        (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+          .fn()
+          .mockResolvedValue({ totalTokens: 170_000 });
+        await codeTool.execute({ task: 'refactor', maxOutputTokens: 262_144, ...thinking }, ctx);
+        const reserveBudget = ctx.manifest.reserveBudget as unknown as ReturnType<typeof vi.fn>;
+        return (reserveBudget.mock.calls[0]?.[0] as { estimatedCostMicros: number })
+          .estimatedCostMicros;
+      };
+      expect(await reserved({ thinkingLevel: 'HIGH' })).toBe(
+        await reserved({ thinkingBudget: 32_768 - 1_024 }),
+      );
     });
 
     it('a stop at the cap with no answer is OUTPUT_CAP with the fields ask returns for it', async () => {

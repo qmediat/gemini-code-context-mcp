@@ -343,13 +343,100 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T47. Split `src/tools/ask.tool.ts` into modules
+## ~~T47.~~ ✅ SHIPPED 2026-11-17 — Split `src/tools/ask.tool.ts` into modules
+
+**Shipped as:** the tool file is the entry (the registration and the call: opened, its stage steps run in order, the failure result, closed; 3.7 KB, 87 lines); the model step, the attachments, the scan, the guard and the `ask_agentic` fallback (handed back pending, returned unawaited), the sizing, the thinking, the request, the answer and the results are modules under `src/tools/ask/` (`docs/architecture.md`); what `ask` and `code` repeated is one piece in `src/tools/shared/` read by both (`eager-call.ts`, `eager-steps.ts`, `eager-answer.ts`, `serviceTierOrRefusal` in `service-tier.ts`), and `code`'s `executeCodeBody` is an orchestrator over those pieces and its own steps in `src/tools/code.tool.ts`. No behaviour change (no CHANGELOG entry; the defect the reading found below the split, a cache create that returns no name, is T51): the existing tests' assertions unchanged, and a differential probe of 247 scenarios (`docs/DESIGN-ask-tool-modules.md`, "Proof plan") traces every result, message, field order, ledger and throttle call identically on `main` and on the branch. Both tool files left `eslint-suppressions.json` and `jscpd-baseline.json` (the repeats 2,599 → 2,215 lines, the suppressions 89 in 31 files → 80 in 28, `reindex`'s `execute` with them); every unit of the entry, `ask/` and the shared pieces is within the structure limits. The scope below is the entry as written.
+
 
 **Source:** the review of PR #135 (2026-11-17). Opened 2026-11-17.
 
 **Why:** the file is 55 KB, one tool in one module. Beside the change set of PR #135 it did not fit the review packet of one of the automated reviewers (Grok), so that PR was reviewed with that packet's cap raised inside the model's window. PR #135 also touched the file (the `ask_agentic` fallback moved out to `src/tools/ask-agentic-fallback.ts`), so by Rule 2 of `docs/SYSTEMIC.md` the rest of its baseline entries (`complexity` 1, `max-depth` 2, `max-lines-per-function` 1, and its 214 duplicated lines, most of them shared with `src/tools/code.tool.ts`) leave in the next PR.
 
 **Scope:** split it by concern, as T39 did for `ask_agentic` (the input schema and the registration as the entry; the preflight and the workspace guard, the cache and context preparation, the request and its long decode, the settlement, the results as modules), and move what `ask` and `code` repeat into `src/tools/shared/`; no behaviour change, the existing tests green unchanged, a differential probe of the tool's results on `main` against the branch. The immediate next PR after #135.
+
+---
+
+## T48. Three fields in which the results of `ask` and `code` differ
+
+**Source:** the design note of T47 (`docs/DESIGN-ask-tool-modules.md`, decision Q7). Opened 2026-11-17.
+
+**Why:** the split of T47 moves what the two tools repeat into `src/tools/shared/` but builds every result in its own
+tool, so each keeps its fields. Three differences stay:
+
+1. `code`'s answer reports no `filesSkippedTooLarge` (`ask` does: `src/tools/ask.tool.ts:934`; `code`'s scan fields,
+   `src/tools/code.tool.ts:795-804`, have no such key).
+2. `code`'s answer reports no model `fallbackApplied` (`ask`: `src/tools/ask.tool.ts:916`; `code`'s answer,
+   `src/tools/code.tool.ts:763-820`, has none).
+3. `code`'s `TIMEOUT` before the model resolved carries no `serviceTier` (`src/tools/code.tool.ts:849-857` spreads the
+   model audit, empty until `:397`); `ask`'s carries the requested tier (`src/tools/ask.tool.ts:997`, `reportedTier()`).
+
+**Scope:** aligning any of them is a change of a result that callers read — the maintainers' decision, with its own
+CHANGELOG entry; not a refactor. After T47 (line numbers above are of `main` before T47).
+
+---
+
+## T49. Move `code`'s schema, parsers and steps into `src/tools/code/`
+
+**Source:** the design note of T47 (`docs/DESIGN-ask-tool-modules.md`, decision Q4). Opened 2026-11-17.
+
+**Why:** after T47 `src/tools/code.tool.ts` is 812 lines: its steps, typed stages and result groups stand apart
+inside the file, but one file still holds the input schema, the two parsers, the model choice, the four steps, the
+request and the results — past the 600 lines at which Q4 said they move.
+
+**Scope:** layout only, as T39 and T47 did for `ask_agentic` and `ask`: the entry keeps the registration and
+`executeCodeBody`; the schema (`code/input.ts`), the parsers, the steps and the results become modules under
+`src/tools/code/`, the entry re-exporting what the tests and `src/tools/index.ts` import from it today. No behaviour
+change: the existing tests green unchanged and the differential probe of T47 identical on `main` and the branch.
+
+---
+
+## T50. A load-sensitive time bound in `test/unit/agentic-time-bounds.test.ts`
+
+**Source:** the cross-model reading of T47's branch, 2026-11-17. Opened 2026-11-17.
+
+**Why:** "each request of the forced pass, its backoff included, gets the whole finalization default" failed twice
+when three suites ran in parallel on one machine, and passes alone. It gives the forced pass a default of 1,500 ms
+real time; under load the scripted requests and their backoff take longer than that, so the test measures the
+machine, not the rule.
+
+**Scope:** drive the pass clock with a fake clock (vitest's fake timers on the clock the test replaces), or widen the
+default the test sets to a margin no loaded runner reaches; then run the file under load (three suites at once) ten
+times without a failure.
+
+---
+
+## T51. A cache create that returns no name is a failed create
+
+**Source:** the cross-model reading of T47's branch, 2026-11-17 (the request `code` builds). Opened 2026-11-17.
+
+**Why:** `doPrepareContext` (`src/cache/cache-manager.ts`) keeps whatever name `caches.create` returned. An empty
+name is stored as the cache id: `code` then sends the bare prompt with the inline config and no workspace files
+(its contents test `cacheId !== null`, its config tests a truthy id). A create that returns no name at all gives a
+context with no cache id and no inline files, on `ask` and `code` alike. Google has not been seen to return either;
+nothing checks.
+
+**Scope:** a create without a usable name takes the failed-create path that exists (the warning, the manifest
+without a cache id, the files inline); a test red on the code before; a `### Fixed` line in the CHANGELOG. The fix
+changes `doPrepareContext`, 181 lines and in `eslint-suppressions.json`: by Rule 2 of `docs/SYSTEMIC.md` it leaves
+the baseline in the same PR — split by concern, with a differential probe of `prepareContext`'s results and
+manifest writes on `main` and the branch. The immediate next PR after T47.
+
+---
+
+## T52. One mock of `indexer/workspace-validation` for the test suites
+
+**Source:** the review of PR #137 (2026-11-17). Opened 2026-11-17.
+
+**Why:** eight unit suites mock `src/indexer/workspace-validation.js` with a factory of their own. Six of the
+factories export the `WorkspaceValidationError` class the workspace refusal tests with `instanceof`
+(`src/tools/shared/workspace-refusal.ts`); two — `test/unit/ask-attachments.test.ts` and
+`test/unit/service-tier.test.ts` — export only `validateWorkspacePath`, so the first test there that makes the
+validation throw stops at the missing export instead of reaching the refusal. No test does so today. The factories
+are also a repeat the duplicate baseline holds: adding the class to the two would grow it.
+
+**Scope:** one factory in the test helpers (where the repository's test-helper exemplar keeps them), read by the
+eight suites through `vi.mock(path, factory)`; the repeated blocks leave `jscpd-baseline.json`. No production
+change.
 
 ---
 

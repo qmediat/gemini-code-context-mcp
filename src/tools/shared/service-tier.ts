@@ -39,6 +39,23 @@ export function resolveServiceTier(
   return 'standard';
 }
 
+/**
+ * The tier of an `ask` / `code` call from the per-call value and the operator's configuration, or its refusal as a
+ * value: each tool reports a `ServiceTierError` with its own fields. Any other error is thrown, to the call's failure
+ * path.
+ */
+export function serviceTierOrRefusal(
+  perCall: ServiceTierName | undefined,
+  config: { readonly serviceTier: ServiceTierName; readonly vertex: boolean },
+): ServiceTierName | ServiceTierError {
+  try {
+    return resolveServiceTier(perCall, config.serviceTier, config.vertex);
+  } catch (err) {
+    if (err instanceof ServiceTierError) return err;
+    throw err;
+  }
+}
+
 /** What goes into `GenerateContentConfig`: nothing on standard, the enum on flex. */
 export function serviceTierConfig(
   tier: ServiceTierName,
