@@ -343,6 +343,16 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
+## T47. Split `src/tools/ask.tool.ts` into modules
+
+**Source:** the review of PR #135 (2026-11-17). Opened 2026-11-17.
+
+**Why:** the file is 55 KB, one tool in one module. Beside the change set of PR #135 it did not fit the review packet of one of the automated reviewers (Grok), so that PR was reviewed with that packet's cap raised inside the model's window. PR #135 also touched the file (the `ask_agentic` fallback moved out to `src/tools/ask-agentic-fallback.ts`), so by Rule 2 of `docs/SYSTEMIC.md` the rest of its baseline entries (`complexity` 1, `max-depth` 2, `max-lines-per-function` 1, and its 214 duplicated lines, most of them shared with `src/tools/code.tool.ts`) leave in the next PR.
+
+**Scope:** split it by concern, as T39 did for `ask_agentic` (the input schema and the registration as the entry; the preflight and the workspace guard, the cache and context preparation, the request and its long decode, the settlement, the results as modules), and move what `ask` and `code` repeat into `src/tools/shared/`; no behaviour change, the existing tests green unchanged, a differential probe of the tool's results on `main` against the branch. The immediate next PR after #135.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.
