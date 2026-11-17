@@ -107,17 +107,6 @@
       "count": 2
     }
   },
-  "src/tools/code.tool.ts": {
-    "complexity": {
-      "count": 1
-    },
-    "max-depth": {
-      "count": 2
-    },
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
   "src/tools/reindex.tool.ts": {
     "max-lines-per-function": {
       "count": 1
