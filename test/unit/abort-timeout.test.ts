@@ -5,9 +5,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  type TimedTool,
   createTimeoutController,
   getTimeoutKind,
   isTimeoutAbort,
+  timedOutCall,
+  timeoutReason,
+  toolTimeoutController,
 } from '../../src/tools/shared/abort-timeout.js';
 
 /** Test-side helper that lets the v1.6.0–v1.11.0 test fixtures keep their
@@ -17,7 +21,11 @@ import {
  * directly. */
 function totalOnlyController(perCallMs: number | undefined, envVar: string) {
   return perCallMs !== undefined
-    ? createTimeoutController({ totalMs: perCallMs, totalEnvVar: envVar, stallEnvVar: '' })
+    ? createTimeoutController({
+        totalMs: perCallMs,
+        totalEnvVar: envVar,
+        stallEnvVar: '',
+      })
     : createTimeoutController({ totalEnvVar: envVar, stallEnvVar: '' });
 }
 
@@ -510,3 +518,83 @@ describe('getTimeoutKind', () => {
     expect(getTimeoutKind(outer)).toBe('stall');
   });
 });
+
+// The variable names are literals on purpose: reading them from `TOOL_TIMEOUT_ENV` would let a misspelling there pass.
+const TOOL_ENV_VARS: ReadonlyArray<{
+  tool: TimedTool;
+  other: TimedTool;
+  total: string;
+  stall: string;
+  otherTotal: string;
+  otherStall: string;
+}> = [
+  {
+    tool: 'ask',
+    other: 'code',
+    total: 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+    stall: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
+    otherTotal: 'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
+    otherStall: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
+  },
+  {
+    tool: 'code',
+    other: 'ask',
+    total: 'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
+    stall: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
+    otherTotal: 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+    otherStall: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
+  },
+];
+
+describe.each(TOOL_ENV_VARS)(
+  'toolTimeoutController / timedOutCall — $tool env vars',
+  ({ tool, total, stall, otherTotal, otherStall }) => {
+    it('reads its own two env vars when no per-call knob is set', () => {
+      vi.stubEnv(total, '40000');
+      vi.stubEnv(stall, '7000');
+      const c = toolTimeoutController(tool, {});
+      expect(c.timeoutMs).toBe(40_000);
+      expect(c.stallMs).toBe(7000);
+      c.dispose();
+    });
+
+    it("ignores the other tool's env vars", () => {
+      vi.stubEnv(otherTotal, '40000');
+      vi.stubEnv(otherStall, '7000');
+      const c = toolTimeoutController(tool, {});
+      expect(c.timeoutMs).toBeNull();
+      expect(c.stallMs).toBeNull();
+      c.dispose();
+    });
+
+    it('lets a per-call knob win over the env var', () => {
+      vi.stubEnv(total, '40000');
+      vi.stubEnv(stall, '7000');
+      const c = toolTimeoutController(tool, {
+        timeoutMs: 20_000,
+        stallMs: 3000,
+      });
+      expect(c.timeoutMs).toBe(20_000);
+      expect(c.stallMs).toBe(3000);
+      c.dispose();
+    });
+
+    it('names its total-timeout variable in the timeout message', () => {
+      const c = toolTimeoutController(tool, { timeoutMs: 5000 });
+      const call = timedOutCall(tool, timeoutReason(5000, 'total'), c);
+      c.dispose();
+      expect(call.kind).toBe('total');
+      expect(call.message).toContain(`\`${total}\``);
+      expect(call.message).not.toContain(otherTotal);
+    });
+
+    it('names its stall variable in the stall message', () => {
+      const c = toolTimeoutController(tool, { stallMs: 2000 });
+      const call = timedOutCall(tool, timeoutReason(2000, 'stall'), c);
+      c.dispose();
+      expect(call.kind).toBe('stall');
+      expect(call.message).toContain(`\`${stall}\``);
+      expect(call.message).not.toContain(otherStall);
+    });
+  },
+);

@@ -114,16 +114,19 @@ export interface PassClock {
   dispose(): void;
 }
 
-/** The default of a phase no knob bounds; `null` while `iterationTimeoutMs` bounds the pass. */
+/** The default of phase `phase` when no knob bounds it; `null` while `iterationTimeoutMs` bounds the pass. */
 const unlessDeadline =
-  (phase: DefaultedPhase, defaultMs: (d: PhaseDefaults) => number, idle = false) =>
-  (knobs: AgenticKnobs, d: PhaseDefaults): Bound | null =>
+  <P extends DefaultedPhase>(phase: P, defaultMs: (d: PhaseDefaults) => number, idle = false) =>
+  (knobs: AgenticKnobs, d: PhaseDefaults): (DefaultBound & { readonly phase: P }) | null =>
     knobs.iterationMs === null
       ? { kind: 'total', source: 'default', phase, limitMs: defaultMs(d), idle }
       : null;
 
 /** A stream gap: `stallMs`, else the default when no knob bounds the stream. Each chunk re-arms it (`recordChunk`). */
-function streamGapBound(knobs: AgenticKnobs, d: PhaseDefaults): Bound | null {
+function streamGapBound(
+  knobs: AgenticKnobs,
+  d: PhaseDefaults,
+): KnobBound | (DefaultBound & { readonly phase: 'stream' }) | null {
   if (knobs.stallMs !== null) {
     return { kind: 'stall', source: 'stallMs', limitMs: knobs.stallMs, idle: false };
   }
@@ -131,10 +134,16 @@ function streamGapBound(knobs: AgenticKnobs, d: PhaseDefaults): Bound | null {
   return { kind: 'stall', source: 'default', phase: 'stream', limitMs: d.streamGapMs, idle: false };
 }
 
-/** The bound of each phase's own timer. The TPM wait has none: the throttle's delay is finite and known at its start. */
-const PHASE_BOUND: Readonly<
-  Record<PassPhase, (knobs: AgenticKnobs, d: PhaseDefaults) => Bound | null>
-> = {
+/** The bound of each phase's own timer; the entry under key `P` can only return a knob's bound, a default armed for `P`
+ * itself, or `null`. The TPM wait has none: the throttle's delay is finite and known at its start. */
+type PhaseBounds = {
+  readonly [P in PassPhase]: (
+    knobs: AgenticKnobs,
+    d: PhaseDefaults,
+  ) => P extends DefaultedPhase ? KnobBound | (DefaultBound & { readonly phase: P }) | null : null;
+};
+
+const PHASE_BOUND: PhaseBounds = {
   'tpm-wait': () => null,
   opening: unlessDeadline('opening', (d) => d.openingMs),
   stream: streamGapBound,
@@ -142,7 +151,8 @@ const PHASE_BOUND: Readonly<
   finalization: unlessDeadline('finalization', (d) => d.finalizationMs),
 };
 
-/** What a fired bound reports: a default the phase it was armed for, a knob the phase the pass is in. */
+/** What a fired bound reports: a default its own phase — the one it was armed for, which is the pass's phase, since
+ * leaving the phase clears it —, a knob the phase the pass is in. */
 function timeoutOf(bound: Bound, current: PassPhase): ClockTimeout {
   const { kind, limitMs } = bound;
   if (bound.source === 'default') return { phase: bound.phase, kind, source: 'default', limitMs };
