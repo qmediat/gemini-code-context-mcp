@@ -345,7 +345,7 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ## ~~T47.~~ ✅ SHIPPED 2026-11-17 — Split `src/tools/ask.tool.ts` into modules
 
-**Shipped as:** the tool file is the entry (the registration and the call: opened, its stage steps run in order, the failure result, closed; 4 KB, 97 lines); the model step, the attachments, the scan, the guard and the `ask_agentic` fallback (handed back pending, returned unawaited), the sizing, the thinking, the request, the answer and the results are modules under `src/tools/ask/` (`docs/architecture.md`); what `ask` and `code` repeated is one piece in `src/tools/shared/` read by both (`eager-call.ts`, `eager-steps.ts`, `eager-answer.ts`, `serviceTierOrRefusal` in `service-tier.ts`), and `code`'s `executeCodeBody` is an orchestrator over those pieces and its own steps in `src/tools/code.tool.ts`. No behaviour change: the existing tests green unchanged, and a differential probe of 194 scenarios (`docs/DESIGN-ask-tool-modules.md`, "Proof plan") traces every result, message, field order, ledger and throttle call identically on `main` and on every commit. Both tool files left `eslint-suppressions.json` and `jscpd-baseline.json` (the repeats 2,599 → 2,215 lines, the suppressions 89 → 81); every unit of the entry, `ask/` and the shared pieces is within the structure limits. The scope below is the entry as written.
+**Shipped as:** the tool file is the entry (the registration and the call: opened, its stage steps run in order, the failure result, closed; 4 KB, 97 lines); the model step, the attachments, the scan, the guard and the `ask_agentic` fallback (handed back pending, returned unawaited), the sizing, the thinking, the request, the answer and the results are modules under `src/tools/ask/` (`docs/architecture.md`); what `ask` and `code` repeated is one piece in `src/tools/shared/` read by both (`eager-call.ts`, `eager-steps.ts`, `eager-answer.ts`, `serviceTierOrRefusal` in `service-tier.ts`), and `code`'s `executeCodeBody` is an orchestrator over those pieces and its own steps in `src/tools/code.tool.ts`. No behaviour change but one fix, a cache created without a name (CHANGELOG): the existing tests green unchanged, and a differential probe of 247 scenarios (`docs/DESIGN-ask-tool-modules.md`, "Proof plan") traces every result, message, field order, ledger and throttle call identically on `main` and on the branch. Both tool files left `eslint-suppressions.json` and `jscpd-baseline.json` (the repeats 2,599 → 2,215 lines, the suppressions 89 → 80, `reindex`'s `execute` with them); every unit of the entry, `ask/` and the shared pieces is within the structure limits. The scope below is the entry as written.
 
 
 **Source:** the review of PR #135 (2026-11-17). Opened 2026-11-17.
@@ -372,6 +372,36 @@ tool, so each keeps its fields. Three differences stay:
 
 **Scope:** aligning any of them is a change of a result that callers read — the maintainers' decision, with its own
 CHANGELOG entry; not a refactor. After T47 (line numbers above are of `main` before T47).
+
+---
+
+## T49. Move `code`'s schema, parsers and steps into `src/tools/code/`
+
+**Source:** the design note of T47 (`docs/DESIGN-ask-tool-modules.md`, decision Q4). Opened 2026-11-17.
+
+**Why:** after T47 `src/tools/code.tool.ts` is 814 lines: its steps, typed stages and result groups stand apart
+inside the file, but one file still holds the input schema, the two parsers, the model choice, the four steps, the
+request and the results — past the 600 lines at which Q4 said they move.
+
+**Scope:** layout only, as T39 and T47 did for `ask_agentic` and `ask`: the entry keeps the registration and
+`executeCodeBody`; the schema (`code/input.ts`), the parsers, the steps and the results become modules under
+`src/tools/code/`, the entry re-exporting what the tests and `src/tools/index.ts` import from it today. No behaviour
+change: the existing tests green unchanged and the differential probe of T47 identical on `main` and the branch.
+
+---
+
+## T50. A load-sensitive time bound in `test/unit/agentic-time-bounds.test.ts`
+
+**Source:** the cross-model reading of T47's branch, 2026-11-17. Opened 2026-11-17.
+
+**Why:** "each request of the forced pass, its backoff included, gets the whole finalization default" failed twice
+when three suites ran in parallel on one machine, and passes alone. It gives the forced pass a default of 1,500 ms
+real time; under load the scripted requests and their backoff take longer than that, so the test measures the
+machine, not the rule.
+
+**Scope:** drive the pass clock with a fake clock (vitest's fake timers on the clock the test replaces), or widen the
+default the test sets to a margin no loaded runner reaches; then run the file under load (three suites at once) ten
+times without a failure.
 
 ---
 
