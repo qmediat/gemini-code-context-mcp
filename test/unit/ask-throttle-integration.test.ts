@@ -22,6 +22,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
 
 // Hoisted mock state — must be declared before `vi.mock` calls so the mock
@@ -461,5 +462,14 @@ describe('ask.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     await askTool.execute({ prompt: 'q', maxOutputTokens: 999_999 }, ctx);
     const config = lastGenerateContentCall(generateContent);
     expect(config.maxOutputTokens).toBe(65_536);
+  });
+
+  it('a Gemini 4 model takes a cap above its per-request limit unclamped, automatic continuation off', async () => {
+    mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_HYDROGEN);
+    const { ctx, generateContent } = buildCtx();
+    await askTool.execute({ prompt: 'q', maxOutputTokens: 262_144 }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(262_144);
+    expect(config.automaticContinuation).toBe(false);
   });
 });

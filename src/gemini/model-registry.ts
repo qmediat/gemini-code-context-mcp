@@ -7,6 +7,7 @@
 
 import type { GoogleGenAI, Model } from '@google/genai';
 import { logger } from '../utils/logger.js';
+import { longDecodeTokenLimitOf } from './long-decode.js';
 import {
   type CapabilityFlags,
   type ModelCategory,
@@ -105,6 +106,8 @@ export interface ModelInfo {
   displayName: string;
   inputTokenLimit: number | null;
   outputTokenLimit: number | null;
+  /** The total a decode may reach through continuation requests (Gemini 4: 1 048 576); `null` without long decode. */
+  longDecodeTokenLimit: number | null;
   supportsThinking: boolean;
   /** Inferred from input limit ≥ 100k — a heuristic for context-cache eligibility. */
   supportsLongContext: boolean;
@@ -133,6 +136,7 @@ function toModelInfo(model: Model): ModelInfo | null {
     displayName: model.displayName ?? id,
     inputTokenLimit: inputLimit,
     outputTokenLimit: outputLimit,
+    longDecodeTokenLimit: longDecodeTokenLimitOf(id),
     supportsThinking: model.thinking === true,
     supportsLongContext: inputLimit !== null && inputLimit >= 100_000,
     supportsCaching: model.supportedActions?.includes('createCachedContent') ?? true,

@@ -19,6 +19,8 @@ export interface ResolvedModel {
   inputTokenLimit: number | null;
   /** Output token limit advertised by the model. */
   outputTokenLimit: number | null;
+  /** The total a decode may reach through continuation requests; `null` for a model without long decode. */
+  longDecodeTokenLimit: number | null;
   /**
    * Functional taxonomy classification of the resolved model. Tools bind
    * to a required category via `resolveModel(..., { requiredCategory })`

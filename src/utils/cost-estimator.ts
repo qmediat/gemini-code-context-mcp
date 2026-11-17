@@ -9,6 +9,7 @@
  * `GEMINI_PRICING_OVERRIDES` (JSON, keyed by model id) replaces a row at run time.
  */
 
+import { continuationInputTokens } from '../gemini/long-decode.js';
 import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
 import { categorizeModel, costTierOf, isTextGenCategory } from '../gemini/model-taxonomy.js';
 import { parsePricingOverrides } from './pricing-overrides.js';
@@ -356,6 +357,12 @@ export interface PreCallEstimateInputs {
   extraInputTokens?: number | undefined;
   /** Upper bound on output tokens (tool-specific default). */
   expectedOutputTokens: number;
+  /**
+   * The model's per-request output limit, for a call whose cap (`expectedOutputTokens`) is above it on a model with
+   * long decode: the continuation requests bill the prompt again plus what was decoded before them
+   * (`continuationInputTokens`), and the estimate adds that input.
+   */
+  perRequestOutputTokens?: number | undefined;
   /** Thinking budget, passed through as extra output tokens. */
   thinkingTokens?: number;
   /** The call's timeout in ms (`null`: none): the reservation covers the rates of that window. */
@@ -376,12 +383,18 @@ export interface PreCallEstimateInputs {
 export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   const workspaceTokens = Math.ceil(Math.max(0, input.workspaceBytes) / 4);
   const promptTokens = Math.ceil(Math.max(0, input.promptChars) / 4);
+  const requestInput = workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0);
+  const outputCap = Math.max(0, input.expectedOutputTokens);
+  const continuationInput =
+    input.perRequestOutputTokens === undefined
+      ? 0
+      : continuationInputTokens(requestInput, outputCap, input.perRequestOutputTokens);
   const call: CostInputs = {
     model: input.model,
     serviceTier: input.serviceTier,
-    uncachedInputTokens: workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0),
+    uncachedInputTokens: requestInput + continuationInput,
     cachedInputTokens: 0,
-    outputTokens: Math.max(0, input.expectedOutputTokens),
+    outputTokens: outputCap,
     at: input.at,
     ...(input.thinkingTokens !== undefined ? { thinkingTokens: input.thinkingTokens } : {}),
   };

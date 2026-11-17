@@ -13,6 +13,7 @@ import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
 import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { GEMINI_4_ARGON, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
 
 const mocks = vi.hoisted(() => ({
@@ -353,6 +354,110 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     await codeTool.execute({ task: 'refactor', maxOutputTokens: 1_000_000 }, ctx);
     const config = lastGenerateContentCall(generateContent);
     expect(config.maxOutputTokens).toBe(65_536);
+  });
+
+  it('a Gemini 4 model continues past its per-request limit into one edit answer', async () => {
+    mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_ARGON);
+    const { ctx } = buildCtx();
+    const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    generateContent
+      .mockResolvedValueOnce({
+        candidates: [{ index: 0, finishReason: 'CONTINUATION', continuationToken: 'tok-1' }],
+        usageMetadata: {
+          promptTokenCount: 1_000,
+          candidatesTokenCount: 3,
+          thoughtsTokenCount: 65_533,
+        },
+      })
+      .mockResolvedValueOnce({
+        text: 'done',
+        candidates: [{ index: 0, finishReason: 'STOP' }],
+        usageMetadata: {
+          promptTokenCount: 66_536,
+          candidatesTokenCount: 4,
+          thoughtsTokenCount: 10,
+        },
+      });
+    const result = await codeTool.execute({ task: 'refactor', maxOutputTokens: 262_144 }, ctx);
+    expect(generateContent).toHaveBeenCalledTimes(2);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config).toMatchObject({
+      maxOutputTokens: 262_144,
+      automaticContinuation: false,
+      continuationToken: 'tok-1',
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent?.continuationHops).toBe(1);
+    expect(result.structuredContent?.thinkingTokens).toBe(65_543);
+    expect(result.structuredContent?.uncachedTokens).toBe(67_536);
+  });
+
+  describe('the ledger of a decode that fails', () => {
+    /** A context with a daily cap: the call holds budget reservation 1. */
+    const budgeted = () => {
+      const built = buildCtx();
+      (built.ctx.config as { dailyBudgetUsd: number }).dailyBudgetUsd = 100;
+      const generateContent = built.ctx.client.models.generateContent as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      const manifest = built.ctx.manifest as unknown as {
+        finalizeBudgetReservation: ReturnType<typeof vi.fn>;
+        cancelBudgetReservation: ReturnType<typeof vi.fn>;
+      };
+      return { ctx: built.ctx, generateContent, manifest };
+    };
+    const serverError = Object.assign(new Error('Internal error'), { status: 500 });
+
+    beforeEach(() => {
+      mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_HYDROGEN);
+    });
+
+    it('a continuation request that fails keeps the completed request billed; the result carries its usage', async () => {
+      const { ctx, generateContent, manifest } = budgeted();
+      generateContent
+        .mockResolvedValueOnce({
+          candidates: [{ index: 0, finishReason: 'CONTINUATION', continuationToken: 'tok-1' }],
+          usageMetadata: {
+            promptTokenCount: 10_000,
+            candidatesTokenCount: 6,
+            thoughtsTokenCount: 65_530,
+          },
+        })
+        .mockRejectedValueOnce(serverError);
+
+      const result = await codeTool.execute({ task: 'refactor', maxOutputTokens: 262_144 }, ctx);
+
+      expect(generateContent).toHaveBeenCalledTimes(2);
+      expect(manifest.cancelBudgetReservation).not.toHaveBeenCalled();
+      // Hydrogen at 1.50 / 7.50 USD per 1M: 10 000 × 1.50 + 65 536 × 7.50 = 0.50652 USD.
+      expect(manifest.finalizeBudgetReservation).toHaveBeenCalledWith(
+        1,
+        expect.objectContaining({ costUsdMicro: 506_520, uncachedTokens: 10_000 }),
+      );
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        httpStatus: 500,
+        uncachedTokens: 10_000,
+        thinkingTokens: 65_530,
+        outputTokens: 6,
+        costEstimateUsd: 0.5065,
+        continuationHops: 1,
+      });
+    });
+
+    it('a first request that fails releases the reservation whole and reports no usage', async () => {
+      const { ctx, generateContent, manifest } = budgeted();
+      generateContent.mockRejectedValueOnce(serverError);
+
+      const result = await codeTool.execute({ task: 'refactor', maxOutputTokens: 262_144 }, ctx);
+
+      expect(manifest.cancelBudgetReservation).toHaveBeenCalledWith(1);
+      expect(manifest.finalizeBudgetReservation).not.toHaveBeenCalled();
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).not.toHaveProperty('costEstimateUsd');
+    });
   });
 });
 

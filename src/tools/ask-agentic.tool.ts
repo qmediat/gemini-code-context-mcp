@@ -671,6 +671,9 @@ async function executeAskAgenticBody(
       tools: [{ functionDeclarations: buildFunctionDeclarations() }],
       thinkingConfig,
       ...(input.maxOutputTokens !== undefined ? { maxOutputTokens: input.maxOutputTokens } : {}),
+      // One request per model call: a response that stops with `CONTINUATION` is never continued here (long decode
+      // is `ask` / `code` only, `shared/continuation.ts`).
+      automaticContinuation: false,
     };
 
     const conversation: Content[] = [{ role: 'user', parts: [{ text: input.prompt }] }];

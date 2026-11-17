@@ -11,6 +11,15 @@ describe('emptyAtOutputCap', () => {
     expect(message).toContain('maxOutputTokens');
   });
 
+  it('names the long-decode remedy for a decode that stopped at the caller cap with CONTINUATION', () => {
+    const message = emptyAtOutputCap(
+      { text: '', candidates: [{ finishReason: 'CONTINUATION' }] },
+      131_066,
+    );
+    expect(message).toContain('thinking used 131066 tokens');
+    expect(message).toContain('long decode');
+  });
+
   it('is null for an answer cut at the cap, a normal stop, and a response without candidates', () => {
     expect(
       emptyAtOutputCap({ text: 'partial', candidates: [{ finishReason: 'MAX_TOKENS' }] }, 10),

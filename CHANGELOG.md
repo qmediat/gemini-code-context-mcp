@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Long decode on Gemini 4** (`ask`, `code`): a `maxOutputTokens` above the per-request limit (65,536) is sent as
+  asked on Gemini 4 Argon, Carbon and Hydrogen, up to 1,048,576. A response that stops with
+  `finishReason: CONTINUATION` is continued with the same request and Google's continuation token until the model
+  stops or the cap is reached, at most `ceil(maxOutputTokens ÷ 65,536)` requests; the result is one answer with one
+  thinking summary, its token fields and `costEstimateUsd` summed over the requests, and `continuationHops` (`0` for
+  a call that ended in one request). Measured on gemini-4-hydrogen at `XHIGH`: review prompts of 99,712 and 153,906
+  tokens that stopped at 65,533 thinking tokens with no answer now answer in two requests (1.0485 and 1.3164 USD).
+  Without `maxOutputTokens` a call is one request, as before. `ask_agentic` is not covered.
+- `errorCode: OUTPUT_CAP` for a call that stops at the output cap with no answer (`MAX_TOKENS`, or a long decode cut
+  at its cap); the error carries the billed token fields, `costEstimateUsd` and `continuationHops`, and names the
+  remedies (a cap above the per-request limit on Gemini 4, or a lower thinking level).
+
 ### Changed
+
+- `@google/genai` 3.4 (from 1.52): its `FinishReason` has `CONTINUATION` and a candidate keeps its
+  `continuationToken`. Every request is sent with `automaticContinuation: false` (the SDK's default is on): `ask` and
+  `code` drive the continuation themselves so they can count the requests and bound them, and `ask_agentic` keeps one
+  request per model call.
+- `GEMINI_DAILY_BUDGET_USD`: the reservation of a long decode adds the input every continuation request bills again
+  (the prompt plus what was decoded before it); the formula is in `docs/cost-model.md`.
+- `ask` / `code`: a call that fails after one or more of its requests completed (a continuation request that fails, a
+  continuation that meets a stale cache) keeps what those requests billed in the daily budget ledger and releases only
+  the rest of its reservation; the error carries their token fields, `costEstimateUsd` and `continuationHops`.
 
 - Development only: `npm run check:supports` compares `server.json` (`version` and every `packages[].version`) and the
   root of `package-lock.json` (`version`, and `packages[""].version` where the lockfile has that map) with

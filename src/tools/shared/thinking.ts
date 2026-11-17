@@ -84,10 +84,17 @@ export const THINKING_LEVEL_RESERVE: Record<ThinkingLevelLiteral, number | null>
   XHIGH: null,
 };
 
+/** The `errorCode` of a call that ended at the output cap with no answer. */
+export const OUTPUT_CAP_ERROR_CODE = 'OUTPUT_CAP';
+
+/** The finish reasons of a call that ended at the output cap: one request's cap, or a long decode cut at its limits. */
+const AT_OUTPUT_CAP: ReadonlySet<unknown> = new Set(['MAX_TOKENS', 'CONTINUATION']);
+
 /**
  * A call that ended at the output cap with no answer: the model's thinking used the cap (thinking tokens count
- * against `maxOutputTokens`, and Gemini 4 Carbon / Hydrogen and the 3.x Pro models think without being asked).
- * The message names the cause and the remedy; `null` for any call that produced text or stopped for another reason.
+ * against `maxOutputTokens`, and Gemini 4 Carbon / Hydrogen and the 3.x Pro models think without being asked), in
+ * one request (`MAX_TOKENS`) or over a long decode stopped at the caller's cap (`CONTINUATION`). The message names
+ * the cause and the remedies; `null` for any call that produced text or stopped for another reason.
  */
 export function emptyAtOutputCap(
   response: {
@@ -97,6 +104,6 @@ export function emptyAtOutputCap(
   thinkingTokens: number,
 ): string | null {
   const stopped = response.candidates?.[0]?.finishReason;
-  if (response.text.trim() !== '' || stopped !== 'MAX_TOKENS') return null;
-  return `the model stopped at the output cap before writing an answer (thinking used ${thinkingTokens} tokens of it; the call was billed). Raise \`maxOutputTokens\`, or bound the thinking with \`thinkingLevel: "LOW"\` / a smaller \`thinkingBudget\`.`;
+  if (response.text.trim() !== '' || !AT_OUTPUT_CAP.has(stopped)) return null;
+  return `the model stopped at the output cap before writing an answer (thinking used ${thinkingTokens} tokens of it; the call was billed). On a model with long decode (Gemini 4) ask for \`maxOutputTokens\` above its per-request output limit, so the decode continues in further requests; or lower the thinking: \`thinkingLevel: "LOW"\` / a smaller \`thinkingBudget\`.`;
 }

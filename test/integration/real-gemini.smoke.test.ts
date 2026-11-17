@@ -12,19 +12,25 @@
  *     our whole strategy falls back to inline parts).
  *   - `generateContent({ cachedContent })` picks up the cache ID.
  *   - Token accounting fields (`usageMetadata.cachedContentTokenCount` etc.).
+ *   - The TTL watcher's `caches.update`, the teardown's `caches.delete` / `files.delete`, `countTokens`, and the
+ *     long-decode request of `ask` / `code` (`generateContentStream`, a cap above the per-request limit, a
+ *     continuation token) at the API version the client is pinned to.
  */
 
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { type GenerateContentResponse, ThinkingLevel } from '@google/genai';
 import { describe, expect, it } from 'vitest';
 import { prepareContext } from '../../src/cache/cache-manager.js';
 import { createGeminiClient } from '../../src/gemini/client.js';
 import { listAvailableModels } from '../../src/gemini/model-registry.js';
 import { resolveModel } from '../../src/gemini/models.js';
+import { countForPreflight } from '../../src/gemini/token-counter.js';
 import { clearHashCache } from '../../src/indexer/hasher.js';
 import { scanWorkspace } from '../../src/indexer/workspace-scanner.js';
 import { ManifestDb } from '../../src/manifest/db.js';
+import { CompletedRequests, runDecode } from '../../src/tools/shared/continuation.js';
 
 const apiKey = process.env.GEMINI_API_KEY;
 const suite = apiKey ? describe : describe.skip;
@@ -176,6 +182,21 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
           },
         }),
       ).rejects.toThrow(/INVALID_ARGUMENT|cached[_ ]?content|system_instruction/i);
+
+      // The TTL watcher's refresh, as it calls it.
+      const refreshed = await client.caches.update({
+        name: first.cacheId ?? '',
+        config: { ttl: '600s' },
+      });
+      expect(refreshed.name).toBe(first.cacheId);
+
+      // The teardown `invalidateWorkspaceCache` runs (it logs and swallows a failure, so it is called directly here).
+      await client.caches.delete({ name: first.cacheId ?? '' });
+      expect(first.uploaded.files.length).toBeGreaterThan(0);
+      for (const file of first.uploaded.files) {
+        const uri = file.fileId ?? '';
+        await client.files.delete({ name: uri.slice(uri.lastIndexOf('/files/') + 1) });
+      }
     } finally {
       manifest.close();
     }
@@ -254,5 +275,68 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
     // parsing reads (candidates[0].content.parts + usageMetadata).
     expect(response.candidates?.[0]?.content?.parts).toBeDefined();
     expect(response.usageMetadata).toBeDefined();
+  }, 60_000);
+
+  it('countTokens gives the preflight an exact count (a failed call falls back silently)', async () => {
+    const resolved = await resolveModel('latest-flash', client);
+    const count = await countForPreflight(client, {
+      files: [],
+      prompt: 'How many tokens does this sentence take?',
+      model: resolved.resolved,
+      filesHash: 'smoke-count-tokens',
+      preflightMode: 'exact',
+      inputTokenLimit: resolved.inputTokenLimit ?? 1_000_000,
+    });
+    expect(count.method).toBe('exact');
+    expect(count.rawTokens).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('the long-decode request of ask / code is accepted: stream, XHIGH, a cap above the per-request limit', async () => {
+    const resolved = await resolveModel('gemini-4-hydrogen', client);
+    expect(resolved.longDecodeTokenLimit).not.toBeNull();
+    const completed = new CompletedRequests();
+    const response = await runDecode({
+      client,
+      model: resolved.resolved,
+      contents: 'Say the single word: pong.',
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.XHIGH, includeThoughts: true },
+        maxOutputTokens: 262_144,
+      },
+      openAttempts: 1,
+      label: 'smoke',
+      limits: { maxRequests: 4, cap: 262_144 },
+      collector: { signal: new AbortController().signal },
+      onRequestOpened: () => {},
+      completed,
+    });
+    expect(response.text.toLowerCase()).toContain('pong');
+    expect(completed.count).toBe(1);
+    expect(completed.usage()?.promptTokenCount ?? 0).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('a continuation token is a field the API reads (a stale one is refused as such, never as unknown)', async () => {
+    const resolved = await resolveModel('gemini-4-hydrogen', client);
+    const attempt = async (): Promise<GenerateContentResponse | Error> => {
+      try {
+        return await client.models.generateContent({
+          model: resolved.resolved,
+          contents: 'Say the single word: pong.',
+          config: {
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            automaticContinuation: false,
+            continuationToken: 'smoke-test-not-a-continuation-token',
+          },
+        });
+      } catch (err) {
+        return err instanceof Error ? err : new Error(String(err));
+      }
+    };
+    const outcome = await attempt();
+    if (outcome instanceof Error) {
+      expect(outcome.message).not.toMatch(/unknown name|cannot find field|unknown field/i);
+    } else {
+      expect(outcome.usageMetadata).toBeDefined();
+    }
   }, 60_000);
 });

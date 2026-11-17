@@ -121,14 +121,41 @@ If your pattern is "one query a week on the same repo", consider running `clear`
 
 Raise it (`{ thinkingBudget: 32000 }`) when the task is hard. Drop it (`{ thinkingBudget: 0 }`) when you want a quick generation without deliberation.
 
+## Long decode on Gemini 4
+
+A Gemini 4 call whose `maxOutputTokens` is above the per-request limit continues in further requests
+([tools.md](tools.md#long-decode-on-gemini-4-ask-code)). Each request bills its whole input again: the prompt plus
+everything decoded before it. Measured on gemini-4-hydrogen at `thinkingLevel: XHIGH` with `maxOutputTokens: 262144`
+(2026-11-17, two requests each; the server's own estimate at 1.50 / 7.50 USD per 1 M):
+
+| Prompt | Billed input | Thinking | Answer | Time | Cost |
+|---|---|---|---|---|---|
+| 99,712 tokens | 265,085 | 85,730 | 1,048 | 375 s | 1.0485 USD |
+| 153,906 tokens | 373,458 | 99,836 | 997 | 482 s | 1.3164 USD |
+
+The same prompts with no `maxOutputTokens` stopped at 65,533 thinking tokens with no answer (`OUTPUT_CAP`), billed.
+
+The reservation stays an upper bound. With prompt `P`, cap `C` and per-request limit `L` (the model's advertised
+`outputTokenLimit`):
+
+```
+R = ceil(C / L)                                   requests at most (the server stops there)
+M = max(L, 65,536)                                the most one streaming request decodes
+input reserved = P + Σ_{k=1..R−1} (P + min(k·M, C))
+output reserved = C (+ the thinking reserve)       maxOutputTokens = C travels on every request
+```
+
+`src/gemini/long-decode.ts` (`continuationInputTokens`) holds the formula. Example: `P` = 100 k, `C` = 262,144 on
+Hydrogen → 4 requests, 793,216 input tokens reserved.
+
 ## Budget cap — how the enforcement actually works
 
 `GEMINI_DAILY_BUDGET_USD` is an **atomic** reservation, not a read-then-act check. From v1.0.3 onward:
 
-1. After the workspace is scanned and the model resolved, we compute a conservative cost estimate: `(workspace_bytes ÷ 4 bytes/token) × input_rate + prompt_chars × input_rate + maxOutputTokens × output_rate + thinkingBudget × output_rate`.
+1. After the workspace is scanned and the model resolved, we compute a conservative cost estimate: `(workspace_bytes ÷ 4 bytes/token) × input_rate + prompt_chars × input_rate + maxOutputTokens × output_rate + thinkingBudget × output_rate`, plus the input every continuation request bills again on a Gemini 4 long decode ([above](#long-decode-on-gemini-4)).
 2. That estimate is inserted into the usage-metrics table inside a `BEGIN IMMEDIATE` SQLite transaction. Concurrent tool calls are serialised by SQLite's reserved lock — if the reservation would push cumulative spend over the cap, the transaction rolls back and the tool returns `Daily budget cap would be exceeded: spent $X + estimate $Y > cap $Z`.
-3. The `generateContent` call carries an explicit `maxOutputTokens` matching the estimate, so a runaway response cannot exceed what was reserved.
-4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back.
+3. The `generateContent` call carries an explicit `maxOutputTokens` matching the estimate (every request of a long decode carries the same cap), so a runaway response cannot exceed what was reserved.
+4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back — unless one or more requests of the call had completed (`ask` / `code`: a long decode whose continuation request failed, or met a stale cache): those were billed, so the row is settled at their measured cost and only the rest of the reservation comes back.
 
 Result: N concurrent tool calls cannot collectively overshoot the cap. A single call cannot overshoot either, thanks to `maxOutputTokens`.
 

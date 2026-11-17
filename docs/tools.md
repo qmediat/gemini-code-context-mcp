@@ -28,6 +28,34 @@ The server registers six tools. Every parameter, its default and the matching en
 
 If `ask` fails with `errorCode: WORKSPACE_TOO_LARGE`, switch to `ask_agentic` without restarting. The error message says so.
 
+## Long decode on Gemini 4 (`ask`, `code`)
+
+Thinking tokens count against `maxOutputTokens`. On a long prompt a high thinking level can use the whole
+per-request limit (65,536 tokens) before the model writes a word; the call then fails with `errorCode: OUTPUT_CAP`.
+
+On a Gemini 4 model (Argon, Carbon, Hydrogen) a `maxOutputTokens` above the per-request limit is sent as asked, up to
+1,048,576. A response that reaches the per-request limit stops with `finishReason: CONTINUATION`; the server sends the
+same request again with the continuation token Google returned, until the model stops or the cap is reached, and
+returns one answer.
+
+| | |
+|---|---|
+| Default | No `maxOutputTokens`: one request, the model's own cap, the same cost as before |
+| Turn it on | `ask({ prompt, model: "gemini-4-hydrogen", thinkingLevel: "XHIGH", maxOutputTokens: 262144 })` |
+| Requests | At most `ceil(maxOutputTokens ÷ 65,536)`; the server stops there, or when the decoded tokens reach the cap |
+| Cost | Every continuation request bills the prompt again plus everything decoded before it ([cost-model.md](cost-model.md#long-decode-on-gemini-4)) |
+| Timeouts | `timeoutMs` and `stallMs` cover the whole call, every request |
+| Other models | A value above the model's limit is clamped to it, as before |
+| `ask_agentic` | Not covered: its loop calls the model without streaming, one bounded call per iteration |
+
+What the result carries:
+
+| Field | Meaning |
+|---|---|
+| `continuationHops` | The requests after the first; `0` for a call that ended in one request |
+| `cachedTokens`, `uncachedTokens`, `outputTokens`, `thinkingTokens`, `costEstimateUsd` | Summed over every request: what the call billed |
+| `errorCode: OUTPUT_CAP` | The call stopped at the cap with no answer (`MAX_TOKENS`, or a long decode cut at its cap). The error carries the same token fields, `costEstimateUsd`, `continuationHops` and `retryable: false`. Remedy: on Gemini 4 ask for `maxOutputTokens` above 65,536; or lower `thinkingLevel` |
+
 ## `ask_agentic` safety
 
 - **Sandboxed FS access.** Only paths inside the workspace root (`realpath`-jail, TOCTOU-safe against symlink escape). Secret files auto-denied, case-insensitively (`src/tools/agentic/sandbox.ts`): by exact basename — `.env`, `.env.local`, `.env.development`, `.env.production`, `.env.test`, `.env.staging`, `.netrc`, `.npmrc`, `.pgpass`, `.git-credentials`, `.htpasswd`, `credentials`, `credentials.json`, `secrets.json`, `secrets.yaml`, `secrets.yml`, `service-account.json`; by extension — `.pem`, `.key`, `.crt`, `.cer`, `.p12`, `.pfx`, `.p8`, `.asc`, `.gpg`, `.keystore`, `.jks`, `.ppk`, `.ovpn`; and every file under `.ssh`, `.aws`, `.gnupg`, `.gpg`, `.kube`, `.docker`, `.1password`, `.pki`, `.gcloud`, `.azure`, `.config/gcloud`, `.config/azure`, `Keychains`. A secret under any other name (say `.env.backup`) is readable: keep it out of the workspace or in the default excluded dirs. Default excluded dirs (`node_modules`, `.git`, `.next`, etc.) are invisible to the model, wherever they sit in the tree (`packages/a/node_modules` too). `bin/` is source, not one of them (only .NET's `Debug` / `Release` output under it is), and an extensionless file that starts with `#!` (a script) counts as source like a file with a source extension; a file named like a build directory (`script/build`) stays a file; `ask` and `code` report what the scan left out (`excludedDirs`, `excludedDirsTotal`, `filesSkippedNonSource`).
