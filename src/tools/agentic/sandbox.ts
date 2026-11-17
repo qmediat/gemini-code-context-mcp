@@ -103,14 +103,14 @@ export function secretListOf(fileName: string): SecretList | null {
  *
  *   PATH_TRAVERSAL     — sandbox.ts (jail violation: symlink escape, abs path outside)
  *   SECRET_DENYLIST    — sandbox.ts (basename / extension / dir on hardcoded secret list)
- *   EXCLUDED_DIR       — sandbox.ts (DEFAULT_EXCLUDE_DIRS hit, line ~302)
+ *   EXCLUDED_DIR       — sandbox.ts (DEFAULT_EXCLUDE_DIRS hit, excludedDirError)
  *                        AND workspace-tools.ts top-level gates (v1.9.0+):
  *                        listDirectoryExecutor + grepExecutor's pathPrefix,
  *                        when the requested dir matches user-supplied excludeGlobs
  *   EXCLUDED_FILE      — workspace-tools.ts (v1.9.0+): readFileExecutor when
  *                        the file is excluded by user globs (filename / extension
  *                        / dir-prefix). Generic message — no path leak.
- *   EXCLUDED_FILENAME  — sandbox.ts (DEFAULT_EXCLUDE_FILE_NAMES hit, line ~321)
+ *   EXCLUDED_FILENAME  — sandbox.ts (DEFAULT_EXCLUDE_FILE_NAMES hit, refuseDefaultExcluded)
  *   NON_SOURCE_FILE    — workspace-tools.ts: readFileExecutor when no
  *                        include-extension matches (path retained — different
  *                        threat model from EXCLUDED_FILE)
@@ -181,6 +181,161 @@ export async function resolveWorkspaceRoot(rootInput: string): Promise<string> {
   }
 }
 
+/** The argument trimmed; an empty, non-string or whitespace-only argument is refused before any file system call. */
+function cleanedPathArgument(relOrAbs: string): string {
+  if (typeof relOrAbs !== 'string' || relOrAbs.length === 0) {
+    throw new SandboxError('PATH_TRAVERSAL', 'path argument is empty', relOrAbs);
+  }
+  const cleaned = relOrAbs.trim();
+  if (cleaned.length === 0) {
+    throw new SandboxError('PATH_TRAVERSAL', 'path argument is whitespace only', relOrAbs);
+  }
+  return cleaned;
+}
+
+/** The real path of the nearest ancestor of `candidate` that exists, or `null` when none does up to the file system
+ * root. `candidate` itself is not tried: the caller's `realpath` of it has already failed. */
+async function nearestExistingAncestor(candidate: string): Promise<string | null> {
+  let parent = candidate;
+  while (true) {
+    const next = resolve(parent, '..');
+    if (next === parent) return null; // hit filesystem root
+    parent = next;
+    try {
+      return await realpath(parent);
+    } catch {
+      /* keep walking */
+    }
+  }
+}
+
+/**
+ * The refusal of a target that does not exist. The structural jail still holds on its nearest existing ancestor, so a
+ * path that is structurally illegal is refused as traversal and never answered with "file not found": an ancestor
+ * inside the jail means the leaf is legitimately absent in the workspace (`NOT_FOUND`); one outside means the request
+ * tried to escape through a path whose leaf does not exist (`PATH_TRAVERSAL`).
+ */
+async function refuseMissingPath(
+  workspaceRoot: string,
+  candidate: string,
+  relOrAbs: string,
+): Promise<never> {
+  const existingAncestor = await nearestExistingAncestor(candidate);
+  if (existingAncestor === null) {
+    throw new SandboxError('NOT_FOUND', `path has no existing ancestor: ${relOrAbs}`, relOrAbs);
+  }
+  if (!isInside(workspaceRoot, existingAncestor)) {
+    throw new SandboxError('PATH_TRAVERSAL', `path escapes workspace root: ${relOrAbs}`, relOrAbs);
+  }
+  throw new SandboxError('NOT_FOUND', `path does not exist: ${relOrAbs}`, relOrAbs);
+}
+
+/** The canonical (symlink-resolved) form of `candidate`, inside the jail. The jail is enforced on the RESOLVED path,
+ * so a symlink inside the root that points outside it is caught. */
+async function realpathInsideRoot(
+  workspaceRoot: string,
+  candidate: string,
+  relOrAbs: string,
+): Promise<string> {
+  let resolved: string;
+  try {
+    resolved = await realpath(candidate);
+  } catch {
+    return refuseMissingPath(workspaceRoot, candidate, relOrAbs);
+  }
+  if (!isInside(workspaceRoot, resolved)) {
+    throw new SandboxError(
+      'PATH_TRAVERSAL',
+      `path escapes workspace root (symlink or absolute outside): ${relOrAbs}`,
+      relOrAbs,
+    );
+  }
+  return resolved;
+}
+
+/** Content denylist: secrets by basename or extension, case-insensitively — macOS/APFS and Windows/NTFS are
+ * case-insensitive by default, so `.ENV` (or `.Env.Local`, `CREDENTIALS`, …) is the same file as `.env`. */
+function refuseSecretFile(base: string, relOrAbs: string): void {
+  const secretList = secretListOf(base);
+  if (secretList !== null) {
+    throw new SandboxError(
+      'SECRET_DENYLIST',
+      `filename on secret-${secretList} denylist: ${base}`,
+      relOrAbs,
+    );
+  }
+}
+
+/**
+ * The refusal of a path that `pathHitsDir` placed in the excluded directory `dir`. `SECRET_EXCLUDE_DIRS` wins over
+ * the generic list, so `.ssh/id_ed25519` yields `SECRET_DENYLIST` (not `EXCLUDED_DIR`) — "user tried to exfiltrate"
+ * stays distinct from "this dir is just boring build output" in observability; functionally both are blocked. The
+ * message says whether the path is inside the directory, is the directory, or is a file named like it.
+ */
+function excludedDirError(
+  dir: string,
+  relLower: string,
+  kind: PathKind,
+  relOrAbs: string,
+): SandboxError {
+  const dirLower = dir.toLowerCase();
+  if (SECRET_EXCLUDE_DIRS.has(dirLower)) {
+    return new SandboxError(
+      'SECRET_DENYLIST',
+      `path is inside a secret-bearing directory: ${dir}`,
+      relOrAbs,
+    );
+  }
+  const namesTheDir = relLower === dirLower || relLower.endsWith(`/${dirLower}`);
+  if (!namesTheDir) {
+    return new SandboxError('EXCLUDED_DIR', `path is inside excluded directory: ${dir}`, relOrAbs);
+  }
+  const detail =
+    kind === 'dir'
+      ? `path is an excluded directory: ${dir}`
+      : `path is a file named like an excluded directory: ${dir}`;
+  return new SandboxError('EXCLUDED_DIR', detail, relOrAbs);
+}
+
+/**
+ * The default excludes, in this order: the excluded directories, the excluded file names, .NET build output.
+ *
+ * Excluded-dir check: the POSIX relative path sitting under any entry of `DEFAULT_EXCLUDE_DIRS` is refused. Same
+ * semantics as `globs.ts#isPathExcluded`, but it reuses the table rather than the function to skip the MatchConfig
+ * plumbing (the path is already inside the jail, so only dir-name matching matters). The comparison is on the
+ * lowercased path and entries, so on a case-insensitive file system `NODE_MODULES/foo.js` does not slip past.
+ *
+ * `DEFAULT_EXCLUDE_FILE_NAMES` (lockfiles, `tsconfig.tsbuildinfo`, …) are matched through their lowercased `Set`, so
+ * mis-cased files (`PACKAGE-LOCK.JSON`) match too; their code `EXCLUDED_FILENAME` is distinct from `EXCLUDED_DIR` so
+ * the calling model can tell a refused file name from a refused directory in the `functionResponse.error` payload.
+ */
+function refuseDefaultExcluded(
+  base: string,
+  relLower: string,
+  kind: PathKind,
+  relOrAbs: string,
+): void {
+  for (const dir of DEFAULT_EXCLUDE_DIRS) {
+    if (pathHitsDir(relLower, dir.toLowerCase(), kind)) {
+      throw excludedDirError(dir, relLower, kind, relOrAbs);
+    }
+  }
+  if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(base.toLowerCase())) {
+    throw new SandboxError(
+      'EXCLUDED_FILENAME',
+      `filename on default exclude list: ${base}`,
+      relOrAbs,
+    );
+  }
+  if (isDotnetBuildOutput(relLower, kind)) {
+    throw new SandboxError(
+      'EXCLUDED_DIR',
+      'path is .NET build output (bin/…/Debug or Release)',
+      relOrAbs,
+    );
+  }
+}
+
 /**
  * Resolve `relOrAbs` to a real (symlink-resolved) absolute path, or throw
  * `SandboxError` if it escapes the workspace or matches a denylist.
@@ -198,143 +353,21 @@ export async function resolveWorkspaceRoot(rootInput: string): Promise<string> {
  * attacker — indirect enumeration signal. Acceptable trade-off: the
  * missing-file error for a valid path inside the root still surfaces as
  * `NOT_FOUND` once the parent resolves.
+ *
+ * The steps run in this order and each refuses with its own code: the argument, the jail, the secret denylist (before
+ * the `stat` of the target), the default excludes.
  */
 export async function resolveInsideWorkspace(
   workspaceRoot: string,
   relOrAbs: string,
 ): Promise<ResolvedPath> {
-  if (typeof relOrAbs !== 'string' || relOrAbs.length === 0) {
-    throw new SandboxError('PATH_TRAVERSAL', 'path argument is empty', relOrAbs);
-  }
-  // Empty after normalisation (only whitespace) → reject.
-  const cleaned = relOrAbs.trim();
-  if (cleaned.length === 0) {
-    throw new SandboxError('PATH_TRAVERSAL', 'path argument is whitespace only', relOrAbs);
-  }
-
-  const candidate = resolve(workspaceRoot, cleaned);
-
-  // First pass: try to realpath the target. If it exists, we get a canonical
-  // symlink-resolved form. If not, walk up to the nearest existing parent
-  // and realpath that — so we detect escapes through symlinks that exist
-  // even if the leaf does not.
-  let resolved: string;
-  try {
-    resolved = await realpath(candidate);
-  } catch {
-    // Target doesn't exist (yet). Walk to nearest existing ancestor so we
-    // can still assert "the parent is inside the workspace". This avoids
-    // leaking "file not found" for paths that are structurally illegal.
-    let parent = candidate;
-    let existingAncestor: string | null = null;
-    while (true) {
-      const next = resolve(parent, '..');
-      if (next === parent) break; // hit filesystem root
-      parent = next;
-      try {
-        existingAncestor = await realpath(parent);
-        break;
-      } catch {
-        /* keep walking */
-      }
-    }
-    if (existingAncestor === null) {
-      throw new SandboxError('NOT_FOUND', `path has no existing ancestor: ${relOrAbs}`, relOrAbs);
-    }
-    // Assert the existing ancestor is inside the jail. If YES, the missing
-    // leaf is legitimately absent inside the workspace; we return a
-    // `NOT_FOUND`. If NO, the request was trying to escape via a path
-    // whose leaf doesn't exist — treat as traversal.
-    if (!isInside(workspaceRoot, existingAncestor)) {
-      throw new SandboxError(
-        'PATH_TRAVERSAL',
-        `path escapes workspace root: ${relOrAbs}`,
-        relOrAbs,
-      );
-    }
-    throw new SandboxError('NOT_FOUND', `path does not exist: ${relOrAbs}`, relOrAbs);
-  }
-
-  // realpath succeeded — enforce jail on the RESOLVED path so symlinks are caught.
-  if (!isInside(workspaceRoot, resolved)) {
-    throw new SandboxError(
-      'PATH_TRAVERSAL',
-      `path escapes workspace root (symlink or absolute outside): ${relOrAbs}`,
-      relOrAbs,
-    );
-  }
-
+  const candidate = resolve(workspaceRoot, cleanedPathArgument(relOrAbs));
+  const resolved = await realpathInsideRoot(workspaceRoot, candidate, relOrAbs);
   const rel = toPosix(relative(workspaceRoot, resolved));
-
-  // Content denylist: secrets by basename or extension, case-insensitively — macOS/APFS and Windows/NTFS are
-  // case-insensitive by default, so `.ENV` (or `.Env.Local`, `CREDENTIALS`, …) is the same file as `.env`.
   const base = basename(resolved);
-  const lowerBase = base.toLowerCase();
-  const secretList = secretListOf(base);
-  if (secretList !== null) {
-    throw new SandboxError(
-      'SECRET_DENYLIST',
-      `filename on secret-${secretList} denylist: ${base}`,
-      relOrAbs,
-    );
-  }
-
-  // Excluded-dir check: if the POSIX relative path sits under any entry in
-  // `DEFAULT_EXCLUDE_DIRS`, refuse. Same semantics as `globs.ts#isPathExcluded`
-  // but we reuse the table rather than the function to skip the MatchConfig
-  // plumbing (we already know we're inside the jail, so only dir-name
-  // matching matters here).
-  //
-  // Case-insensitive matching (PR #24 round-3 #2): we compare against the
-  // lowercased relative path + lowercased dir entries so macOS APFS /
-  // Windows NTFS (case-insensitive by default) don't let a file named
-  // `NODE_MODULES/foo.js` slip past a strict-case check.
-  //
-  // `SECRET_EXCLUDE_DIRS` wins before the generic list so `.ssh/id_ed25519`
-  // yields `SECRET_DENYLIST` (not `EXCLUDED_DIR`) — distinguishes "user
-  // tried to exfiltrate" from "this dir is just boring build output" in
-  // observability. Functionally both are blocked.
-  const relLower = rel.toLowerCase();
+  refuseSecretFile(base, relOrAbs);
   const kind = await kindOf(resolved, relOrAbs);
-  for (const dir of DEFAULT_EXCLUDE_DIRS) {
-    const dirLower = dir.toLowerCase();
-    if (!pathHitsDir(relLower, dirLower, kind)) continue;
-    const code: SandboxErrorCode = SECRET_EXCLUDE_DIRS.has(dirLower)
-      ? 'SECRET_DENYLIST'
-      : 'EXCLUDED_DIR';
-    const detail =
-      code === 'SECRET_DENYLIST'
-        ? `path is inside a secret-bearing directory: ${dir}`
-        : !(relLower === dirLower || relLower.endsWith(`/${dirLower}`))
-          ? `path is inside excluded directory: ${dir}`
-          : kind === 'dir'
-            ? `path is an excluded directory: ${dir}`
-            : `path is a file named like an excluded directory: ${dir}`;
-    throw new SandboxError(code, detail, relOrAbs);
-  }
-  // And one more pass over DEFAULT_EXCLUDE_FILE_NAMES — lockfiles,
-  // tsconfig.tsbuildinfo, etc. — they were uninteresting even in the
-  // eager path, and definitely shouldn't cost agentic iterations.
-  // Uses the lowercased `Set` so mis-cased files (e.g. `PACKAGE-LOCK.JSON`
-  // on case-insensitive FS) still match. Uses `EXCLUDED_FILENAME`
-  // (distinct from `EXCLUDED_DIR`) so the calling model can tell
-  // "this is a blacklisted filename" from "this is a blacklisted
-  // directory" in the `functionResponse.error` payload.
-  if (DEFAULT_EXCLUDE_FILE_NAMES_LOWER.has(lowerBase)) {
-    throw new SandboxError(
-      'EXCLUDED_FILENAME',
-      `filename on default exclude list: ${base}`,
-      relOrAbs,
-    );
-  }
-
-  if (isDotnetBuildOutput(relLower, kind)) {
-    throw new SandboxError(
-      'EXCLUDED_DIR',
-      'path is .NET build output (bin/…/Debug or Release)',
-      relOrAbs,
-    );
-  }
+  refuseDefaultExcluded(base, rel.toLowerCase(), kind, relOrAbs);
   return { absolutePath: resolved, relpath: rel, kind };
 }
 

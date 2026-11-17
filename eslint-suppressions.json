@@ -107,14 +107,6 @@
       "count": 2
     }
   },
-  "src/tools/agentic/sandbox.ts": {
-    "complexity": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
   "src/tools/ask.tool.ts": {
     "complexity": {
       "count": 1

@@ -333,6 +333,16 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
+## T46. One secret-file list for the eager path and the agentic path
+
+**Source:** found while fixing the agentic executors' secret denylist, 2026-11-17. Opened 2026-11-17.
+
+**Why:** the eager path of `ask` / `code` excludes by default the files `docs/security.md` names (`.netrc`, `.pypirc`, `.npmrc`, `.pgpass`, `.git-credentials`, `credentials`) and the secret directories; the agentic sandbox's list is longer (`credentials.json`, `secrets.json`, `secrets.yaml`, `secrets.yml`, `service-account.json`, the dot-env names `.env`, `.env.local`, `.env.development`, `.env.production`, `.env.test` and `.env.staging`, `.htpasswd`, and the key extensions `.pem`, `.key`, …; `src/tools/agentic/sandbox.ts`). So a workspace holding `credentials.json` has it uploaded by `ask` / `code` while `ask_agentic` refuses it.
+
+**Scope:** decide whether the indexer's default excludes take the agentic list (unconditional, as the existing ones are — `includeGlobs` cannot re-enable them); it changes which files `ask` / `code` upload and the workspace hash of a workspace that holds such a file — a public contract, the maintainer's decision; then one list both paths read.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.
