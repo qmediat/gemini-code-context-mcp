@@ -107,11 +107,6 @@
       "count": 2
     }
   },
-  "src/tools/reindex.tool.ts": {
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
   "src/tools/shared/stream-collector.ts": {
     "complexity": {
       "count": 1

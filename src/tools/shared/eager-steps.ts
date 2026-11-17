@@ -12,33 +12,12 @@ import {
 } from '../../gemini/long-decode.js';
 import { type PreflightTokenResult, countForPreflight } from '../../gemini/token-counter.js';
 import { type ScanResult, buildScanMemo, scanWorkspace } from '../../indexer/workspace-scanner.js';
-import {
-  WorkspaceValidationError,
-  validateWorkspacePath,
-} from '../../indexer/workspace-validation.js';
 import type { ResolvedModel } from '../../types.js';
 import { estimatePreCallCostUsd, toMicrosUsd } from '../../utils/cost-estimator.js';
 import { logger, safeForLog } from '../../utils/logger.js';
-import { type TextToolResult, type ToolContext, errorResult } from '../registry.js';
-import type { TimedTool } from './abort-timeout.js';
-import type { EagerCall, ModelReached } from './eager-call.js';
+import type { ToolContext } from '../registry.js';
+import type { EagerMachinery } from './eager-call.js';
 import type { ServiceTierName } from './service-tier.js';
-
-/**
- * The refusal of a workspace path the validation rejects (`<tool>: <message>`, no fields), else `null`. Called inside
- * the call's `try`: any other error of the validation reaches the call's failure path.
- */
-export function workspaceRefusal(tool: TimedTool, workspaceRoot: string): TextToolResult | null {
-  try {
-    validateWorkspacePath(workspaceRoot);
-  } catch (err) {
-    if (err instanceof WorkspaceValidationError) {
-      return errorResult(`${tool}: ${err.message}`);
-    }
-    throw err;
-  }
-  return null;
-}
 
 /** The caller's narrowing of the workspace scan: the knobs of both tools' input, read from it as it is. */
 export interface ScanFilters {
@@ -53,7 +32,7 @@ export interface ScanFilters {
  * operator bypasses it.
  */
 export function scanForCall(
-  call: EagerCall<ModelReached>,
+  call: EagerMachinery,
   ctx: ToolContext,
   filters: ScanFilters,
 ): Promise<ScanResult> {
@@ -70,7 +49,7 @@ export function scanForCall(
 }
 
 /** The output cap of a model that advertises no `outputTokenLimit`: the pro-tier ceiling, the model's full capacity. */
-export const EAGER_OUTPUT_FALLBACK_TOKENS = 65_536;
+const EAGER_OUTPUT_FALLBACK_TOKENS = 65_536;
 
 /**
  * The output cap, in three layers (`resolveOutputCap`): the caller's `maxOutputTokens` (clamped to the model's
@@ -139,7 +118,7 @@ export interface PreflightCount {
  * the model advertises no limit: the guard is skipped with a warning, and the request may fail downstream.
  */
 export async function countPreflight(
-  call: EagerCall<ModelReached>,
+  call: EagerMachinery,
   ctx: ToolContext,
   req: PreflightRequest,
 ): Promise<PreflightCount | null> {
@@ -250,7 +229,7 @@ export type ReservationOutcome =
  * between a reservation and its owner.
  */
 export function reserveCallBudget(
-  call: EagerCall<ModelReached>,
+  call: EagerMachinery,
   ctx: ToolContext,
   sized: SizedCall,
   req: ReservationRequest,

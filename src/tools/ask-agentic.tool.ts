@@ -32,10 +32,6 @@ import { resolve } from 'node:path';
 import { thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { defaultMatchConfig } from '../indexer/globs.js';
-import {
-  WorkspaceValidationError,
-  validateWorkspacePath,
-} from '../indexer/workspace-validation.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { type ProgressEmitter, createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticInputSchema } from './agentic/input.js';
@@ -63,6 +59,7 @@ import {
   errorResult,
 } from './registry.js';
 import { seedRetryHint } from './shared/throttle.js';
+import { workspaceRefusal } from './shared/workspace-refusal.js';
 
 export { resolveToolExecutionConcurrency } from './agentic/dispatch.js';
 export { type AskAgenticInput, askAgenticInputSchema } from './agentic/input.js';
@@ -127,14 +124,8 @@ interface CallProgress {
 async function openWorkspace(
   rawWorkspaceRoot: string,
 ): Promise<{ root: string } | { refused: TextToolResult }> {
-  try {
-    validateWorkspacePath(rawWorkspaceRoot);
-  } catch (err) {
-    if (err instanceof WorkspaceValidationError) {
-      return { refused: errorResult(`ask_agentic: ${err.message}`) };
-    }
-    throw err;
-  }
+  const refusal = workspaceRefusal('ask_agentic', rawWorkspaceRoot);
+  if (refusal !== null) return { refused: refusal };
   try {
     return { root: await resolveWorkspaceRoot(rawWorkspaceRoot) };
   } catch (err) {

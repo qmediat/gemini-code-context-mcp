@@ -1,6 +1,7 @@
 /**
- * The answer of an `ask` / `code` call: its context, prepared once and again by the stale-cache retry. Each result
- * keeps its tool's own fields and their order.
+ * The answer of an `ask` / `code` call, as both tools run it: the context (prepared once, and again by the stale-cache
+ * retry), the decode on it with the tool's request, the settlement that books it once, the warning of a truncated scan
+ * and the scan's result fields. Each result keeps its tool's own fields and their order.
  */
 
 import { createHash } from 'node:crypto';
@@ -16,7 +17,7 @@ import type { ResolvedModel } from '../../types.js';
 import { logger } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
 import { type ContextDecode, type ContextRequest, decodeOnContext } from './context-decode.js';
-import type { EagerCall, ModelReached } from './eager-call.js';
+import type { EagerMachinery } from './eager-call.js';
 import type { SizedCall } from './eager-steps.js';
 import { networkAttempts } from './service-tier.js';
 import { type SettledAnswer, settleAnswer } from './settle-call.js';
@@ -48,7 +49,7 @@ export interface CallContext {
  * timeout also ends an upload.
  */
 export async function prepareCallContext(
-  call: EagerCall<ModelReached>,
+  call: EagerMachinery,
   ctx: ToolContext,
   spec: ContextSpec,
 ): Promise<CallContext> {
@@ -76,16 +77,28 @@ export async function prepareCallContext(
 }
 
 /**
+ * A tool's request on a prepared context, built for every request of the decode — the stale-cache retry's rebuilt
+ * context included. On a context with a cache the request carries `cachedContent` and never `systemInstruction`,
+ * `tools` or `toolConfig`: Gemini answers that combination with 400 ("CachedContent can not be used with
+ * GenerateContent request setting system_instruction, tools or tool_config"), and the system instruction is baked into
+ * the cache when it is built (`cache-manager.ts`, `cacheConfig.systemInstruction`). On a context without one the
+ * request carries the files inline and the tool's full config. `thinkingConfig` is a per-request control and travels
+ * either way.
+ */
+export type RequestBuilder = (prep: PreparedContext) => ContextRequest;
+
+/**
  * Decode the answer on the call's context with the tool's request — with a cache, or inline on a context without one —
- * and, on a stale cache before any request completed, once more on a rebuilt one (`decodeOnContext`). The TPM reservation is taken after the context and just before the first request, so its
- * timestamp is when the tokens reach Gemini's quota counter; only the OPENING of a request is retried (a flex request
- * never): a mid-stream failure re-sent would bill the work again.
+ * and, on a stale cache before any request completed, once more on a rebuilt one (`decodeOnContext`). The TPM
+ * reservation is taken after the context and just before the first request, so its timestamp is when the tokens reach
+ * Gemini's quota counter; only the OPENING of a request is retried (a flex request never): a mid-stream failure re-sent
+ * would bill the work again.
  */
 export function decodeEagerCall(
-  call: EagerCall<ModelReached>,
+  call: EagerMachinery,
   ctx: ToolContext,
   sized: SizedCall,
-  request: (prep: PreparedContext) => ContextRequest,
+  request: RequestBuilder,
   context: CallContext,
 ): Promise<ContextDecode> {
   const cap = sized.bounded.cap;
@@ -135,7 +148,7 @@ export interface SettledDecode {
  * the call again nor releases what was booked — and reports no usage.
  */
 export function settleDecoded(
-  call: EagerCall<ModelReached>,
+  call: EagerMachinery,
   ctx: ToolContext,
   decoded: ContextDecode,
   sized: SizedCall,
@@ -167,11 +180,7 @@ export function settleDecoded(
 }
 
 /** Said in the log when the scan dropped the files past `GEMINI_CODE_CONTEXT_MAX_FILES`. */
-export function warnTruncatedScan(
-  call: EagerCall<ModelReached>,
-  ctx: ToolContext,
-  scan: ScanResult,
-): void {
+export function warnTruncatedScan(call: EagerMachinery, ctx: ToolContext, scan: ScanResult): void {
   if (!scan.truncated) return;
   logger.warn(
     `workspace ${call.workspaceRoot} contains more files than GEMINI_CODE_CONTEXT_MAX_FILES (${ctx.config.maxFilesPerWorkspace}); the tail was dropped before indexing.`,

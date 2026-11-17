@@ -4,15 +4,20 @@
  * reservation counts is `thinkingReserve`'s (`../shared/thinking.ts`), called with the level and `thinkingBudgetField`.
  */
 
-import type { ThinkingConfig, ThinkingLevel } from '@google/genai';
+import type { ThinkingConfig } from '@google/genai';
 import type { OutputCap } from '../../gemini/long-decode.js';
-import { type ThinkingLevelLiteral, thinkingBudgetUnder } from '../shared/thinking.js';
+import {
+  type ThinkingLevelLiteral,
+  levelThinkingConfig,
+  thinkingBudgetUnder,
+} from '../shared/thinking.js';
 import type { AskInput } from './input.js';
 
 /**
- * How the call drives the model's reasoning. Schema `.refine()` guarantees `thinkingBudget` and `thinkingLevel` are
- * never both set, so the three are mutually exclusive:
- *   - `level`: the caller's `thinkingLevel`, Google's recommended path on Gemini 3 (rejected by the Gemini 2.5 family);
+ * How the call drives the model's reasoning, one of three on the wire:
+ *   - `level`: the caller's `thinkingLevel`, Google's recommended path on Gemini 3 (rejected by the Gemini 2.5 family).
+ *     The schema's `.refine()` refuses a `thinkingBudget` beside it; a call that reaches `execute` with both anyway
+ *     sends the level alone and reports the budget normalised as on the budget path (`reportedBudget`);
  *   - `model-default`: neither knob set — nothing goes on the wire but `includeThoughts`, and Gemini uses each model's
  *     native default, which per Google's Gemini 3 guide (https://ai.google.dev/gemini-api/docs/gemini-3) is
  *     HIGH-dynamic on Gemini 3 Pro. Google flags an explicit `thinkingBudget` as the "legacy" path on Gemini 3 ("may
@@ -23,7 +28,12 @@ import type { AskInput } from './input.js';
  *     positive budget clamped under the cap that runs.
  */
 export type AskThinking =
-  | { readonly kind: 'level'; readonly level: ThinkingLevelLiteral }
+  | {
+      readonly kind: 'level';
+      readonly level: ThinkingLevelLiteral;
+      /** The caller's `thinkingBudget` normalised under the cap, never sent: the result reports it. */
+      readonly reportedBudget: number | null;
+    }
   | { readonly kind: 'model-default' }
   | { readonly kind: 'budget'; readonly budget: number };
 
@@ -34,25 +44,28 @@ export type AskThinking =
  * one request (its value on the wire) the budget stays below it.
  */
 export function askThinking(input: AskInput, cap: OutputCap): AskThinking {
-  if (input.thinkingLevel !== undefined) return { kind: 'level', level: input.thinkingLevel };
-  const raw = input.thinkingBudget;
-  if (raw === undefined) return { kind: 'model-default' };
-  if (raw === -1) return { kind: 'budget', budget: -1 };
-  return { kind: 'budget', budget: raw > 0 ? thinkingBudgetUnder(cap, raw) : 0 };
+  const budget = normalisedBudget(input.thinkingBudget, cap);
+  if (input.thinkingLevel !== undefined) {
+    return { kind: 'level', level: input.thinkingLevel, reportedBudget: budget };
+  }
+  return budget === null ? { kind: 'model-default' } : { kind: 'budget', budget };
+}
+
+/** The caller's `thinkingBudget` under `cap`: `null` unset, `-1` and `0` as they are, a positive one clamped. */
+function normalisedBudget(raw: number | undefined, cap: OutputCap): number | null {
+  if (raw === undefined) return null;
+  if (raw === -1) return -1;
+  return raw > 0 ? thinkingBudgetUnder(cap, raw) : 0;
 }
 
 /**
- * The `thinkingConfig` of every request. `thinkingConfig` is a per-request reasoning control, not one of the fields a
- * cached context forbids, so it travels with every request whatever the cache's state; `includeThoughts: true` is
- * always set so the caller sees Gemini's reasoning digest. The level is cast to `ThinkingLevel` rather than indexing
- * the runtime enum object: for a string enum the value IS the member name, so the cast is the same at runtime — and
- * it survives an SDK rename, where the literal reaches Gemini, which answers 400 with a clear message, instead of
- * silently becoming `undefined` at the indexing step.
+ * The `thinkingConfig` of every request, with a cache too (`RequestBuilder`, `../shared/eager-answer.ts`).
+ * `includeThoughts: true` is always set so the caller sees Gemini's reasoning digest.
  */
 export function thinkingConfigOf(thinking: AskThinking): ThinkingConfig {
   switch (thinking.kind) {
     case 'level':
-      return { thinkingLevel: thinking.level as ThinkingLevel, includeThoughts: true };
+      return levelThinkingConfig(thinking.level);
     case 'model-default':
       return { includeThoughts: true };
     case 'budget':
@@ -60,9 +73,19 @@ export function thinkingConfigOf(thinking: AskThinking): ThinkingConfig {
   }
 }
 
-/** The budget sent on the wire, as the result reports it and the reservation counts it; `null` when none is sent. */
+/**
+ * The budget the result reports and the reservation counts: the one sent on the budget path, the one normalised but
+ * not sent on the level path (the reservation then counts the level's tier), `null` when the caller set none.
+ */
 export function thinkingBudgetField(thinking: AskThinking): number | null {
-  return thinking.kind === 'budget' ? thinking.budget : null;
+  switch (thinking.kind) {
+    case 'level':
+      return thinking.reportedBudget;
+    case 'model-default':
+      return null;
+    case 'budget':
+      return thinking.budget;
+  }
 }
 
 /** The progress line that opens the decode. */

@@ -6,10 +6,11 @@
 import { thinkingBudgetRefusal } from '../../gemini/long-decode.js';
 import { resolveModel } from '../../gemini/models.js';
 import { errorResult } from '../registry.js';
+import type { StepOutcome } from '../shared/eager-call.js';
 import { eagerOutputCap, estimateInput, scanForCall } from '../shared/eager-steps.js';
 import { ServiceTierError, serviceTierOrRefusal } from '../shared/service-tier.js';
 import { inlineRequestRefusal } from './attachments.js';
-import type { AskAttached, AskCall, AskResolved, AskScanned, StepOutcome } from './call.js';
+import type { AskAttached, AskCall, AskResolved, AskScanned } from './call.js';
 
 /**
  * Resolve the model asked for and the call's tier. `ask` accepts all three text-generation tiers — the caller picks

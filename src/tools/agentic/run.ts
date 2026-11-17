@@ -3,7 +3,7 @@
  * limits, the request config, the per-pass reservation inputs) and what the loop accumulates (`LoopState`).
  */
 
-import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
+import type { Content, GenerateContentConfig, ThinkingConfig } from '@google/genai';
 import type { resolveModel } from '../../gemini/models.js';
 import type { MatchConfig } from '../../indexer/globs.js';
 import { estimateReservationUsd } from '../../utils/cost-estimator.js';
@@ -11,6 +11,7 @@ import type { ProgressEmitter } from '../../utils/progress.js';
 import type { ToolContext } from '../registry.js';
 import { resolveStallTimeoutMs, resolveTotalTimeoutMs } from '../shared/abort-timeout.js';
 import type { BilledFields } from '../shared/call-ledger.js';
+import { levelThinkingConfig } from '../shared/thinking.js';
 import type { AskAgenticInput } from './input.js';
 import { SYSTEM_INSTRUCTION_AGENTIC, buildFunctionDeclarations } from './instructions.js';
 import type { SignatureCounts } from './no-progress.js';
@@ -171,12 +172,7 @@ export function runLimitsOf(input: AskAgenticInput): RunLimits {
 }
 
 function thinkingConfigOf(input: AskAgenticInput): ThinkingConfig {
-  if (input.thinkingLevel !== undefined) {
-    return {
-      thinkingLevel: input.thinkingLevel as ThinkingLevel,
-      includeThoughts: true,
-    };
-  }
+  if (input.thinkingLevel !== undefined) return levelThinkingConfig(input.thinkingLevel);
   if (input.thinkingBudget !== undefined) {
     return { thinkingBudget: input.thinkingBudget, includeThoughts: true };
   }

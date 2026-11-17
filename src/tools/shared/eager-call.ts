@@ -12,7 +12,7 @@
 
 import { logger, safeForLog } from '../../utils/logger.js';
 import { type ProgressEmitter, createProgressEmitter } from '../../utils/progress.js';
-import type { ToolContext } from '../registry.js';
+import type { TextToolResult, ToolContext } from '../registry.js';
 import {
   type TimedOutCall,
   type TimedTool,
@@ -40,14 +40,18 @@ export interface ModelReached {
   readonly serviceTier: ServiceTierName;
 }
 
-/** What a call's failure path reads besides the decode's tracking: each field written by its step the moment its
- * value exists. */
-export interface FailureTrail<M extends ModelReached> {
+/** The part of a call's failure trail the shared steps keep: the daily-budget reservation. */
+export interface ReservationTrail {
   /** The daily-budget reservation held: set as soon as `reserveBudget` returned its id; cleared before the answer is
    * booked, and by the failure path. */
   reservationId: number | null;
-  /** Set once the model and its tier resolved; `null` before: no retry hint is seeded, the requested tier is
-   * reported. */
+}
+
+/** What a call's failure path reads besides the decode's tracking: each field written by its step the moment its
+ * value exists. */
+export interface FailureTrail<M extends ModelReached> extends ReservationTrail {
+  /** Set by the tool's model step once the model and its tier resolved; `null` before: no retry hint is seeded, the
+   * requested tier is reported. */
   model: M | null;
 }
 
@@ -62,8 +66,11 @@ export interface EagerCallRequest {
   readonly started: number;
 }
 
-/** The machinery of one `ask` / `code` call, created before its first await. */
-export interface EagerCall<M extends ModelReached> {
+/**
+ * The machinery of one `ask` / `code` call as the shared steps read and write it: everything but the trail's model,
+ * which only the tool's own model step writes — a shared step cannot replace a tool's model with a narrower one.
+ */
+export interface EagerMachinery {
   readonly tool: TimedTool;
   readonly workspaceRoot: string;
   readonly started: number;
@@ -75,8 +82,16 @@ export interface EagerCall<M extends ModelReached> {
   readonly completed: CompletedRequests;
   /** The running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent). */
   readonly tracking: DecodeTracking;
+  readonly trail: ReservationTrail;
+}
+
+/** The machinery of one `ask` / `code` call, created before its first await, with the tool's model in its trail. */
+export interface EagerCall<M extends ModelReached> extends EagerMachinery {
   readonly trail: FailureTrail<M>;
 }
+
+/** A step's outcome: the next stage, or the result that ends the call (a refusal). */
+export type StepOutcome<T> = { readonly next: T } | { readonly end: TextToolResult };
 
 interface FailureCommon<M extends ModelReached> {
   /** What the completed requests billed; `null` when no decode started, none of its requests completed, or the call
@@ -88,7 +103,7 @@ interface FailureCommon<M extends ModelReached> {
 }
 
 /** A call its controller aborted: the progress line `<tool>: aborted after …` is emitted. */
-export interface TimedOutEagerCall<M extends ModelReached> extends FailureCommon<M> {
+interface TimedOutEagerCall<M extends ModelReached> extends FailureCommon<M> {
   readonly kind: 'timeout';
   /** The limit that fired and its message. */
   readonly timedOut: TimedOutCall;
@@ -98,7 +113,7 @@ export interface TimedOutEagerCall<M extends ModelReached> extends FailureCommon
 }
 
 /** A call that failed otherwise. */
-export interface ErroredEagerCall<M extends ModelReached> extends FailureCommon<M> {
+interface ErroredEagerCall<M extends ModelReached> extends FailureCommon<M> {
   readonly kind: 'error';
   /** `<tool> failed: <message>`. */
   readonly message: string;
@@ -194,7 +209,7 @@ function timedOutFailure<M extends ModelReached>(
 }
 
 /** Close a call, on every path: the controller disposed, then the emitter stopped. */
-export function closeEagerCall(call: EagerCall<ModelReached>): void {
+export function closeEagerCall(call: EagerMachinery): void {
   call.timeout.dispose();
   call.emitter.stop();
 }

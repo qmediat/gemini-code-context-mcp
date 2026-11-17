@@ -5,21 +5,19 @@
 
 import type { Content, GenerateContentConfig } from '@google/genai';
 import type { PreparedContext } from '../../cache/cache-manager.js';
-import type { ContextRequest } from '../shared/context-decode.js';
+import type { RequestBuilder } from '../shared/eager-answer.js';
 import { serviceTierConfig } from '../shared/service-tier.js';
 import type { AskSized } from './call.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './instruction.js';
 import { thinkingConfigOf } from './thinking.js';
 
 /**
- * The request builder of one call. Gemini rejects `generateContent({cachedContent, systemInstruction})` with 400
- * ("CachedContent can not be used with GenerateContent request setting system_instruction, tools or tool_config"):
- * the system instruction is baked into the cache when it is built (`cache-manager.ts`, `cacheConfig.systemInstruction`),
- * so a request on a cached context omits it. `maxOutputTokens` goes on the wire only when the cap has a wire value (the
- * caller's `maxOutputTokens`, the operator's force-max, or a cap the input window cut); otherwise Gemini applies the
- * model's own default. The user turn carries the attachments first and the question last, with a cache too.
+ * The request builder of one call; what a cached context forbids is `RequestBuilder`'s rule
+ * (`../shared/eager-answer.ts`). `maxOutputTokens` goes on the wire only when the cap has a wire value (the caller's
+ * `maxOutputTokens`, the operator's force-max, or a cap the input window cut); otherwise Gemini applies the model's own
+ * default. The user turn carries the attachments first and the question last, with a cache too.
  */
-export function askRequest(call: AskSized): (prep: PreparedContext) => ContextRequest {
+export function askRequest(call: AskSized): RequestBuilder {
   const { input, attachments } = call;
   const cap = call.bounded.cap;
   const thinkingConfig = thinkingConfigOf(call.thinking);

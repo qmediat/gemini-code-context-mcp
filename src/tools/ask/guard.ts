@@ -5,9 +5,13 @@
 
 import { fallBackToAgentic } from '../ask-agentic-fallback.js';
 import { type TextToolResult, errorResult } from '../registry.js';
+import type { StepOutcome } from '../shared/eager-call.js';
 import { type OverWindow, countPreflight, overWindow } from '../shared/eager-steps.js';
 import { attachmentMetadata } from './attachments.js';
-import type { AskCounted, AskScanned, StepOutcome } from './call.js';
+import type { AskCounted, AskScanned } from './call.js';
+
+/** The guard's outcome: a step's, or the `ask_agentic` fallback, still pending, which the entry returns unawaited. */
+type GuardOutcome = StepOutcome<AskCounted> | { readonly handOff: Promise<TextToolResult> };
 
 /**
  * Count the call's input and hold it against the model's window. A workspace the window cannot hold is refused
@@ -19,7 +23,7 @@ import type { AskCounted, AskScanned, StepOutcome } from './call.js';
  * run up to its first await (it disposed this call's controller and started the agentic call), and the entry returns
  * the promise from inside its `try`.
  */
-export async function guardAsk(call: AskScanned): Promise<StepOutcome<AskCounted>> {
+export async function guardAsk(call: AskScanned): Promise<GuardOutcome> {
   const { input, ctx, eager } = call;
   const count = await countPreflight(eager, ctx, {
     scan: call.scan,

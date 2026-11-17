@@ -9,13 +9,10 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import { invalidateWorkspaceCache } from '../cache/cache-manager.js';
 import { invalidateModelCache } from '../gemini/model-registry.js';
-import { scanWorkspace } from '../indexer/workspace-scanner.js';
-import {
-  WorkspaceValidationError,
-  validateWorkspacePath,
-} from '../indexer/workspace-validation.js';
+import { type ScanResult, scanWorkspace } from '../indexer/workspace-scanner.js';
 import { createProgressEmitter } from '../utils/progress.js';
-import { type ToolDefinition, errorResult, textResult } from './registry.js';
+import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
+import { workspaceRefusal } from './shared/workspace-refusal.js';
 
 export const reindexInputSchema = z.object({
   workspace: z.string().optional().describe('Workspace path (default: cwd).'),
@@ -38,14 +35,8 @@ export const reindexTool: ToolDefinition<ReindexInput> = {
     const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
     try {
       const workspaceRoot = resolve(input.workspace ?? process.cwd());
-      try {
-        validateWorkspacePath(workspaceRoot);
-      } catch (err) {
-        if (err instanceof WorkspaceValidationError) {
-          return errorResult(`reindex: ${err.message}`);
-        }
-        throw err;
-      }
+      const refusal = workspaceRefusal('reindex', workspaceRoot);
+      if (refusal !== null) return refusal;
       emitter.emit('invalidating cache…');
       await invalidateWorkspaceCache({
         client: ctx.client,
@@ -57,28 +48,14 @@ export const reindexTool: ToolDefinition<ReindexInput> = {
       }
 
       emitter.emit('rescanning workspace…');
-      // v1.13.0 — `reindex` is the operator's explicit "blow away the memo"
-      // tool, so force a fresh hash for every file regardless of the
-      // mtime+size shortcut. Other tools (ask/code) use the memo by default.
+      // `reindex` is the operator's explicit "blow away the memo": every file is hashed again, whatever its mtime and
+      // size (`ask` and `code` use the memo by default).
       const scan = await scanWorkspace(workspaceRoot, {
         maxFiles: ctx.config.maxFilesPerWorkspace,
         maxFileSizeBytes: ctx.config.maxFileSizeBytes,
         forceRescan: true,
       });
-
-      const structured = {
-        workspace: workspaceRoot,
-        filesRescanned: scan.files.length,
-        skippedTooLarge: scan.skippedTooLarge,
-        truncated: scan.truncated,
-        filesHash: scan.filesHash,
-        note: 'Next `ask`/`code` call will upload changed files and build a fresh cache.',
-      };
-
-      return textResult(
-        `Workspace ${workspaceRoot} reindexed. ${scan.files.length} files tracked (${scan.skippedTooLarge} skipped as oversized${scan.truncated ? '; results were truncated by maxFiles cap' : ''}). Next ask/code call will rebuild the cache.`,
-        structured,
-      );
+      return reindexedResult(workspaceRoot, scan);
     } catch (err) {
       return errorResult(`reindex failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -86,3 +63,19 @@ export const reindexTool: ToolDefinition<ReindexInput> = {
     }
   },
 };
+
+/** The rescanned workspace: what it tracks now, what the scan skipped, and that the next call rebuilds the cache. */
+function reindexedResult(workspaceRoot: string, scan: ScanResult): TextToolResult {
+  const structured = {
+    workspace: workspaceRoot,
+    filesRescanned: scan.files.length,
+    skippedTooLarge: scan.skippedTooLarge,
+    truncated: scan.truncated,
+    filesHash: scan.filesHash,
+    note: 'Next `ask`/`code` call will upload changed files and build a fresh cache.',
+  };
+  return textResult(
+    `Workspace ${workspaceRoot} reindexed. ${scan.files.length} files tracked (${scan.skippedTooLarge} skipped as oversized${scan.truncated ? '; results were truncated by maxFiles cap' : ''}). Next ask/code call will rebuild the cache.`,
+    structured,
+  );
+}

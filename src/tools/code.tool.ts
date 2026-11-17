@@ -9,7 +9,7 @@
  */
 
 import { resolve } from 'node:path';
-import type { GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
+import type { GenerateContentConfig, ThinkingConfig } from '@google/genai';
 import { z } from 'zod';
 import type { PreparedContext } from '../cache/cache-manager.js';
 import { CACHING_MODE_FALLBACK_DESCRIPTION, type RanCaching } from '../cache/caching-mode.js';
@@ -31,9 +31,10 @@ import {
   errorResult,
   textResult,
 } from './registry.js';
-import type { ContextDecode, ContextRequest } from './shared/context-decode.js';
+import type { ContextDecode } from './shared/context-decode.js';
 import { type DecodedResponse, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import {
+  type RequestBuilder,
   type SettledDecode,
   decodeEagerCall,
   prepareCallContext,
@@ -45,6 +46,7 @@ import {
   type EagerCall,
   type FailedEagerCall,
   type ModelReached,
+  type StepOutcome,
   closeEagerCall,
   openEagerCall,
   settleFailedEager,
@@ -60,7 +62,6 @@ import {
   preflightFields,
   reserveCallBudget,
   scanForCall,
-  workspaceRefusal,
 } from './shared/eager-steps.js';
 import {
   SERVICE_TIER_DESCRIPTION,
@@ -70,7 +71,13 @@ import {
   serviceTierOrRefusal,
 } from './shared/service-tier.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
+import {
+  THINKING_LEVEL_FIELD,
+  levelThinkingConfig,
+  thinkingBudgetUnder,
+  thinkingReserve,
+} from './shared/thinking.js';
+import { workspaceRefusal } from './shared/workspace-refusal.js';
 
 /**
  * `code` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -361,9 +368,6 @@ interface CodeSized extends CodeCounted {
   readonly thinkingBudget: number;
 }
 
-/** A step's outcome: the next stage, or the result that ends the call. */
-type CodeStep<T> = { readonly next: T } | { readonly end: TextToolResult };
-
 /** What the answer carries besides its text: the edits, the code blocks, the Code Execution tool's parts. */
 interface CodeArtifacts {
   readonly edits: ParsedEdit[];
@@ -423,7 +427,7 @@ async function executeCodeBody(
  * `generateContent` with a coding prompt. From here every result, error results included, carries the audit, so an
  * audit of a failed call can still tell a fallback from a caller's choice.
  */
-async function resolveCode(call: CodeCall): Promise<CodeStep<CodeResolved>> {
+async function resolveCode(call: CodeCall): Promise<StepOutcome<CodeResolved>> {
   const { input, ctx, eager } = call;
   const modelRequest = input.model ?? ctx.config.defaultModel ?? CODE_FALLBACK_MODEL; // the last ?? as ask_agentic has it
   eager.emitter.emit(`resolving model '${modelRequest}'…`);
@@ -461,7 +465,7 @@ async function resolveCode(call: CodeCall): Promise<CodeStep<CodeResolved>> {
  * positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused first
  * (`thinkingBudgetRefusal`; the budget on the wire is clamped under the cap that runs later).
  */
-async function guardCode(call: CodeResolved): Promise<CodeStep<CodeCounted>> {
+async function guardCode(call: CodeResolved): Promise<StepOutcome<CodeCounted>> {
   const { input, ctx, eager, resolved } = call;
   const scan = await scanForCall(eager, ctx, input);
   const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, resolved);
@@ -511,7 +515,7 @@ function codeTooLargeResult(call: CodeCounted, over: OverWindow): TextToolResult
  * Size the call: the output cap bounded by the model's input window (a cut is said on the progress channel and the
  * log), the budget clamped under it, then the reservation — the thinking it counts from the cap that runs.
  */
-function sizeCode(call: CodeCounted): CodeStep<CodeSized> {
+function sizeCode(call: CodeCounted): StepOutcome<CodeSized> {
   const { input, eager } = call;
   const bounded = capThatRuns({
     tool: 'code',
@@ -593,16 +597,12 @@ function codeGeneratingLine(call: CodeSized): string {
 }
 
 /**
- * The request builder of one call. Gemini rejects `generateContent({cachedContent, system_instruction|tools|
- * tool_config})` with 400: the system instruction is baked into the cache when it is built, and `tools`
- * (`codeExecution`) cannot be combined with a cache built without them — so with `codeExecution` an active cache is
+ * The request builder of one call; what a cached context forbids is `RequestBuilder`'s rule
+ * (`./shared/eager-answer.ts`). `tools` (`codeExecution`) are among it, so with `codeExecution` an active cache is
  * bypassed (said in the log) and the caller's explicit request wins. The user prompt asks for OLD/NEW blocks when
  * edits are expected.
  */
-function codeRequest(
-  call: CodeSized,
-  prepared: PreparedContext,
-): (prep: PreparedContext) => ContextRequest {
+function codeRequest(call: CodeSized, prepared: PreparedContext): RequestBuilder {
   const { codeExecution } = call;
   const userPrompt = call.expectEdits
     ? `${call.input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
@@ -623,9 +623,8 @@ function codeRequest(
 }
 
 /**
- * The `config` of every request. With a cache the system instruction is baked in and `thinkingConfig` stays (a
- * per-request control); without one — or with the cache bypassed for `codeExecution` — the full config, `tools` with
- * `codeExecution`. `maxOutputTokens` goes on the wire only when the cap has a wire value (the caller's
+ * The `config` of every request. With a cache, `cachedContent` and `thinkingConfig`; without one — or with the cache
+ * bypassed for `codeExecution` — the full config, `tools` with `codeExecution`. `maxOutputTokens` goes on the wire only when the cap has a wire value (the caller's
  * `maxOutputTokens`, `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`, or a cap the input window cut); otherwise Gemini
  * applies the model's default.
  */
@@ -652,14 +651,13 @@ function codeConfig(
 }
 
 /**
- * The `thinkingConfig` of every request: the caller's `thinkingLevel`, cast to the SDK enum rather than looked up in
- * the runtime enum object, so a future SDK rename surfaces as a Gemini 400, not a silent `undefined`; else the budget.
+ * The `thinkingConfig` of every request: the caller's `thinkingLevel` (`levelThinkingConfig`), else the budget.
  * `includeThoughts: true` always, so the answer has a thought summary to report.
  */
 function codeThinkingConfig(call: CodeSized): ThinkingConfig {
   const level = call.input.thinkingLevel;
   return level !== undefined
-    ? { thinkingLevel: level as ThinkingLevel, includeThoughts: true }
+    ? levelThinkingConfig(level)
     : { thinkingBudget: call.thinkingBudget, includeThoughts: true };
 }
 

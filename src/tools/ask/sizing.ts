@@ -1,9 +1,10 @@
 /** `ask`'s sizing: the cap that runs, the thinking under it, and the daily-budget reservation of the worst case. */
 
 import { capThatRuns } from '../../gemini/long-decode.js';
+import type { StepOutcome } from '../shared/eager-call.js';
 import { reserveCallBudget } from '../shared/eager-steps.js';
 import { thinkingReserve } from '../shared/thinking.js';
-import type { AskCounted, AskSized, StepOutcome } from './call.js';
+import type { AskCounted, AskSized } from './call.js';
 import { budgetRejectResult } from './results.js';
 import { askThinking, thinkingBudgetField } from './thinking.js';
 

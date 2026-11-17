@@ -1,16 +1,17 @@
 /**
- * One `ask` call as it grows: each stage adds what its step produced — nothing optional — and a step's outcome says
- * whether the call goes on, ends with a result, or hands off to the `ask_agentic` fallback.
+ * One `ask` call as it grows: each stage adds what its step produced — nothing optional. A step's outcome
+ * (`StepOutcome`, `../shared/eager-call.ts`) says whether the call goes on or ends with a result.
  */
 
+import type { Part } from '@google/genai';
+import type { Attachment } from '../../attachments.js';
 import type { BoundedOutputCap, OutputCap } from '../../gemini/long-decode.js';
 import type { ScanResult } from '../../indexer/workspace-scanner.js';
 import type { ResolvedModel } from '../../types.js';
-import type { TextToolResult, ToolContext } from '../registry.js';
+import type { ToolContext } from '../registry.js';
 import type { EagerCall, ModelReached } from '../shared/eager-call.js';
 import type { InputEstimate, PreflightCount } from '../shared/eager-steps.js';
 import type { ServiceTierName } from '../shared/service-tier.js';
-import type { PreparedAttachments } from './attachments.js';
 import type { AskInput } from './input.js';
 import type { AskThinking } from './thinking.js';
 
@@ -27,6 +28,16 @@ export interface AskCall {
 export interface AskResolved extends AskCall {
   readonly resolved: ResolvedModel;
   readonly serviceTier: ServiceTierName;
+}
+
+/** The attachments of one call, inspected, read and counted by Gemini. */
+export interface PreparedAttachments {
+  readonly attached: Attachment[];
+  readonly parts: Part[];
+  /** Raw bytes read. */
+  readonly bytes: number;
+  /** What Gemini counted for the parts. */
+  readonly tokens: number;
 }
 
 /** The attachments inspected, read and counted. */
@@ -55,13 +66,3 @@ export interface AskSized extends AskCounted {
   readonly bounded: BoundedOutputCap;
   readonly thinking: AskThinking;
 }
-
-/**
- * A step's outcome: the next stage; the result that ends the call (a refusal); or the fallback, still pending, which
- * the entry returns unawaited — its `finally` runs while the fallback runs, and a rejection of the fallback reaches
- * the caller as it came, never the call's failure path.
- */
-export type StepOutcome<T> =
-  | { readonly next: T }
-  | { readonly end: TextToolResult }
-  | { readonly handOff: Promise<TextToolResult> };

@@ -3,9 +3,7 @@
  * and the throttle; the refusals that end a call over them; the request-size refusal; their result fields.
  */
 
-import type { Part } from '@google/genai';
 import {
-  type Attachment,
   AttachmentError,
   AttachmentTokensUncountedError,
   INLINE_REQUEST_LIMIT_BYTES,
@@ -16,17 +14,10 @@ import {
 } from '../../attachments.js';
 import { safeForLog } from '../../utils/logger.js';
 import { type TextToolResult, errorResult } from '../registry.js';
-import type { AskAttached, AskResolved, StepOutcome } from './call.js';
+import type { StepOutcome } from '../shared/eager-call.js';
+import type { ServiceTierName } from '../shared/service-tier.js';
+import type { AskAttached, AskResolved, PreparedAttachments } from './call.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './instruction.js';
-
-export interface PreparedAttachments {
-  readonly attached: Attachment[];
-  readonly parts: Part[];
-  /** Raw bytes read. */
-  readonly bytes: number;
-  /** What Gemini counted for the parts. */
-  readonly tokens: number;
-}
 
 /** The attachments of one call: inspected, read and counted by Gemini, in that order — a refused file is never read,
  * a file that fails to read is never counted, and nothing has been reserved yet. */
@@ -99,7 +90,7 @@ export function inlineRequestRefusal(
   prepared: PreparedAttachments,
   files: readonly { relpath: string; size: number }[],
   prompt: string,
-  serviceTier: 'standard' | 'flex',
+  serviceTier: ServiceTierName,
 ): TextToolResult | undefined {
   if (prepared.attached.length === 0) return undefined;
   const textBytes =
