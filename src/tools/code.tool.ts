@@ -22,7 +22,6 @@ import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
 import type { ResolvedModel } from '../types.js';
-import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { decodeOnContext } from './shared/context-decode.js';
@@ -38,6 +37,7 @@ import {
   countPreflight,
   eagerOutputCap,
   estimateInput,
+  reserveCallBudget,
   scanForCall,
   workspaceRefusal,
 } from './shared/eager-steps.js';
@@ -408,7 +408,7 @@ async function executeCodeBody(
     );
     if (budgetRefusal !== null) return errorResult(`code: ${budgetRefusal}`);
 
-    const { workspaceBytes, tokens: estimatedInputTokens } = estimateInput(scan, input.task, 0);
+    const estimate = estimateInput(scan, input.task, 0);
 
     // The preflight: the same guard as `ask`'s, with no fallback.
     const count = await countPreflight(call, ctx, {
@@ -463,39 +463,22 @@ async function executeCodeBody(
       runCap,
     );
 
-    // Atomic budget reservation — see ask.tool.ts for the full rationale.
-    // Estimate includes the thinking budget (billed as output tokens on Pro)
-    // PLUS the candidate output cap.
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const estimateUsd = estimatePreCallCostUsd({
-        model: resolved.resolved,
-        serviceTier,
-        workspaceBytes,
-        promptChars: input.task.length,
-        expectedOutputTokens: runCap.effective,
-        // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
-        perRequestOutputTokens: runCap.perRequest,
-        // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
-        countedInputTokens: preflight?.effectiveTokens,
-        thinkingTokens: thinkingTokensForEstimate,
-        coverMs: timeoutController.timeoutMs,
+    const reservation = reserveCallBudget(call, ctx, {
+      resolved,
+      serviceTier,
+      estimate,
+      promptChars: input.task.length,
+      extraInputTokens: 0,
+      cap: runCap,
+      countedInputTokens: preflight?.effectiveTokens,
+      thinkingTokens: thinkingTokensForEstimate,
+    });
+    if (reservation.kind === 'rejected') {
+      return errorResult(reservation.message, {
+        errorCode: 'BUDGET_REJECT',
+        retryable: false,
+        ...modelAudit,
       });
-      const reserve = ctx.manifest.reserveBudget({
-        workspaceRoot,
-        toolName: 'code',
-        model: resolved.resolved,
-        estimatedCostMicros: toMicrosUsd(estimateUsd),
-        dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
-        nowMs: Date.now(),
-      });
-      if ('rejected' in reserve) {
-        const spentUsd = reserve.spentMicros / 1_000_000;
-        return errorResult(
-          `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false, ...modelAudit },
-        );
-      }
-      call.trail.reservationId = reserve.id;
     }
 
     const systemPromptHash = createHash('sha256')
@@ -632,7 +615,7 @@ async function executeCodeBody(
         completed,
         tracking,
         throttle: dispatch,
-        inputTokens: { estimated: estimatedInputTokens, counted: preflight?.effectiveTokens },
+        inputTokens: { estimated: estimate.tokens, counted: preflight?.effectiveTokens },
       },
       ctxPrep,
     );

@@ -16,10 +16,12 @@ import {
   validateWorkspacePath,
 } from '../../indexer/workspace-validation.js';
 import type { ResolvedModel } from '../../types.js';
+import { estimatePreCallCostUsd, toMicrosUsd } from '../../utils/cost-estimator.js';
 import { logger, safeForLog } from '../../utils/logger.js';
 import { type TextToolResult, type ToolContext, errorResult } from '../registry.js';
 import type { TimedTool } from './abort-timeout.js';
 import type { EagerCall, ModelReached } from './eager-call.js';
+import type { ServiceTierName } from './service-tier.js';
 
 /**
  * The refusal of a workspace path the validation rejects (`<tool>: <message>`, no fields), else `null`. Called inside
@@ -164,4 +166,73 @@ export async function countPreflight(
     contextWindow,
     threshold: Math.floor(contextWindow * ctx.config.workspaceGuardRatio),
   };
+}
+
+/** What the daily-budget reservation is estimated from. */
+export interface ReservationRequest {
+  readonly resolved: ResolvedModel;
+  readonly serviceTier: ServiceTierName;
+  readonly estimate: InputEstimate;
+  readonly promptChars: number;
+  /** Input tokens beyond the files and the prompt (`ask`'s attachments; 0 for `code`). */
+  readonly extraInputTokens: number;
+  /** The cap that runs: its value bounds what a completed request bills; above the per-request limit (a long decode)
+   * every continuation request bills the input again. */
+  readonly cap: OutputCap;
+  /** The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic. */
+  readonly countedInputTokens: number | undefined;
+  readonly thinkingTokens: number;
+}
+
+/** How the reservation ended. */
+export type ReservationOutcome =
+  /** No daily cap: nothing reserved. */
+  | { readonly kind: 'unbounded' }
+  /** Reserved: the call's trail holds the id. */
+  | { readonly kind: 'reserved' }
+  /** The cap would be exceeded: nothing reserved; the message is the same for both tools. */
+  | { readonly kind: 'rejected'; readonly message: string };
+
+/**
+ * Reserve the call's worst case against the daily budget: after the scan (the estimate needs it), before anything
+ * billable. `reserveBudget` checks and inserts in one `BEGIN IMMEDIATE` transaction, so concurrent calls cannot all
+ * pass the check and overshoot the cap together. The id goes into the call's trail at once: no statement comes
+ * between a reservation and its owner.
+ */
+export function reserveCallBudget(
+  call: EagerCall<ModelReached>,
+  ctx: ToolContext,
+  req: ReservationRequest,
+): ReservationOutcome {
+  const dailyBudgetUsd = ctx.config.dailyBudgetUsd;
+  if (!Number.isFinite(dailyBudgetUsd)) return { kind: 'unbounded' };
+  const estimateUsd = estimatePreCallCostUsd({
+    model: req.resolved.resolved,
+    serviceTier: req.serviceTier,
+    extraInputTokens: req.extraInputTokens,
+    workspaceBytes: req.estimate.workspaceBytes,
+    promptChars: req.promptChars,
+    expectedOutputTokens: req.cap.effective,
+    perRequestOutputTokens: req.cap.perRequest,
+    countedInputTokens: req.countedInputTokens,
+    thinkingTokens: req.thinkingTokens,
+    coverMs: call.timeout.timeoutMs,
+  });
+  const reserve = ctx.manifest.reserveBudget({
+    workspaceRoot: call.workspaceRoot,
+    toolName: call.tool,
+    model: req.resolved.resolved,
+    estimatedCostMicros: toMicrosUsd(estimateUsd),
+    dailyBudgetMicros: toMicrosUsd(dailyBudgetUsd),
+    nowMs: Date.now(),
+  });
+  if ('rejected' in reserve) {
+    const spentUsd = reserve.spentMicros / 1_000_000;
+    return {
+      kind: 'rejected',
+      message: `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
+    };
+  }
+  call.trail.reservationId = reserve.id;
+  return { kind: 'reserved' };
 }

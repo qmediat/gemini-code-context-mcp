@@ -14,7 +14,6 @@ import { prepareContext } from '../cache/cache-manager.js';
 import { cachingModeFor, cachingRan } from '../cache/caching-mode.js';
 import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
-import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger } from '../utils/logger.js';
 import { fallBackToAgentic } from './ask-agentic-fallback.js';
 import {
@@ -37,6 +36,7 @@ import {
   countPreflight,
   eagerOutputCap,
   estimateInput,
+  reserveCallBudget,
   scanForCall,
   workspaceRefusal,
 } from './shared/eager-steps.js';
@@ -172,11 +172,7 @@ async function executeAskBody(
     );
     if (budgetRefusal !== null) return errorResult(`ask: ${budgetRefusal}`);
 
-    const { workspaceBytes, tokens: estimatedInputTokens } = estimateInput(
-      scan,
-      input.prompt,
-      attachmentTokens,
-    );
+    const estimate = estimateInput(scan, input.prompt, attachmentTokens);
     const inlineRefusal = inlineRequestRefusal(attachments, scan.files, input.prompt, serviceTier);
     if (inlineRefusal !== undefined) return inlineRefusal;
 
@@ -292,46 +288,22 @@ async function executeAskBody(
       runCap,
     );
 
-    // Atomic budget reservation. Happens AFTER scan (so the estimate is
-    // accurate) but BEFORE any billable upload or generateContent call.
-    // Concurrent tool calls cannot all pass a pre-check and then
-    // collectively overshoot the cap: `reserveBudget` uses a
-    // `BEGIN IMMEDIATE` SQLite transaction that serialises check-and-insert.
-    if (Number.isFinite(ctx.config.dailyBudgetUsd)) {
-      const estimateUsd = estimatePreCallCostUsd({
-        model: resolved.resolved,
+    const reservation = reserveCallBudget(call, ctx, {
+      resolved,
+      serviceTier,
+      estimate,
+      promptChars: input.prompt.length,
+      extraInputTokens: attachmentTokens,
+      cap: runCap,
+      countedInputTokens: preflight?.effectiveTokens,
+      thinkingTokens: thinkingTokensForEstimate,
+    });
+    if (reservation.kind === 'rejected') {
+      return errorResult(reservation.message, {
+        errorCode: 'BUDGET_REJECT',
+        retryable: false,
         serviceTier,
-        extraInputTokens: attachmentTokens,
-        workspaceBytes,
-        promptChars: input.prompt.length,
-        // Budget reservation uses the effective cap (explicit-user-cap
-        // OR model's full limit) as `expectedOutputTokens` — a TRUE
-        // upper bound, since Gemini's default stops at the model's
-        // advertised `outputTokenLimit`.
-        expectedOutputTokens: runCap.effective,
-        // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
-        perRequestOutputTokens: runCap.perRequest,
-        // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
-        countedInputTokens: preflight?.effectiveTokens,
-        thinkingTokens: thinkingTokensForEstimate,
-        coverMs: timeoutController.timeoutMs,
       });
-      const reserve = ctx.manifest.reserveBudget({
-        workspaceRoot,
-        toolName: 'ask',
-        model: resolved.resolved,
-        estimatedCostMicros: toMicrosUsd(estimateUsd),
-        dailyBudgetMicros: toMicrosUsd(ctx.config.dailyBudgetUsd),
-        nowMs: Date.now(),
-      });
-      if ('rejected' in reserve) {
-        const spentUsd = reserve.spentMicros / 1_000_000;
-        return errorResult(
-          `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${ctx.config.dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-          { errorCode: 'BUDGET_REJECT', retryable: false, serviceTier },
-        );
-      }
-      call.trail.reservationId = reserve.id;
     }
 
     const systemPromptHash = createHash('sha256')
@@ -473,7 +445,7 @@ async function executeAskBody(
         completed,
         tracking,
         throttle: dispatch,
-        inputTokens: { estimated: estimatedInputTokens, counted: preflight?.effectiveTokens },
+        inputTokens: { estimated: estimate.tokens, counted: preflight?.effectiveTokens },
       },
       ctxPrep,
     );
