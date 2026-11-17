@@ -1,9 +1,15 @@
-/** `ask`'s model and its tier: the first step of a call, before anything is read, counted or reserved. */
+/**
+ * The steps of an `ask` call before its count: the model and its tier, then the scan and the refusals over it. Nothing
+ * is counted by the preflight or reserved yet.
+ */
 
+import { thinkingBudgetRefusal } from '../../gemini/long-decode.js';
 import { resolveModel } from '../../gemini/models.js';
 import { errorResult } from '../registry.js';
+import { eagerOutputCap, estimateInput, scanForCall } from '../shared/eager-steps.js';
 import { ServiceTierError, serviceTierOrRefusal } from '../shared/service-tier.js';
-import type { AskCall, AskResolved, StepOutcome } from './call.js';
+import { inlineRequestRefusal } from './attachments.js';
+import type { AskAttached, AskCall, AskResolved, AskScanned, StepOutcome } from './call.js';
 
 /**
  * Resolve the model asked for and the call's tier. `ask` accepts all three text-generation tiers — the caller picks
@@ -31,4 +37,31 @@ export async function resolveAsk(call: AskCall): Promise<StepOutcome<AskResolved
   }
   eager.trail.model = { resolvedModel: resolved.resolved, serviceTier };
   return { next: { ...call, resolved, serviceTier } };
+}
+
+/**
+ * Scan the workspace, then the refusals that need the scan and cost nothing: a positive `thinkingBudget` that leaves
+ * no answer reserve under the caller's own cap (`thinkingBudgetRefusal`; the budget on the wire is clamped under the
+ * cap that runs later), and an inline request over Google's size limit (only with attachments). The input estimate is
+ * the one the budget and the TPM reservations both hold.
+ */
+export async function scanAsk(call: AskAttached): Promise<StepOutcome<AskScanned>> {
+  const { input, ctx, attachments } = call;
+  const scan = await scanForCall(call.eager, ctx, input);
+  const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, call.resolved);
+  const budgetRefusal = thinkingBudgetRefusal(
+    input.thinkingBudget,
+    input.maxOutputTokens,
+    outputCap.effective,
+  );
+  if (budgetRefusal !== null) return { end: errorResult(`ask: ${budgetRefusal}`) };
+  const estimate = estimateInput(scan, input.prompt, attachments.tokens);
+  const inlineRefusal = inlineRequestRefusal(
+    attachments,
+    scan.files,
+    input.prompt,
+    call.serviceTier,
+  );
+  if (inlineRefusal !== undefined) return { end: inlineRefusal };
+  return { next: { ...call, scan, outputCap, estimate } };
 }

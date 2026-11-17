@@ -37,6 +37,7 @@ import {
   countPreflight,
   eagerOutputCap,
   estimateInput,
+  overWindow,
   reserveCallBudget,
   scanForCall,
   workspaceRefusal,
@@ -381,11 +382,7 @@ async function executeCodeBody(
       );
     }
 
-    const scan = await scanForCall(call, ctx, {
-      includeGlobs: input.includeGlobs,
-      excludeGlobs: input.excludeGlobs,
-      forceRescan: input.forceRescan,
-    });
+    const scan = await scanForCall(call, ctx, input);
     const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, resolved);
 
     // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
@@ -409,12 +406,11 @@ async function executeCodeBody(
       extraTokens: 0,
     });
     const preflight = count?.preflight;
-    if (count !== null && count.preflight.effectiveTokens > count.threshold) {
-      const { threshold, contextWindow } = count;
-      const counted = count.preflight;
-      const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
+    const over = overWindow(count, ctx);
+    if (over !== null) {
+      const { counted, threshold, contextWindow } = over;
       return errorResult(
-        `Workspace too large for eager \`code\`: ~${counted.effectiveTokens.toLocaleString()} input tokens (${counted.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
+        `Workspace too large for eager \`code\`: ~${counted.effectiveTokens.toLocaleString()} input tokens (${counted.method} count) exceeds ${threshold.toLocaleString()} (${over.pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, (d) split the workspace into subdirectories, or (e) use \`ask_agentic\` for Q&A-style analysis without uploading the repo (\`code\` itself still requires the eager path for its OLD/NEW edit format).`,
         {
           errorCode: 'WORKSPACE_TOO_LARGE',
           retryable: false,

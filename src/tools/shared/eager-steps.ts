@@ -39,11 +39,11 @@ export function workspaceRefusal(tool: TimedTool, workspaceRoot: string): TextTo
   return null;
 }
 
-/** The caller's narrowing of the workspace scan. */
+/** The caller's narrowing of the workspace scan: the knobs of both tools' input, read from it as it is. */
 export interface ScanFilters {
-  readonly includeGlobs: readonly string[] | undefined;
-  readonly excludeGlobs: readonly string[] | undefined;
-  readonly forceRescan: boolean | undefined;
+  readonly includeGlobs?: readonly string[] | undefined;
+  readonly excludeGlobs?: readonly string[] | undefined;
+  readonly forceRescan?: boolean | undefined;
 }
 
 /**
@@ -166,6 +166,32 @@ export async function countPreflight(
     contextWindow,
     threshold: Math.floor(contextWindow * ctx.config.workspaceGuardRatio),
   };
+}
+
+/** A count over the window: the workspace is too large for the eager path. */
+export interface OverWindow {
+  /** The count, the extra tokens included. */
+  readonly counted: PreflightTokenResult;
+  readonly contextWindow: number;
+  readonly threshold: number;
+  /** `workspaceGuardRatio` as a whole percent, as the refusal says it. */
+  readonly pctDisplay: number;
+}
+
+/**
+ * The guard's verdict on the count: the values a refusal reports when the count passed the threshold, else `null` —
+ * the count fits, or the model advertises no input limit (the guard did not run). Each tool composes its own refusal.
+ */
+export function overWindow(count: PreflightCount | null, ctx: ToolContext): OverWindow | null {
+  if (count !== null && count.preflight.effectiveTokens > count.threshold) {
+    return {
+      counted: count.preflight,
+      contextWindow: count.contextWindow,
+      threshold: count.threshold,
+      pctDisplay: Math.round(ctx.config.workspaceGuardRatio * 100),
+    };
+  }
+  return null;
 }
 
 /** What the daily-budget reservation is estimated from. */

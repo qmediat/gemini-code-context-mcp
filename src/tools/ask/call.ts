@@ -3,9 +3,12 @@
  * whether the call goes on, ends with a result, or hands off to the `ask_agentic` fallback.
  */
 
+import type { OutputCap } from '../../gemini/long-decode.js';
+import type { ScanResult } from '../../indexer/workspace-scanner.js';
 import type { ResolvedModel } from '../../types.js';
 import type { TextToolResult, ToolContext } from '../registry.js';
 import type { EagerCall, ModelReached } from '../shared/eager-call.js';
+import type { InputEstimate, PreflightCount } from '../shared/eager-steps.js';
 import type { ServiceTierName } from '../shared/service-tier.js';
 import type { PreparedAttachments } from './attachments.js';
 import type { AskInput } from './input.js';
@@ -28,6 +31,19 @@ export interface AskResolved extends AskCall {
 /** The attachments inspected, read and counted. */
 export interface AskAttached extends AskResolved {
   readonly attachments: PreparedAttachments;
+}
+
+/** The workspace scanned, the output cap asked for, the input estimated; no refusal over them. */
+export interface AskScanned extends AskAttached {
+  readonly scan: ScanResult;
+  readonly outputCap: OutputCap;
+  readonly estimate: InputEstimate;
+}
+
+/** The input counted and held against the model's window. */
+export interface AskCounted extends AskScanned {
+  /** `null`: the model advertises no input limit; the guard did not run. */
+  readonly count: PreflightCount | null;
 }
 
 /**

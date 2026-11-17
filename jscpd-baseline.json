@@ -1,9 +1,7 @@
 {
-  "duplicatedLines": 2319,
+  "duplicatedLines": 2215,
   "files": {
     "src/cache/cache-manager.ts": 58,
-    "src/tools/ask.tool.ts": 57,
-    "src/tools/code.tool.ts": 47,
     "test/integration/v1.7.0-srogi-extras.test.ts": 29,
     "test/integration/v1.7.0-streaming-srogi.test.ts": 37,
     "test/unit/abort-timeout.test.ts": 30,

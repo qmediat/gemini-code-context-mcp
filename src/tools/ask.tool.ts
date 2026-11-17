@@ -8,14 +8,14 @@
  */
 
 import { resolve } from 'node:path';
-import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
-import { fallBackToAgentic } from './ask-agentic-fallback.js';
-import { attachAsk, attachmentMetadata, inlineRequestRefusal } from './ask/attachments.js';
+import { capThatRuns } from '../gemini/long-decode.js';
+import { attachAsk, attachmentMetadata } from './ask/attachments.js';
 import type { StepOutcome } from './ask/call.js';
+import { guardAsk } from './ask/guard.js';
 import { type AskInput, askInputSchema } from './ask/input.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './ask/instruction.js';
 import { askRequest } from './ask/request.js';
-import { resolveAsk } from './ask/setup.js';
+import { resolveAsk, scanAsk } from './ask/setup.js';
 import { askThinking, generatingLine, thinkingBudgetField } from './ask/thinking.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import {
@@ -32,14 +32,7 @@ import {
   openEagerCall,
   settleFailedEager,
 } from './shared/eager-call.js';
-import {
-  countPreflight,
-  eagerOutputCap,
-  estimateInput,
-  reserveCallBudget,
-  scanForCall,
-  workspaceRefusal,
-} from './shared/eager-steps.js';
+import { reserveCallBudget, workspaceRefusal } from './shared/eager-steps.js';
 import { thinkingReserve } from './shared/thinking.js';
 
 export { askInputSchema, type AskInput };
@@ -77,7 +70,6 @@ async function executeAskBody(
     ctx,
   );
   const { emitter } = eager;
-  const timeoutController = eager.timeout;
   try {
     const refusal = workspaceRefusal('ask', workspaceRoot);
     if (refusal !== null) return refusal;
@@ -86,101 +78,14 @@ async function executeAskBody(
     if (!('next' in resolvedStep)) return endOf(resolvedStep);
     const attachedStep = await attachAsk(resolvedStep.next);
     if (!('next' in attachedStep)) return endOf(attachedStep);
-    const { resolved, serviceTier, attachments } = attachedStep.next;
+    const scannedStep = await scanAsk(attachedStep.next);
+    if (!('next' in scannedStep)) return endOf(scannedStep);
+    const countedStep = await guardAsk(scannedStep.next);
+    if (!('next' in countedStep)) return endOf(countedStep);
+    const { resolved, serviceTier, attachments, scan, outputCap, estimate, count } =
+      countedStep.next;
     const attachmentTokens = attachments.tokens;
-
-    const scan = await scanForCall(eager, ctx, {
-      includeGlobs: input.includeGlobs,
-      excludeGlobs: input.excludeGlobs,
-      forceRescan: input.forceRescan,
-    });
-    const outputCap = eagerOutputCap(input.maxOutputTokens, ctx, resolved);
-
-    // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
-    // (`thinkingBudgetRefusal`); below, the budget on the wire is clamped under the cap that runs.
-    const budgetRefusal = thinkingBudgetRefusal(
-      input.thinkingBudget,
-      input.maxOutputTokens,
-      outputCap.effective,
-    );
-    if (budgetRefusal !== null) return errorResult(`ask: ${budgetRefusal}`);
-
-    const estimate = estimateInput(scan, input.prompt, attachmentTokens);
-    const inlineRefusal = inlineRequestRefusal(attachments, scan.files, input.prompt, serviceTier);
-    if (inlineRefusal !== undefined) return inlineRefusal;
-
-    // The preflight refuses a workspace the model's window cannot hold (`WORKSPACE_TOO_LARGE`, not retryable): sent,
-    // Gemini would answer 400 "exceeds maximum", which a caller cannot tell from a transient error.
-    const count = await countPreflight(eager, ctx, {
-      scan,
-      prompt: input.prompt,
-      resolved,
-      mode: input.preflightMode,
-      cap: outputCap,
-      extraTokens: attachmentTokens,
-    });
     const preflight = count?.preflight;
-    if (count !== null && count.preflight.effectiveTokens > count.threshold) {
-      const { threshold, contextWindow } = count;
-      const counted = count.preflight;
-      const pctDisplay = Math.round(ctx.config.workspaceGuardRatio * 100);
-
-      // v1.11.0 — opt-in transparent fallback to `ask_agentic` when the
-      // caller explicitly asked for it via `onWorkspaceTooLarge:
-      // 'fallback-to-agentic'`. Default stays `'error'` so pre-v1.11.0
-      // callers see identical behaviour. The fallback re-uses this
-      // tool's resolved inputs (model / globs / thinking config /
-      // workspace) and forwards its resolved `timeoutMs` as `iterationTimeoutMs`
-      // (per-iteration cap; total wall-clock can be N × that) and `stallMs` as
-      // `stallMs` (`ask-agentic-fallback.ts`). Cost + timing shape genuinely
-      // changes — opt-in is the right default.
-      if (input.onWorkspaceTooLarge === 'fallback-to-agentic' && attachments.attached.length > 0) {
-        return errorResult(
-          'ask: the workspace is too large for the eager path and `attachments` cannot follow the ask_agentic fallback (it sends no inline parts); drop the attachments or narrow the workspace',
-          {
-            errorCode: 'WORKSPACE_TOO_LARGE',
-            retryable: false,
-            serviceTier,
-            ...attachmentMetadata(attachments),
-          },
-        );
-      }
-      if (input.onWorkspaceTooLarge === 'fallback-to-agentic') {
-        return fallBackToAgentic({
-          input,
-          ctx,
-          emitter,
-          serviceTier,
-          preflight: counted,
-          threshold,
-          timeout: timeoutController,
-        });
-      }
-
-      const attachmentsNote =
-        attachments.attached.length > 0
-          ? ' — it carries no attachments: drop them, or narrow the workspace and ask again'
-          : '';
-
-      return errorResult(
-        `Workspace too large: ~${counted.effectiveTokens.toLocaleString()} input tokens (${counted.method} count) exceeds ${threshold.toLocaleString()} (${pctDisplay}% of ${resolved.resolved}'s ${contextWindow.toLocaleString()} context window). Best option: use \`mcp__gemini-code-context__ask_agentic\` — same model, but it reads only the files it needs via sandboxed tool calls (no eager repo upload)${attachmentsNote}. Or set \`onWorkspaceTooLarge: 'fallback-to-agentic'\` on \`ask\` to have the server route automatically. Other options: (a) pass \`excludeGlobs\` to filter large/generated files — supports \`*.ext\` patterns, filenames, and directory paths, (b) narrow with \`includeGlobs\`, (c) switch to a larger-context model, or (d) split the workspace into subdirectories.`,
-        {
-          errorCode: 'WORKSPACE_TOO_LARGE',
-          serviceTier,
-          ...attachmentMetadata(attachments),
-          retryable: false,
-          estimatedInputTokens: counted.effectiveTokens,
-          tokenCountMethod: counted.method,
-          rawTokenCount: counted.rawTokens,
-          tokenCountCacheHit: counted.cacheHit,
-          contextWindowTokens: contextWindow,
-          thresholdTokens: threshold,
-          guardRatio: ctx.config.workspaceGuardRatio,
-          resolvedModel: resolved.resolved,
-          filesIndexed: scan.files.length,
-        },
-      );
-    }
 
     const bounded = capThatRuns({
       tool: 'ask',
