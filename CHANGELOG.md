@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `ask_agentic`: a 429 on a loop iteration seeds the throttle's retry hint once, not twice.
+
 ## [1.24.0] - 2026-11-17
 
 ### Added

@@ -16,11 +16,18 @@ interface AnswerTotals {
   outputTokens: number;
   thinkingTokens: number;
   thinkingSummary: string | null;
-  convergenceForced: boolean;
 }
 
+/** Which pass produced the answer: the loop, or the forced-finalization pass (then `convergenceForced: true`). */
+type AnswerSource = 'organic' | 'forced';
+
 /** An answer's structured fields; `overBudget` says whether its input tokens passed `maxTotalInputTokens`. */
-function answerFields(run: AgenticRun, state: LoopState, totals: AnswerTotals) {
+function answerFields(
+  run: AgenticRun,
+  state: LoopState,
+  totals: AnswerTotals,
+  source: AnswerSource,
+) {
   const { resolved } = run;
   return {
     resolvedModel: resolved.resolved,
@@ -37,7 +44,7 @@ function answerFields(run: AgenticRun, state: LoopState, totals: AnswerTotals) {
     filesReadList: [...state.filesReadSet].slice(0, 40),
     durationMs: Date.now() - run.started,
     thinkingSummary: totals.thinkingSummary,
-    ...(totals.convergenceForced ? { convergenceForced: true } : {}),
+    ...(source === 'forced' ? { convergenceForced: true } : {}),
     overBudget: totals.inputTokens > run.limits.maxTotalInputTokens,
   };
 }
@@ -51,14 +58,18 @@ export function organicAnswer(
 ): TextToolResult {
   return textResult(
     finalText,
-    answerFields(run, state, {
-      apiCalls: state.iterations,
-      inputTokens: state.cumulativeInputTokens,
-      outputTokens: state.cumulativeOutputTokens,
-      thinkingTokens: state.cumulativeThinkingTokens,
-      thinkingSummary,
-      convergenceForced: false,
-    }),
+    answerFields(
+      run,
+      state,
+      {
+        apiCalls: state.iterations,
+        inputTokens: state.cumulativeInputTokens,
+        outputTokens: state.cumulativeOutputTokens,
+        thinkingTokens: state.cumulativeThinkingTokens,
+        thinkingSummary,
+      },
+      'organic',
+    ),
   );
 }
 
@@ -200,10 +211,9 @@ export function maxIterationsResult(
     outputTokens: state.cumulativeOutputTokens + rescue.usage.candidatesTokenCount,
     thinkingTokens: state.cumulativeThinkingTokens + rescue.usage.thoughtsTokenCount,
     thinkingSummary: rescue.thinkingSummary,
-    convergenceForced: true,
   };
   if (rescue.text.length > 0) {
-    return textResult(rescue.text, answerFields(run, state, totals));
+    return textResult(rescue.text, answerFields(run, state, totals, 'forced'));
   }
   return rescueFailed(run, state, rescue, totals);
 }

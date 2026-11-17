@@ -21,7 +21,7 @@
  *   - Hard byte limits on tool responses (executors enforce)
  *   - `realpath` + root jail (sandbox module)
  *   - Prompt-injection defence in `systemInstruction`
- *   - No-progress detection (same call signature 3× → partial answer)
+ *   - No-progress detection (a call signature repeated with no new file read → partial answer)
  *   - Parallel tool execution with concurrency cap
  *   - Recoverable-error via `functionResponse.error`; hard-fail for
  *     security / budget / timeouts
@@ -29,7 +29,6 @@
  */
 
 import { resolve } from 'node:path';
-import { z } from 'zod';
 import { thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { defaultMatchConfig } from '../indexer/globs.js';
@@ -39,6 +38,8 @@ import {
 } from '../indexer/workspace-validation.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { type ProgressEmitter, createProgressEmitter } from '../utils/progress.js';
+import { type AskAgenticInput, askAgenticInputSchema } from './agentic/input.js';
+import { seedRetryHint } from './agentic/ledger.js';
 import { runLoop } from './agentic/loop.js';
 import { runRescue } from './agentic/rescue.js';
 import { maxIterationsResult } from './agentic/results.js';
@@ -57,95 +58,9 @@ import {
   type ToolDefinition,
   errorResult,
 } from './registry.js';
-import { THINKING_LEVEL_FIELD } from './shared/thinking.js';
-import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
 
 export { resolveToolExecutionConcurrency } from './agentic/dispatch.js';
-
-// ---------------------------------------------------------------------------
-// Schema
-// ---------------------------------------------------------------------------
-
-export const askAgenticInputSchema = z
-  .object({
-    prompt: z.string().min(1).describe('The question or analysis request.'),
-    workspace: z
-      .string()
-      .optional()
-      .describe('Absolute or cwd-relative path to the workspace. Defaults to process.cwd().'),
-    model: z
-      .string()
-      .optional()
-      .describe(
-        "Model alias ('latest-pro', 'latest-pro-thinking', 'latest-flash') or literal model ID. Defaults to the configured default (GEMINI_CODE_CONTEXT_DEFAULT_MODEL, then the credentials profile, then `latest-pro-thinking`).",
-      ),
-    includeGlobs: z
-      .array(z.string())
-      .optional()
-      .describe(
-        'Additional file extensions or filenames to include. Honoured by the four agentic tools (`list_directory`, `find_files`, `read_file`, `grep`) — the model never sees paths outside these globs. Mirrors the `ask` / `code` semantics so callers (or `ask` → `ask_agentic` fallback in v1.9.0+) get consistent filtering.',
-      ),
-    excludeGlobs: z
-      .array(z.string())
-      .optional()
-      .describe(
-        'Additional patterns to exclude. Same three shapes as `ask` / `code`: (1) directory names or path prefixes (`node_modules`, `src/vendor`, `./dist/`, `.vercel/`), (2) literal filenames exact-match including bare dot-prefixed names (`pr27-diff.txt`, `foo.bar.baz`, `.env`, `.tsbuildinfo`), (3) extension globs that match via endsWith (`*.tsbuildinfo`, `*.map`). Bare dot-prefixed names like `.env` are treated as exact filename literals — write `*.env` for extension semantics. Paths are POSIX-normalised. Case-insensitive. No mid-string `*` / `**` / `?`. **Privacy-relevant:** when `ask` falls back to `ask_agentic` on `WORKSPACE_TOO_LARGE`, the user-supplied excludes here are honoured by every executor: `read_file` rejects with `EXCLUDED_FILE` (generic message — does NOT echo the excluded path, so the error string cannot be used as a path-existence oracle); `list_directory` and `grep` reject the requested directory / `pathPrefix` itself with `EXCLUDED_DIR` when it matches an exclude (top-level gate, not just child filtering); `find_files` skips the dir during walk; child entries inside an unexcluded parent are still hidden when they themselves match an exclude.',
-      ),
-    thinkingBudget: z.number().int().min(-1).max(65_536).optional(),
-    thinkingLevel: THINKING_LEVEL_FIELD,
-    maxOutputTokens: z.number().int().min(1).optional(),
-    maxIterations: z
-      .number()
-      .int()
-      .min(1)
-      .max(50)
-      .optional()
-      .describe(
-        "Hard cap on agentic LOOP iterations (each iteration = one Gemini generateContent + possible tool calls). Default 20. When the loop exhausts this cap without producing final-text, ONE additional non-tool `generateContent` (forced-finalization rescue) runs to synthesise an answer from gathered tool responses. **`structuredContent.apiCalls` is the authoritative total `generateContent` count** (loop iterations + 1 if the rescue dispatched, regardless of outcome). `convergenceForced: true` indicates ONLY that the rescue produced text successfully — an attempted-but-failed rescue increments `apiCalls` without setting `convergenceForced`. Rescue is bounded by `dailyBudgetUsd` and `iterationTimeoutMs`; see `maxTotalInputTokens` for the cap-overshoot contract. **v1.15.0:** rescue-attempted-but-failed paths additionally surface `structuredContent.rescueErrorCode` (`'TIMEOUT' | 'RATE_LIMIT' | 'INTERNAL' | 'API_ERROR' | 'NETWORK' | 'EMPTY_TEXT'`) + `rescueErrorMessage` (truncated to 500 chars) so wrappers can branch retry behaviour without log scraping. Retry policy: TIMEOUT → raise iterationTimeoutMs; RATE_LIMIT → wait retry-hint window; INTERNAL → investigate code (don't retry blindly); API_ERROR → check status (don't retry 4xx); NETWORK → safe to retry; EMPTY_TEXT → narrow prompt.",
-      ),
-    maxTotalInputTokens: z
-      .number()
-      .int()
-      .min(10_000)
-      .optional()
-      .describe(
-        "Cumulative input-token budget across all iterations. Default 1_000_000. Loop iterations HARD-STOP past this cap (subReason: 'AGENTIC_INPUT_BUDGET_EXCEEDED'). The post-loop forced-finalization rescue is NOT gated on this cap — it may push cumulative tokens past by one call's worth, signalled via `overBudget: true` on the result. Rescue cost remains bounded by `dailyBudgetUsd`; wall-clock by `iterationTimeoutMs`.",
-      ),
-    maxFilesRead: z
-      .number()
-      .int()
-      .min(1)
-      .max(500)
-      .optional()
-      .describe(
-        'Cap on distinct files opened via `read_file` during this agentic call. Default 40.',
-      ),
-    iterationTimeoutMs: z
-      .number()
-      .int()
-      .min(1_000)
-      .max(1_800_000)
-      .optional()
-      .describe(
-        "Per-iteration wall-clock timeout in ms (1s–30min). Each agentic iteration (one generateContent + possible tool calls + per-iteration TPM throttle wait) is bounded by this. **A single iteration that times out FAILS THE WHOLE agentic call** with `errorCode: 'TIMEOUT'` (the failed iteration's function-call results never came back, leaving the conversation structurally incomplete — continuing with partial state would 400 on the next turn). The post-loop forced-finalization rescue pass is ALSO bounded by this timeout, but its timeout behaviour DIFFERS: rescue timeouts are caught best-effort and fall through to the original `subReason: 'AGENTIC_MAX_ITERATIONS'` shape with `errorCode: 'UNKNOWN'` (NOT `'TIMEOUT'`) — the rescue is the documented exit path, and surfacing TIMEOUT for it would obscure the underlying maxIterations exhaustion. Operators detect rescue-attempted-but-failed via `apiCalls > iterations` and `convergenceForced` absent. Whole-loop budget is also bounded by `maxIterations` × `maxTotalInputTokens`. When omitted, falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`, then to disabled.",
-      ),
-    stallMs: z
-      .number()
-      .int()
-      .min(1_000)
-      .max(600_000)
-      .optional()
-      .describe(
-        'Per-iteration HEARTBEAT-AWARE stall watchdog in ms (1s–10min). Resets on every chunk yielded by `generateContentStream` (text or thought) — fires ONLY when the stream goes silent for this long. Does NOT fire while the model is actively thinking. Right knob for "kill dead sockets quickly without penalising deep reasoning." Recommended: `60_000` (60s). Falls back to env var `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`, then disabled. Returns `errorCode: "TIMEOUT"` with `timeoutKind: "stall"` on abort. Independent of `iterationTimeoutMs` — both can be set; whichever fires first wins. **Loop iterations only — the post-loop forced-finalization rescue pass keeps the v1.15.0 `apiCallSucceeded` non-streaming contract.**',
-      ),
-  })
-  .refine((data) => !(data.thinkingBudget !== undefined && data.thinkingLevel !== undefined), {
-    message:
-      'Cannot specify both `thinkingBudget` and `thinkingLevel` — mutually exclusive (Gemini rejects).',
-    path: [],
-  });
-
-export type AskAgenticInput = z.infer<typeof askAgenticInputSchema>;
+export { type AskAgenticInput, askAgenticInputSchema } from './agentic/input.js';
 
 // ---------------------------------------------------------------------------
 // Tool definition
@@ -234,7 +149,7 @@ function startRun(
   call: AgenticCall,
   resolved: ResolvedModel,
   workspaceRoot: string,
-): AgenticRun | TextToolResult {
+): { run: AgenticRun } | { refused: TextToolResult } {
   const { input, ctx, emitter } = call;
   const limits = runLimitsOf(input);
   const matchConfig = defaultMatchConfig({
@@ -242,22 +157,24 @@ function startRun(
     ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
   });
   const refusal = thinkingRefusal(input);
-  if (refusal !== null) return refusal;
+  if (refusal !== null) return { refused: refusal };
   const baseConfig = baseConfigOf(input);
   emitter.emit('starting agentic loop…');
-  const budget = passBudgetOf(input, ctx, resolved.resolved);
+  const budget = passBudgetOf(input, ctx);
   const { started } = call;
   return {
-    input,
-    ctx,
-    emitter,
-    resolved,
-    workspaceRoot,
-    started,
-    limits,
-    matchConfig,
-    baseConfig,
-    budget,
+    run: {
+      input,
+      ctx,
+      emitter,
+      resolved,
+      workspaceRoot,
+      started,
+      limits,
+      matchConfig,
+      baseConfig,
+      budget,
+    },
   };
 }
 
@@ -275,8 +192,9 @@ async function answerAgentic(call: AgenticCall, resolution: Resolution): Promise
   });
   const resolved = resolution.resolved;
   if (!resolved) throw new Error('ask_agentic: resolveModel returned undefined (unreachable)');
-  const run = startRun(call, resolved, workspace.root);
-  if (!('budget' in run)) return run;
+  const start = startRun(call, resolved, workspace.root);
+  if ('refused' in start) return start.refused;
+  const { run } = start;
   const state = newLoopState(call.input.prompt);
   const ended = await runLoop(run, state);
   if (ended !== null) return ended;
@@ -285,9 +203,9 @@ async function answerAgentic(call: AgenticCall, resolution: Resolution): Promise
 }
 
 /**
- * Any failure the loop did not shape. v1.14.3 (Phase4-F1 follow-up): a 429 thrown POST-resolution
- * that bypassed the inner iteration / finalization catches seeds the throttle hint for the resolved
- * model. PRE-RESOLUTION 429s (Google rate-limiting `models.list()` during the very first call after
+ * Any failure the loop did not shape. A 429 thrown POST-resolution seeds the throttle hint for the
+ * resolved model unless an inner catch already seeded it (`seedRetryHint` records each 429 once — an
+ * iteration's 429 is re-thrown to here). PRE-RESOLUTION 429s (Google rate-limiting `models.list()` during the very first call after
  * API-key rotation or quota reset) still DISCARD the hint: recording it against the unresolved alias
  * (e.g. 'latest-pro-thinking') would key the throttle hint to a string that future calls won't match
  * — they'd resolve to a literal model id, miss the alias-keyed hint, retry too soon. (Pinned by the
@@ -297,10 +215,7 @@ function failedCall(err: unknown, ctx: ToolContext, resolved: ResolvedModel | un
   logger.error(`ask_agentic failed: ${safeForLog(err)}`);
   const httpStatus = (err as { status?: number }).status;
   if (typeof resolved?.resolved === 'string') {
-    const outerRetryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
-    if (outerRetryDelayMs !== null) {
-      ctx.throttle.recordRetryHint(resolved.resolved, outerRetryDelayMs);
-    }
+    seedRetryHint(ctx, resolved.resolved, err);
   }
   return errorResult(`ask_agentic failed: ${err instanceof Error ? err.message : String(err)}`, {
     errorCode: 'UNKNOWN',

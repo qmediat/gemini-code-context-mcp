@@ -29,9 +29,7 @@ import {
  * Operators can override via `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`
  * env var (clamped to [1, 50]) — kill switch for environments where
  * filesystem contention or local I/O bandwidth makes wider concurrency
- * counter-productive. v1.15.1+ telemetry gap: no per-call dispatch metric
- * yet exists; if a future release adds one, the env-override knob lets
- * operators dial back without code changes. (Tracked in `wiggly-twirling-karp.md`.)
+ * counter-productive.
  */
 const DEFAULT_TOOL_EXECUTION_CONCURRENCY = 10;
 
@@ -142,28 +140,9 @@ function failureMessage(err: unknown): string {
 }
 
 /**
- * Ops-side observability for excludeGlobs misconfigurations (v1.9.0
- * Phase 1.2, /6step Finding B): the user-visible `.message` for
- * `EXCLUDED_FILE` and `EXCLUDED_DIR` is deliberately path-free to
- * close the existence-probe oracle (Phase 1.1 Findings #1 + #2).
- * Without this debug log, an operator helping a user debug "why is
- * ask_agentic refusing my file?" has no way to map the generic error
- * back to a specific path. The `requestedPath` field on SandboxError
- * was preserved for exactly this purpose; surface it at debug level
- * so prod log volume stays unchanged but ops can opt in via
- * `GEMINI_CODE_CONTEXT_LOG_LEVEL=debug`.
- *
- * NOTE (v1.9.0 self-review S4): no direct regression test on this emit
- * path. The Phase 1.1 test pins `requestedPath` is set on SandboxError
- * (the input contract this branch consumes), and `safeForLog` has its
- * own 18-test coverage in `test/unit/logger.test.ts`. But "the
- * dispatcher actually CALLS logger.debug on SandboxError" is verified
- * by visual review only — if you remove or refactor this block,
- * existing tests will not catch the regression. If you change anything
- * here, please add a `vi.spyOn(logger, 'debug')` test that runs an
- * agentic scenario through `askAgenticTool.execute` with an
- * excludeGlobs config and asserts the spy received a string starting
- * with `agentic dispatch refused:`.
+ * A sandbox refusal is logged at debug level with the path the model asked for: the message the model
+ * gets for `EXCLUDED_FILE` / `EXCLUDED_DIR` is path-free (no existence oracle), so this line is how an
+ * operator maps it back to a path (`GEMINI_CODE_CONTEXT_LOG_LEVEL=debug`).
  */
 function logSandboxRefusal(name: string, err: unknown): void {
   if (!(err instanceof SandboxError)) return;

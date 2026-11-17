@@ -14,11 +14,7 @@ import type { ToolCall } from './dispatch.js';
  * not a stuck loop. Threshold-3 was tuned for 2.5 Pro and tripped before
  * `maxIterations`, killing the rescue path. Threshold-5 covers the empirical
  * double-check pattern with margin; `maxIterations` (default 20) and
- * `maxTotalInputTokens` (default 1M) remain the upper-bound safety nets.
- *
- * v1.15.0 will replace this with content-aware dedupe — same signature counts
- * toward the cap only if no new `read_file` against an unseen path happened
- * between repeats. (See `docs/FOLLOW-UP-PRS.md` for the planned rewrite.) */
+ * `maxTotalInputTokens` (default 1M) remain the upper-bound safety nets. */
 export const NO_PROGRESS_CALL_THRESHOLD = 5;
 
 /** Call-signature → state, for content-aware no-progress detection.

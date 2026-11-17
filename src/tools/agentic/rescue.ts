@@ -21,13 +21,14 @@ import { ApiError, FunctionCallingConfigMode } from '@google/genai';
 import { withNetworkRetry } from '../../gemini/retry.js';
 import { logger } from '../../utils/logger.js';
 import { createTimeoutController, isTimeoutAbort } from '../shared/abort-timeout.js';
-import { isGemini429, parseRetryDelayMs } from '../shared/throttle.js';
+import { isGemini429 } from '../shared/throttle.js';
 import { SYSTEM_INSTRUCTION_FINALIZATION } from './instructions.js';
 import {
   NO_THROTTLE_RESERVATION,
   type RescueReservations,
   cancelPass,
   reservePass,
+  seedRetryHint,
   settleBilledRescue,
   waitForTpm,
 } from './ledger.js';
@@ -219,18 +220,15 @@ function rescueFailureCode(
   return 'NETWORK';
 }
 
-/** v1.14.2 Fix 4: the rescue's generateContent can also 429 — its retry hint seeds the throttle
- * cache for future ask_agentic / ask / code calls, the same way the per-iteration catch does. */
+/** The rescue's generateContent can also 429 — its retry hint seeds the throttle cache for future
+ * ask_agentic / ask / code calls, the same way the per-iteration catch does. */
 function recordRescueFailure(
   run: AgenticRun,
   finalErr: unknown,
   apiCallSucceeded: boolean,
   outcome: RescueOutcome,
 ): void {
-  const finalRetryDelayMs = isGemini429(finalErr) ? parseRetryDelayMs(finalErr.message) : null;
-  if (finalRetryDelayMs !== null) {
-    run.ctx.throttle.recordRetryHint(run.resolved.resolved, finalRetryDelayMs);
-  }
+  const finalRetryDelayMs = seedRetryHint(run.ctx, run.resolved.resolved, finalErr);
   outcome.errorCode = rescueFailureCode(finalErr, finalRetryDelayMs, apiCallSucceeded);
   outcome.errorMessage =
     finalErr instanceof Error ? finalErr.message.slice(0, 500) : String(finalErr).slice(0, 500);
@@ -321,7 +319,7 @@ export async function runRescue(run: AgenticRun, state: LoopState): Promise<Resc
     skipReason: null,
   };
   const estimate = finalizationEstimateOf(state);
-  const reservationId = reserveRescue(run, passReservationUsd(run.budget, estimate), outcome);
+  const reservationId = reserveRescue(run, passReservationUsd(run, estimate), outcome);
   if (reservationId !== null || !run.budget.dailyBudgetEnforced) {
     await attemptRescue(run, state, reservationId, estimate, outcome);
   }

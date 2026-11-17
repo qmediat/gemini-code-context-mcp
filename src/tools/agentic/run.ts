@@ -8,9 +8,9 @@ import type { resolveModel } from '../../gemini/models.js';
 import type { MatchConfig } from '../../indexer/globs.js';
 import { estimateReservationUsd } from '../../utils/cost-estimator.js';
 import type { ProgressEmitter } from '../../utils/progress.js';
-import type { AskAgenticInput } from '../ask-agentic.tool.js';
 import type { ToolContext } from '../registry.js';
 import { resolveTotalTimeoutMs } from '../shared/abort-timeout.js';
+import type { AskAgenticInput } from './input.js';
 import { SYSTEM_INSTRUCTION_AGENTIC, buildFunctionDeclarations } from './instructions.js';
 import type { SignatureCounts } from './no-progress.js';
 
@@ -39,10 +39,8 @@ export interface RunLimits {
   maxFilesRead: number;
 }
 
-/** What every pass's reservation is priced from. */
+/** What every pass's reservation is priced from, beside the resolved model. */
 export interface PassBudget {
-  /** The model each reservation is priced and throttled for. */
-  model: string;
   /** Output (and thinking) tokens a pass reserves for. */
   outputTokens: number;
   /** The longest an iteration (or the finalization pass) can run: the window each reservation covers. */
@@ -131,9 +129,8 @@ export function baseConfigOf(input: AskAgenticInput): GenerateContentConfig {
   };
 }
 
-export function passBudgetOf(input: AskAgenticInput, ctx: ToolContext, model: string): PassBudget {
+export function passBudgetOf(input: AskAgenticInput, ctx: ToolContext): PassBudget {
   return {
-    model,
     outputTokens: typeof input.maxOutputTokens === 'number' ? input.maxOutputTokens : 4096,
     coverMs: resolveTotalTimeoutMs(input.iterationTimeoutMs, ITERATION_TIMEOUT_ENV),
     dailyBudgetEnforced: Number.isFinite(ctx.config.dailyBudgetUsd),
@@ -141,11 +138,12 @@ export function passBudgetOf(input: AskAgenticInput, ctx: ToolContext, model: st
   };
 }
 
-/** One pass's reservation, at the rates in force from now until its timeout. */
-export function passReservationUsd(budget: PassBudget, inputTokens: number): number {
+/** One pass's reservation for the resolved model, at the rates in force from now until its timeout. */
+export function passReservationUsd(run: AgenticRun, inputTokens: number): number {
+  const { budget } = run;
   return estimateReservationUsd(
     {
-      model: budget.model,
+      model: run.resolved.resolved,
       uncachedInputTokens: inputTokens,
       cachedInputTokens: 0,
       outputTokens: budget.outputTokens,

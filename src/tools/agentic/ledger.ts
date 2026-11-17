@@ -2,7 +2,8 @@
  * The budget ledger and TPM throttle calls of `ask_agentic`. Each pass (a loop iteration or the forced-finalization
  * pass) is an independent `generateContent` billable, so each gets its own reservation and settles it: a pass that
  * reached Google is booked at what it billed and its TPM reservation released at the input it sent; a pass that never
- * did has both reservations cancelled. A ledger failure while settling is logged, never thrown.
+ * did has both reservations cancelled. A ledger failure while settling is logged, never thrown. A Gemini 429's retry
+ * hint seeds the throttle once per error, whichever catch meets it first.
  */
 
 import { abortableSleep } from '../../gemini/retry.js';
@@ -10,6 +11,7 @@ import { estimateCostUsd, toMicrosUsd } from '../../utils/cost-estimator.js';
 import { logger, safeForLog } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
 import { billedInputTokens } from '../shared/call-ledger.js';
+import { isGemini429, parseRetryDelayMs } from '../shared/throttle.js';
 import type { UsageCounts } from './response.js';
 import type { AgenticRun } from './run.js';
 
@@ -17,6 +19,23 @@ export type BudgetReservation = ReturnType<ToolContext['manifest']['reserveBudge
 
 /** A TPM reservation id that was never taken. */
 export const NO_THROTTLE_RESERVATION = -1;
+
+/** The 429s whose retry hint has seeded the throttle: an iteration's 429 reaches the call's outer catch too. */
+const seededRetryHints = new WeakSet<object>();
+
+/**
+ * The retry delay a Gemini 429 carries (`retryInfo.retryDelay`), or `null` for any other failure or a 429 without
+ * one. The first time an error is met its delay seeds the throttle's hint for `model`, which later calls honour
+ * through `throttle.reserve`; meeting the same error again seeds nothing.
+ */
+export function seedRetryHint(ctx: ToolContext, model: string, err: unknown): number | null {
+  if (!isGemini429(err)) return null;
+  const delayMs = parseRetryDelayMs(err.message);
+  if (delayMs === null || seededRetryHints.has(err)) return delayMs;
+  seededRetryHints.add(err);
+  ctx.throttle.recordRetryHint(model, delayMs);
+  return delayMs;
+}
 
 /** Reserve one pass's estimated cost against the daily budget cap. */
 export function reservePass(run: AgenticRun, costUsd: number): BudgetReservation {

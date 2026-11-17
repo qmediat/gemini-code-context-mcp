@@ -11,12 +11,12 @@ import {
   getTimeoutKind,
   isTimeoutAbort,
 } from '../shared/abort-timeout.js';
-import { isGemini429, parseRetryDelayMs } from '../shared/throttle.js';
 import { type IterationResult, runAgenticIteration } from './iteration.js';
 import {
   NO_THROTTLE_RESERVATION,
   cancelPass,
   reservePass,
+  seedRetryHint,
   settleIteration,
   waitForTpm,
 } from './ledger.js';
@@ -128,11 +128,9 @@ async function throttledIteration(
 }
 
 /**
- * A failed iteration: both reservations are released, a Gemini 429's `retryInfo.retryDelay` seeds
- * the throttle hint cache (v1.14.2 Fix 4 — gated on `isGemini429`, which only real Gemini 429s
- * match; future iterations and calls honour it via `throttle.reserve`'s `activeHint` lookup). A
- * timeout becomes the structured TIMEOUT result naming the iteration (v1.16.2: `timeoutKind` says
- * whether the stall or the total cap fired); any other failure is re-thrown.
+ * A failed iteration: both reservations are released and a Gemini 429's retry hint seeds the throttle.
+ * A timeout becomes the structured TIMEOUT result naming the iteration (`timeoutKind` says whether the
+ * stall or the total cap fired); any other failure gives `null`, for the caller to re-throw.
  */
 function iterationFailure(
   run: AgenticRun,
@@ -140,13 +138,10 @@ function iterationFailure(
   iterErr: unknown,
   iterTimeout: TimeoutController,
   flight: IterationFlight,
-): TextToolResult {
+): TextToolResult | null {
   cancelPass(run.ctx, flight.reservationId, flight.throttleReservationId, 'ask_agentic');
-  const iterRetryDelayMs = isGemini429(iterErr) ? parseRetryDelayMs(iterErr.message) : null;
-  if (iterRetryDelayMs !== null) {
-    run.ctx.throttle.recordRetryHint(run.resolved.resolved, iterRetryDelayMs);
-  }
-  if (!isTimeoutAbort(iterErr)) throw iterErr;
+  seedRetryHint(run.ctx, run.resolved.resolved, iterErr);
+  if (!isTimeoutAbort(iterErr)) return null;
   const kind = getTimeoutKind(iterErr) ?? 'total';
   const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
   run.emitter.emit(
@@ -175,10 +170,9 @@ async function attemptIteration(
     const iteration = await throttledIteration(run, state, iterTimeout, flight);
     return { kind: 'completed', iteration };
   } catch (iterErr) {
-    return {
-      kind: 'timed-out',
-      result: iterationFailure(run, state, iterErr, iterTimeout, flight),
-    };
+    const timedOut = iterationFailure(run, state, iterErr, iterTimeout, flight);
+    if (timedOut === null) throw iterErr;
+    return { kind: 'timed-out', result: timedOut };
   } finally {
     iterTimeout.dispose();
   }
@@ -225,7 +219,7 @@ function endOfIteration(
  * settlement books. Returns the result that ends the call, or `null` to go on.
  */
 async function runIteration(run: AgenticRun, state: LoopState): Promise<TextToolResult | null> {
-  const perIterationCostUsd = passReservationUsd(run.budget, PER_ITERATION_INPUT_TOKENS);
+  const perIterationCostUsd = passReservationUsd(run, PER_ITERATION_INPUT_TOKENS);
   const reservation = reserveIteration(run, state, perIterationCostUsd);
   if ('refused' in reservation) return reservation.refused;
   const iterTimeout = iterationTimeoutOf(run);

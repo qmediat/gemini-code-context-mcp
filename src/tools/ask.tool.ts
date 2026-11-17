@@ -58,6 +58,7 @@ import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './share
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
+import { PROMPT_FIELD, WORKSPACE_FIELD } from './shared/question-fields.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
@@ -119,11 +120,8 @@ const THINKING_BUDGET_MODEL_DEFAULT = null;
 
 export const askInputSchema = z
   .object({
-    prompt: z.string().min(1).describe('The question or analysis request.'),
-    workspace: z
-      .string()
-      .optional()
-      .describe('Absolute or cwd-relative path to the workspace. Defaults to process.cwd().'),
+    prompt: PROMPT_FIELD,
+    workspace: WORKSPACE_FIELD,
     model: z
       .string()
       .optional()
