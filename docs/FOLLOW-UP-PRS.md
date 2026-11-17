@@ -407,7 +407,7 @@ times without a failure.
 
 ## ~~T51.~~ ✅ SHIPPED 2026-11-17 — A cache create that returns no name is a failed create
 
-**Shipped as:** a create that answers with an empty name or none takes the failed-create path (the warning, the row without a cache id, the files inline). Two defects of the same create step were fixed with it: the stored expiry now reads the TTL the create request sends (whole seconds, at least 60 — a TTL of 30 was recorded as 30 s against Google's 60 s), and a cache whose manifest write fails after a successful create is deleted, best-effort, with a warning that names the manifest write (before, it stayed alive and unrecorded until its TTL). Each has a `### Fixed` line in the CHANGELOG and a test red on the code before it. `doPrepareContext` (260 lines, complexity 32) is an orchestrator over named steps in `src/cache/cache-manager.ts` — the call's start (`startCall`), one row writer (`writeWorkspaceRow`), the inline exit shared by the inline modes and the token floor (`prepareInline`, fed the debug line by `inlineModeLine` / `tokenFloorLine`), the reuse (`reusedCache`), the uploads and their threshold (`uploadForCache`, `assertUploadsComplete`), the create (`buildCache`, `createCache`), the record with the previous cache's delete (`recordCreatedCache`) and the failed-create path (`fallBackInline`, `reportCreateFailure`) — with typed values between them; `invalidateWorkspaceCache` is split the same way and has unit tests now. A differential probe of `prepareContext` (92 scenarios: every client call, manifest call, log and progress line, the return and the final rows) traces the split identically to the fixed code, and `main` identically except the seven scenarios the three fixes change. `src/cache/cache-manager.ts` left `eslint-suppressions.json` (80 suppressions in 28 files → 77 in 27) and `jscpd-baseline.json` (2,215 → 2,157 lines). The scope below is the entry as written.
+**Shipped as:** a create that answers with an empty name or none takes the failed-create path (the warning, the row without a cache id, the files inline). Two defects of the same create step were fixed with it: the stored expiry now reads the TTL the create request sends (whole seconds, at least 60 — a TTL of 30 was recorded as 30 s against Google's 60 s), and a cache whose manifest write fails after a successful create is deleted, best-effort, with a warning that names the manifest write (before, it stayed alive and unrecorded until its TTL). Each has a `### Fixed` line in the CHANGELOG and a test red on the code before it. `doPrepareContext` (260 lines, complexity 32) is an orchestrator over named steps in `src/cache/cache-manager.ts` — the call's start (`startCall`), one row writer (`writeWorkspaceRow`), the inline exit shared by the inline modes and the token floor (`prepareInline`, fed the debug line by `inlineModeLine` / `tokenFloorLine`), the reuse (`reusedCache`), the uploads and their threshold (`uploadForCache`, `assertUploadsComplete`), the create (`buildCache`, `createCache`), the record with the previous cache's delete (`recordCreatedCache`) and the failed-create path (`fallBackInline`, `reportCreateFailure`) — with typed values between them; `invalidateWorkspaceCache` is split the same way and has unit tests now. The split changes no behaviour: across 92 cases of `prepareContext` (reuse, rebuild, the inline modes, the token floor, failed uploads and creates, manifest faults, concurrent calls), every client call, manifest call, log and progress line, the return and the final rows were compared with the fixed code before the split, and with `main` apart from the cases the three fixes change; the unit tests in `test/unit/cache-manager.test.ts` hold the order of the record failure's delete and row write, the reuse test, the in-flight entry, the expiry clock and the purge. `src/cache/cache-manager.ts` left `eslint-suppressions.json` (80 suppressions in 28 files → 77 in 27) and `jscpd-baseline.json` (2,215 → 2,157 lines). The scope below is the entry as written.
 
 **Source:** the cross-model reading of T47's branch, 2026-11-17 (the request `code` builds). Opened 2026-11-17.
 
@@ -450,9 +450,11 @@ change.
 while the cache the previous row named stays alive on Google's side: the inline exit (`ask`'s `noCache`,
 `cachingMode: 'implicit'`, `code`'s `codeExecution`), the token-floor exit (a workspace now below `cacheMinTokens`),
 both through `prepareInline`, and the failed-create path (`fallBackInline`). Nothing deletes that cache and nothing
-can reuse it, since no row names it any more: it is billed until its TTL. The differential probe of `prepareContext`
-used for T51 shows it in the scenarios `inline-no-caching-existing-row`, `small-over-old-cache` and
-`create-throws-over-old-cache`.
+can reuse it, since no row names it any more: it is billed until its TTL. For example: the row names a live cache and
+the next call passes `noCache: true`, or its workspace shrank below the floor, or its `caches.create` throws — the row
+is written with no cache id and no `caches.delete` is sent. Since T51 a create that answers without a cache name
+takes the failed-create path too: before, it went down the success path, which deleted the previous cache and stored
+the empty name or none; now the previous cache stays to its TTL like the others.
 
 **Scope:** a cost decision for the maintainers, one of two remedies: keep the pointer on these paths (the next
 caching call whose fingerprint matches reuses the cache until its TTL), or delete the cache when the pointer is
@@ -468,17 +470,36 @@ CHANGELOG line.
 **Why:** the in-flight map of `prepareContext` (`inFlightKey`, `src/cache/cache-manager.ts`) coalesces only calls
 with the same key. Two calls on one workspace whose keys differ — for example `ask` and `code`, whose system prompts
 differ — both upload, both create a cache, both delete the previous cache, and the row keeps the cache of the last
-writer: the other cache is untracked until its TTL. The differential probe used for T51 shows it in
-`concurrent-same-ws-different-prompt` (`cachedContents/old` deleted twice, the row ends on the second cache).
+writer: the other cache is untracked until its TTL. For example: the row names `cachedContents/old`, and `ask` and
+`code` start at once; both read that row, both create a cache, both send `caches.delete` for `cachedContents/old`,
+and the row ends on the cache of the second to write.
 `ttlSeconds` is not in the key, and need not be: it is a process-wide setting, `config.cacheTtlSeconds`
 (`src/config.ts:217`, read from `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS`), which the one caller passes unchanged
 (`src/tools/shared/eager-answer.ts:69`), so two calls in one process cannot ask for different TTLs. The same race
-between two server processes is `docs/KNOWN-DEFICITS.md`'s; `docs/ACCEPTED-RISKS.md` describes the in-process
-mutex as a `Map<workspaceRoot, Promise>`, while the map is keyed by the whole fingerprint.
+between two server processes is `docs/KNOWN-DEFICITS.md`'s.
 
 **Scope:** a per-workspace build lock, so a second build for the workspace waits for the first and then decides on
 the row it left — a new mechanism, its own PR, with a concurrency test red on the code before; `docs/ACCEPTED-RISKS.md`
 then says what the lock holds.
+
+---
+
+## T55. One clock for a cache's stored expiry
+
+**Source:** the cross-model reading of T51's branch, 2026-11-18. Opened 2026-11-18.
+
+**Why:** two writers store a workspace row's `cacheExpiresAt` from different clocks. The create (`createCache`,
+`src/cache/cache-manager.ts`) stores the local clock read after the create's answer plus the TTL, so the stored
+expiry is later than Google's own by up to the answer's latency. The TTL watcher (`src/cache/ttl-watcher.ts`) stores
+the `expireTime` Google answers to `caches.update`, and counts locally only when the answer carries none. A local
+count is immune to a skew between this machine's clock and Google's; Google's `expireTime` is exact when the clocks
+agree. The reuse test (`isUsableExistingCache`) compares the stored expiry with the local clock without a margin, so
+a request can be sent on a cache that expired within that latency; the stale-cache retry of `ask` and `code`
+rebuilds it.
+
+**Scope:** a decision for the maintainers, one of two rules: store Google's `expireTime` when the create's answer
+carries one (as the watcher does), or keep the local count and give the reuse test a margin. Either way the create
+and the watcher store the same clock; a test of the rule red on the code before; a CHANGELOG line.
 
 ---
 

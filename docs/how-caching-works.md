@@ -70,7 +70,7 @@ The `files` table enables **hash-based dedup**: if you rename `utils/a.ts` → `
 
 ## TTL management
 
-Gemini caches expire. The default TTL is 3600 s (1 hour) — configurable via `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS`.
+Gemini caches expire. The default TTL is 3600 s (1 hour) — configurable via `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS`. A cache is created, refreshed and recorded with that TTL in whole seconds, at least 60 s: a setting of 30 gives a 60 s cache.
 
 A background `ttl-watcher` refreshes caches for **hot workspaces** (used in the last 10 minutes). Cold workspaces are allowed to expire; the next query will rebuild automatically.
 
@@ -95,7 +95,7 @@ The server falls back to inline file parts (slower, more expensive) when:
 - The user passes `noCache: true` on `ask`
 - The workspace has zero matching files
 - **The workspace is under ~1 024 tokens** — Gemini requires a minimum cache size of 1 024 tokens; below that `caches.create` returns 400. We estimate token count from file sizes (~4 bytes/token) and skip the cache attempt silently when below the floor. Floor is configurable via `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS`.
-- `caches.create` fails for any other reason (network, quota, model rejection) — we log a warning and degrade to inline parts so the query still succeeds.
+- The Context Cache cannot be built or recorded: `caches.create` fails for any other reason (network, quota, model rejection) or answers without a cache name, or the manifest cannot record the new cache (which is then deleted) — we log a warning and degrade to inline parts so the query still succeeds, and the response's `cachingModeNote` says so.
 
 ### Token-estimation caveat (minified / tightly-packed source)
 

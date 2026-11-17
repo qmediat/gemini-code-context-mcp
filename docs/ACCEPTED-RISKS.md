@@ -56,7 +56,7 @@ This list is the flip side of `docs/KNOWN-DEFICITS.md`: deficits are issues we'l
 
 **Risk claim:** Two MCP server processes on the same machine (two Claude Code windows) can both decide to build the same cache concurrently, resulting in one orphan cache on Google's side.
 
-**What we did:** In-process mutex via `Map<workspaceRoot, Promise>` inside `prepareContext`. Covers the common case — parallel tool calls from a single MCP host.
+**What we did:** In-process coalescing inside `prepareContext`, keyed by the whole call fingerprint (`inFlightKey` in `src/cache/cache-manager.ts`: workspace, files hash, model, system prompt hash and the caching options). Covers parallel tool calls with the same fingerprint from a single MCP host; two calls on one workspace whose fingerprints differ (`ask` and `code`) are not serialised (`docs/FOLLOW-UP-PRS.md` T54).
 
 **Why we don't fix cross-process:** Cross-process coordination requires file-based locking (flock, SQLite `BEGIN IMMEDIATE`), which adds complexity and a new failure mode (locks abandoned by crashed processes). The impact is one orphan cache per concurrent-build event, bounded by TTL — on the order of cents per event.
 
@@ -64,20 +64,17 @@ This list is the flip side of `docs/KNOWN-DEFICITS.md`: deficits are issues we'l
 
 ---
 
-## Pre-rebuild `caches.delete` loses working cache on transient create failure
+## A replaced cache whose delete fails stays billed until its TTL
 
-**Source:** Grok code review, April 2026 — "transient Gemini outage now costs the cache".
+**Source:** Grok code review, April 2026, of the rebuild order of that time (the old cache deleted before the create).
 
-**Risk claim:** The cache-manager deletes an existing stale cache BEFORE calling `caches.create`. If the create then fails with a transient 5xx (Gemini outage, rate limit), the user has lost their working cache and falls back to inline parts for the rest of the session.
+**Risk claim:** A rebuild deletes the previous cache only after the new one is created and the workspace row points at it (`recordCreatedCache` in `src/cache/cache-manager.ts`). The delete is fired without waiting and retried three times (1 s, 3 s, 9 s) on transient errors; a delete that still fails is logged at warn and leaves the previous cache on Google's side, billed until its TTL. A create that fails, or answers without a cache name, takes the inline path and drops the row's pointer, leaving the previous cache to its TTL as well (`docs/FOLLOW-UP-PRS.md` T53).
 
-**Why we accept:** The alternative — create-then-delete-old — leaks the old cache on Google's side when create succeeds with a new ID (the orphan keeps billing at storage rate until TTL expiry). We picked "lose-on-transient-failure" over "leak-on-success" because:
-1. Transient 5xx is rare (<1% of calls) and recovers on the next `ask`/`code` (which rebuilds).
-2. Orphan caches on success are COMMON (every filesHash change) and cost money every time.
-3. The total expected loss from transient failures is bounded by 1h of cache-miss input token costs; orphan caches bill over 1h × N failures.
+**Why we accept:** no request waits on the delete, the row never points at a deleted cache, and the cost of a delete that failed is one cache's storage for at most `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` (default 3600 s).
 
-**What would change our mind:** Real observability from users showing frequent transient 5xx (e.g. >5% of rebuilds) would justify moving to a `Promise.allSettled` two-step pattern (run delete in parallel with create; if create fails, retain old cacheId).
+**What would change our mind:** user reports of orphan-cache bills after rebuilds.
 
-**Mitigation available now:** Set `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS=3600` (default) and accept that a single Gemini outage costs one cache-build worth of input tokens (~$0.5-$3 for large workspaces). Users on very large workspaces who feel this pain can report it.
+**Mitigation available now:** a shorter `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` bounds what an orphan costs.
 
 ---
 
