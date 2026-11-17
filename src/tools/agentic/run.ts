@@ -35,15 +35,6 @@ export const PER_ITERATION_INPUT_TOKENS = 50_000;
 /** The env var that bounds an iteration (and the finalization pass) when the call sets no `iterationTimeoutMs`. */
 export const ITERATION_TIMEOUT_ENV = 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS';
 
-/**
- * The longest an iteration's tool batch may run when no iteration timeout bounds it (`timeoutKind: 'tool-batch'`).
- * The executors bound what they return (a read ≤ 1 MB, ≤ 100 grep matches, ≤ 200 entries, a walk ≤ 20 levels) but
- * not how long they take: a grep with few matches reads every file of the workspace, and a hung file system call never
- * returns. Two minutes leaves a whole-tree grep of a large local workspace room to finish and still ends a hung batch;
- * `iterationTimeoutMs` (up to 30 min) replaces it.
- */
-export const TOOL_BATCH_CEILING_MS = 120_000;
-
 export interface RunLimits {
   maxIterations: number;
   maxTotalInputTokens: number;

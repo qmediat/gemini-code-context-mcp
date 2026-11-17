@@ -54,12 +54,7 @@ import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
-import {
-  createTimeoutController,
-  isTimeoutAbort,
-  isTimeoutKind,
-  timedOutCall,
-} from './shared/abort-timeout.js';
+import { createTimeoutController, isTimeoutAbort, timedOutCall } from './shared/abort-timeout.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
@@ -361,44 +356,6 @@ function attachmentMetadata(prepared: PreparedAttachments): Record<string, unkno
   };
 }
 
-/** The timeouts an `ask` → `ask_agentic` fallback runs with: what it passes, what its result reports, what it logs. */
-interface FallbackTimeouts {
-  /** `timeoutMs` as the per-iteration cap (`iterationTimeoutMs`), `stallMs` as ask_agentic's stall watchdog. */
-  readonly agentic: Pick<AskAgenticInput, 'iterationTimeoutMs' | 'stallMs'>;
-  /** `iterTimeoutMs` / `iterTimeoutSource` when `timeoutMs` became the per-iteration cap; `stallMs` when forwarded. */
-  readonly reported: Record<string, unknown>;
-  /** The warning that names them; `null` when neither was set. */
-  readonly logLine: string | null;
-}
-
-function fallbackTimeoutsOf(input: Pick<AskInput, 'timeoutMs' | 'stallMs'>): FallbackTimeouts {
-  const { timeoutMs, stallMs } = input;
-  const parts: string[] = [];
-  if (timeoutMs !== undefined) {
-    parts.push(
-      `\`iterationTimeoutMs\` set to ${timeoutMs}ms from \`timeoutMs\` — total wall-clock for the agentic call can reach \`maxIterations × iterationTimeoutMs\``,
-    );
-  }
-  if (stallMs !== undefined) {
-    parts.push(
-      `\`stallMs\` ${stallMs}ms forwarded as ask_agentic's stall watchdog — it counts each iteration's stream, not its tool batch`,
-    );
-  }
-  return {
-    agentic: {
-      ...(timeoutMs !== undefined ? { iterationTimeoutMs: timeoutMs } : {}),
-      ...(stallMs !== undefined ? { stallMs } : {}),
-    },
-    reported: {
-      ...(timeoutMs !== undefined
-        ? { iterTimeoutMs: timeoutMs, iterTimeoutSource: 'timeoutMs' }
-        : {}),
-      ...(stallMs !== undefined ? { stallMs } : {}),
-    },
-    logLine: parts.length === 0 ? null : `ask: fallback to ask_agentic — ${parts.join('; ')}.`,
-  };
-}
-
 async function executeAskBody(
   input: AskInput,
   ctx: Parameters<typeof askTool.execute>[1],
@@ -650,11 +607,41 @@ async function executeAskBody(
           logger.warn(
             `ask: WORKSPACE_TOO_LARGE (${preflight.effectiveTokens} > ${threshold}); falling back to ask_agentic per onWorkspaceTooLarge='fallback-to-agentic'`,
           );
-          // `timeoutMs` (ask's wall-clock cap) becomes ask_agentic's per-iteration cap, so the agentic call can run
-          // `maxIterations × timeoutMs` in all; `stallMs` is forwarded as ask_agentic's own stall watchdog, which
-          // counts each iteration's stream and not its tool batch. Both are named in the log and the result.
-          const fallbackTimeouts = fallbackTimeoutsOf(input);
-          if (fallbackTimeouts.logLine !== null) logger.warn(fallbackTimeouts.logLine);
+          // Translate `timeoutMs` AND `stallMs` to the agentic per-iteration
+          // wall-clock cap (`iterationTimeoutMs`). Pre-v1.12.1 only `timeoutMs`
+          // was forwarded — a user who set `stallMs: 60000` (the v1.12.0
+          // recommended liveness watchdog) saw it silently dropped on the
+          // fallback path. The agentic loop uses non-streaming
+          // `generateContent`, so there's no chunk stream to reset on; we
+          // collapse both knobs onto the per-iteration cap and use the
+          // TIGHTER of the two as the bound. The CHANGELOG documents the
+          // semantic divergence on `timeoutMs` (total → per-iteration).
+          //
+          // v1.12.2 — `iterTimeoutSource` is surfaced in metadata AND emitted
+          // in the warn-log so users can see WHICH knob bound their call
+          // (one of: 'timeoutMs', 'stallMs', or 'min(timeoutMs,stallMs)').
+          // Pre-v1.12.2 the log only fired when stallMs was set alone; the
+          // both-set case had no signal explaining the pick.
+          const iterTimeoutPick = ((): {
+            cap: number | undefined;
+            source: 'timeoutMs' | 'stallMs' | 'min(timeoutMs,stallMs)' | 'none';
+          } => {
+            const a = input.timeoutMs;
+            const b = input.stallMs;
+            if (a !== undefined && b !== undefined) {
+              const cap = Math.min(a, b);
+              return { cap, source: 'min(timeoutMs,stallMs)' };
+            }
+            if (a !== undefined) return { cap: a, source: 'timeoutMs' };
+            if (b !== undefined) return { cap: b, source: 'stallMs' };
+            return { cap: undefined, source: 'none' };
+          })();
+          const tightestPerIterCap = iterTimeoutPick.cap;
+          if (iterTimeoutPick.source !== 'none') {
+            logger.warn(
+              `ask: fallback to ask_agentic — \`iterationTimeoutMs\` set to ${tightestPerIterCap}ms (source: ${iterTimeoutPick.source}). The agentic loop uses non-streaming \`generateContent\` so there's no chunk stream to reset on; \`stallMs\` (when set) is treated as a per-iteration wall-clock cap, the same way \`timeoutMs\` is. Total wall-clock for the agentic call can reach \`maxIterations × iterationTimeoutMs\`.`,
+            );
+          }
           const agenticInput: AskAgenticInput = {
             prompt: input.prompt,
             ...(input.workspace !== undefined ? { workspace: input.workspace } : {}),
@@ -666,7 +653,13 @@ async function executeAskBody(
             ...(input.maxOutputTokens !== undefined
               ? { maxOutputTokens: input.maxOutputTokens }
               : {}),
-            ...fallbackTimeouts.agentic,
+            // `timeoutMs` (ask wall-clock cap) → `iterationTimeoutMs`
+            // (ask_agentic per-iteration cap). Total wall-clock for the
+            // agentic call can be `maxIterations × iterationTimeoutMs`.
+            // v1.12.1 fix: also collapses `stallMs` onto this cap (using
+            // the TIGHTER of the two when both are set), so the fallback
+            // path doesn't silently drop the user's stall watchdog.
+            ...(tightestPerIterCap !== undefined ? { iterationTimeoutMs: tightestPerIterCap } : {}),
           };
           const agenticResult = await askAgenticTool.execute(agenticInput, ctx);
 
@@ -714,8 +707,17 @@ async function executeAskBody(
               cacheHit: preflight.cacheHit,
               rawTokens: preflight.rawTokens,
             },
-            // The timeouts the agentic call ran with, for an audit of what bounded it.
-            ...fallbackTimeouts.reported,
+            // v1.12.2 — surface the per-iteration cap selection so callers
+            // can audit which knob bound the fallback call. Useful when the
+            // user passed both `timeoutMs` and `stallMs` (we use the tighter
+            // of the two — `iterTimeoutSource: 'min(timeoutMs,stallMs)'`).
+            // Omitted when neither knob was set (`source: 'none'`).
+            ...(iterTimeoutPick.source !== 'none'
+              ? {
+                  iterTimeoutMs: tightestPerIterCap,
+                  iterTimeoutSource: iterTimeoutPick.source,
+                }
+              : {}),
             // Lift top-level error metadata from the agentic call's
             // structuredContent so orchestrator policies (e.g. retry on
             // BUDGET_EXHAUSTED, retry on stall but not total) keep working
@@ -730,7 +732,8 @@ async function executeAskBody(
             ...(agenticResult.isError && typeof agenticStructured.retryable === 'boolean'
               ? { retryable: agenticStructured.retryable }
               : {}),
-            ...(agenticResult.isError && isTimeoutKind(agenticStructured.timeoutKind)
+            ...(agenticResult.isError &&
+            (agenticStructured.timeoutKind === 'total' || agenticStructured.timeoutKind === 'stall')
               ? { timeoutKind: agenticStructured.timeoutKind }
               : {}),
             ...(Object.keys(agenticStructured).length > 0

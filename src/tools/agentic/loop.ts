@@ -7,7 +7,6 @@
 import type { TextToolResult } from '../registry.js';
 import {
   type TimeoutController,
-  type TimeoutKind,
   createTimeoutController,
   getTimeoutKind,
   isTimeoutAbort,
@@ -35,7 +34,6 @@ import {
   ITERATION_TIMEOUT_ENV,
   type LoopState,
   PER_ITERATION_INPUT_TOKENS,
-  TOOL_BATCH_CEILING_MS,
   passReservationUsd,
 } from './run.js';
 
@@ -76,8 +74,7 @@ function reserveIteration(
  * 10s iterationTimeoutMs without ever firing.) v1.16.2 (T33 TRIM): the loop streams, so `recordChunk()`
  * resets the stall watchdog on every text/thought chunk. The TPM throttle wait has no chunks to
  * record — `stallMs` only governs the stream itself; the wall-clock `totalMs` still bounds the
- * throttle wait. The composite signal fires on whichever cap hits first. The tool batch after the stream is bounded
- * by `totalMs`, else by `TOOL_BATCH_CEILING_MS` (`toolBatchCeilingOf`).
+ * throttle wait. The composite signal fires on whichever cap hits first.
  */
 function iterationTimeoutOf(run: AgenticRun): TimeoutController {
   const { input } = run;
@@ -87,21 +84,6 @@ function iterationTimeoutOf(run: AgenticRun): TimeoutController {
     ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
     stallEnvVar: 'GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS',
   });
-}
-
-/** The ceiling of an iteration's tool batch: `null` when the iteration timeout bounds the batch. */
-function toolBatchCeilingOf(iterTimeout: TimeoutController): number | null {
-  return iterTimeout.timeoutMs === null ? TOOL_BATCH_CEILING_MS : null;
-}
-
-/** The limit, in ms, that a timeout of `kind` fired at (`null` when not configured). */
-function limitOf(kind: TimeoutKind, iterTimeout: TimeoutController): number | null {
-  const limits: Readonly<Record<TimeoutKind, number | null>> = {
-    total: iterTimeout.timeoutMs,
-    stall: iterTimeout.stallMs,
-    'tool-batch': toolBatchCeilingOf(iterTimeout),
-  };
-  return limits[kind];
 }
 
 /**
@@ -137,8 +119,6 @@ async function throttledIteration(
     call: flight.call,
     matchConfig: run.matchConfig,
     recordChunk: () => iterTimeout.recordChunk(),
-    pauseStall: () => iterTimeout.pauseStall(),
-    toolBatchCeilingMs: toolBatchCeilingOf(iterTimeout),
     onThoughtChunk: (text) => {
       const trimmed = text.trim().slice(0, 80);
       if (trimmed.length > 0) run.emitter.emit(`thinking: ${trimmed}…`);
@@ -150,7 +130,7 @@ async function throttledIteration(
  * A failed iteration is closed (`closePass`): booked at what it billed when its model call had completed — a timeout
  * in its tool batch, a throw while its response was read — and both reservations released when the call had not (the
  * 429 retry hint is seeded once, by the call's own catch). A timeout becomes the structured TIMEOUT result naming the
- * iteration (`timeoutKind` says whether the stall, the total cap or the tool batch's ceiling fired) with the booked
+ * iteration (`timeoutKind` says whether the stall or the total cap fired) with the booked
  * pass's billed fields; any other failure gives `null`, for the caller to re-throw, the billed fields left in `state`
  * for the outer catch.
  */
@@ -167,7 +147,7 @@ function iterationFailure(
     return null;
   }
   const kind = getTimeoutKind(iterErr) ?? 'total';
-  const limitMs = limitOf(kind, iterTimeout);
+  const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
   run.emitter.emit(
     `ask_agentic: iteration ${state.iterations} aborted after ${limitMs ?? '?'}ms (${kind})`,
   );

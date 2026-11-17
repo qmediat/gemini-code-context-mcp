@@ -2204,10 +2204,15 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(elapsedMs).toBeLessThan(5_000);
   });
 
-  it('surfaces TIMEOUT the moment the iteration timer fires DURING tool execution (F2)', async () => {
-    // The tool batch is awaited through `boundedBatch` (`src/tools/agentic/iteration.ts`): the iteration's
-    // abort signal ends the wait when it fires, so a slow tool cannot overrun the deadline, and the catch path
-    // maps `signal.reason` to TIMEOUT.
+  it('surfaces TIMEOUT when the iteration timer fires DURING tool execution (F2 — post-dispatch abort check)', async () => {
+    // Production guards against a slow tool overrunning the deadline in
+    // `throwIfIterationAborted` (`src/tools/agentic/iteration.ts`): after `dispatchToolCallsParallel`
+    // returns, if the signal aborted during dispatch we re-throw
+    // `signal.reason` so the catch path maps it to TIMEOUT. None of the
+    // other tests reach the THROW arm of that branch — test 1 dispatches
+    // a fast `read_file`, test 4 hangs on the SDK call before dispatch
+    // ever happens. Without this case, deleting that check would not
+    // fail any test, silently uncapping per-iteration deadlines.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-tool-'));
     writeFileSync(join(root, 'a.ts'), 'export const x = 1;');
 
@@ -2220,11 +2225,13 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // for `grepExecutor` (top of file) sleeps `mocks.grepExecutorDelayMs`
     // before delegating to the real executor — long enough that the
     // 1 s iter timeout fires mid-dispatch. `setTimeout` here is NOT
-    // wired to `abortSignal`: the executor runs on, and the call ends without waiting for it.
+    // wired to `abortSignal`, so the dispatch completes naturally; the
+    // post-dispatch `abortSignal.aborted` check is what triggers
+    // the throw.
     generateContent.mockResolvedValueOnce(
       buildResponse({ functionCalls: [{ id: 'g1', name: 'grep', args: { pattern: 'x' } }] }),
     );
-    mocks.grepExecutorDelayMs = 3_000; // > iterationTimeoutMs
+    mocks.grepExecutorDelayMs = 1_500; // > iterationTimeoutMs
 
     const startedAt = Date.now();
     const result = await askAgenticTool.execute(
@@ -2237,7 +2244,7 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
     expect(result.structuredContent?.timeoutMs).toBe(1_000);
     expect(result.structuredContent?.iteration).toBe(1);
-    // The SDK was called once (model issued the grep call); the abort fired during dispatch.
+    // The SDK was called once (model issued the grep call); the abort fired during the ~1.5 s dispatch.
     expect(generateContent).toHaveBeenCalledTimes(1);
     // Single iteration → single reservation → finalised (not cancelled): the
     // model call completed before the tool batch, so its work is billed even
@@ -2249,10 +2256,13 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     // in `buildCtx`), so `throttle.reserve` never ran and `throttle.cancel`
     // has nothing to release. F3 covers the throttle-cancel path.
     expect(throttle.cancel).not.toHaveBeenCalled();
-    // Timing: the call ended at the 1 s timer, not after the 3 s executor. Lower bound 950ms for the
-    // `setTimeout` precision reason documented in the F3 / end-to-end tests above.
-    expect(elapsedMs).toBeGreaterThanOrEqual(950);
-    expect(elapsedMs).toBeLessThan(2_500);
+    // Timing sanity: must have actually waited for the slow executor
+    // (≥ ~1.5 s). If this falls below 1.5 s the wrapper isn't being
+    // invoked and the test is silently a no-op. Lower bound is 1450ms
+    // (~3 % slack) for the same `setTimeout` precision reason documented
+    // in the F3 / end-to-end tests above.
+    expect(elapsedMs).toBeGreaterThanOrEqual(1_450);
+    expect(elapsedMs).toBeLessThan(5_000);
   });
 
   it('end-to-end: real timer fires on a hung generateContent and surfaces TIMEOUT', async () => {

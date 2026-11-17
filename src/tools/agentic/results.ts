@@ -105,16 +105,6 @@ export function budgetRejected(
   );
 }
 
-/** What raises each limit an iteration can time out on. */
-const KNOB_HINT: Readonly<Record<TimeoutKind, string>> = {
-  stall:
-    'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.',
-  total:
-    'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.',
-  'tool-batch':
-    'The tool batch ran past the ceiling that bounds it when no iteration timeout is set. Set `iterationTimeoutMs` per call or `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` (up to 30 min) to bound the iteration, its tool batch included, with your own limit.',
-};
-
 /** What the message of an iteration booked before it timed out says of its cost. */
 const BOOKED_ITERATION_NOTE =
   "The iteration's model call had completed: it is booked at the token and cost fields this result reports.";
@@ -149,9 +139,13 @@ export interface IterationTimeout {
  */
 export function iterationTimedOut(iterations: number, timeout: IterationTimeout): TextToolResult {
   const { controller, kind, limitMs } = timeout;
+  const knobHint =
+    kind === 'stall'
+      ? 'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.'
+      : 'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.';
   const costNote = timeout.billed === null ? ABORTED_REQUEST_NOTE : BOOKED_ITERATION_NOTE;
   return errorResult(
-    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${KNOB_HINT[kind]} ${costNote}`,
+    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} ${costNote}`,
     {
       errorCode: 'TIMEOUT',
       timeoutMs: controller.timeoutMs,
