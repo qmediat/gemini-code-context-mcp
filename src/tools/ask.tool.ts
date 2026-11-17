@@ -53,6 +53,7 @@ import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js'
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { fallBackToAgentic } from './ask-agentic-fallback.js';
+import { SYSTEM_INSTRUCTION_Q_AND_A } from './ask/instruction.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { isTimeoutAbort, timedOutCall, toolTimeoutController } from './shared/abort-timeout.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
@@ -69,25 +70,7 @@ import {
   tierErrorMeta,
 } from './shared/service-tier.js';
 import { settleAnswer, settleFailure } from './shared/settle-call.js';
-import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
-
-/**
- * `ask` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
- * data-vs-instruction firewall (added in v1.15.2 — pre-v1.15.2 `ask` had no
- * safety rules at all, leaving it open to indirect prompt injection via
- * adversarial workspace file content; same risk profile as v1.14.4 A1' for
- * `ask_agentic`'s rescue path, just for the eager workspace upload channel).
- *
- * The role-statement after the safety block is the original v1.0 wording —
- * task-specific guidance lives there; cross-tool security boundaries live
- * in the shared safety block above.
- */
-const SYSTEM_INSTRUCTION_Q_AND_A = [
-  SYSTEM_INSTRUCTION_SAFETY_EAGER,
-  '',
-  'You are a senior software engineer analysing a codebase. Be precise, reference specific file paths and line numbers, and cite evidence from the provided files rather than guessing. If the answer is not derivable from the context, say so.',
-].join('\n');
 
 /**
  * Fallback output cap used only when the resolved model doesn't advertise
