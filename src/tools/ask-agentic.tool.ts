@@ -40,6 +40,7 @@ import type {
 } from '@google/genai';
 import { ApiError, FunctionCallingConfigMode, Type as GeminiType } from '@google/genai';
 import { z } from 'zod';
+import { thinkingBudgetRefusal } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
 import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type MatchConfig, defaultMatchConfig } from '../indexer/globs.js';
@@ -64,6 +65,7 @@ import {
   isTimeoutAbort,
   resolveTotalTimeoutMs,
 } from './shared/abort-timeout.js';
+import { billedInputTokens } from './shared/call-ledger.js';
 import { collectStream } from './shared/stream-collector.js';
 import { SYSTEM_INSTRUCTION_SAFETY_AGENTIC } from './shared/system-instruction-safety.js';
 import { THINKING_LEVEL_FIELD } from './shared/thinking.js';
@@ -633,24 +635,18 @@ async function executeAskAgenticBody(
       ...(input.excludeGlobs !== undefined ? { excludeGlobs: input.excludeGlobs } : {}),
     });
 
-    // Compatibility guard (mirror of ask.tool.ts): reject locally when
-    // thinkingBudget + answer-reserve > maxOutputTokens so the model
-    // never sees a 400 "thinking exceeds output budget" from Gemini.
-    // PR #24 review by GPT.
-    if (
-      typeof input.thinkingBudget === 'number' &&
-      input.thinkingBudget > 0 &&
-      typeof input.maxOutputTokens === 'number' &&
-      input.maxOutputTokens < input.thinkingBudget + 1024
-    ) {
-      return errorResult(
-        `ask_agentic: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${input.maxOutputTokens}). Raise maxOutputTokens to at least ${input.thinkingBudget + 1024}, or lower thinkingBudget.`,
-        {
-          errorCode: 'UNKNOWN',
-          retryable: false,
-          subReason: 'INVALID_THINKING_OUTPUT_COMBO',
-        },
-      );
+    // Refused locally, so the model never answers a 400 "thinking exceeds output budget".
+    const budgetRefusal = thinkingBudgetRefusal(
+      input.thinkingBudget,
+      input.maxOutputTokens,
+      input.maxOutputTokens ?? 0,
+    );
+    if (budgetRefusal !== null) {
+      return errorResult(`ask_agentic: ${budgetRefusal}`, {
+        errorCode: 'UNKNOWN',
+        retryable: false,
+        subReason: 'INVALID_THINKING_OUTPUT_COMBO',
+      });
     }
 
     const thinkingConfig: ThinkingConfig | undefined = (() => {
@@ -671,6 +667,9 @@ async function executeAskAgenticBody(
       tools: [{ functionDeclarations: buildFunctionDeclarations() }],
       thinkingConfig,
       ...(input.maxOutputTokens !== undefined ? { maxOutputTokens: input.maxOutputTokens } : {}),
+      // One request per model call: a response that stops with `CONTINUATION` is never continued here (long decode
+      // is `ask` / `code` only, `shared/continuation.ts`).
+      automaticContinuation: false,
     };
 
     const conversation: Content[] = [{ role: 'user', parts: [{ text: input.prompt }] }];
@@ -1477,10 +1476,10 @@ async function executeAskAgenticBody(
           // `finalizationEstimate` (correct) but throttle.release passed 0,
           // mutating the TPM window entry to 0 — under-throttling subsequent
           // calls. Sharing the same fallback keeps both releases symmetric.
-          const billedUncachedTokens =
-            finalizationUsage.promptTokenCount > 0
-              ? finalizationUsage.promptTokenCount
-              : finalizationEstimate;
+          const billedUncachedTokens = billedInputTokens(
+            finalizationUsage.promptTokenCount,
+            finalizationEstimate,
+          );
           if (finalizationReservationId !== null) {
             // If parse-after-await threw, finalizationUsage is still {0,0,0}.
             // Fall back to `finalizationEstimate` for billing — under-billing

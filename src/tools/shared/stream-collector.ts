@@ -73,7 +73,8 @@
 import type { Candidate, GenerateContentResponse, Part } from '@google/genai';
 
 const DEFAULT_THOUGHT_EMIT_THROTTLE_MS = 1500;
-const THOUGHTS_SUMMARY_MAX_CHARS = 1200;
+/** The thought summary a response carries is cut to this many characters. */
+export const THOUGHTS_SUMMARY_MAX_CHARS = 1200;
 
 export interface StreamCollectorOptions {
   /** Per-call abort (T19). Threading through here means we drop chunks the
@@ -114,6 +115,11 @@ export interface CollectedResponse {
   /** Wall-clock timestamps for first/last chunk arrival (Date.now() values). */
   readonly firstChunkAt: number | null;
   readonly lastChunkAt: number | null;
+  /**
+   * The latest `continuationToken` the first candidate carried (Gemini 4 long decode: the stream ended with
+   * `finishReason: CONTINUATION`, or passed a checkpoint); `null` when no chunk carried one.
+   */
+  readonly continuationToken: string | null;
 }
 
 /**
@@ -165,6 +171,7 @@ export async function collectStream(
   // synthesise the returned `lastCandidates`.
   const scaffoldsByIndex = new Map<number, Candidate>();
   let lastUsageMetadata: GenerateContentResponse['usageMetadata'];
+  let continuationToken: string | null = null;
   let chunkCount = 0;
   let firstChunkAt: number | null = null;
   let lastChunkAt: number | null = null;
@@ -333,6 +340,8 @@ export async function collectStream(
         }
       }
 
+      continuationToken = chunk.candidates?.[0]?.continuationToken ?? continuationToken;
+
       // usageMetadata appears on the final chunk; keep last-write-wins.
       if (chunk.usageMetadata) {
         lastUsageMetadata = chunk.usageMetadata;
@@ -401,5 +410,6 @@ export async function collectStream(
     chunkCount,
     firstChunkAt,
     lastChunkAt,
+    continuationToken,
   };
 }

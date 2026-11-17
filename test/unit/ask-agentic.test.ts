@@ -1096,6 +1096,14 @@ describe('ask_agentic loop — forced-finalization pass (post-maxIterations)', (
     // applies to the rescue too — otherwise a caller capping at 8k could see
     // the rescue ignore the cap and emit up to the model default 65k).
     expect(finalConfig?.config?.maxOutputTokens).toBe(8192);
+    // One request per model call, the loop's and the rescue's: the SDK never continues a CONTINUATION stop here.
+    for (const call of generateContent.mock.calls) {
+      expect((call[0] as { config?: Record<string, unknown> }).config).toHaveProperty(
+        'automaticContinuation',
+        false,
+      );
+    }
+    expect(generateContent).toHaveBeenCalledTimes(2);
     // C2 (v1.15.0): citation directive must be CONDITIONAL on format
     // compatibility, not unconditional. Pin the new wording so a future
     // PR can't silently revert to the v1.14.4 unconditional `Cite specific

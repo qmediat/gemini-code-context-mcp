@@ -16,10 +16,19 @@ import type { AuthProfile } from '../types.js';
 // handled at the tool layer by `isGemini429` + `parseRetryDelayMs` (see
 // `src/tools/shared/throttle.ts`). Pre-response network failures are handled
 // by `withNetworkRetry` in `src/gemini/retry.ts`.
+
+/**
+ * The Gemini Developer API version every request of an API-key client goes to. `@google/genai` defaults to the
+ * stable `v1`, which has no `cachedContents` resource (an explicit Context Cache answers 404 there); `v1beta`
+ * serves every surface this server calls — the Files API, `cachedContents`, `models`, `countTokens`,
+ * `generateContent` and its stream. Set in the constructor, it also wins over `GOOGLE_GENAI_API_VERSION`.
+ */
+export const GEMINI_API_VERSION = 'v1beta';
+
 export function createGeminiClient(profile: AuthProfile): GoogleGenAI {
   switch (profile.kind) {
     case 'api-key':
-      return new GoogleGenAI({ apiKey: profile.apiKey });
+      return new GoogleGenAI({ apiKey: profile.apiKey, apiVersion: GEMINI_API_VERSION });
     case 'vertex':
       // Vertex path implicitly uses ADC (gcloud application-default credentials).
       // Set GEMINI_USE_VERTEX=true + GOOGLE_CLOUD_PROJECT to route through here.

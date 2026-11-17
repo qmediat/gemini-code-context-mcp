@@ -172,6 +172,7 @@ export async function resolveModel(
     fallbackApplied,
     inputTokenLimit: picked.inputTokenLimit,
     outputTokenLimit: picked.outputTokenLimit,
+    longDecodeTokenLimit: picked.longDecodeTokenLimit,
     category: picked.category,
     capabilities: picked.capabilities,
     supportsCaching: picked.supportsCaching,

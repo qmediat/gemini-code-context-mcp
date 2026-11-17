@@ -22,7 +22,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
+import { GEMINI_3_PRO, GEMINI_4_HYDROGEN } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
+import { INLINE_CONTEXT, ONE_FILE_SCAN } from '../helpers/workspace.js';
 
 // Hoisted mock state — must be declared before `vi.mock` calls so the mock
 // factories close over them. vi.hoisted pattern is the Vitest-official way.
@@ -136,9 +138,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       insertUsageMetric: vi.fn(),
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: {
-      markHot: vi.fn(),
-    } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle: throttleSpy,
   };
@@ -155,38 +155,9 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     vi.clearAllMocks();
 
     mocks.validateWorkspacePath.mockReturnValue(undefined);
-    mocks.scanWorkspace.mockResolvedValue({
-      workspaceRoot: '/fake',
-      filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
-      skippedTooLarge: 0,
-      excludedDirs: [],
-      excludedDirsTotal: 0,
-      skippedNonSource: 0,
-      truncated: false,
-    });
-    mocks.resolveModel.mockResolvedValue({
-      requested: 'latest-pro',
-      resolved: 'gemini-3-pro-preview',
-      inputTokenLimit: 2_000_000,
-      outputTokenLimit: 65_536,
-      fallbackApplied: false,
-      category: 'text-reasoning',
-      capabilities: {
-        supportsThinking: true,
-        supportsVision: true,
-        supportsCodeExecution: true,
-        costTier: 'premium',
-      },
-    });
-    mocks.prepareContext.mockResolvedValue({
-      cacheId: null,
-      inlineContents: [],
-      reused: false,
-      rebuilt: false,
-      inlineOnly: true,
-      uploaded: { failedCount: 0, failures: [] },
-    });
+    mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
+    mocks.resolveModel.mockResolvedValue({ ...GEMINI_3_PRO, inputTokenLimit: 2_000_000 });
+    mocks.prepareContext.mockResolvedValue(INLINE_CONTEXT);
     mocks.isStaleCacheError.mockReturnValue(false);
   });
 
@@ -361,14 +332,7 @@ describe('ask.tool.ts throttle call sequence (T22b regression)', () => {
     const order: string[] = [];
     mocks.prepareContext.mockImplementation(async () => {
       order.push('prepareContext');
-      return {
-        cacheId: null,
-        inlineContents: [],
-        reused: false,
-        rebuilt: false,
-        inlineOnly: true,
-        uploaded: { failedCount: 0, failures: [] },
-      };
+      return INLINE_CONTEXT;
     });
 
     const { ctx, throttleSpy } = buildCtx();
@@ -389,38 +353,9 @@ describe('ask.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.validateWorkspacePath.mockReturnValue(undefined);
-    mocks.scanWorkspace.mockResolvedValue({
-      workspaceRoot: '/fake',
-      filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
-      skippedTooLarge: 0,
-      excludedDirs: [],
-      excludedDirsTotal: 0,
-      skippedNonSource: 0,
-      truncated: false,
-    });
-    mocks.resolveModel.mockResolvedValue({
-      requested: 'latest-pro',
-      resolved: 'gemini-3-pro-preview',
-      inputTokenLimit: 1_048_576,
-      outputTokenLimit: 65_536,
-      fallbackApplied: false,
-      category: 'text-reasoning',
-      capabilities: {
-        supportsThinking: true,
-        supportsVision: true,
-        supportsCodeExecution: true,
-        costTier: 'premium',
-      },
-    });
-    mocks.prepareContext.mockResolvedValue({
-      cacheId: null,
-      inlineContents: [],
-      reused: false,
-      rebuilt: false,
-      inlineOnly: true,
-      uploaded: { failedCount: 0, failures: [] },
-    });
+    mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
+    mocks.resolveModel.mockResolvedValue({ ...GEMINI_3_PRO });
+    mocks.prepareContext.mockResolvedValue(INLINE_CONTEXT);
     mocks.isStaleCacheError.mockReturnValue(false);
   });
 
@@ -461,5 +396,14 @@ describe('ask.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     await askTool.execute({ prompt: 'q', maxOutputTokens: 999_999 }, ctx);
     const config = lastGenerateContentCall(generateContent);
     expect(config.maxOutputTokens).toBe(65_536);
+  });
+
+  it('a Gemini 4 model takes a cap above its per-request limit unclamped, automatic continuation off', async () => {
+    mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_HYDROGEN);
+    const { ctx, generateContent } = buildCtx();
+    await askTool.execute({ prompt: 'q', maxOutputTokens: 262_144 }, ctx);
+    const config = lastGenerateContentCall(generateContent);
+    expect(config.maxOutputTokens).toBe(262_144);
+    expect(config.automaticContinuation).toBe(false);
   });
 });

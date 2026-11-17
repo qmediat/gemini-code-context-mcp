@@ -121,18 +121,72 @@ If your pattern is "one query a week on the same repo", consider running `clear`
 
 Raise it (`{ thinkingBudget: 32000 }`) when the task is hard. Drop it (`{ thinkingBudget: 0 }`) when you want a quick generation without deliberation.
 
+## Long decode on Gemini 4
+
+A Gemini 4 call whose `maxOutputTokens` is above the per-request limit continues in further requests
+([tools.md](tools.md#long-decode-on-gemini-4-ask-code)). Each request bills its whole input again: the prompt plus
+everything decoded before it. Measured on gemini-4-hydrogen at `thinkingLevel: XHIGH` with `maxOutputTokens: 262144`
+(2026-11-17, two requests each; the server's own estimate at 1.50 / 7.50 USD per 1 M):
+
+| Prompt | Billed input | Thinking | Answer | Time | Cost |
+|---|---|---|---|---|---|
+| 99,712 tokens | 265,085 | 85,730 | 1,048 | 375 s | 1.0485 USD |
+| 153,906 tokens | 373,458 | 99,836 | 997 | 482 s | 1.3164 USD |
+
+The same prompts with no `maxOutputTokens` stopped at 65,533 thinking tokens with no answer (`OUTPUT_CAP`), billed.
+
+The reservation stays an upper bound. With prompt `P`, cap `C` and per-request limit `L` (the model's advertised
+`outputTokenLimit`):
+
+```
+R = ceil(C / L)                                   requests at most (the server stops there)
+M = max(L, 65,536)                                the most one streaming request decodes
+O = 256                                           what a continuation request bills beyond P and the decode before it
+input reserved = P + Σ_{k=1..R−1} (P + min(k·M, C) + O)
+output reserved = C, or min(R·M, C + M − 1) when R > 1   (+ the thinking reserve)
+```
+
+- `P` is the larger of the bytes ÷ 4 heuristic and the preflight's count. A decode that may take more than one request
+  takes the exact count (`countTokens`, whatever `preflightMode` asked for): its prompt is billed once per request,
+  so the heuristic's undercount would be billed `R` times.
+- `O`: request 2 of the measured calls billed 125 and 89 tokens more than the prompt plus the decode before it;
+  `CONTINUATION_REQUEST_OVERHEAD_TOKENS` reserves twice the larger.
+- The output side rests on Google holding `maxOutputTokens` = `C` over the whole chain of requests, which the client
+  cannot check. The client stops after a request ends, once the decoded tokens reached `C`; a server that held the cap
+  per request would let the last request run up to one request's decode past `C`. The reservation counts that
+  overshoot (`decodedTokensBound`): `C + M − 1` at most, never more than `R` requests of `M`. For a cap that is a
+  multiple of `M` (262,144, 1,048,576 on Hydrogen) that is `C` itself.
+- Under a cap the model's input window cut (`outputCapCutByInputWindow`), `C` is the cut value. A cut that leaves
+  several requests keeps the caller's cap on the wire, above `C`, so the overshoot past `C` is certain and reserved as
+  above; a cut that leaves one request sends `C` itself as `maxOutputTokens`. The thinking reserve is sized from the cut
+  `C` too. The cut rests on a premise that is assumed, not measured: that the API refuses a continuation request
+  whose prompt plus decoded tokens pass the input window (`docs/FOLLOW-UP-PRS.md` T41).
+- A request that reports no usage is billed at the reservation's own input estimate — the larger of the heuristic and
+  the preflight's count — plus what was decoded before it, so the ledger keeps the daily cap a bound.
+- A request that makes no progress (it returns the token it was sent with, or decodes nothing) ends the decode, so
+  a stuck stop is not re-billed up to `R` times.
+- A context cache that expires after a request of the decode completed ends the call with that request billed; the
+  decode is not restarted, so a call never bills more than one decode under its reservation.
+
+`src/gemini/long-decode.ts` (`continuationInputTokens`, `decodedTokensBound`) holds the formula. Example: `P` = 100 k,
+`C` = 262,144 on Hydrogen → 4 requests, 793,984 input tokens reserved.
+
+**Time.** `timeoutMs` (at most 30 minutes) covers the whole decode. At the measured pace (375–482 s for two requests)
+about 7 to 9 requests fit in it; a call that needs more ends in `errorCode: TIMEOUT`, its completed requests billed
+and reported in the error (token fields, `costEstimateUsd`, `continuationHops`).
+
 ## Budget cap — how the enforcement actually works
 
 `GEMINI_DAILY_BUDGET_USD` is an **atomic** reservation, not a read-then-act check. From v1.0.3 onward:
 
-1. After the workspace is scanned and the model resolved, we compute a conservative cost estimate: `(workspace_bytes ÷ 4 bytes/token) × input_rate + prompt_chars × input_rate + maxOutputTokens × output_rate + thinkingBudget × output_rate`.
+1. After the workspace is scanned and the model resolved, we compute a conservative cost estimate: `input_tokens × input_rate + maxOutputTokens × output_rate + thinkingBudget × output_rate`, where `input_tokens` is the larger of `workspace_bytes ÷ 4 + prompt_chars ÷ 4` and the preflight's count when it ran, plus the input every continuation request bills again on a Gemini 4 long decode ([above](#long-decode-on-gemini-4)).
 2. That estimate is inserted into the usage-metrics table inside a `BEGIN IMMEDIATE` SQLite transaction. Concurrent tool calls are serialised by SQLite's reserved lock — if the reservation would push cumulative spend over the cap, the transaction rolls back and the tool returns `Daily budget cap would be exceeded: spent $X + estimate $Y > cap $Z`.
-3. The `generateContent` call carries an explicit `maxOutputTokens` matching the estimate, so a runaway response cannot exceed what was reserved.
-4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back.
+3. The `generateContent` call carries an explicit `maxOutputTokens` matching the estimate (every request of a long decode carries the same cap), so a runaway response cannot exceed what was reserved.
+4. On success, the estimate row is overwritten with the measured cost (typically lower — finalize corrects the over-estimate). On failure, the reservation is cancelled so its headroom comes back — unless one or more requests of the call had completed (`ask` / `code`: a long decode whose continuation request failed, met a stale cache or timed out): those were billed, so the row is settled at their measured cost and only the rest of the reservation comes back.
 
 Result: N concurrent tool calls cannot collectively overshoot the cap. A single call cannot overshoot either, thanks to `maxOutputTokens`.
 
-**Caveat:** the `bytes ÷ 4` token heuristic undercounts multibyte / CJK / emoji-dense content by ~1.3×–2×. For accurate caps on those workloads, set `GEMINI_DAILY_BUDGET_USD` ~2× lower than your true limit until the heuristic is upgraded (see [FOLLOW-UP-PRS.md T17](./FOLLOW-UP-PRS.md)).
+**Caveat:** the `bytes ÷ 4` token heuristic undercounts multibyte / CJK / emoji-dense content by ~1.3×–2×. The reservation uses the preflight's count instead whenever the preflight counted (`preflightMode: 'exact'`, `'auto'` near the input limit, and every Gemini 4 long decode); on other calls it rests on the heuristic. For accurate caps on those workloads, set `preflightMode: 'exact'`, or `GEMINI_DAILY_BUDGET_USD` ~2× lower than your true limit (see [FOLLOW-UP-PRS.md T17](./FOLLOW-UP-PRS.md)).
 
 **`status` cost breakdown:** `spentTodayUsd` keeps its conservative-upper-bound semantics (settled + in-flight reservations) so daily-budget enforcement stays a true cap. *(v1.7.0+)* `status` additionally exposes `spentTodaySettledUsd` and `inFlightReservedTodayUsd` (plus workspace-scoped equivalents `usage.settledCostUsd` / `usage.inFlightReservedUsd`), and the human-readable line shows `"(settled $X + $Y in-flight reserved)"` whenever in-flight ≠ 0. Streaming made the in-flight window much more observable on long HIGH-thinking calls (60–180 s) — the breakdown closes that perception gap.
 

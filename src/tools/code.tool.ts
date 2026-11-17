@@ -12,15 +12,20 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
-import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { prepareContext } from '../cache/cache-manager.js';
 import {
   CACHING_MODE_FALLBACK_DESCRIPTION,
   cachingModeFor,
   cachingRan,
 } from '../cache/caching-mode.js';
+import {
+  capThatRuns,
+  preflightModeFor,
+  resolveOutputCap,
+  thinkingBudgetRefusal,
+} from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
-import { abortableSleep, withNetworkRetry } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
@@ -28,11 +33,14 @@ import {
   validateWorkspacePath,
 } from '../indexer/workspace-validation.js';
 import type { ResolvedModel } from '../types.js';
-import { estimateCostUsd, estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
+import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
+import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
+import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
+import { DispatchThrottle } from './shared/dispatch-throttle.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
@@ -42,14 +50,9 @@ import {
   statusOf,
   tierErrorMeta,
 } from './shared/service-tier.js';
-import { type CollectedResponse, collectStream } from './shared/stream-collector.js';
+import { settleAnswer, settleFailure } from './shared/settle-call.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
-import {
-  THINKING_LEVEL_FIELD,
-  THINKING_LEVEL_RESERVE,
-  emptyAtOutputCap,
-} from './shared/thinking.js';
-import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
+import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
 
 /**
  * `code` system instruction. Prepends the shared `SYSTEM_INSTRUCTION_SAFETY_EAGER`
@@ -123,7 +126,10 @@ export const codeInputSchema = z
       .min(1)
       .optional()
       .describe(
-        "Per-call opt-in cap on response length (tokens). OMIT for auto — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value to bound a specific call (e.g. `maxOutputTokens: 16384` for a tight code-review summary). Values larger than the resolved model's limit are clamped. Operators who want EVERY call at full model capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level — that env override is still beaten by this per-call field.",
+        [
+          "Per-call opt-in cap on response length (tokens). OMIT for auto — Gemini uses its model-default cap (per Google docs, equal to the model's advertised `outputTokenLimit`: 65,536 for Gemini 3.x / 2.5 Pro-tier; see ai.google.dev/gemini-api/docs/models/gemini-2.5-pro). Pass a smaller value to bound a specific call (e.g. `maxOutputTokens: 16384` for a tight code-review summary). On any other model a value larger than the resolved model's limit is clamped to it. Operators who want EVERY call at full model capacity set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true` at MCP-host level — that env override is still beaten by this per-call field.",
+          LONG_DECODE_CAP_DESCRIPTION,
+        ].join(' '),
       ),
     includeGlobs: z
       .array(z.string())
@@ -194,6 +200,19 @@ export interface ParsedEdit {
   file: string;
   old: string;
   new: string;
+}
+
+/** Leads the text result of an answer with edits (`expectEdits`) cut at the output cap: its edit list is incomplete. */
+export const TRUNCATED_EDITS_NOTE =
+  '[truncated] The answer stopped at the output cap before the model finished it (see `finishReason`): the edit list below is cut — do not apply it as complete. Raise `maxOutputTokens` or lower the thinking, and ask again.';
+
+/** Leads the text result of a prose answer (`expectEdits: false`) cut at the output cap. */
+export const TRUNCATED_ANSWER_NOTE =
+  '[truncated] The answer stopped at the output cap before the model finished it (see `finishReason`): the answer below is cut. Raise `maxOutputTokens` or lower the thinking, and ask again.';
+
+/** The note that leads a truncated answer: about its edit list when edits were asked for, else about the prose. */
+export function truncatedNote(expectEdits: boolean): string {
+  return expectEdits ? TRUNCATED_EDITS_NOTE : TRUNCATED_ANSWER_NOTE;
 }
 
 const EDIT_REGEX =
@@ -313,13 +332,13 @@ async function executeCodeBody(
   const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
 
   let reservationId: number | null = null;
-  // `-1` signals "no reservation held". Mirror of ask.tool.ts.
-  let throttleReservationId = -1;
   // Canonical resolved-model string for retry-hint seeding (T22a).
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
-  // once a stream opened, a later transport failure is mid-stream: billed work, not to be re-sent
-  let streamOpened = false;
+  // every request that completed is billed: the ledger settles from these, on an answer and on a failure alike
+  const completed = new CompletedRequests();
+  // the running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent)
+  const tracking: DecodeTracking = { ledgerEntry: null, streamOpened: false };
   let modelAudit: Record<string, unknown> = {};
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
@@ -331,6 +350,13 @@ async function executeCodeBody(
     stallEnvVar: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
   });
   const abortSignal = timeoutController.signal;
+  // Each request of the decode holds its own TPM reservation; a failure drops the one held.
+  const dispatch = new DispatchThrottle({
+    throttle: ctx.throttle,
+    enabled: ctx.config.tpmThrottleLimit > 0,
+    signal: abortSignal,
+    emit: (message) => emitter.emit(message),
+  });
   try {
     // Workspace validation inside try → reported as a regular tool error
     // (errorResult, "code failed: …") rather than an unhandled exception
@@ -405,75 +431,24 @@ async function executeCodeBody(
     // heavy review work set `GEMINI_CODE_CONTEXT_FORCE_MAX_OUTPUT=true`
     // to pin every call at the model's full 65,536-token capacity.
     const CODE_MAX_OUTPUT_TOKENS_FALLBACK = 65_536;
-    const modelOutputLimit =
-      typeof resolved.outputTokenLimit === 'number' && resolved.outputTokenLimit > 0
-        ? resolved.outputTokenLimit
-        : CODE_MAX_OUTPUT_TOKENS_FALLBACK;
-    const wireMaxOutputTokens: number | undefined =
-      input.maxOutputTokens !== undefined
-        ? Math.min(input.maxOutputTokens, modelOutputLimit)
-        : ctx.config.forceMaxOutputTokens
-          ? modelOutputLimit
-          : undefined;
-    // Effective cap for thinking-budget clamp and budget reservation.
-    // When auto (neither override set), Gemini's model-default equals
-    // modelOutputLimit per Google docs, so using the limit as worst-case
-    // keeps the daily $ cap a true upper bound.
-    const effectiveOutputCap = wireMaxOutputTokens ?? modelOutputLimit;
+    // The caller's `thinkingBudget` is checked against `outputCap` (the wire cap, else the model's per-request limit);
+    // the clamp and the reservation use the cap that runs (`runCap`, after the input window's cut).
+    const outputCap = resolveOutputCap({
+      requested: input.maxOutputTokens,
+      forceMax: ctx.config.forceMaxOutputTokens,
+      outputTokenLimit: resolved.outputTokenLimit,
+      longDecodeTokenLimit: resolved.longDecodeTokenLimit,
+      fallbackLimit: CODE_MAX_OUTPUT_TOKENS_FALLBACK,
+    });
 
-    // Gemini requires `thinkingBudget < maxOutputTokens` (the thinking pool
-    // is carved out of the candidate-output allowance). The hard cap above
-    // may clamp maxOutputTokens as low as the model's `outputTokenLimit`
-    // (e.g. 8_192 on Flash-lite). Clamp the effective thinkingBudget so
-    // the generateContent call never 400s on this invariant; reserve at
-    // least 1_024 tokens for the actual completion.
-    //
-    // Only meaningful on the thinkingBudget path — when the caller uses
-    // `thinkingLevel` instead, `thinkingBudget` is `undefined` and this
-    // value is ignored by the thinkingConfig builder below.
-    //
-    // Early-reject when the caller's per-call `maxOutputTokens` can't fit
-    // an explicit positive `thinkingBudget` + 1024-token answer reserve.
-    // Silently clamping to 0 would make Gemini 3 Pro 400 on a
-    // "thinking disabled" error and obscure the real mismatch (PR #22
-    // round-3 review finding #C).
-    if (
-      input.thinkingBudget !== undefined &&
-      input.thinkingBudget > 0 &&
-      input.maxOutputTokens !== undefined &&
-      effectiveOutputCap < input.thinkingBudget + 1024
-    ) {
-      return errorResult(
-        `code: thinkingBudget (${input.thinkingBudget}) + 1024-token answer reserve exceeds maxOutputTokens (${effectiveOutputCap}). Raise \`maxOutputTokens\` to at least ${input.thinkingBudget + 1024}, or lower \`thinkingBudget\`.`,
-      );
-    }
-    const effectiveThinkingBudget =
-      thinkingBudget !== undefined && thinkingBudget > 0
-        ? Math.max(0, Math.min(thinkingBudget, effectiveOutputCap - 1024))
-        : 0;
-
-    // Cost-estimate thinking-token reserve — tier-aware when the caller
-    // uses `thinkingLevel`, exact-on-the-budget when they use
-    // `thinkingBudget`. Mirror of `ask.tool.ts` logic; see
-    // `THINKING_LEVEL_RESERVE` in `shared/thinking.ts` for the rationale
-    // behind the per-tier numbers and why HIGH falls through to the
-    // dynamic cap.
-    //
-    // Defensive clamp: tier reserves (MINIMAL=512, LOW=2048, MEDIUM=4096)
-    // are fixed constants, but `maxOutputTokens` can be clamped down to a
-    // resolved model's `outputTokenLimit`. A future small-cap model (say
-    // `outputTokenLimit: 4000`) would let MEDIUM's 4096 exceed the
-    // available headroom and over-estimate the budget reservation. Clamp
-    // every tier's reserve against the dynamic headroom so the upper
-    // bound stays coherent across model rollouts (PR #17 self-review F2).
-    const thinkingHeadroom = Math.max(0, effectiveOutputCap - 1024);
-    const thinkingTokensForEstimate =
-      input.thinkingLevel !== undefined
-        ? Math.min(
-            THINKING_LEVEL_RESERVE[input.thinkingLevel] ?? thinkingHeadroom,
-            thinkingHeadroom,
-          )
-        : effectiveThinkingBudget;
+    // A positive `thinkingBudget` that leaves no answer reserve under the caller's own cap is refused
+    // (`thinkingBudgetRefusal`); below, the budget on the wire is clamped under the cap that runs.
+    const budgetRefusal = thinkingBudgetRefusal(
+      input.thinkingBudget,
+      input.maxOutputTokens,
+      outputCap.effective,
+    );
+    if (budgetRefusal !== null) return errorResult(`code: ${budgetRefusal}`);
 
     // Shared input-token fingerprint for budget + TPM throttle (see
     // ask.tool.ts for the rationale — same `Math.ceil(bytes/4)` tokenisation
@@ -489,6 +464,8 @@ async function executeCodeBody(
     // success-path metadata can surface preflight provenance.
     let preflight: PreflightTokenResult | undefined;
     const contextWindow = resolved.inputTokenLimit;
+    // A decode that may take more than one request takes the exact count: its prompt is billed per request.
+    const preflightMode = preflightModeFor(input.preflightMode, outputCap);
     if (typeof contextWindow === 'number' && contextWindow > 0) {
       preflight = await countForPreflight(ctx.client, {
         files: scan.files,
@@ -496,7 +473,7 @@ async function executeCodeBody(
         model: resolved.resolved,
         // `filesHash` is post-glob-filter — no separate globsHash needed.
         filesHash: scan.filesHash,
-        ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
+        ...(preflightMode !== undefined ? { preflightMode } : {}),
         inputTokenLimit: contextWindow,
         // See ask.tool.ts for AbortSignal contract — abort propagates as
         // `AbortError` to outer catch (mapped to `errorCode: 'TIMEOUT'`).
@@ -528,6 +505,27 @@ async function executeCodeBody(
       );
     }
 
+    const { cap: runCap, cut: inputWindowCut } = capThatRuns({
+      tool: 'code',
+      cap: outputCap,
+      promptTokens: preflight?.effectiveTokens,
+      inputTokenLimit: contextWindow,
+      emit: (message) => emitter.emit(message),
+    });
+
+    // The budget on the wire: clamped below the cap that runs, after the input window's cut — a cap cut to one
+    // request goes on the wire as its cut value, and `thinkingBudget < maxOutputTokens` holds there too.
+    const effectiveThinkingBudget =
+      thinkingBudget !== undefined && thinkingBudget > 0
+        ? thinkingBudgetUnder(runCap, thinkingBudget)
+        : 0;
+    // The thinking the budget reservation counts, from the cap that runs.
+    const thinkingTokensForEstimate = thinkingReserve(
+      input.thinkingLevel,
+      effectiveThinkingBudget,
+      runCap,
+    );
+
     // Atomic budget reservation — see ask.tool.ts for the full rationale.
     // Estimate includes the thinking budget (billed as output tokens on Pro)
     // PLUS the candidate output cap.
@@ -537,7 +535,11 @@ async function executeCodeBody(
         serviceTier,
         workspaceBytes,
         promptChars: input.task.length,
-        expectedOutputTokens: effectiveOutputCap,
+        expectedOutputTokens: runCap.effective,
+        // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
+        perRequestOutputTokens: runCap.perRequest,
+        // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
+        countedInputTokens: preflight?.effectiveTokens,
         thinkingTokens: thinkingTokensForEstimate,
         coverMs: timeoutController.timeoutMs,
       });
@@ -572,46 +574,29 @@ async function executeCodeBody(
     const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
     const requestedCachingMode = caching.mode;
 
-    const ctxPrep = await prepareContext({
-      client: ctx.client,
-      manifest: ctx.manifest,
-      scan,
-      model: resolved,
-      systemPromptHash,
-      systemInstruction: SYSTEM_INSTRUCTION_CODE,
-      ttlSeconds: ctx.config.cacheTtlSeconds,
-      cacheMinTokens: ctx.config.cacheMinTokens,
-      emitter,
-      // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
-      // which Gemini rejects together with cachedContent. Force inline path
-      // when codeExecution is requested so we have actual inline file parts
-      // to embed alongside the prompt.
-      allowCaching: scan.files.length > 0 && !codeExecution,
-      // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
-      signal: abortSignal,
-      // v1.13.0 — opt-in implicit caching path (skip caches.create).
-      cachingMode: requestedCachingMode,
-    });
-
-    // TPM throttle — placed AFTER `prepareContext`, immediately before
-    // `generateContent`, so the reservation's `tsMs` accurately reflects
-    // when tokens hit Gemini's quota counter. See ask.tool.ts for the
-    // full rationale and the cold-cache-timing concern it fixes.
-    //
-    // Extracted into a helper so the stale-cache retry branch can
-    // cancel-and-re-reserve with an accurate tsMs rather than reusing a
-    // stale reservation.
-    const reserveForDispatch = async (): Promise<void> => {
-      if (ctx.config.tpmThrottleLimit <= 0) return;
-      const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
-      throttleReservationId = reservation.releaseId;
-      if (reservation.delayMs > 0) {
-        emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
-        // Abortable — wall-clock timeout (T19) must beat throttle delay.
-        await abortableSleep(reservation.delayMs, abortSignal);
-      }
-    };
-    await reserveForDispatch();
+    // The context of the call: built here, and again by the stale-cache retry on a fresh cache.
+    const prepare = () =>
+      prepareContext({
+        client: ctx.client,
+        manifest: ctx.manifest,
+        scan,
+        model: resolved,
+        systemPromptHash,
+        systemInstruction: SYSTEM_INSTRUCTION_CODE,
+        ttlSeconds: ctx.config.cacheTtlSeconds,
+        cacheMinTokens: ctx.config.cacheMinTokens,
+        emitter,
+        // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
+        // which Gemini rejects together with cachedContent. Force inline path
+        // when codeExecution is requested so we have actual inline file parts
+        // to embed alongside the prompt.
+        allowCaching: scan.files.length > 0 && !codeExecution,
+        // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
+        signal: abortSignal,
+        // v1.13.0 — opt-in implicit caching path (skip caches.create).
+        cachingMode: requestedCachingMode,
+      });
+    const ctxPrep = await prepare();
 
     const userPrompt = expectEdits
       ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
@@ -656,8 +641,7 @@ async function executeCodeBody(
     }
     const tierField = serviceTierConfig(serviceTier);
     const buildConfig = (cacheId: string | null): GenerateContentConfig => {
-      const maxOutputField =
-        wireMaxOutputTokens !== undefined ? { maxOutputTokens: wireMaxOutputTokens } : {};
+      const maxOutputField = runCap.wire !== undefined ? { maxOutputTokens: runCap.wire } : {};
       if (canUseCache(cacheId) && cacheId) {
         // With cache: system_instruction is baked in; thinkingConfig remains OK.
         // `maxOutputTokens` only emitted when the caller set it explicitly
@@ -687,136 +671,35 @@ async function executeCodeBody(
         ? userPrompt
         : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
 
-    let activePrep = ctxPrep;
-    let retriedOnStaleCache = false;
-    let response: CollectedResponse;
-    try {
-      // T20 (v1.7.0) — withNetworkRetry wraps ONLY the stream opening.
-      // Mid-stream failures cannot be retried (Gemini's stream API has no
-      // resume) — wrapping collectStream too would discard the partial
-      // response and re-open a new stream → DOUBLE BILLING. See
-      // ask.tool.ts for the full rationale.
-      const stream = await withNetworkRetry(
-        () =>
-          ctx.client.models.generateContentStream({
-            model: resolved.resolved,
-            contents: buildContents(activePrep.cacheId, activePrep.inlineContents),
-            config: { ...buildConfig(activePrep.cacheId), abortSignal },
-          }),
-        {
-          attempts: networkAttempts(serviceTier), // a flex request is never re-sent
-          signal: abortSignal,
-          onRetry: (attempt, retryErr) => {
-            logger.warn(
-              `code: retrying generateContent after transient network failure (attempt ${attempt}): ${
-                retryErr instanceof Error ? retryErr.message : String(retryErr)
-              }`,
-            );
-          },
+    // The decode and its one stale-cache retry — the shared path of `ask` and `code` (see ask.tool.ts).
+    const decoded = await decodeOnContext(
+      {
+        client: ctx.client,
+        booking: { workspaceRoot, toolName: 'code', model: resolved.resolved, serviceTier },
+        // `cachingRan`: a codeExecution call is forced inline and never builds a cache.
+        cachingMode: (prep) => cachingRan(prep, caching).mode,
+        request: (prep) => ({
+          contents: buildContents(prep.cacheId, prep.inlineContents),
+          config: buildConfig(prep.cacheId),
+        }),
+        cache: {
+          ttlWatcher: ctx.ttlWatcher,
+          manifest: ctx.manifest,
+          ttlSeconds: ctx.config.cacheTtlSeconds,
+          prepare,
         },
-      );
-      streamOpened = true;
-      response = await collectStream(stream, {
-        signal: abortSignal,
-        onThoughtChunk: (text) => {
-          const trimmed = text.trim().slice(0, 80);
-          if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-        },
-        // v1.12.0 — stall watchdog reset on every chunk.
-        onChunkReceived: () => timeoutController.recordChunk(),
-      });
-    } catch (err) {
-      if (activePrep.cacheId && isStaleCacheError(err)) {
-        logger.warn(
-          `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
-        );
-        try {
-          // Reset cache pointer only — preserve `files` rows so the rebuild
-          // reuses uploaded files via content-hash dedup instead of double-
-          // uploading. The Gemini-side cache is already dead.
-          markCacheStale({ manifest: ctx.manifest, workspaceRoot });
-          const rebuilt = await prepareContext({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            scan,
-            model: resolved,
-            systemPromptHash,
-            systemInstruction: SYSTEM_INSTRUCTION_CODE,
-            ttlSeconds: ctx.config.cacheTtlSeconds,
-            cacheMinTokens: ctx.config.cacheMinTokens,
-            emitter,
-            allowCaching: scan.files.length > 0 && !codeExecution,
-            // v1.12.1 — propagate signal into stale-cache rebuild too.
-            signal: abortSignal,
-            // v1.13.0 — keep cachingMode consistent across happy + retry paths.
-            cachingMode: requestedCachingMode,
-          });
-          // Cancel stale reservation (tsMs was stamped before first
-          // dispatch, now seconds old after rebuild) and re-reserve so
-          // the retry's tsMs matches actual dispatch time. Mirror of
-          // ask.tool.ts — see rationale there.
-          if (throttleReservationId !== -1) {
-            ctx.throttle.cancel(throttleReservationId);
-            throttleReservationId = -1;
-          }
-          await reserveForDispatch();
-          // The stale-cache retry itself can hit a transient network failure;
-          // wrap it too so the rebuild isn't wasted on a one-off blip.
-          // Stale-cache retry — discard partial, open fresh stream. Same
-          // retry-OPENING-only contract as the happy path above.
-          const retryStream = await withNetworkRetry(
-            () =>
-              ctx.client.models.generateContentStream({
-                model: resolved.resolved,
-                contents: buildContents(rebuilt.cacheId, rebuilt.inlineContents),
-                config: { ...buildConfig(rebuilt.cacheId), abortSignal },
-              }),
-            {
-              attempts: networkAttempts(serviceTier),
-              signal: abortSignal,
-              onRetry: (attempt, retryErr) => {
-                logger.warn(
-                  `code (stale-cache retry): retrying generateContent after transient network failure (attempt ${attempt}): ${
-                    retryErr instanceof Error ? retryErr.message : String(retryErr)
-                  }`,
-                );
-              },
-            },
-          );
-          streamOpened = true;
-          response = await collectStream(retryStream, {
-            signal: abortSignal,
-            onThoughtChunk: (text) => {
-              const trimmed = text.trim().slice(0, 80);
-              if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-            },
-            // v1.12.0 — stall watchdog reset on retry stream.
-            onChunkReceived: () => timeoutController.recordChunk(),
-          });
-          activePrep = rebuilt;
-          retriedOnStaleCache = true;
-        } catch (retryErr) {
-          // Re-throw timeout directly so the outer catch's `isTimeoutAbort`
-          // sees it. Wrapping with `cause: err` (the original stale-cache
-          // error) would mask the timeout; outer catch would map to UNKNOWN
-          // instead of TIMEOUT.
-          if (isTimeoutAbort(retryErr)) throw retryErr;
-          if (statusOf(retryErr) !== undefined) throw retryErr; // an HTTP error on the retry is the error itself
-          throw new Error(
-            `code retry after stale cache failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`,
-            { cause: err },
-          );
-        }
-      } else {
-        throw err;
-      }
-    }
-
-    if (activePrep.cacheId) {
-      ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
-    }
+        openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
+        limits: { maxRequests: runCap.maxRequests, cap: runCap.effective },
+        timeout: timeoutController,
+        emit: (message) => emitter.emit(message),
+        completed,
+        tracking,
+        throttle: dispatch,
+        inputTokens: { estimated: estimatedInputTokens, counted: preflight?.effectiveTokens },
+      },
+      ctxPrep,
+    );
+    const { response, prep: activePrep, retriedOnStaleCache } = decoded;
 
     const text = response.text;
     const edits = expectEdits ? parseEdits(text) : [];
@@ -839,75 +722,42 @@ async function executeCodeBody(
     }
     const thinkingSummary = response.thoughtsSummary;
 
-    const usage = response.usageMetadata;
-    const cached =
-      typeof usage?.cachedContentTokenCount === 'number' ? usage.cachedContentTokenCount : 0;
-    const inputTotal = typeof usage?.promptTokenCount === 'number' ? usage.promptTokenCount : 0;
-    const uncached = Math.max(0, inputTotal - cached);
-    const output = typeof usage?.candidatesTokenCount === 'number' ? usage.candidatesTokenCount : 0;
-    const thinking = typeof usage?.thoughtsTokenCount === 'number' ? usage.thoughtsTokenCount : 0;
-
-    // Finalise TPM throttle reservation with actual input tokens
-    // (cached + uncached — both count toward Gemini's per-minute quota).
-    if (throttleReservationId !== -1) {
-      ctx.throttle.release(throttleReservationId, inputTotal);
-      throttleReservationId = -1;
-    }
-
-    const cost = estimateCostUsd({
-      model: resolved.resolved,
-      serviceTier,
-      uncachedInputTokens: uncached,
-      cachedInputTokens: cached,
-      outputTokens: output,
-      thinkingTokens: thinking,
-    });
-    const costMicros = toMicrosUsd(cost);
-
     // Telemetry and the response record the mode that ran, not the one asked for
     // (`cachingRan`: a codeExecution call is forced inline and never builds a cache).
     const ran = cachingRan(activePrep, caching);
     const effectiveCachingMode = ran.mode;
 
     const durationMs = Date.now() - started;
-    if (reservationId !== null) {
-      // Defensive: if `finalize` throws (disk full / lock contention), keep
-      // the reservation row so we don't lose all record of this billable
-      // call. Drop `reservationId` either way so the outer catch doesn't
-      // touch it.
-      try {
-        ctx.manifest.finalizeBudgetReservation(reservationId, {
-          cachedTokens: cached,
-          uncachedTokens: uncached,
-          costUsdMicro: costMicros,
-          durationMs,
-          cachingMode: effectiveCachingMode,
-          cachedContentTokenCount: cached,
-        });
-      } catch (finalizeErr) {
-        logger.error(
-          `code: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${costMicros} micros). Error: ${String(finalizeErr)}`,
-        );
-      }
-      reservationId = null;
-    } else {
-      ctx.manifest.insertUsageMetric({
+    // Settled here, once: the outer catch then neither releases the reservation nor books the call again. What the
+    // API billed is every request that completed, over a long decode and a stale-cache retry alike.
+    const settledReservation = reservationId;
+    reservationId = null;
+    tracking.ledgerEntry = null;
+    const settled = settleAnswer({
+      manifest: ctx.manifest,
+      reservationId: settledReservation,
+      entry: {
         workspaceRoot,
         toolName: 'code',
         model: resolved.resolved,
-        cachedTokens: cached,
-        uncachedTokens: uncached,
-        costUsdMicro: costMicros,
-        durationMs,
-        occurredAt: Date.now(),
+        serviceTier,
         cachingMode: effectiveCachingMode,
-        cachedContentTokenCount: cached,
-      });
-    }
+      },
+      completed,
+      response,
+      cap: runCap,
+      cut: inputWindowCut,
+      durationMs,
+    });
+    const finish = settled.finish;
 
     // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
-    const starved = emptyAtOutputCap(response, thinking);
-    if (starved !== null) return errorResult(`code: ${starved}`);
+    if (settled.outputCapStop !== null) {
+      return errorResult(`code: ${settled.outputCapStop.message}`, {
+        ...modelAudit,
+        ...settled.outputCapStop.fields,
+      });
+    }
 
     if (scan.truncated) {
       logger.warn(
@@ -934,11 +784,11 @@ async function executeCodeBody(
       cacheHit: activePrep.reused,
       cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
       retriedOnStaleCache,
-      cachedTokens: cached,
-      uncachedTokens: uncached,
-      thinkingTokens: thinking,
-      outputTokens: output,
-      costEstimateUsd: Math.round(cost * 10000) / 10000,
+      ...settled.usage,
+      ...settled.cutFields,
+      // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
+      finishReason: finish.finishReason,
+      truncated: finish.truncated,
       durationMs,
       edits: edits.map((e) => ({
         file: e.file,
@@ -974,32 +824,29 @@ async function executeCodeBody(
       ...(executionOutput.length > 0 ? { executionOutput } : {}),
     };
 
-    return textResult(text, structured);
+    return textResult(
+      finish.truncated ? `${truncatedNote(expectEdits)}\n\n${text}` : text,
+      structured,
+    );
   } catch (err) {
     logger.error(`code failed: ${safeForLog(err)}`);
-    // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
-    // bodies, gated on `isGemini429` (ApiError instance + status===429)
-    // to prevent hint-poisoning. Mirror of ask.tool.ts — see there for
-    // full rationale.
-    const retryDelayMs = isGemini429(err) ? parseRetryDelayMs(err.message) : null;
-    if (retryDelayMs !== null && resolvedModelKey !== null) {
-      ctx.throttle.recordRetryHint(resolvedModelKey, retryDelayMs);
-    }
-    if (reservationId !== null) {
-      try {
-        ctx.manifest.cancelBudgetReservation(reservationId);
-      } catch (cancelErr) {
-        logger.error(
-          `code: cancelBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate. Error: ${String(cancelErr)}`,
-        );
-      }
-      reservationId = null;
-    }
-    // Drop TPM reservation on failure — mirror of ask.tool.ts rationale.
-    if (throttleReservationId !== -1) {
-      ctx.throttle.cancel(throttleReservationId);
-      throttleReservationId = -1;
-    }
+    // A 429's retry hint seeds the throttle; the ledger keeps what the completed requests billed and releases the rest
+    // (all of it when none completed).
+    const failedUsage = settleFailure({
+      manifest: ctx.manifest,
+      failed: {
+        toolName: 'code',
+        reservationId,
+        entry: tracking.ledgerEntry,
+        completed,
+        durationMs: Date.now() - started,
+      },
+      err,
+      model: resolvedModelKey,
+      throttle: ctx.throttle,
+      dispatch,
+    });
+    reservationId = null;
     // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
     if (isTimeoutAbort(err)) {
       const ms = timeoutController.timeoutMs;
@@ -1018,14 +865,16 @@ async function executeCodeBody(
         stallMs,
         retryable: true,
         ...modelAudit,
+        ...failedUsage,
       });
     }
     const httpStatus = statusOf(err);
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err, streamOpened),
+      ...tierErrorMeta(err, tracking.streamOpened),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       serviceTier: input.serviceTier ?? ctx.config.serviceTier, // before the model is resolved: the requested tier
       ...modelAudit,
+      ...failedUsage,
     });
   } finally {
     timeoutController.dispose();

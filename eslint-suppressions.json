@@ -39,17 +39,6 @@
       "count": 2
     }
   },
-  "src/cache/ttl-watcher.ts": {
-    "complexity": {
-      "count": 1
-    },
-    "max-depth": {
-      "count": 1
-    },
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
   "src/config.ts": {
     "max-lines-per-function": {
       "count": 1
@@ -150,7 +139,7 @@
       "count": 1
     },
     "max-depth": {
-      "count": 8
+      "count": 4
     },
     "max-lines-per-function": {
       "count": 1
@@ -161,7 +150,7 @@
       "count": 1
     },
     "max-depth": {
-      "count": 6
+      "count": 2
     },
     "max-lines-per-function": {
       "count": 1

@@ -12,19 +12,28 @@
  *     our whole strategy falls back to inline parts).
  *   - `generateContent({ cachedContent })` picks up the cache ID.
  *   - Token accounting fields (`usageMetadata.cachedContentTokenCount` etc.).
+ *   - The TTL watcher's `caches.update`, the teardown's `caches.delete` / `files.delete`, `countTokens`, and the
+ *     long-decode request of `ask` / `code` (`generateContentStream`, a cap above the per-request limit, a
+ *     continuation token) at the API version the client is pinned to.
  */
 
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ApiError, ThinkingLevel } from '@google/genai';
 import { describe, expect, it } from 'vitest';
 import { prepareContext } from '../../src/cache/cache-manager.js';
 import { createGeminiClient } from '../../src/gemini/client.js';
 import { listAvailableModels } from '../../src/gemini/model-registry.js';
 import { resolveModel } from '../../src/gemini/models.js';
+import { countForPreflight } from '../../src/gemini/token-counter.js';
 import { clearHashCache } from '../../src/indexer/hasher.js';
 import { scanWorkspace } from '../../src/indexer/workspace-scanner.js';
 import { ManifestDb } from '../../src/manifest/db.js';
+import { CompletedRequests, runDecode } from '../../src/tools/shared/continuation.js';
+
+/** What `models.list` advertises for Gemini 4 Argon a request (the unit fixture `GEMINI_4_ARGON` carries it). */
+const ARGON_OUTPUT_LIMIT = 32_768;
 
 const apiKey = process.env.GEMINI_API_KEY;
 const suite = apiKey ? describe : describe.skip;
@@ -37,6 +46,19 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
     const models = await listAvailableModels(client, { force: true });
     expect(models.length).toBeGreaterThan(0);
     expect(models[0]?.id).toBeTruthy();
+  }, 30_000);
+
+  it('reads the per-request output limits of the Gemini 4 models from models.list (free)', async () => {
+    const models = await listAvailableModels(client, { force: true });
+    const limits = Object.fromEntries(
+      models
+        .filter((m) => /^gemini-4-(argon|hydrogen)$/.test(m.id))
+        .map((m) => [m.id, { out: m.outputTokenLimit, longDecode: m.longDecodeTokenLimit }]),
+    );
+    expect(limits).toEqual({
+      'gemini-4-argon': { out: ARGON_OUTPUT_LIMIT, longDecode: 1_048_576 },
+      'gemini-4-hydrogen': { out: 65_536, longDecode: 1_048_576 },
+    });
   }, 30_000);
 
   it("resolves 'latest-flash' alias against live registry", async () => {
@@ -176,6 +198,21 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
           },
         }),
       ).rejects.toThrow(/INVALID_ARGUMENT|cached[_ ]?content|system_instruction/i);
+
+      // The TTL watcher's refresh, as it calls it.
+      const refreshed = await client.caches.update({
+        name: first.cacheId ?? '',
+        config: { ttl: '600s' },
+      });
+      expect(refreshed.name).toBe(first.cacheId);
+
+      // The teardown `invalidateWorkspaceCache` runs (it logs and swallows a failure, so it is called directly here).
+      await client.caches.delete({ name: first.cacheId ?? '' });
+      expect(first.uploaded.files.length).toBeGreaterThan(0);
+      for (const file of first.uploaded.files) {
+        const uri = file.fileId ?? '';
+        await client.files.delete({ name: uri.slice(uri.lastIndexOf('/files/') + 1) });
+      }
     } finally {
       manifest.close();
     }
@@ -254,5 +291,69 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
     // parsing reads (candidates[0].content.parts + usageMetadata).
     expect(response.candidates?.[0]?.content?.parts).toBeDefined();
     expect(response.usageMetadata).toBeDefined();
+  }, 60_000);
+
+  it('countTokens gives the preflight an exact count (a failed call falls back silently)', async () => {
+    const resolved = await resolveModel('latest-flash', client);
+    const count = await countForPreflight(client, {
+      files: [],
+      prompt: 'How many tokens does this sentence take?',
+      model: resolved.resolved,
+      filesHash: 'smoke-count-tokens',
+      preflightMode: 'exact',
+      inputTokenLimit: resolved.inputTokenLimit ?? 1_000_000,
+    });
+    expect(count.method).toBe('exact');
+    expect(count.rawTokens).toBeGreaterThan(0);
+  }, 30_000);
+
+  it('the long-decode request of ask / code is accepted: stream, XHIGH, a cap above the per-request limit', async () => {
+    const resolved = await resolveModel('gemini-4-hydrogen', client);
+    expect(resolved.longDecodeTokenLimit).not.toBeNull();
+    const completed = new CompletedRequests();
+    const response = await runDecode({
+      client,
+      model: resolved.resolved,
+      contents: 'Say the single word: pong.',
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.XHIGH, includeThoughts: true },
+        maxOutputTokens: 262_144,
+      },
+      openAttempts: 1,
+      label: 'smoke',
+      limits: { maxRequests: 4, cap: 262_144 },
+      collector: { signal: new AbortController().signal },
+      onRequestOpened: () => {},
+      completed,
+    });
+    expect(response.text.toLowerCase()).toContain('pong');
+    expect(completed.count).toBe(1);
+    expect(completed.usage()?.promptTokenCount ?? 0).toBeGreaterThan(0);
+  }, 120_000);
+
+  it('a continuation token is a field the API reads: a forged one is refused for what it is', async () => {
+    const resolved = await resolveModel('gemini-4-hydrogen', client);
+    const refusal = await client.models
+      .generateContent({
+        model: resolved.resolved,
+        contents: 'Say the single word: pong.',
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          automaticContinuation: false,
+          continuationToken: 'smoke-test-not-a-continuation-token',
+        },
+      })
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    // an answer, a network failure or another API error is not the API reading the token: each fails here
+    expect(refusal).toBeInstanceOf(ApiError);
+    expect((refusal as ApiError).status).toBe(400);
+    expect((refusal as ApiError).message).toMatch(/continuation/i);
+    // an unknown field would mean the API does not read the token at all
+    expect((refusal as ApiError).message).not.toMatch(
+      /unknown name|cannot find field|unknown field/i,
+    );
   }, 60_000);
 });

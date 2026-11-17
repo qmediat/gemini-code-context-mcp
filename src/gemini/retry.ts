@@ -149,7 +149,7 @@ export async function withNetworkRetry<T>(
 }
 
 /** Throws the signal's reason (or synthesised AbortError) if aborted. */
-function throwIfAborted(signal: AbortSignal | undefined): void {
+export function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throwAbortReason(signal);
 }
 
@@ -157,6 +157,40 @@ function throwAbortReason(signal: AbortSignal): never {
   const reason = signal.reason;
   if (reason instanceof Error) throw reason;
   throw new DOMException('Operation aborted', 'AbortError');
+}
+
+/**
+ * `work`'s outcome, or a rejection with the abort reason as soon as `signal` fires — whichever comes first. The
+ * caller is released at the abort even when `work` itself never settles; `work` runs on, its late outcome ignored
+ * (a late rejection is handled, never unhandled).
+ */
+export function abortable<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return work;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      try {
+        throwAbortReason(signal);
+      } catch (err) {
+        reject(err);
+      }
+    };
+    if (signal.aborted) {
+      onAbort();
+      work.catch(() => undefined);
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**

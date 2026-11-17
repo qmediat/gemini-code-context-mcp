@@ -9,6 +9,7 @@
  * `GEMINI_PRICING_OVERRIDES` (JSON, keyed by model id) replaces a row at run time.
  */
 
+import { continuationInputTokens, decodedTokensBound } from '../gemini/long-decode.js';
 import type { CapabilityFlags, ModelCategory } from '../gemini/model-taxonomy.js';
 import { categorizeModel, costTierOf, isTextGenCategory } from '../gemini/model-taxonomy.js';
 import { parsePricingOverrides } from './pricing-overrides.js';
@@ -354,14 +355,34 @@ export interface PreCallEstimateInputs {
   promptChars: number;
   /** Input tokens beyond the workspace and the prompt (the attachments), counted by Gemini. */
   extraInputTokens?: number | undefined;
+  /**
+   * The preflight's count of the whole request input, when it ran: the reservation takes the larger of it and the
+   * bytes/4 heuristic, which undercounts dense text and is billed once per request of a long decode.
+   */
+  countedInputTokens?: number | undefined;
   /** Upper bound on output tokens (tool-specific default). */
   expectedOutputTokens: number;
+  /**
+   * The model's per-request output limit, for a call whose cap (`expectedOutputTokens`) is above it on a model with
+   * long decode: the continuation requests bill the prompt again plus what was decoded before them
+   * (`continuationInputTokens`), and the estimate adds that input; its output is the decode's bound
+   * (`decodedTokensBound`).
+   */
+  perRequestOutputTokens?: number | undefined;
   /** Thinking budget, passed through as extra output tokens. */
   thinkingTokens?: number;
   /** The call's timeout in ms (`null`: none): the reservation covers the rates of that window. */
   coverMs: number | null;
   /** When the reservation is made. Defaults to now. */
   at?: Date | undefined;
+}
+
+/**
+ * The input one request of a call is reserved at — and billed at when it reports no usage: the larger of the bytes/4
+ * heuristic and the preflight's count, when it ran (the heuristic undercounts dense text).
+ */
+export function requestInputTokens(heuristic: number, counted: number | undefined): number {
+  return Math.max(heuristic, counted ?? 0);
 }
 
 /**
@@ -376,12 +397,18 @@ export interface PreCallEstimateInputs {
 export function estimatePreCallCostUsd(input: PreCallEstimateInputs): number {
   const workspaceTokens = Math.ceil(Math.max(0, input.workspaceBytes) / 4);
   const promptTokens = Math.ceil(Math.max(0, input.promptChars) / 4);
+  const heuristicInput = workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0);
+  const requestInput = requestInputTokens(heuristicInput, input.countedInputTokens);
+  const outputCap = Math.max(0, input.expectedOutputTokens);
+  const perRequest = input.perRequestOutputTokens;
+  const continuationInput =
+    perRequest === undefined ? 0 : continuationInputTokens(requestInput, outputCap, perRequest);
   const call: CostInputs = {
     model: input.model,
     serviceTier: input.serviceTier,
-    uncachedInputTokens: workspaceTokens + promptTokens + Math.max(0, input.extraInputTokens ?? 0),
+    uncachedInputTokens: requestInput + continuationInput,
     cachedInputTokens: 0,
-    outputTokens: Math.max(0, input.expectedOutputTokens),
+    outputTokens: perRequest === undefined ? outputCap : decodedTokensBound(outputCap, perRequest),
     at: input.at,
     ...(input.thinkingTokens !== undefined ? { thinkingTokens: input.thinkingTokens } : {}),
   };

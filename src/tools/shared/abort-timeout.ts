@@ -76,6 +76,12 @@ export interface TimeoutController {
    * to be missed during the gap between request-open and first-chunk.
    */
   recordChunk(): void;
+  /**
+   * Stop the stall timer until the next `recordChunk()`. Called when one request of a decode has streamed to its
+   * end: the gap before the next request's first chunk (its opening, its prefill) is exempt like the first
+   * request's, and the first chunk re-arms the watchdog. No-op when the stall watchdog is disabled.
+   */
+  pauseStall(): void;
 }
 
 export interface CreateTimeoutControllerOpts {
@@ -221,6 +227,11 @@ export function createTimeoutController(opts: CreateTimeoutControllerOpts): Time
         if (stallTimer !== null) clearTimeout(stallTimer);
         stallTimer = armStallTimer();
       },
+      pauseStall: () => {
+        if (stallTimer === null) return;
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      },
     };
   }
 
@@ -237,6 +248,9 @@ export function createTimeoutController(opts: CreateTimeoutControllerOpts): Time
       }
     },
     recordChunk: () => {
+      /* stall disabled — no-op */
+    },
+    pauseStall: () => {
       /* stall disabled — no-op */
     },
   };
@@ -260,6 +274,9 @@ function disabledController(): TimeoutController {
     },
     recordChunk: () => {
       /* nothing to record */
+    },
+    pauseStall: () => {
+      /* nothing to pause */
     },
   };
 }

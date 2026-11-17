@@ -18,7 +18,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { askTool } from '../../src/tools/ask.tool.js';
 import { codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
+import { GEMINI_3_PRO } from '../helpers/models.js';
 import { forwardingStream } from '../helpers/stream-mock.js';
+import { INLINE_CONTEXT, oneFileScan } from '../helpers/workspace.js';
 
 const mocks = vi.hoisted(() => ({
   validateWorkspacePath: vi.fn(),
@@ -92,7 +94,7 @@ function buildCtx(): {
       insertUsageMetric: vi.fn(),
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle,
   };
@@ -102,38 +104,9 @@ function buildCtx(): {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.validateWorkspacePath.mockReturnValue(undefined);
-  mocks.scanWorkspace.mockResolvedValue({
-    workspaceRoot: '/fake',
-    filesHash: 'abc',
-    files: [{ relpath: 'a.ts', size: 1000, contentHash: 'h1', absolutePath: '/fake/a.ts' }],
-    skippedTooLarge: 0,
-    excludedDirs: [],
-    excludedDirsTotal: 0,
-    skippedNonSource: 0,
-    truncated: false,
-  });
-  mocks.resolveModel.mockResolvedValue({
-    requested: 'latest-pro',
-    resolved: 'gemini-3-pro-preview',
-    inputTokenLimit: 1_048_576,
-    outputTokenLimit: 65_536,
-    fallbackApplied: false,
-    category: 'text-reasoning',
-    capabilities: {
-      supportsThinking: true,
-      supportsVision: true,
-      supportsCodeExecution: true,
-      costTier: 'premium',
-    },
-  });
-  mocks.prepareContext.mockResolvedValue({
-    cacheId: null,
-    inlineContents: [],
-    reused: false,
-    rebuilt: false,
-    inlineOnly: true,
-    uploaded: { failedCount: 0, failures: [] },
-  });
+  mocks.scanWorkspace.mockResolvedValue(oneFileScan({ size: 1000 }));
+  mocks.resolveModel.mockResolvedValue({ ...GEMINI_3_PRO });
+  mocks.prepareContext.mockResolvedValue(INLINE_CONTEXT);
   mocks.isStaleCacheError.mockReturnValue(false);
 });
 
