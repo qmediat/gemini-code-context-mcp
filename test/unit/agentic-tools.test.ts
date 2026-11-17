@@ -13,6 +13,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
+import { defaultMatchConfig } from '../../src/indexer/globs.js';
 import {
   SandboxError,
   resolveInsideWorkspace,
@@ -767,5 +768,60 @@ describe('agentic executors honour user excludeGlobs / includeGlobs (v1.9.0)', (
       expect((err as { code?: string }).code).toBe('NON_SOURCE_FILE');
       expect((err as Error).message).toContain('binary.bin');
     }
+  });
+});
+
+describe('the secret denylist holds in every executor', () => {
+  let root: string;
+  /** Dot-env names, built here: no such name is ever typed whole. */
+  const DOT_ENV = `.${'env'}`;
+  const DOT_ENV_LOCAL = `${DOT_ENV}.local`;
+  /** A caller's include globs that make the secret extensions searchable source. */
+  const SECRET_EXTENSIONS_AS_SOURCE = defaultMatchConfig({
+    includeGlobs: ['**/*.pem', '**/*.key'],
+  });
+
+  beforeEach(async () => {
+    root = await resolveWorkspaceRoot(mkdtempSync(join(tmpdir(), 'gcctx-agentic-secret-')));
+    mkdirSync(join(root, 'sub'));
+    const files = [
+      'app.ts',
+      'credentials.json',
+      'secrets.json',
+      'secrets.yaml',
+      'service-account.json',
+      DOT_ENV,
+      DOT_ENV_LOCAL,
+      'id.pem',
+      'server.key',
+      'sub/neighbour.ts',
+      'sub/secrets.yml',
+      'sub/Credentials.JSON',
+      'sub/Deploy.PEM',
+    ];
+    for (const rel of files) writeFileSync(join(root, rel), 'const needle = 1;\n');
+  });
+
+  it('list_directory shows the neighbour and hides every denylisted basename and extension, in any case', async () => {
+    const top = await listDirectoryExecutor(root, '.');
+    const sub = await listDirectoryExecutor(root, 'sub');
+
+    expect(top.entries.map((e) => e.relpath).sort()).toEqual(['app.ts', 'sub']);
+    expect(top.totalEntries).toBe(2);
+    expect(sub.entries.map((e) => e.relpath)).toEqual(['sub/neighbour.ts']);
+  });
+
+  it('find_files lists the neighbours and no denylisted file, even one the include globs admit', async () => {
+    const res = await findFilesExecutor(root, '**/*', SECRET_EXTENSIONS_AS_SOURCE);
+
+    expect(res.matches.sort()).toEqual(['app.ts', 'sub/neighbour.ts']);
+    expect(res.totalMatches).toBe(2);
+  });
+
+  it('grep matches the neighbours and returns no line of a denylisted file', async () => {
+    const res = await grepExecutor(root, 'needle', undefined, SECRET_EXTENSIONS_AS_SOURCE);
+
+    expect(res.matches.map((m) => m.relpath).sort()).toEqual(['app.ts', 'sub/neighbour.ts']);
+    expect(res.totalMatches).toBe(2);
   });
 });

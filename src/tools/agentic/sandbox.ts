@@ -83,6 +83,20 @@ const AGENTIC_SECRET_EXTENSIONS: readonly string[] = [
   '.ovpn',
 ];
 
+/** Which list of the secret denylist a file name is on: its exact basename, or its extension. */
+export type SecretList = 'basename' | 'extension';
+
+/**
+ * The list of the secret denylist `fileName` (a basename) is on, case-insensitively, or `null` when it is on neither.
+ * The one test of the denylist: `read_file` refuses such a file (`resolveInsideWorkspace`), `list_directory` hides it,
+ * and the walk of `find_files` and `grep` never visits it — its name, size and content stay out of every response.
+ */
+export function secretListOf(fileName: string): SecretList | null {
+  const lowerBase = fileName.toLowerCase();
+  if (AGENTIC_SECRET_BASENAMES_LOWER.has(lowerBase)) return 'basename';
+  return AGENTIC_SECRET_EXTENSIONS.some((ext) => lowerBase.endsWith(ext)) ? 'extension' : null;
+}
+
 /**
  * Where each code fires (v1.9.0 — keep this map current as new throw sites
  * are added):
@@ -252,30 +266,17 @@ export async function resolveInsideWorkspace(
 
   const rel = toPosix(relative(workspaceRoot, resolved));
 
-  // Content denylist (Codex #4): secrets-by-basename + extension.
-  // Both checks are case-insensitive — macOS/APFS and Windows/NTFS are
-  // case-insensitive by default, so `.ENV` resolves to the same inode as
-  // `.env`. Comparing pre-lowercased protects against a file literally
-  // stored as `.ENV` (or `.Env.Local`, `CREDENTIALS`, …) bypassing the
-  // list. Extension check was already case-insensitive; basename check
-  // used to be strict-equal — bug reported in PR #24 review by Gemini.
+  // Content denylist: secrets by basename or extension, case-insensitively — macOS/APFS and Windows/NTFS are
+  // case-insensitive by default, so `.ENV` (or `.Env.Local`, `CREDENTIALS`, …) is the same file as `.env`.
   const base = basename(resolved);
   const lowerBase = base.toLowerCase();
-  if (AGENTIC_SECRET_BASENAMES_LOWER.has(lowerBase)) {
+  const secretList = secretListOf(base);
+  if (secretList !== null) {
     throw new SandboxError(
       'SECRET_DENYLIST',
-      `filename on secret-basename denylist: ${base}`,
+      `filename on secret-${secretList} denylist: ${base}`,
       relOrAbs,
     );
-  }
-  for (const ext of AGENTIC_SECRET_EXTENSIONS) {
-    if (lowerBase.endsWith(ext)) {
-      throw new SandboxError(
-        'SECRET_DENYLIST',
-        `filename on secret-extension denylist: ${base}`,
-        relOrAbs,
-      );
-    }
   }
 
   // Excluded-dir check: if the POSIX relative path sits under any entry in

@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { throwIfAborted } from '../../gemini/retry.js';
 import { type MatchConfig, defaultMatchConfig, isPathExcluded } from '../../indexer/globs.js';
 import { isSourceFile } from '../../indexer/source-files.js';
-import { SandboxError, resolveInsideWorkspace } from './sandbox.js';
+import { SandboxError, resolveInsideWorkspace, secretListOf } from './sandbox.js';
 
 type ResolvedPath = Awaited<ReturnType<typeof resolveInsideWorkspace>>;
 
@@ -47,10 +47,11 @@ function resolveMatchConfig(matchConfig: MatchConfig | undefined): MatchConfig {
 
 /**
  * Exclude-side check for `list_directory` (v1.9.0+). Returns `true` when the
- * file should be hidden from a navigation listing — covers default filename
- * denylist (lockfiles, `.env*`, etc.), default extension denylist
+ * file should be hidden from a navigation listing — covers the default filename
+ * excludes (lockfiles, `.netrc`, …), the default extension excludes
  * (`.tsbuildinfo`), user `excludeGlobs` filename / extension entries, AND
- * dir-prefix excludes that match the file's parent path. Deliberately does
+ * dir-prefix excludes that match the file's parent path. The secret denylist is
+ * the sandbox's (`secretListOf`), checked beside this. Deliberately does
  * NOT enforce include-extension membership — `list_directory` is a
  * navigation aid; the read-side gate lives in `readFileExecutor`.
  *
@@ -209,8 +210,8 @@ async function directoryEntries(
 /**
  * A child as a listing shows it, or `null` when it is hidden: symlinks, sockets and other non-file, non-directory
  * entries are skipped; an excluded directory (defaults and the caller's `excludeGlobs`, matched on the full nested
- * path) and an excluded file are omitted. A file is NOT required to match an include extension: `list_directory` is a
- * navigation aid, the read-side gate is `read_file`'s.
+ * path), a file on the secret denylist and an excluded file are omitted. A file is NOT required to match an include
+ * extension: `list_directory` is a navigation aid, the read-side gate is `read_file`'s.
  */
 function visibleChild(
   parentRel: string,
@@ -223,7 +224,7 @@ function visibleChild(
   const hidden =
     type === 'dir'
       ? isPathExcluded(relpath, config, 'dir')
-      : isFileExcludedByConfig(relpath, entry.name, config);
+      : secretListOf(entry.name) !== null || isFileExcludedByConfig(relpath, entry.name, config);
   return hidden ? null : { relpath, type };
 }
 
@@ -324,7 +325,10 @@ async function enterDirectory(
   }
 }
 
-/** One entry of a walked directory: an included directory is walked, a visible file visited, the rest skipped. */
+/**
+ * One entry of a walked directory: an included directory is walked, a visible file visited, the rest skipped — a file
+ * on the secret denylist is never visited, so `find_files` does not list it and `grep` never opens it.
+ */
 async function walkEntry(
   walk: TreeWalk,
   entry: Dirent<string>,
@@ -337,7 +341,7 @@ async function walkEntry(
     await walkTree(walk, childAbs, childRel, parent.depth + 1);
     return;
   }
-  if (!entry.isFile()) return;
+  if (!entry.isFile() || secretListOf(entry.name) !== null) return;
   if (!(await isSourceFile(childAbs, childRel, walk.config))) return;
   await walk.visitFile(childAbs, childRel);
 }
@@ -378,8 +382,8 @@ export interface FindFilesResult {
 }
 
 /**
- * Recursive glob search inside the workspace. Respects default excludes + extension gating (same rules as the eager
- * scanner, so the model never sees paths it could not `read_file` on anyway).
+ * Recursive glob search inside the workspace. Respects default excludes, the secret denylist and extension gating, so
+ * the model never sees paths it could not `read_file` on anyway.
  */
 export async function findFilesExecutor(
   workspaceRoot: string,

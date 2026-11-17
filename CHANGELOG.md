@@ -66,6 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ask` and `code`: an answer whose usage row cannot be written (a busy or failing database) is returned, and the
   failed write is logged; the paid answer used to be lost behind an error.
 
+### Security
+
+- `ask_agentic`: `list_directory`, `find_files` and `grep` no longer show a file on the secret denylist that `read_file`
+  refuses — a basename such as `.env`, `.env.local`, `credentials.json`, `secrets.yaml` or `service-account.json`, or a
+  name ending in `.pem`, `.key` or another secret extension, in any case. Before, since these tools shipped with
+  `ask_agentic`, `list_directory` listed such files with their sizes, `find_files` listed those its source rules admit
+  (`credentials.json`, `secrets.json`, `secrets.yaml`, …), and `grep` returned their matching lines. The three tools and
+  `read_file` now read one denylist.
+
 ## [1.24.0] - 2026-11-17
 
 ### Added
