@@ -353,6 +353,25 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
+## T48. Three fields in which the results of `ask` and `code` differ
+
+**Source:** the design note of T47 (`docs/DESIGN-ask-tool-modules.md`, decision Q7). Opened 2026-11-17.
+
+**Why:** the split of T47 moves what the two tools repeat into `src/tools/shared/` but builds every result in its own
+tool, so each keeps its fields. Three differences stay:
+
+1. `code`'s answer reports no `filesSkippedTooLarge` (`ask` does: `src/tools/ask.tool.ts:934`; `code`'s scan fields,
+   `src/tools/code.tool.ts:795-804`, have no such key).
+2. `code`'s answer reports no model `fallbackApplied` (`ask`: `src/tools/ask.tool.ts:916`; `code`'s answer,
+   `src/tools/code.tool.ts:763-820`, has none).
+3. `code`'s `TIMEOUT` before the model resolved carries no `serviceTier` (`src/tools/code.tool.ts:849-857` spreads the
+   model audit, empty until `:397`); `ask`'s carries the requested tier (`src/tools/ask.tool.ts:997`, `reportedTier()`).
+
+**Scope:** aligning any of them is a change of a result that callers read — the maintainers' decision, with its own
+CHANGELOG entry; not a refactor. After T47 (line numbers above are of `main` before T47).
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.

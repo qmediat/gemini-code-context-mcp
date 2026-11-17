@@ -1,6 +1,6 @@
 # Design — the split of `src/tools/ask.tool.ts` into modules
 
-Status: proposed ([FOLLOW-UP-PRS.md T47](./FOLLOW-UP-PRS.md)). No behaviour change: every result, message, field, key
+Status: accepted, corrected after its architecture review ([FOLLOW-UP-PRS.md T47](./FOLLOW-UP-PRS.md)). No behaviour change: every result, message, field, key
 order, ledger and throttle call stays as it is on `main`; a differential probe proves it ([§ Proof plan](#proof-plan)).
 The sections "Today" describe `main` at `074212c`; line numbers are of that tree.
 
@@ -19,7 +19,7 @@ repeat. The same job was done for `ask_agentic` in T39: the tool file is the ent
 | **F** | the failure path: the outer `catch` (`ask.tool.ts:964-1007`, `code.tool.ts:826-866`) |
 | booked | the daily-budget reservation finalised at what the completed requests billed, or — without a daily cap — a usage row inserted (`recordBilledCall`, `src/tools/shared/call-ledger.ts:158`); a failed write is logged, never thrown |
 | released | the reservation cancelled whole (`releaseReservation`, `call-ledger.ts:208`); a no-op when none is held |
-| F's rule | booked at the completed requests when a decode started and at least one request completed, else released (`settleFailedCall`, `call-ledger.ts:190`) — the rule of `docs/cost-model.md`, "What is booked when a call fails" |
+| F's rule | booked at the completed requests when a decode started and at least one request completed, else released (`settleFailedCall`, `call-ledger.ts:190`) — the rule of `docs/cost-model.md`, "What is booked when a call fails". The settlement clears the decode's entry and the reservation (step 14), so a failure after it books nothing more and reports no usage |
 | (r) | read from the code, not run |
 
 ## Today: `ask` (`executeAskBody`)
@@ -29,30 +29,32 @@ The call's state is held in locals; those that cross a step boundary are named (
 | # | Step | Lines | State | Awaits | Exits and what the result carries | Ledger | TPM |
 |---|---|---|---|---|---|---|---|
 | 0 | Entry | 235-240 | → `started`, `workspaceRoot`, `model` (the alias as asked) | — | — | — | — |
-| 1 | Call machinery | 366-396 | → `reservationId = null`, `resolvedModelKey = null`, `completed`, `tracking`, `serviceTier = undefined`, `reportedTier()` (a closure over `serviceTier`), `emitter`, `timeoutController` (timers armed before any await), `abortSignal`, `dispatch` | — | — | — | — |
+| 1 | Call machinery | 366-396 | → `reservationId = null`, `resolvedModelKey = null`, `completed`, `tracking`, `serviceTier = undefined`, `reportedTier()` (a closure over `serviceTier`), `emitter`, `timeoutController` (created before any await: its total timer arms at once, its stall timer at the first chunk — `abort-timeout.ts:242`, `:251-256`), `abortSignal`, `dispatch` | — | — | — | — |
 | 2 | Workspace guard | 404-411 | ← `workspaceRoot` | — | **X1** `:408` `ask: <message>`, no fields; another error → F | — | — |
 | 3 | Model and tier | 413-437 | → `resolved`, `resolvedModelKey` (`:422`), `serviceTier` | `resolveModel` (no signal) | **X2** `:431` `SERVICE_TIER_UNSUPPORTED` `{errorCode, retryable: false, serviceTier: 'flex', resolvedModel}`; a throw of `resolveModel` → F with no model (no retry hint seeded) | — | — |
 | 4 | Attachments | 439-451 | ← `resolved`, `serviceTier`, `abortSignal`; → `attachments`, `attachmentTokens` | `inspectAttachments`, `readAttachments` (signal), `countAttachmentTokens` (signal) | **X3** `:449` `ATTACHMENTS_UNSUPPORTED` / `ATTACHMENT_INVALID` / `ATTACHMENT_TOKENS_UNCOUNTED` `{errorCode, retryable, serviceTier, resolvedModel}`; an abort → F (`attachments.ts:311` rethrows the signal's reason) | — | — |
 | 5 | Scan | 453-466 | ← `manifest.getFiles`; → `scan` | `scanWorkspace` (no signal) | a throw → F | — | — |
 | 6 | Output cap, budget refusal | 468-504 | → `outputCap`, `usingThinkingLevel` | — | **X4** `:504` `ask: thinkingBudget (…) …`, no fields | — | — |
 | 7 | Input estimate, inline size | 506-520 | ← `scan`, `attachments`; → `workspaceBytes`, `estimatedInputTokens` | — | **X5** `:520` `REQUEST_TOO_LARGE` `{errorCode, retryable: false, serviceTier, attachments, attachmentTokens}` (only with attachments) | — | — |
-| 8 | Preflight and workspace guard | 522-636 | ← `scan`, `outputCap`, `attachmentTokens`, `abortSignal`; → `preflight`, `contextWindow` | `countForPreflight` (signal; only when the model advertises an input limit), `fallBackToAgentic` | **X6** `:586` `WORKSPACE_TOO_LARGE` (fallback asked, attachments given) `{errorCode, retryable: false, serviceTier, attachments, attachmentTokens}`; **X7** `:597` the fallback's wrapped result (`ask-agentic-fallback.ts:102-140`); **X8** `:613` `WORKSPACE_TOO_LARGE` `{errorCode, serviceTier, attachments?, retryable: false, estimatedInputTokens, tokenCountMethod, rawTokenCount, tokenCountCacheHit, contextWindowTokens, thresholdTokens, guardRatio, resolvedModel, filesIndexed}`; no input limit: a warn line, on; an abort → F | — (X7: the agentic loop books its own passes) | — |
+| 8 | Preflight and workspace guard | 522-636 | ← `scan`, `outputCap`, `attachmentTokens`, `abortSignal`; → `preflight`, `contextWindow` | `countForPreflight` (signal; only when the model advertises an input limit), `fallBackToAgentic` | **X6** `:586` `WORKSPACE_TOO_LARGE` (fallback asked, attachments given) `{errorCode, retryable: false, serviceTier, attachments, attachmentTokens}`; **X7** `:597` the fallback's wrapped result (`ask-agentic-fallback.ts:102-140`), returned WITHOUT `await`: the `finally` runs (the controller disposed, the emitter stopped) while the fallback is still pending, and a rejection of the fallback never reaches F — the caller sees it as it came; **X8** `:613` `WORKSPACE_TOO_LARGE` `{errorCode, serviceTier, attachments?, retryable: false, estimatedInputTokens, tokenCountMethod, rawTokenCount, tokenCountCacheHit, contextWindowTokens, thresholdTokens, guardRatio, resolvedModel, filesIndexed}`; no input limit: a warn line, on; an abort → F | — (X7: the agentic loop books its own passes) | — |
 | 9 | Cap that runs, thinking | 638-675 | ← `outputCap`, `preflight`, `contextWindow`; → `runCap`, `inputWindowCut`, `effectiveThinkingBudget`, `thinkingTokensForEstimate` | — | — (a cut is said on the progress channel and the log) | — | — |
 | 10 | Budget reservation | 677-717 | ← `resolved`, `serviceTier`, `attachmentTokens`, `workspaceBytes`, `runCap`, `preflight`, `thinkingTokensForEstimate`, `timeoutController.timeoutMs`; → `reservationId` | — (one SQLite transaction) | **X9** `:711` `BUDGET_REJECT` `{errorCode, retryable: false, serviceTier}` — only under a daily cap | nothing reserved; else reserved | — |
 | 11 | Context | 719-753 | ← `scan`, `resolved`, `input.noCache`, `abortSignal`; → `caching`, `prepare` (a closure the stale-cache retry calls again), `ctxPrep` | `prepareContext` (signal) | a throw → F | released (no decode started) | — |
 | 12 | Request | 755-830 | ← `effectiveThinkingBudget`, `runCap`, `serviceTier`, `attachments`; → `thinkingConfig`, `buildConfig`, `userTurn`, `buildContents` | — | — | — | — |
-| 13 | Decode | 832-862 | ← all of the above, `completed`, `tracking`, `dispatch`; → `response`, `activePrep`, `retriedOnStaleCache`; `tracking.ledgerEntry` set when a decode starts (`context-decode.ts:140`), `tracking.streamOpened` | `decodeOnContext`: the TPM wait, the cache's keep-alive, each request's opening and stream, the stale-cache rebuild | a throw → F | F's rule; a TPM-wait timeout before the first request: released (the entry is set after the wait, `context-decode.ts:101`, `:140`) | one reservation per request, settled at its reported input when it ends (`context-decode.ts:160-163`) |
+| 13 | Decode | 832-862 | ← all of the above, `completed`, `tracking`, `dispatch`; → `response`, `activePrep`, `retriedOnStaleCache`; `tracking.ledgerEntry` set when a decode starts (`context-decode.ts:140`), `tracking.streamOpened` | `decodeOnContext`: the TPM wait, the cache's keep-alive, each request's opening and stream, the stale-cache rebuild | a throw → F | F's rule; a TPM-wait timeout before the first request: released (the entry is set after the wait, `context-decode.ts:101`, `:140`) | one reservation per request, settled when it ends at its reported input, or at the held estimate when it reported none (`context-decode.ts:160-163`, `dispatch-throttle.ts:63-67`). A stale cache before any request completed: the cache is invalidated, the context rebuilt, and only then the replacement reservation taken, which first cancels the one held (`context-decode.ts:203-206`, `dispatch-throttle.ts:38-41`); after a completed request a stale cache is invalidated and the call fails without a rebuild (`context-decode.ts:192-198`) |
 | 14 | Settle | 864-903 | ← `response`, `activePrep`, `caching`; `reservationId` and `tracking.ledgerEntry` cleared (`:879-881`) BEFORE `settleAnswer` | — | **X10** `:901` `OUTPUT_CAP` `{errorCode, retryable: false, resolvedModel, serviceTier, finishReason, usage…, outputCapCutByInputWindow?}` | booked | settled |
 | 15 | Result | 905-963 | ← everything | — | **X11** `:963` the answer, text and metadata | booked | settled |
 | F | Failure | 964-1007 | ← `reservationId`, `tracking`, `completed`, `resolvedModelKey`, `timeoutController`, `reportedTier()` | — | **X12** `:991` `TIMEOUT` `{errorCode, timeoutKind, timeoutMs, stallMs, retryable: true, serviceTier, usage…?}`, after the progress line `ask: aborted after <n>ms <kind>`; **X13** `:1002` `ask failed: <message>` `{errorCode: RATE_LIMIT \| OVERLOADED \| NETWORK_ERROR \| UNKNOWN, retryable?, retryAfterMs?, serviceTier, httpStatus?, usage…?}` | F's rule | the held reservation dropped; a 429's retry hint seeded once when the model had resolved (`settle-call.ts:115-123`) |
 | — | `finally` | 1008-1011 | — | — | — | — | the controller disposed, then the emitter stopped |
 
 **13 exits.** `usage…` is `cachedTokens`, `uncachedTokens`, `outputTokens`, `thinkingTokens`, `costEstimateUsd`,
-`continuationHops`. The `serviceTier` of F is `reportedTier()`: the resolved tier, else the requested one. Every exit
+`continuationHops`; F carries it when a decode started and a request completed, and not when the failure comes after the
+settlement (step 14 cleared the entry: `call-ledger.ts:190-193`). The `serviceTier` of F is `reportedTier()`: the resolved tier, else the requested one. Every exit
 matches the table of `docs/cost-model.md` for `ask`: nothing is reserved before step 10, a failure before a decode
 started releases, a completed request stays booked, an answer whose ledger write fails is returned. One reachable
 escape: a `throttle` whose `recordRetryHint` or `cancel` throws inside F would leave the function (r) — the real
-`TpmThrottle` does not throw there (`throttle.ts:371-381`).
+`TpmThrottle` does not throw there (`throttle.ts:371-381`). And X7 is outside F by construction: the fallback's
+promise is returned unawaited, so its rejection leaves the function as it came.
 
 ## Today: `code` (`executeCodeBody`)
 
@@ -108,7 +110,7 @@ level branch of `thinkingConfig`, the non-timeout branch of F (same values, othe
 close. Its steps become modules under `src/tools/ask/`, beside `src/tools/agentic/`. What `ask` and `code` repeat moves
 to `src/tools/shared/` once, read by both: the call's machinery and its failure trail (R1, R10), the scan and the output
 cap (R2), the preflight's count (R3), the budget reservation (R4), the context (R5), the decode and the settlement (R6-R8)
-and the scan's fields (R9). Money and classification are shared; every result is built by its own tool, so each keeps its
+and the scan's fields (R9), in three new modules (`eager-call.ts`, `eager-steps.ts`, `eager-answer.ts`). Money and classification are shared; every result is built by its own tool, so each keeps its
 fields and their order. The long decode does not move: it already lives in `shared/continuation.ts` and
 `shared/context-decode.ts`, and the tools only call `decodeOnContext`.
 
@@ -123,52 +125,76 @@ is left of `code` for the next PR is layout only — its schema, parsers and ste
 
 | File | Holds | Exports |
 |---|---|---|
-| `src/tools/ask.tool.ts` (entry) | the registration; `executeAskBody` as the orchestrator (`try` / `catch` / `finally`) over three phase functions: setup (steps 2-5), sizing (6-10), answer (11-15) | `askTool: ToolDefinition<AskInput>`; re-exports `askInputSchema`, `type AskInput` |
+| `src/tools/ask.tool.ts` (entry) | the registration; `executeAskBody` as the orchestrator (`try` / `catch` / `finally`) over three phase functions: setup (steps 2-5), sizing (6-10), answer (11-15) | `askTool: ToolDefinition<AskInput>`; re-exports `askInputSchema`, `type AskInput` — nothing else |
 | `src/tools/ask/input.ts` | the input schema, moved verbatim | `askInputSchema`, `type AskInput` |
-| `src/tools/ask/call.ts` | the call's stages (below) | `AskCall`, `AskResolved`, `AskAttached`, `AskScanned`, `AskSized`, `AskPrepared`, `StepOutcome<T>` |
+| `src/tools/ask/instruction.ts` | `ask`'s system instruction, moved verbatim: the attachments' size refusal and the request both read it | `SYSTEM_INSTRUCTION_Q_AND_A` |
+| `src/tools/ask/call.ts` | the call's stages (below), each arriving with the commit of its first reader | `AskCall`, `AskResolved`, `AskAttached`, `AskScanned`, `AskCounted`, `AskSized`, `AskPrepared`, `StepOutcome<T>` — to the `ask/` modules and the entry only |
 | `src/tools/ask/setup.ts` | the model and its tier (step 3) | `resolveAsk(call: AskCall): Promise<StepOutcome<AskResolved>>` |
 | `src/tools/ask/attachments.ts` | step 4 and the inline-size refusal, moved (`:243-357`) | `PreparedAttachments`; `attachAsk(call: AskResolved): Promise<StepOutcome<AskAttached>>`; `inlineRequestRefusal(prepared: PreparedAttachments, files: readonly ScannedFile[], prompt: string, serviceTier: ServiceTierName): TextToolResult \| undefined`; `attachmentMetadata(prepared: PreparedAttachments): Record<string, unknown>` |
-| `src/tools/ask/guard.ts` | step 8 for `ask`: the count's verdict, the two `WORKSPACE_TOO_LARGE` results, the fallback | `guardAsk(call: AskScanned): Promise<StepOutcome<AskCounted>>` |
-| `src/tools/ask/thinking.ts` | step 9's thinking: the normalised budget, the wire config, the progress line | `AskThinking`; `askThinking(input: AskInput, cap: OutputCap): AskThinking`; `thinkingConfigOf(t: AskThinking): ThinkingConfig`; `thinkingBudgetField(t: AskThinking): number \| null`; `thinkingReserveOf(t: AskThinking, cap: OutputCap): number`; `generatingLine(t: AskThinking): string` |
-| `src/tools/ask/request.ts` | the system instruction; step 12 | `SYSTEM_INSTRUCTION_Q_AND_A`; `askRequest(call: AskSized): (prep: PreparedContext) => ContextRequest` |
-| `src/tools/ask/results.ts` | every `ask` result from step 10 on and F's | `budgetRejectResult(call: AskSized, rejection: BudgetRejection): TextToolResult`; `outputCapResult(stop: OutputCapStop): TextToolResult`; `answerResult(call: AskPrepared, decoded: ContextDecode, settled: SettledDecode): TextToolResult`; `failedResult(failure: FailedEagerCall): TextToolResult` |
-| `src/tools/shared/eager-call.ts` (new) | the machinery of one `ask` / `code` call and what its failure path reads | `EagerTool`, `ModelReached`, `FailureTrail<M>`, `EagerCall<M>`; `openEagerCall<M extends ModelReached>(tool: EagerTool, knobs: ToolTimeoutKnobs, ctx: ToolContext, workspaceRoot: string, started: number): EagerCall<M>`; `closeEagerCall(call: EagerCall<ModelReached>): void` |
-| `src/tools/shared/eager-steps.ts` (new) | the steps both tools run the same way | `workspaceRefusal(tool: EagerTool, root: string): TextToolResult \| null`; `scanForCall(call: EagerCall<ModelReached>, ctx: ToolContext, filters: ScanFilters): Promise<ScanResult>`; `EAGER_OUTPUT_FALLBACK_TOKENS`; `eagerOutputCap(requested: number \| undefined, ctx: ToolContext, resolved: ResolvedModel): OutputCap`; `estimateInput(scan: ScanResult, prompt: string, extraTokens: number): InputEstimate`; `countPreflight(call: EagerCall<ModelReached>, ctx: ToolContext, req: PreflightRequest): Promise<PreflightCount \| null>`; `reserveCallBudget(call: EagerCall<ModelReached>, ctx: ToolContext, req: ReservationRequest): ReservationOutcome`; `prepareCallContext(call: EagerCall<ModelReached>, ctx: ToolContext, spec: ContextSpec): Promise<CallContext>`; `scanFields(scan: ScanResult, prep: PreparedContext): Record<string, unknown>` |
-| `src/tools/shared/context-decode.ts` (extended) | the decode of an eager call: `ContextDecodeCall` built from the call | `decodeEagerCall(call: EagerCall<ModelReached>, ctx: ToolContext, spec: DecodeSpec, context: CallContext): Promise<ContextDecode>` |
-| `src/tools/shared/settle-call.ts` (extended) | the answer settled with the trail cleared first; the failure settled and classified | `settleDecoded(call: EagerCall<ModelReached>, ctx: ToolContext, decoded: ContextDecode, run: DecodeRun): SettledDecode`; `settleFailedEager(call: EagerCall<ModelReached>, ctx: ToolContext, err: unknown): FailedEagerCall` |
+| `src/tools/ask/guard.ts` | step 8 for `ask`: the count's verdict, the two `WORKSPACE_TOO_LARGE` results, the fallback handed back pending | `guardAsk(call: AskScanned): Promise<StepOutcome<AskCounted>>` |
+| `src/tools/ask/thinking.ts` | step 9's thinking: the normalised budget, the wire config, the progress line; the reservation's thinking stays `shared/thinking.ts`'s `thinkingReserve` (`:118`), called with the level and `thinkingBudgetField` | `AskThinking`; `askThinking(input: AskInput, cap: OutputCap): AskThinking`; `thinkingConfigOf(t: AskThinking): ThinkingConfig`; `thinkingBudgetField(t: AskThinking): number \| null`; `generatingLine(t: AskThinking): string` |
+| `src/tools/ask/request.ts` | step 12 | `askRequest(call: AskSized): (prep: PreparedContext) => ContextRequest` |
+| `src/tools/ask/results.ts` | every `ask` result from step 10 on and F's | `budgetRejectResult(call: AskSized, message: string): TextToolResult`; `outputCapResult(stop: OutputCapStop): TextToolResult`; `answerResult(call: AskPrepared, decoded: ContextDecode, settled: SettledDecode): TextToolResult`; `failedResult(failure: FailedEagerCall<ModelReached>): TextToolResult` |
+| `src/tools/shared/eager-call.ts` (new) | the machinery of one `ask` / `code` call and its failure path: what the failure reads, its settlement and classification | `ModelReached`, `FailureTrail<M>`, `EagerCallRequest`, `EagerCall<M>`, `FailedEagerCall<M>`; `openEagerCall<M extends ModelReached>(request: EagerCallRequest, ctx: ToolContext): EagerCall<M>`; `settleFailedEager<M extends ModelReached>(call: EagerCall<M>, ctx: ToolContext, err: unknown): FailedEagerCall<M>`; `closeEagerCall(call: EagerCall<ModelReached>): void` |
+| `src/tools/shared/eager-steps.ts` (new) | the steps before the context that both tools run the same way | `workspaceRefusal(tool: TimedTool, root: string): TextToolResult \| null`; `scanForCall(call: EagerCall<ModelReached>, ctx: ToolContext, filters: ScanFilters): Promise<ScanResult>`; `EAGER_OUTPUT_FALLBACK_TOKENS`; `eagerOutputCap(requested: number \| undefined, ctx: ToolContext, resolved: ResolvedModel): OutputCap`; `estimateInput(scan: ScanResult, prompt: string, extraTokens: number): InputEstimate`; `countPreflight(call: EagerCall<ModelReached>, ctx: ToolContext, req: PreflightRequest): Promise<PreflightCount \| null>`; `reserveCallBudget(call: EagerCall<ModelReached>, ctx: ToolContext, req: ReservationRequest): ReservationOutcome` |
+| `src/tools/shared/eager-answer.ts` (new) | the context, the decode and the settlement of an answer, the scan's result fields | `prepareCallContext(call: EagerCall<ModelReached>, ctx: ToolContext, spec: ContextSpec): Promise<CallContext>`; `decodeEagerCall(call: EagerCall<ModelReached>, ctx: ToolContext, spec: DecodeSpec, context: CallContext): Promise<ContextDecode>`; `settleDecoded(call: EagerCall<ModelReached>, ctx: ToolContext, decoded: ContextDecode, run: DecodeRun): SettledDecode`; `warnTruncatedScan(call: EagerCall<ModelReached>, ctx: ToolContext, scan: ScanResult): void`; `scanFields(scan: ScanResult, prep: PreparedContext): Record<string, unknown>` |
 | `src/tools/code.tool.ts` | the schema, the parsers, `resolveCodeModel` (unchanged); `executeCodeBody` as an orchestrator over the shared pieces and its own steps: `resolveCode`, `guardCode`, `codeRequest`, `codeArtifacts`, `codeAnswerResult`, `codeFailedResult` | unchanged: `codeTool`, `codeInputSchema`, `CodeInput`, `parseEdits`, `parseCodeBlocks`, `truncatedNote`, the two notes |
 | `src/tools/ask-agentic-fallback.ts` | unchanged but one line: `AskInput` imported from `./ask/input.js` | unchanged |
 
 The schema moves to `ask/input.ts`, as T39 put `ask_agentic`'s in `agentic/input.ts`: the steps and the fallback read
 `AskInput` without importing the entry, which imports them. The entry re-exports both names; every test and
-`src/tools/index.ts` import them from the entry as today.
+`src/tools/index.ts` import them from the entry as today. The instruction gets a module of its own because two `ask/`
+modules read it and the request module will read the attachments' type: one of them holding it would make the two
+import each other.
+
+The decode and the ledger rules stay where they are, unchanged: `shared/context-decode.ts`, `shared/continuation.ts`,
+`shared/settle-call.ts` and `shared/call-ledger.ts` gain nothing. The new pieces call them from the two new modules
+(`eager-call.ts`, `eager-steps.ts`) and a third, `eager-answer.ts`, so that no existing shared module imports the call
+type and no module of the decode is touched by the split.
+
+A type is exported only when a module other than its own reads it (the declaration build requires every type of an
+exported signature to be exported too); the entry re-exports none of them. No one-use adapter: the reservation's
+thinking is `thinkingReserve` itself, the budget refusal is a message, not a wrapper type.
 
 ### Data model
 
 ```ts
 // src/tools/shared/eager-call.ts
-export type EagerTool = TimedTool; // 'ask' | 'code'
-
 /** What the failure path reports of the model: written once the model and its tier resolved. */
 export interface ModelReached {
   readonly resolvedModel: string;
   readonly serviceTier: ServiceTierName;
 }
 
-/** What a call's failure path reads, written by the step named on each field. */
+/** What a call's failure path reads besides the decode's tracking: each field written by its step the moment its
+ * value exists, never when a stage returns. */
 export interface FailureTrail<M extends ModelReached> {
-  /** The daily-budget reservation held: set by the reservation, cleared before the answer is settled. */
+  /** The daily-budget reservation held: set by `reserveCallBudget` as soon as `reserveBudget` returned its id;
+   * cleared by `settleDecoded` before the answer is booked, and by `settleFailedEager`. */
   reservationId: number | null;
-  /** Set by the model step; `null` before it (no retry hint is seeded, the requested tier is reported). */
+  /** Set by the model step once the model and its tier resolved; `null` before: no retry hint is seeded, the
+   * requested tier is reported, and `code` reports no model audit. */
   model: M | null;
 }
 
-/** The machinery of one `ask` / `code` call, created before its first await. */
-export interface EagerCall<M extends ModelReached> {
-  readonly tool: EagerTool;
+/** What opens a call. */
+export interface EagerCallRequest {
+  readonly tool: TimedTool;
+  /** The per-call `timeoutMs` / `stallMs`; an unset one falls back to the tool's env var. */
+  readonly knobs: ToolTimeoutKnobs;
+  /** The tier asked for (per call, else the configured one): what a failure reports before the model resolved. */
+  readonly requestedTier: ServiceTierName;
   readonly workspaceRoot: string;
   readonly started: number;
-  /** The tier asked for (per call, else the configured one): what a failure reports before the model resolved. */
+}
+
+/** The machinery of one `ask` / `code` call, created before its first await. ONE tracking object, ONE completed-request
+ * accumulator, ONE dispatch throttle and ONE trail live through the whole call: every step writes into them, the
+ * failure path reads them. */
+export interface EagerCall<M extends ModelReached> {
+  readonly tool: TimedTool;
+  readonly workspaceRoot: string;
+  readonly started: number;
   readonly requestedTier: ServiceTierName;
   readonly emitter: ProgressEmitter;
   readonly timeout: TimeoutController;
@@ -176,6 +202,33 @@ export interface EagerCall<M extends ModelReached> {
   readonly completed: CompletedRequests;
   readonly tracking: DecodeTracking;
   readonly trail: FailureTrail<M>;
+}
+
+/** A failed call, settled and classified; each tool builds its result from it, in its own field order. */
+export type FailedEagerCall<M extends ModelReached> = TimedOutEagerCall<M> | ErroredEagerCall<M>;
+
+interface FailureCommon<M extends ModelReached> {
+  /** What the completed requests billed; `null` when no decode started, none of its requests completed, or the call
+   * failed after its answer was settled (the entry was cleared then: `call-ledger.ts:190-193`). */
+  readonly usage: UsageFields | null;
+  /** The trail's model at the failure; `null` before the model resolved. */
+  readonly model: M | null;
+  readonly requestedTier: ServiceTierName;
+}
+export interface TimedOutEagerCall<M extends ModelReached> extends FailureCommon<M> {
+  readonly kind: 'timeout';
+  /** The limit that fired and its message; the progress line `<tool>: aborted after …` is emitted. */
+  readonly timedOut: TimedOutCall;
+  /** Both knobs of the controller, whichever fired: the result reports both. */
+  readonly timeoutMs: number | null;
+  readonly stallMs: number | null;
+}
+export interface ErroredEagerCall<M extends ModelReached> extends FailureCommon<M> {
+  readonly kind: 'error';
+  /** `<tool> failed: <message>`. */
+  readonly message: string;
+  readonly tierMeta: TierErrorMeta;
+  readonly httpStatus: number | undefined;
 }
 
 // src/tools/shared/eager-steps.ts
@@ -194,6 +247,8 @@ export interface PreflightRequest {
   readonly prompt: string;
   readonly resolved: ResolvedModel;
   readonly mode: PreflightMode | undefined;
+  /** The cap asked for: a cap that may take more than one request takes the exact count (`preflightModeFor`). */
+  readonly cap: OutputCap;
   /** Tokens beyond the files and the prompt, counted by Gemini (`ask`'s attachments; 0 for `code`). */
   readonly extraTokens: number;
 }
@@ -213,14 +268,12 @@ export interface ReservationRequest {
   readonly countedInputTokens: number | undefined;
   readonly thinkingTokens: number;
 }
-export interface BudgetRejection {
-  /** "Daily budget cap would be exceeded: …" — one text for both tools. */
-  readonly message: string;
-}
 export type ReservationOutcome =
   | { readonly kind: 'unbounded' }       // no daily cap: nothing reserved
-  | { readonly kind: 'reserved' }        // `trail.reservationId` set
-  | { readonly kind: 'rejected'; readonly rejection: BudgetRejection };
+  | { readonly kind: 'reserved' }        // `trail.reservationId` already set
+  | { readonly kind: 'rejected'; readonly message: string }; // "Daily budget cap would be exceeded: …", one text
+
+// src/tools/shared/eager-answer.ts
 export interface ContextSpec {
   readonly scan: ScanResult;
   readonly resolved: ResolvedModel;
@@ -234,8 +287,6 @@ export interface CallContext {
   readonly prepare: () => Promise<PreparedContext>;
   readonly prepared: PreparedContext;
 }
-
-// src/tools/shared/context-decode.ts
 export interface DecodeSpec {
   readonly resolved: ResolvedModel;
   readonly serviceTier: ServiceTierName;
@@ -244,8 +295,6 @@ export interface DecodeSpec {
   readonly estimate: InputEstimate;
   readonly countedInputTokens: number | undefined;
 }
-
-// src/tools/shared/settle-call.ts
 export interface DecodeRun {
   readonly resolved: ResolvedModel;
   readonly serviceTier: ServiceTierName;
@@ -256,18 +305,6 @@ export interface SettledDecode {
   readonly settled: SettledAnswer;
   readonly ran: RanCaching;
   readonly durationMs: number;
-}
-export interface FailedEagerCall {
-  /** What the completed requests billed; `null` when none completed. */
-  readonly usage: UsageFields | null;
-  /** Set when the call timed out (`isTimeoutAbort`); the progress line is already emitted. */
-  readonly timedOut: TimedOutCall | null;
-  readonly tierMeta: TierErrorMeta;
-  readonly httpStatus: number | undefined;
-  /** `<tool> failed: <message>`. */
-  readonly message: string;
-  /** The resolved tier, else the requested one. */
-  readonly serviceTier: ServiceTierName;
 }
 
 // src/tools/ask/call.ts — the call as it grows; each stage adds what its step produced, nothing optional
@@ -301,8 +338,12 @@ export interface AskSized extends AskCounted {
 export interface AskPrepared extends AskSized {
   readonly context: CallContext;
 }
-/** A step's outcome: the next stage, or the result that ends the call (a refusal, or the fallback's answer). */
-export type StepOutcome<T> = { readonly next: T } | { readonly end: TextToolResult };
+/** A step's outcome: the next stage; the result that ends the call (a refusal); or the fallback, still pending,
+ * which the entry returns unawaited (order-sensitive point 3). */
+export type StepOutcome<T> =
+  | { readonly next: T }
+  | { readonly end: TextToolResult }
+  | { readonly handOff: Promise<TextToolResult> };
 
 // src/tools/ask/thinking.ts
 export type AskThinking =
@@ -310,7 +351,7 @@ export type AskThinking =
   | { readonly kind: 'model-default' }               // nothing sent but includeThoughts
   | { readonly kind: 'budget'; readonly budget: number }; // -1, 0, or a positive budget clamped under the cap
 
-// src/tools/code.tool.ts
+// src/tools/code.tool.ts — created in this field order: it is spread as `code`'s model audit
 interface CodeModelReached extends ModelReached {
   readonly configuredModelReplaced: string | null;
 }
@@ -319,7 +360,10 @@ interface CodeModelReached extends ModelReached {
 `ResolvedModel` is `src/types.ts`'s (`resolveModel`'s return type); `ResolvedAskModel` (`ask.tool.ts:267`) goes.
 The two mutable fields of `FailureTrail` replace the four mutable locals the failure paths read today
 (`reservationId`, `resolvedModelKey`, `serviceTier` behind `reportedTier()`, `modelAudit`); `tracking` and `completed`
-keep their shared types.
+keep their shared types. Every value a failure result carries today reaches `FailedEagerCall`: the requested tier for a
+failure before the model resolved (`ask :379`, `code :863`), both knobs of the controller for a timeout (`ask :994-995`,
+`code :852-853` — `TimedOutCall` carries only the limit that fired), and `code`'s model audit, which a failure before the
+model resolved deliberately omits (`code :855`, `:864`: `modelAudit` is `{}` until `:397`).
 
 ### Baselines
 
@@ -336,25 +380,35 @@ entries do not move: no test changes.
 ### Order-sensitive points a naive extraction breaks
 
 1. The controller is created before the first await (`:388`, the first await is `:419`): `openEagerCall` is synchronous
-   and runs first, after the emitter (`:380`) as today.
+   and runs first, the emitter created before the controller as today (`:380`). Only the total timer arms there; the
+   stall timer arms at the first chunk.
 2. `reservationId` and `tracking.ledgerEntry` are cleared BEFORE `settleAnswer` (`:879-881`), so a throw after it
-   neither books the call again nor releases what was booked: `settleDecoded` clears the trail first.
-3. The fallback disposes `ask`'s controller and runs the agentic call inside `ask`'s `try` (`:597`); `ask`'s emitter is
-   stopped by the `finally` after the agentic call returned, and a throw of the fallback reaches F. `guardAsk` awaits the
-   fallback and returns its result as `{ end }`; it never returns a promise for the entry to await outside the `try`.
-   A second `dispose` is a no-op (`abort-timeout.ts:232-237`, `:247-250`).
+   neither books the call again nor releases what was booked: `settleDecoded` clears the trail first. A failure while
+   the result is built after the settlement therefore reports no usage.
+3. The fallback is returned WITHOUT `await` (`:597`). `fallBackToAgentic` runs synchronously up to its first await —
+   it disposes `ask`'s controller and starts the agentic call (`ask-agentic-fallback.ts:126-139`) —; then `ask`'s
+   `finally` runs while the agentic call is pending: the controller disposed a second time (a no-op,
+   `abort-timeout.ts:247-250`), the emitter stopped. A rejection of the fallback bypasses `ask`'s catch: no `ask failed`
+   line, no settlement, the caller sees the rejection. The split keeps exactly that boundary: `guardAsk` hands the
+   pending promise back as its own outcome (`{ handOff }`), never awaiting it, and the entry returns it from inside its
+   `try` without awaiting, in the same run of microtasks.
 4. F settles first, then classifies: the error line, `settleFailure` (the retry hint, the ledger, the TPM reservation),
    then the timeout's progress line (`:965-990`). `settleFailedEager` keeps that order.
 5. `OUTPUT_CAP` returns before the truncated-scan warning (`:901` before `:905`).
 6. The stale-cache retry calls the same `prepare` closure (`:736`, `context-decode.ts:204`): `CallContext.prepare` is
    that closure, with the same arguments in the same key order.
 7. Result keys keep their order per tool (R8, R9, R10, F's non-timeout branch): the shared pieces return values and
-   field groups, never a whole result.
+   field groups, never a whole result (the one exception, `workspaceRefusal`, carries no field: `<tool>: <message>`).
+8. The reservation's id is written to the trail inside `reserveCallBudget`, right after `reserveBudget` returned it and
+   before any other statement: no throw can come between a reservation and its owner.
+9. `code` parses its artefacts BEFORE the settlement (`code :700-718` before `:731`): a failure there is booked at the
+   completed requests and reports their usage; `settleDecoded` is called after them.
 
 ### Error policy
 
 Unchanged. No new `catch`: a step ends the call by returning `{ end }`, and every throw reaches the one failure path as
-today. `recordBilledCall` and `releaseReservation` stay the only places that catch a ledger write.
+today — but the fallback's rejection, which bypasses it as today (point 3). `recordBilledCall` and `releaseReservation`
+stay the only places that catch a ledger write.
 
 ### Performance budget
 
@@ -402,7 +456,10 @@ real `ask_agentic` loop on the fake client; attachments are real files in a temp
 cache is cleared before each scenario. Each scenario writes one ordered trace (every call above with its arguments,
 every progress and log line, the result) with the workspace path, `durationMs`, `nowMs` and `occurredAt` masked and the
 key order kept (objects written as entry lists). It runs on `main` (`074212c`) and on every commit of the PR. Target:
-every scenario's trace identical.
+every scenario's trace identical. Two pass-through mocks record the controller's `dispose` and the emitter's `stop`
+(`shared/abort-timeout`'s `toolTimeoutController`, `utils/progress`'s `createProgressEmitter`): the shared pieces call
+them the way those recorders see. 194 scenarios (99 + 17 of `ask`, 61 + 17 of `code`), deterministic over three runs on
+`main`.
 
 | Exit | `ask` scenarios |
 |---|---|
@@ -433,6 +490,23 @@ controller's, which the X12 scenarios cover.
 | Y8 | `code-timeout-total`, `code-timeout-stall`, `code-timeout-before-model` (no `serviceTier`) |
 | Y9 | `code-model-mismatch-named`, `code-open-429-hint`, `code-mid-stream-network`, `code-prepare-throws`, `code-flex-503` |
 
+The failure boundaries — each for `ask` and, as `code-<name>`, for `code` where it applies:
+
+| Boundary | Scenarios |
+|---|---|
+| the fallback pending past `ask`'s `finally`, and rejecting | `too-large-fallback-pending` (the agentic call's events follow `ask`'s dispose and stop), `too-large-fallback-rejects` (the result is the rejection: no `ask failed` line, no settlement) |
+| the cache's keep-alive fails at the opening and at a continuation | `keepalive-fails-opening` (released), `keepalive-fails-continuation` (booked) |
+| the stale-cache invalidation, rebuild and re-reservation fail | `stale-cache-invalidation-fails`, `stale-cache-after-completed-invalidation-fails` (booked), `stale-cache-rebuild-fails`, `stale-cache-rereserve-fails` (the held id cancelled first), `stale-cache-rereserve-timeout` |
+| a terminal `markHot` failure | `markhot-fails` (booked) |
+| `code`'s artefacts fail | `code-artifact-fails` (booked: before the settlement) |
+| the result fails after the settlement | `result-fails-after-settlement` (booked once, no usage in the failure) |
+| a failed cancellation write on a timeout | `timeout-failed-cancel-write` |
+| a completed request, then a failure, without a daily cap | `code-no-budget-failure-after-completed` (and `ask`'s `no-budget-failure-after-completed` above) |
+| a continuation's reopening exhausted, and timed out | `long-decode-reopen-exhausted`, `long-decode-reopen-timeout` |
+| the long decode stops without progress | `long-decode-no-progress` (the same token), `code-long-decode-no-progress` (nothing decoded) |
+| no usage reported, the exact count above the heuristic | `answer-no-usage-exact-count` |
+| a primed preflight cache | `preflight-primed` (two calls; the second counts from the cache) |
+
 **The existing tests, green and unchanged.** `ask`: `test/unit/ask-tool.test.ts`, `ask-attachments.test.ts`,
 `ask-streaming-integration.test.ts`, `ask-throttle-integration.test.ts`, `ask-timeout-integration.test.ts`,
 `preflight-guard.test.ts`, `service-tier.test.ts`, `agentic-time-bounds.test.ts` (the fallback's hand-off),
@@ -450,36 +524,43 @@ suppressions pruned with `npx eslint --prune-suppressions`, the repeats re-recor
 `node lint/baseline-ratchet.mjs --write-duplicates .jscpd-report/jscpd-report.json`). A shared piece lands with both
 readers in one commit: one reader alone would leave the other's copy repeating the new file.
 
-| # | Commit | Moves |
-|---|---|---|
-| 0 | — | the probe recorded on `main` (outside the tree) |
-| 1 | `ask`: the input schema in `ask/input.ts` | the schema; the entry re-exports it; the fallback's type import |
-| 2 | `ask`: the attachments in `ask/attachments.ts` | `:243-357` verbatim |
-| 3 | shared: the eager call and its failure trail | R1, R10, the `finally`; both tools |
-| 4 | shared: the scan, the output cap, the preflight's count | R2, R3; both tools |
-| 5 | shared: the budget reservation | R4; both tools |
-| 6 | shared: the context | R5; both tools |
-| 7 | shared: the decode, the settlement, the scan's fields | R6-R9; both tools; both files leave `jscpd-baseline.json` |
-| 8 | `ask`: thinking and request in `ask/thinking.ts`, `ask/request.ts` | step 9's thinking, step 12 |
-| 9 | `ask`: the guard and the fallback in `ask/guard.ts` | step 8 |
-| 10 | `ask`: the stages, the setup and the results; the entry as orchestrator | `ask/call.ts`, `ask/setup.ts`, `ask/results.ts`; `ask.tool.ts` leaves `eslint-suppressions.json` |
-| 11 | `code`: the orchestrator over its own steps | `code.tool.ts` leaves `eslint-suppressions.json` |
-| 12 | docs | `docs/architecture.md` (`src/tools/ask/`, the two new shared modules), T47 closed in `docs/FOLLOW-UP-PRS.md`, this note's status |
+Each type arrives with the commit of its first reader, never in a later one.
+
+| # | Commit | Moves | Types it brings |
+|---|---|---|---|
+| 0 | — | the probe recorded on `main` (outside the tree) | — |
+| 1 | docs: this note corrected after its architecture review; T48 | — | — |
+| 2 | `ask`: the system instruction in `ask/instruction.ts` | `:76-90` verbatim — before the attachments: `inlineRequestRefusal` reads it (`:328`) | — |
+| 3 | `ask`: the input schema in `ask/input.ts` | the schema; the entry re-exports it; the fallback's type import | — |
+| 4 | `ask`: the attachments in `ask/attachments.ts` | `:243-357` verbatim but `ResolvedAskModel`, which becomes `ResolvedModel` | `PreparedAttachments` |
+| 5 | shared: the eager call and its failure trail | R1, R10, the `finally`; `eager-call.ts`, `workspaceRefusal` in `eager-steps.ts`; both tools | `ModelReached`, `FailureTrail`, `EagerCallRequest`, `EagerCall`, `FailedEagerCall` |
+| 6 | shared: the scan, the output cap, the input estimate, the preflight's count | R2, R3; both tools | `ScanFilters`, `InputEstimate`, `PreflightRequest`, `PreflightCount` |
+| 7 | shared: the budget reservation | R4; both tools | `ReservationRequest`, `ReservationOutcome` |
+| 8 | shared: the context | R5; `eager-answer.ts`; both tools | `ContextSpec`, `CallContext` |
+| 9 | shared: the decode, the settlement, the scan's fields | R6-R9; both tools; both files leave `jscpd-baseline.json` | `DecodeSpec`, `DecodeRun`, `SettledDecode` |
+| 10 | `ask`: thinking and request in `ask/thinking.ts`, `ask/request.ts` | step 9's thinking, step 12 | `AskThinking` |
+| 11 | `ask`: the model step and the attachments as stage steps | `ask/call.ts`, `ask/setup.ts`, `attachAsk` | `AskCall`, `AskResolved`, `AskAttached`, `StepOutcome` |
+| 12 | `ask`: the guard and the fallback in `ask/guard.ts` | step 8; the fallback handed back pending (`{ handOff }`) | `AskScanned`, `AskCounted` |
+| 13 | `ask`: the results; the entry as orchestrator | `ask/results.ts`; `ask.tool.ts` leaves `eslint-suppressions.json` | `AskSized`, `AskPrepared` |
+| 14 | `code`: the orchestrator over its own steps | `code.tool.ts` leaves `eslint-suppressions.json` | `CodeModelReached` |
+| 15 | docs | `docs/architecture.md` (`src/tools/ask/`, the three new shared modules), T47 closed in `docs/FOLLOW-UP-PRS.md`, this note's status | — |
 
 No CHANGELOG entry: nothing a user sees changes.
 
-## Risks and open questions
+## Decisions
 
-| # | Question | Recommendation | The fact that would flip it |
+The eight questions of the note are decided as it recommended; each keeps the fact that would reopen it.
+
+| # | Question | Decision | The fact that would flip it |
 |---|---|---|---|
 | Q1 | Does the long-decode loop move as one unit? | Nothing of it moves: it is `shared/continuation.ts` and `shared/context-decode.ts` already, and `ask` calls `decodeOnContext` once (`:836-861`); the split wraps that call (`decodeEagerCall`) | a decode decision found inside `executeAskBody` (none: every request, reopening and continuation is in the shared modules) |
-| Q2 | Is anything order-sensitive in a way a naive extraction breaks? | Yes — the seven points [above](#order-sensitive-points-a-naive-extraction-breaks); the closure `reportedTier()` over a mutable local becomes the trail's `model`, the fallback stays awaited inside the `try`, the trail is cleared before the settlement | a probe scenario that differs after a move: the move is wrong, never the trace |
+| Q2 | Is anything order-sensitive in a way a naive extraction breaks? | Yes — the nine points [above](#order-sensitive-points-a-naive-extraction-breaks); the closure `reportedTier()` over a mutable local becomes the trail's `model`, the fallback's promise is handed back and returned unawaited, the trail is cleared before the settlement | a probe scenario that differs after a move: the move is wrong, never the trace |
 | Q3 | Does `code` join `src/tools/shared/` now or only later? | Now, for every shared piece: the ratchet refuses a repeat of `code` with a new shared file, and Rule 2 takes `executeCodeBody` out of the baseline in the PR that changes it | a ratchet that admitted a repeat in a new file (it does not: `lint/baseline-ratchet.mjs`) |
 | Q4 | Where do `code`'s own steps live? | In `code.tool.ts` for this PR; `src/tools/code/` (the schema, the parsers, the steps) is the next PR, layout only | `code.tool.ts` after this PR over about 600 lines, or not fitting a reviewer's packet beside this change set |
 | Q5 | The schema in the entry, or in `ask/input.ts` re-exported? | `ask/input.ts`, as T39 did: the steps and the fallback read `AskInput` without importing the entry that imports them | a reviewer who wants the schema readable in the entry file; the re-export keeps every import working either way |
 | Q6 | Share whole results between the tools? | No: the two tools order their fields differently (R8, R9, R10, F) and report different fields; the shared pieces return values, each tool composes its results | a decision to align the two tools' results, which is a change of the contract with its own CHANGELOG entry, not this refactor |
-| Q7 | The differences the tables show — `code` reports no `filesSkippedTooLarge` and no model `fallbackApplied`, and its `TIMEOUT` before the model resolved has no `serviceTier` | Kept as they are; each is a change of a result, for a follow-up entry if wanted | the maintainers want them aligned in this PR |
-| Q8 | Commit the probe as a test? | No: it pins every message and key of about 120 scenarios to golden traces, so every later wording change would regenerate them; the existing tests stay the regression suite and the PR body carries the probe's totals | a request to keep the per-commit equivalence checkable in CI |
+| Q7 | The differences the tables show — `code` reports no `filesSkippedTooLarge` and no model `fallbackApplied`, and its `TIMEOUT` before the model resolved has no `serviceTier` | Kept as they are; each is a change of a result: [FOLLOW-UP-PRS.md T48](./FOLLOW-UP-PRS.md) names them for the maintainers' decision | the maintainers want them aligned in this PR |
+| Q8 | Commit the probe as a test? | No: it pins every message and key of 194 scenarios to golden traces, so every later wording change would regenerate them; the existing tests stay the regression suite and the PR body carries the probe's totals | a request to keep the per-commit equivalence checkable in CI |
 
 ## Not in scope
 
