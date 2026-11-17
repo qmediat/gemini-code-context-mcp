@@ -44,8 +44,8 @@ import {
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
-  resolveServiceTier,
   serviceTierConfig,
+  serviceTierOrRefusal,
 } from './shared/service-tier.js';
 import { SYSTEM_INSTRUCTION_SAFETY_EAGER } from './shared/system-instruction-safety.js';
 import { THINKING_LEVEL_FIELD, thinkingBudgetUnder, thinkingReserve } from './shared/thinking.js';
@@ -359,17 +359,10 @@ async function executeCodeBody(
     const resolved = choice.resolved;
     // The same two fields on every result after this point, error results included: an audit of a failed call
     // can still tell a fallback from a caller's choice.
-    let serviceTier: 'standard' | 'flex';
-    try {
-      serviceTier = resolveServiceTier(
-        input.serviceTier,
-        ctx.config.serviceTier,
-        ctx.config.vertex,
-      );
-    } catch (err) {
-      if (!(err instanceof ServiceTierError)) throw err;
-      return errorResult(`code: ${err.message}`, {
-        errorCode: err.code,
+    const serviceTier = serviceTierOrRefusal(input.serviceTier, ctx.config);
+    if (serviceTier instanceof ServiceTierError) {
+      return errorResult(`code: ${serviceTier.message}`, {
+        errorCode: serviceTier.code,
         retryable: false,
         serviceTier: 'flex',
         resolvedModel: resolved.resolved,

@@ -14,9 +14,9 @@ import {
   inspectAttachments,
   readAttachments,
 } from '../../attachments.js';
-import type { ResolvedModel } from '../../types.js';
 import { safeForLog } from '../../utils/logger.js';
 import { type TextToolResult, errorResult } from '../registry.js';
+import type { AskAttached, AskResolved, StepOutcome } from './call.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './instruction.js';
 
 export interface PreparedAttachments {
@@ -43,34 +43,37 @@ async function prepareAttachments(
   return { attached, parts, bytes, tokens };
 }
 
-/** The attachments of one call, or the refusal that ends it: a model without vision, a bad file (never retryable),
- * a count Gemini could not give. Nothing has been scanned or reserved yet. */
-export async function attachmentsOrRefusal(
-  client: Parameters<typeof countAttachmentTokens>[0],
-  paths: readonly string[],
-  resolved: ResolvedModel,
-  serviceTier: 'standard' | 'flex',
-  workspaceRoot: string,
-  signal: AbortSignal,
-): Promise<{ prepared: PreparedAttachments } | { refusal: TextToolResult }> {
-  const meta = { serviceTier, resolvedModel: resolved.resolved };
+/**
+ * The attachments of one call, or the refusal that ends it: a model without vision, a bad file (never retryable), a
+ * count Gemini could not give. Inspected, read and counted under the call's signal — before the scan, the preflight,
+ * the budget reservation and the throttle: a bad file costs nothing.
+ */
+export async function attachAsk(call: AskResolved): Promise<StepOutcome<AskAttached>> {
+  const { resolved, eager } = call;
+  const paths = call.input.attachments ?? [];
+  const meta = { serviceTier: call.serviceTier, resolvedModel: resolved.resolved };
   if (paths.length > 0 && !resolved.capabilities.supportsVision) {
     return {
-      refusal: errorResult(
+      end: errorResult(
         `ask: ${paths.length} attachment(s) given, but ${safeForLog(resolved.resolved)} does not support vision — use \`latest-vision\` or a model that lists it`,
         { errorCode: 'ATTACHMENTS_UNSUPPORTED', retryable: false, ...meta },
       ),
     };
   }
   try {
-    return {
-      prepared: await prepareAttachments(client, paths, workspaceRoot, resolved.resolved, signal),
-    };
+    const attachments = await prepareAttachments(
+      call.ctx.client,
+      paths,
+      eager.workspaceRoot,
+      resolved.resolved,
+      eager.timeout.signal,
+    );
+    return { next: { ...call, attachments } };
   } catch (err) {
     if (!(err instanceof AttachmentError) && !(err instanceof AttachmentTokensUncountedError))
       throw err;
     return {
-      refusal: errorResult(`ask: ${err.message}`, {
+      end: errorResult(`ask: ${err.message}`, {
         errorCode: err.code,
         retryable: err.retryable,
         ...meta,

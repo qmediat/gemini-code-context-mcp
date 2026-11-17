@@ -9,16 +9,13 @@
 
 import { resolve } from 'node:path';
 import { capThatRuns, thinkingBudgetRefusal } from '../gemini/long-decode.js';
-import { resolveModel } from '../gemini/models.js';
 import { fallBackToAgentic } from './ask-agentic-fallback.js';
-import {
-  attachmentMetadata,
-  attachmentsOrRefusal,
-  inlineRequestRefusal,
-} from './ask/attachments.js';
+import { attachAsk, attachmentMetadata, inlineRequestRefusal } from './ask/attachments.js';
+import type { StepOutcome } from './ask/call.js';
 import { type AskInput, askInputSchema } from './ask/input.js';
 import { SYSTEM_INSTRUCTION_Q_AND_A } from './ask/instruction.js';
 import { askRequest } from './ask/request.js';
+import { resolveAsk } from './ask/setup.js';
 import { askThinking, generatingLine, thinkingBudgetField } from './ask/thinking.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import {
@@ -43,7 +40,6 @@ import {
   scanForCall,
   workspaceRefusal,
 } from './shared/eager-steps.js';
-import { ServiceTierError, resolveServiceTier } from './shared/service-tier.js';
 import { thinkingReserve } from './shared/thinking.js';
 
 export { askInputSchema, type AskInput };
@@ -70,7 +66,7 @@ async function executeAskBody(
   model: string,
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
-  const call = openEagerCall<ModelReached>(
+  const eager = openEagerCall<ModelReached>(
     {
       tool: 'ask',
       knobs: input,
@@ -80,55 +76,20 @@ async function executeAskBody(
     },
     ctx,
   );
-  const { emitter } = call;
-  const timeoutController = call.timeout;
-  const abortSignal = timeoutController.signal;
+  const { emitter } = eager;
+  const timeoutController = eager.timeout;
   try {
     const refusal = workspaceRefusal('ask', workspaceRoot);
     if (refusal !== null) return refusal;
 
-    emitter.emit(`resolving model '${model}'…`);
-    // `ask` accepts all three text-gen tiers — caller picks via alias
-    // (`latest-pro` / `latest-flash` / `latest-lite` / `latest-vision`)
-    // or literal model ID. Resolver refuses to dispatch to a category
-    // outside this set — protects against an image/audio/agent model
-    // slipping in (e.g. `nano-banana-pro-preview` pre-v1.4.0).
-    const resolved = await resolveModel(model, ctx.client, {
-      requiredCategory: ['text-reasoning', 'text-fast', 'text-lite'],
-    });
-    let serviceTier: 'standard' | 'flex';
-    try {
-      serviceTier = resolveServiceTier(
-        input.serviceTier,
-        ctx.config.serviceTier,
-        ctx.config.vertex,
-      );
-    } catch (err) {
-      if (!(err instanceof ServiceTierError)) throw err;
-      return errorResult(`ask: ${err.message}`, {
-        errorCode: err.code,
-        retryable: false,
-        serviceTier: 'flex',
-        resolvedModel: resolved.resolved,
-      });
-    }
-    call.trail.model = { resolvedModel: resolved.resolved, serviceTier };
-
-    // Attachments ride with the prompt as inline parts. Inspected, read and counted here — before the scan, the
-    // preflight, the budget reservation and the throttle: a bad file costs nothing.
-    const attachmentsOutcome = await attachmentsOrRefusal(
-      ctx.client,
-      input.attachments ?? [],
-      resolved,
-      serviceTier,
-      workspaceRoot,
-      abortSignal,
-    );
-    if ('refusal' in attachmentsOutcome) return attachmentsOutcome.refusal;
-    const attachments = attachmentsOutcome.prepared;
+    const resolvedStep = await resolveAsk({ input, ctx, model, eager });
+    if (!('next' in resolvedStep)) return endOf(resolvedStep);
+    const attachedStep = await attachAsk(resolvedStep.next);
+    if (!('next' in attachedStep)) return endOf(attachedStep);
+    const { resolved, serviceTier, attachments } = attachedStep.next;
     const attachmentTokens = attachments.tokens;
 
-    const scan = await scanForCall(call, ctx, {
+    const scan = await scanForCall(eager, ctx, {
       includeGlobs: input.includeGlobs,
       excludeGlobs: input.excludeGlobs,
       forceRescan: input.forceRescan,
@@ -150,7 +111,7 @@ async function executeAskBody(
 
     // The preflight refuses a workspace the model's window cannot hold (`WORKSPACE_TOO_LARGE`, not retryable): sent,
     // Gemini would answer 400 "exceeds maximum", which a caller cannot tell from a transient error.
-    const count = await countPreflight(call, ctx, {
+    const count = await countPreflight(eager, ctx, {
       scan,
       prompt: input.prompt,
       resolved,
@@ -238,7 +199,7 @@ async function executeAskBody(
       runCap,
     );
 
-    const reservation = reserveCallBudget(call, ctx, {
+    const reservation = reserveCallBudget(eager, ctx, {
       resolved,
       serviceTier,
       estimate,
@@ -256,7 +217,7 @@ async function executeAskBody(
       });
     }
 
-    const context = await prepareCallContext(call, ctx, {
+    const context = await prepareCallContext(eager, ctx, {
       scan,
       resolved,
       systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
@@ -268,7 +229,7 @@ async function executeAskBody(
     emitter.emit(generatingLine(thinking));
 
     const decoded = await decodeEagerCall(
-      call,
+      eager,
       ctx,
       {
         resolved,
@@ -290,7 +251,7 @@ async function executeAskBody(
     // emit (live progress) and post-call summary.
     const thinkingSummary = response.thoughtsSummary;
 
-    const { settled, ran, durationMs } = settleDecoded(call, ctx, decoded, {
+    const { settled, ran, durationMs } = settleDecoded(eager, ctx, decoded, {
       resolved,
       serviceTier,
       caching,
@@ -304,7 +265,7 @@ async function executeAskBody(
       return errorResult(`ask: ${settled.outputCapStop.message}`, settled.outputCapStop.fields);
     }
 
-    warnTruncatedScan(call, ctx, scan);
+    warnTruncatedScan(eager, ctx, scan);
 
     const metadata: Record<string, unknown> = {
       resolvedModel: resolved.resolved,
@@ -352,10 +313,21 @@ async function executeAskBody(
 
     return textResult(text, metadata);
   } catch (err) {
-    return askFailedResult(settleFailedEager(call, ctx, err));
+    return askFailedResult(settleFailedEager(eager, ctx, err));
   } finally {
-    closeEagerCall(call);
+    closeEagerCall(eager);
   }
+}
+
+/**
+ * What ends the call before its answer: a refusal, or the `ask_agentic` fallback still pending — returned unawaited
+ * from inside the call's `try`, so the `finally` runs while the fallback runs and a rejection of the fallback never
+ * reaches the call's failure path.
+ */
+function endOf(
+  outcome: Exclude<StepOutcome<unknown>, { readonly next: unknown }>,
+): TextToolResult | Promise<TextToolResult> {
+  return 'end' in outcome ? outcome.end : outcome.handOff;
 }
 
 /** `ask`'s result of a failed call: the resolved tier, else the one requested. */
