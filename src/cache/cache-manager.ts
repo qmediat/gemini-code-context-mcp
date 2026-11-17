@@ -155,7 +155,7 @@ function isUsableExistingCache(
 function buildContentFromUploaded(files: { fileId: string | null; relpath: string }[]): Content[] {
   const parts: Part[] = [];
   for (const f of files) {
-    if (typeof f.fileId !== 'string' || f.fileId.length === 0) continue;
+    if (!isFileId(f.fileId)) continue;
     parts.push({ text: `\n\n--- FILE: ${f.relpath} ---\n` });
     parts.push({
       fileData: {
@@ -630,9 +630,17 @@ function deleteReplacedCache(
   void bestEffortDeleteCache(client, previousCacheId, 'stale');
 }
 
+/**
+ * Whether an uploaded or stored file holds a Files API id. The uploader never yields an empty one (an upload Google
+ * answers without an identifier throws); a file row without an upload holds `null`, and an empty id means none too.
+ */
+function isFileId(fileId: string | null): fileId is string {
+  return typeof fileId === 'string' && fileId.length > 0;
+}
+
 /** The Files API ids of the uploads that have one. */
 function uploadedFileIds(uploaded: UploadResult): string[] {
-  return uploaded.files.map((f) => f.fileId).filter((v): v is string => v !== null);
+  return uploaded.files.map((f) => f.fileId).filter(isFileId);
 }
 
 /**
@@ -717,7 +725,7 @@ function storedFileIds(manifest: ManifestDb, workspaceRoot: string): string[] {
       manifest
         .getFiles(workspaceRoot)
         .map((r) => r.fileId)
-        .filter((v): v is string => typeof v === 'string' && v.length > 0),
+        .filter(isFileId),
     ),
   );
 }

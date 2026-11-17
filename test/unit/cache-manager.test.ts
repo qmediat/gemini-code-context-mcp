@@ -1406,12 +1406,14 @@ describe('invalidateWorkspaceCache', () => {
     });
   }
 
+  /** A client whose deletes take the resource name as the SDK's do; with `fail`, every delete rejects. */
   function mkPurgeClient(fail = false) {
     const settle = async () => {
       if (fail) throw new Error('503 UNAVAILABLE');
       return {};
     };
-    return { caches: { delete: vi.fn(settle) }, files: { delete: vi.fn(settle) } };
+    const deleteByName = () => vi.fn<(params: { name: string }) => Promise<object>>(settle);
+    return { caches: { delete: deleteByName() }, files: { delete: deleteByName() } };
   }
 
   function purge(client: ReturnType<typeof mkPurgeClient>): Promise<void> {
