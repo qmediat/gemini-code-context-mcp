@@ -526,14 +526,14 @@ function sizeCode(call: CodeCounted): StepOutcome<CodeSized> {
   });
   const thinkingBudget = codeThinkingBudget(input, bounded.cap);
   const sized: CodeSized = { ...call, bounded, thinkingBudget };
-  const reservation = reserveCallBudget(eager, call.ctx, sized, {
+  const refusal = reserveCallBudget(eager, call.ctx, sized, {
     promptChars: input.task.length,
     extraInputTokens: 0,
     thinkingTokens: thinkingReserve(input.thinkingLevel, thinkingBudget, bounded.cap),
   });
-  if (reservation.kind === 'rejected') {
+  if (refusal !== null) {
     return {
-      end: errorResult(reservation.message, {
+      end: errorResult(refusal, {
         errorCode: 'BUDGET_REJECT',
         retryable: false,
         ...call.audit,

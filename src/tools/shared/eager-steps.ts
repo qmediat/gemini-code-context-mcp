@@ -213,29 +213,21 @@ export interface ReservationRequest {
   readonly thinkingTokens: number;
 }
 
-/** How the reservation ended. */
-export type ReservationOutcome =
-  /** No daily cap: nothing reserved. */
-  | { readonly kind: 'unbounded' }
-  /** Reserved: the call's trail holds the id. */
-  | { readonly kind: 'reserved' }
-  /** The cap would be exceeded: nothing reserved; the message is the same for both tools. */
-  | { readonly kind: 'rejected'; readonly message: string };
-
 /**
  * Reserve the call's worst case against the daily budget: after the scan (the estimate needs it), before anything
  * billable. `reserveBudget` checks and inserts in one `BEGIN IMMEDIATE` transaction, so concurrent calls cannot all
  * pass the check and overshoot the cap together. The id goes into the call's trail at once: no statement comes
- * between a reservation and its owner.
+ * between a reservation and its owner. Returns the refusal's message when the cap would be exceeded (nothing is
+ * reserved; the message is the same for both tools), or null when the call may go on (no daily cap, or reserved).
  */
 export function reserveCallBudget(
   call: EagerMachinery,
   ctx: ToolContext,
   sized: SizedCall,
   req: ReservationRequest,
-): ReservationOutcome {
+): string | null {
   const dailyBudgetUsd = ctx.config.dailyBudgetUsd;
-  if (!Number.isFinite(dailyBudgetUsd)) return { kind: 'unbounded' };
+  if (!Number.isFinite(dailyBudgetUsd)) return null;
   const cap = sized.bounded.cap;
   const estimateUsd = estimatePreCallCostUsd({
     model: sized.resolved.resolved,
@@ -260,11 +252,8 @@ export function reserveCallBudget(
   });
   if ('rejected' in reserve) {
     const spentUsd = reserve.spentMicros / 1_000_000;
-    return {
-      kind: 'rejected',
-      message: `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`,
-    };
+    return `Daily budget cap would be exceeded: spent $${spentUsd.toFixed(4)} + estimate $${estimateUsd.toFixed(4)} > cap $${dailyBudgetUsd.toFixed(2)}. Retry after UTC midnight, or raise \`GEMINI_DAILY_BUDGET_USD\`.`;
   }
   call.trail.reservationId = reserve.id;
-  return { kind: 'reserved' };
+  return null;
 }

@@ -117,7 +117,7 @@ describe('reserveCallBudget', () => {
   function reservedMicros(extraInputTokens: number): number {
     const ctx = context();
     const scan: ScanResult = ONE_FILE_SCAN;
-    const outcome = reserveCallBudget(
+    const refusal = reserveCallBudget(
       machinery(),
       ctx,
       {
@@ -129,7 +129,7 @@ describe('reserveCallBudget', () => {
       },
       { promptChars: 1, extraInputTokens, thinkingTokens: 0 },
     );
-    expect(outcome).toEqual({ kind: 'reserved' });
+    expect(refusal).toBeNull();
     const reserveBudget = ctx.manifest.reserveBudget as unknown as ReturnType<typeof vi.fn>;
     return (reserveBudget.mock.calls[0]?.[0] as { estimatedCostMicros: number })
       .estimatedCostMicros;

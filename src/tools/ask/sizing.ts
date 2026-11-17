@@ -24,7 +24,7 @@ export function sizeAsk(call: AskCounted): StepOutcome<AskSized> {
   });
   const thinking = askThinking(input, bounded.cap);
   const sized: AskSized = { ...call, bounded, thinking };
-  const reservation = reserveCallBudget(eager, call.ctx, sized, {
+  const refusal = reserveCallBudget(eager, call.ctx, sized, {
     promptChars: input.prompt.length,
     extraInputTokens: call.attachments.tokens,
     thinkingTokens: thinkingReserve(
@@ -33,8 +33,8 @@ export function sizeAsk(call: AskCounted): StepOutcome<AskSized> {
       bounded.cap,
     ),
   });
-  if (reservation.kind === 'rejected') {
-    return { end: budgetRejectResult(sized, reservation.message) };
+  if (refusal !== null) {
+    return { end: budgetRejectResult(sized, refusal) };
   }
   return { next: sized };
 }

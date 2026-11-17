@@ -149,7 +149,7 @@ is left of `code` for the next PR is layout only — its schema, parsers and ste
 | `src/tools/ask/answer.ts` | steps 11-15: the context, the generating line, the decode, the settlement, the result | `answerAsk(call: AskSized): Promise<TextToolResult>` |
 | `src/tools/ask/results.ts` | every `ask` result from step 10 on and F's | `budgetRejectResult(call: AskSized, message: string): TextToolResult`; `outputCapResult(stop: OutputCapStop): TextToolResult`; `answerResult(call: AskSized, decoded: ContextDecode, settled: SettledDecode): TextToolResult`; `failedResult(failure: FailedEagerCall<ModelReached>): TextToolResult` |
 | `src/tools/shared/eager-call.ts` (new) | the machinery of one `ask` / `code` call and its failure path: what the failure reads, its settlement and classification | `ModelReached`, `ReservationTrail`, `FailureTrail<M>`, `EagerCallRequest`, `EagerMachinery`, `EagerCall<M>`, `StepOutcome<T>`, `FailedEagerCall<M>`; `openEagerCall<M extends ModelReached>(request: EagerCallRequest, ctx: ToolContext): EagerCall<M>`; `settleFailedEager<M extends ModelReached>(call: EagerCall<M>, ctx: ToolContext, err: unknown): FailedEagerCall<M>`; `closeEagerCall(call: EagerMachinery): void` |
-| `src/tools/shared/eager-steps.ts` (new) | the steps before the context that both tools run the same way; the sized call the reservation, the decode and the settlement read | `scanForCall(call: EagerMachinery, ctx: ToolContext, filters: ScanFilters): Promise<ScanResult>`; `eagerOutputCap(requested: number \| undefined, ctx: ToolContext, resolved: ResolvedModel): OutputCap`; `estimateInput(scan: ScanResult, prompt: string, extraTokens: number): InputEstimate`; `countPreflight(call: EagerMachinery, ctx: ToolContext, req: PreflightRequest): Promise<PreflightCount \| null>`; `preflightFields(count: PreflightCount \| null): Record<string, unknown>`; `overWindow(count: PreflightCount \| null, ctx: ToolContext): OverWindow \| null`; `reserveCallBudget(call: EagerMachinery, ctx: ToolContext, sized: SizedCall, req: ReservationRequest): ReservationOutcome` |
+| `src/tools/shared/eager-steps.ts` (new) | the steps before the context that both tools run the same way; the sized call the reservation, the decode and the settlement read | `scanForCall(call: EagerMachinery, ctx: ToolContext, filters: ScanFilters): Promise<ScanResult>`; `eagerOutputCap(requested: number \| undefined, ctx: ToolContext, resolved: ResolvedModel): OutputCap`; `estimateInput(scan: ScanResult, prompt: string, extraTokens: number): InputEstimate`; `countPreflight(call: EagerMachinery, ctx: ToolContext, req: PreflightRequest): Promise<PreflightCount \| null>`; `preflightFields(count: PreflightCount \| null): Record<string, unknown>`; `overWindow(count: PreflightCount \| null, ctx: ToolContext): OverWindow \| null`; `reserveCallBudget(call: EagerMachinery, ctx: ToolContext, sized: SizedCall, req: ReservationRequest): string \| null` (the refusal's message, or null when the call may go on) |
 | `src/tools/shared/eager-answer.ts` (new) | the context, the decode and the settlement of an answer, the scan's result fields | `RequestBuilder` (the cached-context rule both request builders keep); `prepareCallContext(call: EagerMachinery, ctx: ToolContext, spec: ContextSpec): Promise<CallContext>`; `decodeEagerCall(call: EagerMachinery, ctx: ToolContext, sized: SizedCall, request: RequestBuilder, context: CallContext): Promise<ContextDecode>`; `settleDecoded(call: EagerMachinery, ctx: ToolContext, decoded: ContextDecode, sized: SizedCall, caching: CachingModeChoice): SettledDecode`; `warnTruncatedScan(call: EagerMachinery, ctx: ToolContext, scan: ScanResult): void`; `scanFields(scan: ScanResult, prep: PreparedContext): Record<string, unknown>` |
 | `src/tools/shared/workspace-refusal.ts` (new) | the refusal of a workspace path the validation rejects, read by every tool that validates its workspace (`ask`, `code`, `ask_agentic`, `reindex`) | `WorkspaceTool`; `workspaceRefusal(tool: WorkspaceTool, workspaceRoot: string): TextToolResult \| null` |
 | `src/tools/shared/thinking.ts` | gains the level branch of `thinkingConfig` and its cast's rationale, read by `ask`, `code` and `ask_agentic` | `levelThinkingConfig(level: ThinkingLevelLiteral): ThinkingConfig` |
@@ -309,10 +309,8 @@ export interface ReservationRequest {
   readonly extraInputTokens: number;
   readonly thinkingTokens: number;
 }
-export type ReservationOutcome =
-  | { readonly kind: 'unbounded' }       // no daily cap: nothing reserved
-  | { readonly kind: 'reserved' }        // `trail.reservationId` already set
-  | { readonly kind: 'rejected'; readonly message: string }; // "Daily budget cap would be exceeded: …", one text
+// reserveCallBudget returns the refusal's message ("Daily budget cap would be exceeded: …", one text for both tools),
+// or null when the call may go on: no daily cap (nothing reserved) or reserved (`trail.reservationId` already set)
 
 // src/tools/shared/eager-answer.ts
 export interface ContextSpec {
@@ -398,28 +396,32 @@ model resolved deliberately omits (`code :855`, `:864`: `modelAudit` is `{}` unt
 | `jscpd-baseline.json` | `src/tools/code.tool.ts`: 171 | all: its repeats are R1-R10 only |
 
 The total of `jscpd-baseline.json` falls from 2,599 to 2,215 lines, `eslint-suppressions.json` from 89 suppressions in
-31 files to 81 in 29. No new file enters either baseline. The test files' entries do not move: no test changes.
+31 files to 80 in 28 (`reindex.tool.ts`'s `execute` left with the shared workspace refusal). No new file enters either
+baseline. The existing tests' assertions are unchanged; new tests were added (`test/unit/eager-steps.test.ts`,
+`test/unit/ask-thinking.test.ts`, new cases in three existing files).
 
 Measured on the finished split (bytes, lines; the longest unit, in lines as ESLint counts them):
 
 | File | Bytes | Lines | Longest unit |
 |---|---|---|---|
-| `src/tools/ask.tool.ts` | 4,135 | 97 | `executeAskBody` 37 |
+| `src/tools/ask.tool.ts` | 3,747 | 87 | `executeAskBody` 38 |
 | `src/tools/ask/input.ts` | 11,850 | 123 | — (the schema) |
-| `src/tools/ask/instruction.ts` | 1,130 | 20 | — |
-| `src/tools/ask/call.ts` | 2,691 | 67 | — (types) |
-| `src/tools/ask/setup.ts` | 3,246 | 67 | `resolveAsk` 20 |
-| `src/tools/ask/attachments.ts` | 5,487 | 137 | `attachAsk` 33 |
-| `src/tools/ask/guard.ts` | 4,600 | 88 | `guardAsk` 27 |
-| `src/tools/ask/sizing.ts` | 1,700 | 39 | `sizeAsk` 25 |
-| `src/tools/ask/thinking.ts` | 4,561 | 80 | `generatingLine` 12 |
-| `src/tools/ask/request.ts` | 2,440 | 44 | `askRequest` 23 |
+| `src/tools/ask/instruction.ts` | 893 | 14 | — |
+| `src/tools/ask/call.ts` | 2,562 | 68 | — (types) |
+| `src/tools/ask/setup.ts` | 3,293 | 68 | `resolveAsk` 20 |
+| `src/tools/ask/attachments.ts` | 5,330 | 128 | `attachAsk` 33 |
+| `src/tools/ask/guard.ts` | 4,849 | 92 | `guardAsk` 27 |
+| `src/tools/ask/sizing.ts` | 1,716 | 40 | `sizeAsk` 25 |
+| `src/tools/ask/thinking.ts` | 4,882 | 103 | `generatingLine` 12 |
+| `src/tools/ask/request.ts` | 2,140 | 42 | `askRequest` 23 |
 | `src/tools/ask/answer.ts` | 1,576 | 35 | `answerAsk` 16 |
 | `src/tools/ask/results.ts` | 5,047 | 126 | `decodeFields`, `failedResult` 20 |
-| `src/tools/shared/eager-call.ts` | 8,020 | 200 | `settleFailedEager` 31 |
-| `src/tools/shared/eager-steps.ts` | 12,326 | 291 | `reserveCallBudget` 40 |
-| `src/tools/shared/eager-answer.ts` | 7,422 | 196 | `decodeEagerCall` 40 |
-| `src/tools/code.tool.ts` | 37,797 | 814 | `executeCodeBody` 34 |
+| `src/tools/shared/eager-call.ts` | 8,744 | 215 | `settleFailedEager` 31 |
+| `src/tools/shared/eager-steps.ts` | 11,277 | 259 | `reserveCallBudget` 37 |
+| `src/tools/shared/eager-answer.ts` | 8,295 | 205 | `decodeEagerCall` 40 |
+| `src/tools/shared/workspace-refusal.ts` | 1,056 | 32 | `workspaceRefusal` 14 |
+| `src/tools/reindex.tool.ts` | 3,436 | 81 | `execute` 31 |
+| `src/tools/code.tool.ts` | 37,338 | 812 | `executeCodeBody` 34 |
 
 `code.tool.ts` is over the 600 lines of Q4's tipping fact: its steps, typed stages and result groups now stand apart
 inside the file, which is what `src/tools/code/` (the next PR, layout only) moves.
@@ -588,7 +590,7 @@ Each type arrives with the commit of its first reader, never in a later one.
 | 4 | `ask`: the attachments in `ask/attachments.ts` | `:243-357` verbatim but `ResolvedAskModel`, which becomes `ResolvedModel` | `PreparedAttachments` |
 | 5 | shared: the eager call and its failure trail | R1, R10, the `finally`; `eager-call.ts`, `workspaceRefusal` in `eager-steps.ts`; both tools | `ModelReached`, `FailureTrail`, `EagerCallRequest`, `EagerCall`, `FailedEagerCall` |
 | 6 | shared: the scan, the output cap, the input estimate, the preflight's count | R2, R3; both tools | `ScanFilters`, `InputEstimate`, `PreflightRequest`, `PreflightCount` |
-| 7 | shared: the budget reservation | R4; both tools | `ReservationRequest`, `ReservationOutcome` |
+| 7 | shared: the budget reservation | R4; both tools | `ReservationRequest` |
 | 8 | shared: the context | R5; `eager-answer.ts`; both tools | `ContextSpec`, `CallContext` |
 | 9 | shared: the decode, the settlement, the scan's fields | R6-R9; both tools. Measured after it: `ask.tool.ts` 213 → 93 lines in a repeat, `code.tool.ts` 171 → 82 — what is left are four call sites the later commits reshape (below) | `SettledDecode` |
 | 10 | `ask`: thinking and request in `ask/thinking.ts`, `ask/request.ts` | step 9's thinking, step 12 | `AskThinking` |
@@ -618,9 +620,8 @@ named after the phases they run: `scanAsk` (steps 5-7) sits beside `resolveAsk` 
 `answerAsk` have modules of their own, so the entry imports no shared step but the workspace refusal and the call's
 machinery.
 
-One CHANGELOG entry, for the one fix the split's reading found below it: a Context Cache created without a name is
-no cache (`cache-manager.ts`; the files go inline, as after a failed build) — before, `ask` and `code` sent the question
-with neither the cache nor the files. Nothing else a user sees changes.
+This PR has no CHANGELOG entry: nothing a user sees changes. The reading found one defect below the split, a cache
+create that returns no name; it is [FOLLOW-UP-PRS.md T51](./FOLLOW-UP-PRS.md)'s.
 
 ## Decisions
 
@@ -652,4 +653,4 @@ The eight questions of the note are decided as it recommended; each keeps the fa
 - The `status` and `clear` tools: neither validates its workspace — `status` reads the manifest's rows for the path
   given, `clear` deletes them and the Gemini-side cache; neither reads the workspace's files, so a refusal there would
   be a new behaviour, not a shared copy. `reindex` reads
-  `workspaceRefusal` (its refusal was the same text); the rest of it is not in scope.
+  `workspaceRefusal` (its refusal was the same text), and its `execute` left `eslint-suppressions.json` with it.
