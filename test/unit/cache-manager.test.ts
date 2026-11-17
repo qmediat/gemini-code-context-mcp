@@ -1190,6 +1190,17 @@ describe('invalidateWorkspaceCache', () => {
     );
   });
 
+  it('purging releases every upload when there are more than the 10 concurrent deletes', async () => {
+    const fileIds = Array.from({ length: 12 }, (_, i) => `files/u${i}`);
+    seedUploads('cachedContents/purged', fileIds);
+    const client = mkPurgeClient();
+
+    await purge(client);
+
+    const released = client.files.delete.mock.calls.map((call) => call[0].name);
+    expect(released.sort()).toEqual([...fileIds].sort());
+  });
+
   it('a workspace without a cache has its files released and no cache deleted', async () => {
     seedUploads(null, ['files/only']);
     const client = mkPurgeClient();
