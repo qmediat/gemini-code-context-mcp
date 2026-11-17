@@ -405,7 +405,9 @@ times without a failure.
 
 ---
 
-## T51. A cache create that returns no name is a failed create
+## ~~T51.~~ ✅ SHIPPED 2026-11-17 — A cache create that returns no name is a failed create
+
+**Shipped as:** a create that answers with an empty name or none takes the failed-create path (the warning, the row without a cache id, the files inline). Two defects of the same create step were fixed with it: the stored expiry now reads the TTL the create request sends (whole seconds, at least 60 — a TTL of 30 was recorded as 30 s against Google's 60 s), and a cache whose manifest write fails after a successful create is deleted, best-effort, with a warning that names the manifest write (before, it stayed alive and unrecorded until its TTL). Each has a `### Fixed` line in the CHANGELOG and a test red on the code before it. `doPrepareContext` (260 lines, complexity 32) is an orchestrator over named steps in `src/cache/cache-manager.ts` — the call's start (`startCall`), one row writer (`writeWorkspaceRow`), the inline exit shared by the inline modes and the token floor (`prepareInline`, fed the debug line by `inlineModeLine` / `tokenFloorLine`), the reuse (`reusedCache`), the uploads and their threshold (`uploadForCache`, `assertUploadsComplete`), the create (`buildCache`, `createCache`), the record with the previous cache's delete (`recordCreatedCache`) and the failed-create path (`fallBackInline`, `reportCreateFailure`) — with typed values between them; `invalidateWorkspaceCache` is split the same way and has unit tests now. A differential probe of `prepareContext` (92 scenarios: every client call, manifest call, log and progress line, the return and the final rows) traces the split identically to the fixed code, and `main` identically except the seven scenarios the three fixes change. `src/cache/cache-manager.ts` left `eslint-suppressions.json` (80 suppressions in 28 files → 77 in 27) and `jscpd-baseline.json` (2,215 → 2,157 lines). The scope below is the entry as written.
 
 **Source:** the cross-model reading of T47's branch, 2026-11-17 (the request `code` builds). Opened 2026-11-17.
 
@@ -437,6 +439,46 @@ are also a repeat the duplicate baseline holds: adding the class to the two woul
 **Scope:** one factory in the test helpers (where the repository's test-helper exemplar keeps them), read by the
 eight suites through `vi.mock(path, factory)`; the repeated blocks leave `jscpd-baseline.json`. No production
 change.
+
+---
+
+## T53. A live cache orphaned when a call takes the inline path
+
+**Source:** the split of `doPrepareContext` (T51), 2026-11-17. Opened 2026-11-17.
+
+**Why:** three paths of `prepareContext` (`src/cache/cache-manager.ts`) write the workspace row with no cache id
+while the cache the previous row named stays alive on Google's side: the inline exit (`ask`'s `noCache`,
+`cachingMode: 'implicit'`, `code`'s `codeExecution`), the token-floor exit (a workspace now below `cacheMinTokens`),
+both through `prepareInline`, and the failed-create path (`fallBackInline`). Nothing deletes that cache and nothing
+can reuse it, since no row names it any more: it is billed until its TTL. The differential probe of `prepareContext`
+used for T51 shows it in the scenarios `inline-no-caching-existing-row`, `small-over-old-cache` and
+`create-throws-over-old-cache`.
+
+**Scope:** a cost decision for the maintainers, one of two remedies: keep the pointer on these paths (the next
+caching call whose fingerprint matches reuses the cache until its TTL), or delete the cache when the pointer is
+dropped (the existing `bestEffortDeleteCache`, as after a rebuild). A test per path, red on the code before; a
+CHANGELOG line.
+
+---
+
+## T54. Two concurrent builds for one workspace with different fingerprints
+
+**Source:** the split of `doPrepareContext` (T51), 2026-11-17. Opened 2026-11-17.
+
+**Why:** the in-flight map of `prepareContext` (`inFlightKey`, `src/cache/cache-manager.ts`) coalesces only calls
+with the same key. Two calls on one workspace whose keys differ — for example `ask` and `code`, whose system prompts
+differ — both upload, both create a cache, both delete the previous cache, and the row keeps the cache of the last
+writer: the other cache is untracked until its TTL. The differential probe used for T51 shows it in
+`concurrent-same-ws-different-prompt` (`cachedContents/old` deleted twice, the row ends on the second cache).
+`ttlSeconds` is not in the key, and need not be: it is a process-wide setting, `config.cacheTtlSeconds`
+(`src/config.ts:217`, read from `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS`), which the one caller passes unchanged
+(`src/tools/shared/eager-answer.ts:69`), so two calls in one process cannot ask for different TTLs. The same race
+between two server processes is `docs/KNOWN-DEFICITS.md`'s; `docs/ACCEPTED-RISKS.md` describes the in-process
+mutex as a `Map<workspaceRoot, Promise>`, while the map is keyed by the whole fingerprint.
+
+**Scope:** a per-workspace build lock, so a second build for the workspace waits for the first and then decides on
+the row it left — a new mechanism, its own PR, with a concurrency test red on the code before; `docs/ACCEPTED-RISKS.md`
+then says what the lock holds.
 
 ---
 
