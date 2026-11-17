@@ -103,6 +103,26 @@ export interface CreateTimeoutControllerOpts {
   stallEnvVar: string;
 }
 
+/** The tools whose two timeout knobs this module names: `timeoutMs` and `stallMs`. */
+export type TimedTool = 'ask' | 'code';
+
+/** The env vars of a tool's two knobs, under the names its controller's options take. */
+export type ToolTimeoutEnv = Pick<CreateTimeoutControllerOpts, 'totalEnvVar' | 'stallEnvVar'>;
+
+/** The one place the env vars of `ask`'s and `code`'s knobs are named: their controllers, their timeout messages and
+ * `ask`'s fallback read them here. */
+export const TOOL_TIMEOUT_ENV: Readonly<Record<TimedTool, Readonly<ToolTimeoutEnv>>> =
+  Object.freeze({
+    ask: Object.freeze({
+      totalEnvVar: 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+      stallEnvVar: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
+    }),
+    code: Object.freeze({
+      totalEnvVar: 'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
+      stallEnvVar: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
+    }),
+  });
+
 function readEnvMs(envVarName: string): number {
   const raw = process.env[envVarName];
   if (raw === undefined || raw.length === 0) return 0;
@@ -179,6 +199,21 @@ export function createTimeoutController(opts: CreateTimeoutControllerOpts): Time
   const stallMs = resolveStallTimeoutMs(opts.stallMs, opts.stallEnvVar);
   if (totalMs === null && stallMs === null) return disabledController();
   return composedController(totalMs, stallMs);
+}
+
+/** The per-call knobs of `ask` / `code`; an unset one falls back to the tool's env var. */
+export interface ToolTimeoutKnobs {
+  readonly timeoutMs?: number | undefined;
+  readonly stallMs?: number | undefined;
+}
+
+/** The controller of an `ask` / `code` call: its per-call knobs, else the tool's env vars (`TOOL_TIMEOUT_ENV`). */
+export function toolTimeoutController(tool: TimedTool, knobs: ToolTimeoutKnobs): TimeoutController {
+  return createTimeoutController({
+    ...(knobs.timeoutMs !== undefined ? { totalMs: knobs.timeoutMs } : {}),
+    ...(knobs.stallMs !== undefined ? { stallMs: knobs.stallMs } : {}),
+    ...TOOL_TIMEOUT_ENV[tool],
+  });
 }
 
 /**
@@ -296,22 +331,22 @@ export interface TimedOutCall {
 
 /** What a timeout of an `ask` / `code` call reports: the limit that fired and the message naming its knob. */
 export function timedOutCall(
-  tool: 'ask' | 'code',
+  tool: TimedTool,
   err: unknown,
   controller: TimeoutController,
 ): TimedOutCall {
-  const env = `GEMINI_CODE_CONTEXT_${tool.toUpperCase()}`;
+  const env = TOOL_TIMEOUT_ENV[tool];
   if (getTimeoutKind(err) === 'stall') {
     return {
       kind: 'stall',
       limitMs: controller.stallMs,
-      message: `${tool} timed out — no chunk received for ${controller.stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`${env}_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. ${ABORTED_REQUEST_NOTE}`,
+      message: `${tool} timed out — no chunk received for ${controller.stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`${env.stallEnvVar}\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. ${ABORTED_REQUEST_NOTE}`,
     };
   }
   return {
     kind: 'total',
     limitMs: controller.timeoutMs,
-    message: `${tool} timed out after ${controller.timeoutMs ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`${env}_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. ${ABORTED_REQUEST_NOTE}`,
+    message: `${tool} timed out after ${controller.timeoutMs ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`${env.totalEnvVar}\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. ${ABORTED_REQUEST_NOTE}`,
   };
 }
 

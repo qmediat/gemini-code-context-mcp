@@ -44,6 +44,9 @@ export interface ScriptedTurn {
   readonly failsMidStream?: unknown;
   /** The stream yields the response, then sends nothing until its abort signal fires (`generateContentStream` only). */
   readonly hangsMidStream?: boolean;
+  /** The stream sends an empty chunk at once and one more after each of these gaps but the last, the response after the
+   * last gap; each gap ends early, rejecting, when the abort signal fires (`generateContentStream` only). */
+  readonly chunkGapsMs?: readonly number[];
 }
 
 export type BudgetReserveAnswer = { id: number } | { rejected: true; spentMicros: number };
@@ -148,11 +151,32 @@ interface ModelParams {
   config?: Record<string, unknown> & { abortSignal?: AbortSignal };
 }
 
-/** A scripted turn as the model answers it: the response, and how its stream ends when it does not end cleanly. */
+/** A scripted turn as the model answers it: the response, the gaps its stream's chunks keep, and how its stream ends
+ * when it does not end cleanly. */
 interface Answer {
   readonly response: unknown;
   readonly failsMidStream?: unknown;
   readonly hangsMidStream?: boolean;
+  readonly chunkGapsMs?: readonly number[];
+}
+
+/** `ms`, or a rejection with the signal's reason as soon as it fires. */
+function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<unknown> {
+  return Promise.race([new Promise((r) => setTimeout(r, ms)), untilAborted(signal)]);
+}
+
+/** A stream's chunks: empty ones apart by `gapsMs`, the response after the last gap — or the response alone. */
+async function* chunksOf(
+  response: unknown,
+  gapsMs: readonly number[],
+  signal: AbortSignal | undefined,
+): AsyncGenerator<unknown> {
+  for (const [i, gapMs] of gapsMs.entries()) {
+    if (i === 0) yield {};
+    await abortableDelay(gapMs, signal);
+    if (i < gapsMs.length - 1) yield {};
+  }
+  yield response;
 }
 
 /** The scripted model: each call takes the next turn, in order, whichever method made it. */
@@ -166,28 +190,28 @@ function scriptedModel(script: readonly ScriptedTurn[], trace: TraceEvent[], cal
     if (turn === undefined) throw new Error('script exhausted');
     if (turn.hang) return untilAborted(abortSignal);
     if (turn.delayMs !== undefined) await new Promise((r) => setTimeout(r, turn.delayMs));
-    if (turn.abortableDelayMs !== undefined) {
-      const delay = new Promise((r) => setTimeout(r, turn.abortableDelayMs));
-      await Promise.race([delay, untilAborted(abortSignal)]);
-    }
+    if (turn.abortableDelayMs !== undefined)
+      await abortableDelay(turn.abortableDelayMs, abortSignal);
     if (turn.throws !== undefined) throw turn.throws;
     return {
       response: buildModelResponse(turn),
       failsMidStream: turn.failsMidStream,
       hangsMidStream: turn.hangsMidStream,
+      chunkGapsMs: turn.chunkGapsMs,
     };
   };
   return {
     generateContent: async (params: ModelParams) =>
       (await answer('generateContent', params)).response,
     generateContentStream: async (params: ModelParams) => {
-      const { response, failsMidStream, hangsMidStream } = await answer(
+      const { response, failsMidStream, hangsMidStream, chunkGapsMs } = await answer(
         'generateContentStream',
         params,
       );
+      const signal = params.config?.abortSignal;
       return (async function* stream() {
-        yield response;
-        if (hangsMidStream) await untilAborted(params.config?.abortSignal);
+        yield* chunksOf(response, chunkGapsMs ?? [], signal);
+        if (hangsMidStream) await untilAborted(signal);
         if (failsMidStream !== undefined) throw failsMidStream;
       })();
     },

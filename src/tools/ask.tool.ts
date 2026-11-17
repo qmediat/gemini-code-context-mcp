@@ -52,9 +52,9 @@ import {
 import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js';
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
-import { ASK_STALL_ENV, ASK_TIMEOUT_ENV, fallBackToAgentic } from './ask-agentic-fallback.js';
+import { fallBackToAgentic } from './ask-agentic-fallback.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, isTimeoutAbort, timedOutCall } from './shared/abort-timeout.js';
+import { isTimeoutAbort, timedOutCall, toolTimeoutController } from './shared/abort-timeout.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
@@ -385,12 +385,7 @@ async function executeAskBody(
   // SDK's `config.abortSignal` — whichever timer fires first aborts both
   // layers cleanly. `recordChunk()` is wired into `collectStream` to reset
   // the stall watchdog on every chunk arrival.
-  const timeoutController = createTimeoutController({
-    ...(input.timeoutMs !== undefined ? { totalMs: input.timeoutMs } : {}),
-    totalEnvVar: ASK_TIMEOUT_ENV,
-    ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
-    stallEnvVar: ASK_STALL_ENV,
-  });
+  const timeoutController = toolTimeoutController('ask', input);
   const abortSignal = timeoutController.signal;
   // Each request of the decode holds its own TPM reservation; a failure drops the one held.
   const dispatch = new DispatchThrottle({

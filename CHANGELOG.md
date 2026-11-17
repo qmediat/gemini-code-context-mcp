@@ -11,19 +11,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ask_agentic`: every phase of a pass now has a bound. A phase that could hang forever now ends with `TIMEOUT` after
   its default: 600 s for each request's opening (until its first chunk; a request sent again after a network failure
-  gets the whole 600 s), 600 s for a stream that sends nothing (a `stall`), 120 s without progress in an iteration's
-  path resolution and tool batch — the executors report progress at every directory, file and read, so a long healthy
-  `grep` batch over a large workspace runs on — and 600 s for each request of the forced-finalization pass
-  (`rescueErrorCode: 'TIMEOUT'`). A default applies only where no knob bounds the phase: `iterationTimeoutMs` (or
-  `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`) bounds every phase of an iteration, `stallMs` (or
-  `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`) the gaps of a stream only. The TPM wait keeps the throttle's own delay. Before,
-  with neither knob set — and with only `stallMs` for everything but a stream's gaps — such a phase never ended and
-  held the pass's daily-budget and TPM reservations.
+  gets the whole 600 s, and so does the backoff before it), 600 s for a stream that sends nothing (a `stall`), 120 s
+  without progress in an iteration's path resolution and tool batch — the executors report progress at every directory,
+  file and read, so a long healthy `grep` batch over a large workspace runs on — and 600 s for each request of the
+  forced-finalization pass (`rescueErrorCode: 'TIMEOUT'`). A default applies only where no knob bounds the phase:
+  `iterationTimeoutMs` (or `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`) bounds every phase of an iteration,
+  `stallMs` (or `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`) the gaps of a stream only. The TPM wait keeps the throttle's own
+  delay. Before, with neither knob set — and with only `stallMs` for everything but a stream's gaps — such a phase never
+  ended and held the pass's daily-budget and TPM reservations.
 - `ask_agentic`: `iterationTimeoutMs` ends a tool batch at the bound, not when the batch returns; no queued tool call
   starts once a bound fired, the executors get the abort signal, and a late result is dropped. A `TIMEOUT` is
   `retryable: false` when tool calls still run 1 s after the bound (`toolCallsRunning` says how many).
 - `ask`'s fallback to `ask_agentic` (`onWorkspaceTooLarge: 'fallback-to-agentic'`) forwards `stallMs` as the loop's
   `stallMs`, no longer as a per-iteration wall clock: a healthy stream or a tool batch longer than `stallMs` answers.
+  With only `stallMs` set a pass has no wall clock — a stream that keeps sending ends at the model's output cap, a tool
+  batch that keeps reporting progress when its walk ends; a caller who wants a wall clock per iteration sets
+  `iterationTimeoutMs` (`timeoutMs` on `ask`).
   `timeoutMs` still becomes `iterationTimeoutMs`. `iterTimeoutSource` is now always `'timeoutMs'` (the values
   `'stallMs'` and `'min(timeoutMs,stallMs)'` are gone), and the result reports the forwarded `stallMs`.
 - `ask_agentic`'s timeout messages no longer say "default disabled"; a bound that fired at its default names the

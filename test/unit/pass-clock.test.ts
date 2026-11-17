@@ -212,6 +212,27 @@ describe('pass clock — what fires', () => {
     });
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it('moves no phase after a fire or after dispose: it stays the one the clock stopped in', () => {
+    const fired = createPassClock(NO_KNOB, DEFAULTS);
+    fired.enter('opening');
+    vi.advanceTimersByTime(1_000);
+    fired.recordChunk();
+    fired.enter('tools');
+    const disposed = createPassClock(NO_KNOB, DEFAULTS);
+    disposed.enter('opening');
+    disposed.dispose();
+    disposed.recordChunk();
+    disposed.enter('finalization');
+
+    expect(fired.phase).toBe('opening');
+    expect(disposed.phase).toBe('opening');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('gives the settle grace of its defaults', () => {
+    expect(createPassClock(NO_KNOB, DEFAULTS).settleGraceMs).toBe(10);
+  });
 });
 
 describe('pass clock — executor progress', () => {

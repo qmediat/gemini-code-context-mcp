@@ -7,17 +7,17 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ToolWatch } from '../../src/tools/agentic/workspace-tools.js';
-import {
-  ASK_KNOB_NAMES,
-  ASK_STALL_ENV,
-  ASK_TIMEOUT_ENV,
-  fallBackToAgentic,
-} from '../../src/tools/ask-agentic-fallback.js';
+import { ASK_KNOB_NAMES, fallBackToAgentic } from '../../src/tools/ask-agentic-fallback.js';
 import { type AskAgenticInput, runAskAgentic } from '../../src/tools/ask-agentic.tool.js';
 import type { AskInput } from '../../src/tools/ask.tool.js';
 import type { TextToolResult, ToolContext } from '../../src/tools/registry.js';
-import { createTimeoutController } from '../../src/tools/shared/abort-timeout.js';
-import { type AgenticRunOptions, callsTo, runAgentic } from '../helpers/agentic-run.js';
+import { toolTimeoutController } from '../../src/tools/shared/abort-timeout.js';
+import {
+  type AgenticRunOptions,
+  type ScriptedTurn,
+  callsTo,
+  runAgentic,
+} from '../helpers/agentic-run.js';
 
 const bounds = vi.hoisted(() => ({
   openingMs: 60,
@@ -30,14 +30,23 @@ const bounds = vi.hoisted(() => ({
 /** How each executor behaves: `run` for real, `hang` (never settles, ignores the signal), `honour` (settles when the
  * signal fires), `slow` (runs for real after `slowMs`, ignoring the signal and reporting nothing), `progressing` (runs
  * for real after `slowMs` of progress reported every few ms), `stalls` (reports progress for `slowMs`, then nothing,
- * settling when the signal fires); the names of the calls started, in order. */
+ * settling when the signal fires), `hangOneHonourRest` (the call with `hangArg` hangs, every other call settles when the
+ * signal fires); the names of the calls started, in order. */
 const tools = vi.hoisted(() => ({
-  mode: 'run' as 'run' | 'hang' | 'honour' | 'slow' | 'progressing' | 'stalls',
+  mode: 'run' as
+    | 'run'
+    | 'hang'
+    | 'honour'
+    | 'slow'
+    | 'progressing'
+    | 'stalls'
+    | 'hangOneHonourRest',
   slowMs: 0,
   started: [] as string[],
   /** A path whose sandbox resolution never returns. */
   hangPath: null as string | null,
-  /** With `hang`: the one argument whose call hangs; `null` hangs every call. */
+  /** With `hang`: the one argument whose call hangs, `null` hangs every call; with `hangOneHonourRest`: the call that
+   * hangs. */
   hangArg: null as string | null,
 }));
 
@@ -87,6 +96,8 @@ vi.mock('../../src/tools/agentic/workspace-tools.js', async () => {
       await progressFor(tools.slowMs, watch);
       await untilAborted(watch);
     },
+    hangOneHonourRest: (watch, args) =>
+      args.includes(tools.hangArg) ? never() : untilAborted(watch),
   };
   const isWatch = (arg: unknown): arg is ToolWatch =>
     typeof arg === 'object' && arg !== null && 'onProgress' in arg;
@@ -127,6 +138,18 @@ const HARD_TIMEOUT_MS = 8_000;
 /** A transient network failure: `withNetworkRetry` sends the request again after its backoff (1 s first). */
 const FETCH_FAILED = { throws: new TypeError('fetch failed') };
 
+/** A request retried under a 1 500 ms default: the backoff and the request sent after it each leave 500 ms of it. */
+const RETRIES: ReadonlyArray<readonly [string, readonly ScriptedTurn[]]> = [
+  [
+    'the first request fails at once, the second answers 1 s after the 1 s backoff',
+    [FETCH_FAILED, { abortableDelayMs: 1_000, text: 'done' }],
+  ],
+  [
+    'the first request fails 1 s in, 500 ms before its default, and the second answers at once',
+    [{ abortableDelayMs: 1_000, ...FETCH_FAILED }, { text: 'done' }],
+  ],
+];
+
 /**
  * The call made as `ask`'s fallback, through the real hand-off: `ask`'s controller built from its knobs and its env
  * vars, as `ask` builds it, and the agentic call's input mapped from them.
@@ -140,12 +163,7 @@ function viaAsk(knobs: { timeoutMs?: number; stallMs?: number } = {}) {
       serviceTier: undefined,
       preflight: { effectiveTokens: 2, method: 'heuristic', rawTokens: 1, cacheHit: false },
       threshold: 1,
-      timeout: createTimeoutController({
-        totalMs: knobs.timeoutMs,
-        totalEnvVar: ASK_TIMEOUT_ENV,
-        stallMs: knobs.stallMs,
-        stallEnvVar: ASK_STALL_ENV,
-      }),
+      timeout: toolTimeoutController('ask', knobs),
     });
 }
 
@@ -327,6 +345,37 @@ describe('ask_agentic bounds — the tools phase', () => {
   );
 
   it(
+    'a call refused at the maxFilesRead cap is not counted never started while a path resolution hangs',
+    async () => {
+      tools.hangPath = 'b.ts';
+      const { result, trace } = await timedOutRun({
+        input: { maxFilesRead: 1 },
+        script: [
+          { calls: [{ name: 'read_file', args: { path: 'a.ts' } }] },
+          {
+            calls: [
+              { name: 'read_file', args: { path: 'sub/c.ts' } },
+              { name: 'read_file', args: { path: 'b.ts' } },
+              GREP.calls[0],
+            ],
+          },
+        ],
+      });
+
+      // sub/c.ts was answered at the cap, b.ts is in path resolution, the grep never started
+      expect(result.structuredContent).toMatchObject({
+        timeoutPhase: 'tools',
+        toolCallsRunning: 1,
+      });
+      expect(callsTo(trace, 'log', 'warn').map(([line]) => line)).toContain(
+        "ask_agentic: 1 tool call(s) still running 30 ms after the iteration's bound (1 never started); their results will be dropped",
+      );
+      expect(tools.started).toEqual(['read_file']);
+    },
+    HARD_TIMEOUT_MS,
+  );
+
+  it(
     'no queued tool call starts once the bound fired (one call at a time, three calls)',
     async () => {
       tools.mode = 'honour';
@@ -390,6 +439,24 @@ describe('ask_agentic bounds — the work still running', () => {
     },
     HARD_TIMEOUT_MS,
   );
+
+  it(
+    'counts only the executors still running: one rejected with the timeout at the bound, one ignoring the signal',
+    async () => {
+      Object.assign(tools, { mode: 'hangOneHonourRest', hangArg: 'b' });
+      const { result } = await timedOutRun({
+        script: [{ calls: ['a', 'b'].map((pattern) => ({ name: 'grep', args: { pattern } })) }],
+      });
+
+      expect(tools.started).toEqual(['grep', 'grep']);
+      expect(result.structuredContent).toMatchObject({
+        timeoutPhase: 'tools',
+        retryable: false,
+        toolCallsRunning: 1,
+      });
+    },
+    HARD_TIMEOUT_MS,
+  );
 });
 
 describe('ask_agentic bounds — the request and its stream', () => {
@@ -419,15 +486,11 @@ describe('ask_agentic bounds — the request and its stream', () => {
     HARD_TIMEOUT_MS,
   );
 
-  it(
-    "each request of an iteration gets the whole opening default: a retried request's clock starts at its sending",
-    async () => {
-      bounds.openingMs = 1_200;
-      // the first request fails at once, the second is sent after the 1 s backoff and answers 500 ms later
-      const { result } = await runAgentic({
-        ...ENFORCED,
-        script: [FETCH_FAILED, { abortableDelayMs: 500, text: 'done' }],
-      });
+  it.each(RETRIES)(
+    'each request of an iteration, its backoff included, gets the whole opening default: %s',
+    async (_label, script) => {
+      bounds.openingMs = 1_500;
+      const { result } = await runAgentic({ ...ENFORCED, script });
 
       expect(result.isError).toBeFalsy();
       expect(result.content?.[0]).toEqual({ type: 'text', text: 'done' });
@@ -513,18 +576,18 @@ describe('ask_agentic bounds — the forced-finalization pass', () => {
 });
 
 describe('ask_agentic bounds — the forced pass, per request and at its knob', () => {
-  it(
-    'each request of the forced pass gets the whole finalization default',
-    async () => {
-      bounds.finalizationMs = 1_200;
+  it.each(RETRIES)(
+    'each request of the forced pass, its backoff included, gets the whole finalization default: %s',
+    async (_label, script) => {
+      bounds.finalizationMs = 1_500;
       const { result } = await runAgentic({
         ...ENFORCED,
         input: { maxIterations: 1 },
-        script: [GREP, FETCH_FAILED, { abortableDelayMs: 500, text: 'forced' }],
+        script: [GREP, ...script],
       });
 
       expect(result.isError).toBeFalsy();
-      expect(result.content?.[0]).toEqual({ type: 'text', text: 'forced' });
+      expect(result.content?.[0]).toEqual({ type: 'text', text: 'done' });
     },
     HARD_TIMEOUT_MS,
   );
@@ -581,9 +644,9 @@ describe("ask_agentic bounds — ask's fallback, through the real hand-off", () 
       [GREP, { text: 'done' }],
     ],
     [
-      'a request',
+      'a stream whose chunks keep arriving',
       () => Object.assign(bounds, { openingMs: 5_000 }),
-      [{ delayMs: 1_300, text: 'done' }],
+      [{ chunkGapsMs: [300, 300, 300, 300, 300], text: 'done' }],
     ],
   ])(
     "%s longer than ask's stallMs answers: stallMs is no wall clock",
@@ -598,6 +661,27 @@ describe("ask_agentic bounds — ask's fallback, through the real hand-off", () 
 
       expect(result.isError).toBeFalsy();
       expect(messageOf(result)).toBe('done');
+    },
+    HARD_TIMEOUT_MS,
+  );
+
+  it(
+    "a stream silent for ask's stallMs ends as a stall at stallMs",
+    async () => {
+      bounds.openingMs = 5_000;
+      const { result } = await runAgentic({
+        ...ENFORCED,
+        script: [{ chunkGapsMs: [300, 3_000], text: 'done' }],
+        run: viaAsk({ stallMs: 1_000 }),
+      });
+
+      expect(result.structuredContent).toMatchObject({
+        errorCode: 'TIMEOUT',
+        timeoutKind: 'stall',
+        timeoutPhase: 'stream',
+        timeoutSource: 'stallMs',
+        stallMs: 1_000,
+      });
     },
     HARD_TIMEOUT_MS,
   );

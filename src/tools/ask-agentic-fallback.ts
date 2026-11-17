@@ -16,18 +16,14 @@ import type { KnobNames } from './agentic/run.js';
 import { type AskAgenticInput, runAskAgentic } from './ask-agentic.tool.js';
 import type { AskInput } from './ask.tool.js';
 import type { TextToolResult, ToolContext } from './registry.js';
-import type { TimeoutController } from './shared/abort-timeout.js';
-
-/** The env vars of `ask`'s two knobs. */
-export const ASK_TIMEOUT_ENV = 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS';
-export const ASK_STALL_ENV = 'GEMINI_CODE_CONTEXT_ASK_STALL_MS';
+import { TOOL_TIMEOUT_ENV, type TimeoutController } from './shared/abort-timeout.js';
 
 /** The knobs a fallback's timeout message names: `ask`'s, which became the agentic call's. */
 export const ASK_KNOB_NAMES: KnobNames = Object.freeze({
   totalMs: 'timeoutMs',
-  totalEnv: ASK_TIMEOUT_ENV,
+  totalEnv: TOOL_TIMEOUT_ENV.ask.totalEnvVar,
   stallMs: 'stallMs',
-  stallEnv: ASK_STALL_ENV,
+  stallEnv: TOOL_TIMEOUT_ENV.ask.stallEnvVar,
 });
 
 /** What `ask` hands over when it falls back. */

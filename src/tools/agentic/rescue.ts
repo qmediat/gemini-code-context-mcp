@@ -14,8 +14,9 @@
  * callers can detect the trade.
  *
  * The rescue calls `generateContent`, not the stream: its pass clock has the phases `tpm-wait` and `finalization` —
- * entered by each request, so a retried request gets the whole default — and no stream gap to watch. Its call is marked completed the moment `generateContent` returned (`completeCall`, the idiom of
- * the loop iteration), before the response is read.
+ * entered by each request and by a retry's announcement, so each request, its backoff included, gets the whole default
+ * — and no stream gap to watch. Its call is marked completed the moment `generateContent` returned (`completeCall`, the
+ * idiom of the loop iteration), before the response is read.
  */
 
 import type { GenerateContentConfig, GenerateContentResponse } from '@google/genai';
@@ -171,6 +172,7 @@ function callFinalization(
     {
       signal,
       onRetry: (attempt, retryErr) => {
+        clock.enter('finalization');
         logger.warn(`ask_agentic finalization: retry attempt ${attempt}: ${errorText(retryErr)}`);
       },
     },

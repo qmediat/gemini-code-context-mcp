@@ -21,7 +21,6 @@ import {
 } from './dispatch.js';
 import { type PassCall, completeCall } from './ledger.js';
 import type { PassClock } from './pass-clock.js';
-import { PHASE_DEFAULTS } from './phase-defaults.js';
 import { type UsageCounts, thinkingSummaryOf } from './response.js';
 import { resolveInsideWorkspace } from './sandbox.js';
 import { type ToolWatch, checkpoint } from './workspace-tools.js';
@@ -62,8 +61,9 @@ export interface IterationArgs {
   filesReadSet: Set<string>;
   maxFilesRead: number;
   /** The pass's clock: its signal threads into `withNetworkRetry`, the SDK config and the tools phase; each request
-   * enters `opening`; every chunk reaches `recordChunk`; the tools phase is entered the moment the call completed and
-   * its executors' progress reaches `recordProgress`. */
+   * enters `opening`, and so does a retry's announcement, so the backoff before a request runs under a fresh default;
+   * every chunk reaches `recordChunk`; the tools phase is entered the moment the call completed and its executors'
+   * progress reaches `recordProgress`. */
   clock: PassClock;
   /** The pass's model call: marked completed once the stream ended, then given the usage read (`completeCall`). */
   call: PassCall;
@@ -136,6 +136,7 @@ async function streamIteration(args: IterationArgs): Promise<CollectedResponse> 
     {
       signal: abortSignal,
       onRetry: (attempt, err) => {
+        clock.enter('opening');
         logger.warn(
           `ask_agentic: retrying generateContent after transient network failure (attempt ${attempt}): ${
             err instanceof Error ? err.message : String(err)
@@ -217,11 +218,35 @@ async function capRefusal(
   };
 }
 
-/** The calls of a model turn, each refused at the `maxFilesRead` cap or planned for dispatch; a checkpoint follows each
- * path resolution. */
+/** The tools phase's work as it runs: path resolution in flight, then the batch. Each call is counted once: refused at
+ * the `maxFilesRead` cap, running, or never started. */
+class ToolsWork {
+  resolving = false;
+  /** The calls refused at the `maxFilesRead` cap so far: answered, never an executor's. */
+  refused = 0;
+  batch: ToolBatch | null = null;
+
+  constructor(private readonly calls: number) {}
+
+  /** What still runs: a path resolution in flight counts as one call. */
+  running(): number {
+    return (this.resolving ? 1 : 0) + (this.batch?.running() ?? 0);
+  }
+
+  /** The calls no executor took, as the batch counts them: before it exists, every call neither refused nor in path
+   * resolution. */
+  neverStarted(): number {
+    if (this.batch !== null) return this.batch.neverStarted();
+    return this.calls - this.refused - (this.resolving ? 1 : 0);
+  }
+}
+
+/** The calls of a model turn, each refused at the `maxFilesRead` cap (counted on `work`) or planned for dispatch; a
+ * checkpoint follows each path resolution. */
 async function planDispatch(
   functionCallParts: FunctionCallPart[],
   args: IterationArgs,
+  work: ToolsWork,
   watch: ToolWatch,
 ): Promise<DispatchPlan> {
   const plan: DispatchPlan = {
@@ -243,6 +268,7 @@ async function planDispatch(
     checkpoint(watch);
     if (refusal !== null) {
       plan.responseParts[i] = refusal;
+      work.refused += 1;
       continue;
     }
     plan.dispatchIndexMap.push(i);
@@ -327,26 +353,6 @@ type ToolsOutcome =
     }
   | { readonly kind: 'timed-out'; readonly running: number };
 
-/** The tools phase's work as it runs: path resolution in flight, then the batch. Each call is counted once: running, or
- * never started. */
-class ToolsWork {
-  resolving = false;
-  batch: ToolBatch | null = null;
-
-  constructor(private readonly calls: number) {}
-
-  /** What still runs: a path resolution in flight counts as one call. */
-  running(): number {
-    return (this.resolving ? 1 : 0) + (this.batch?.running() ?? 0);
-  }
-
-  /** The calls no executor took: before the batch, every call but the one whose path resolution is in flight. */
-  neverStarted(): number {
-    if (this.batch !== null) return this.batch.neverStarted();
-    return this.calls - (this.resolving ? 1 : 0);
-  }
-}
-
 /** Resolve the plan, then run its batch: once the clock fired its workers take no call (`startToolBatch`). */
 async function planAndRun(
   functionCallParts: FunctionCallPart[],
@@ -355,8 +361,12 @@ async function planAndRun(
 ): Promise<{ plan: DispatchPlan; dispatched: DispatchedToolResult[] }> {
   const watch = { signal: args.clock.signal, onProgress: () => args.clock.recordProgress() };
   work.resolving = true;
-  const plan = await planDispatch(functionCallParts, args, watch);
-  work.resolving = false;
+  let plan: DispatchPlan;
+  try {
+    plan = await planDispatch(functionCallParts, args, work, watch);
+  } finally {
+    work.resolving = false;
+  }
   work.batch = startToolBatch(
     args.workspaceRoot,
     plan.toDispatch,
@@ -384,12 +394,15 @@ async function settlesWithin(settled: Promise<unknown>, graceMs: number): Promis
 }
 
 /**
- * The tools phase after its bound fired: the executors still running are given `toolSettleGraceMs` to settle; what
- * still runs then is counted and said, and whatever it returns later is dropped — it never reaches the conversation,
- * the files-read set or the ledger.
+ * The tools phase after its bound fired: the executors still running are given `graceMs` (the clock's `settleGraceMs`)
+ * to settle; what still runs then is counted and said, and whatever it returns later is dropped — it never reaches the
+ * conversation, the files-read set or the ledger.
  */
-async function toolsTimedOut(work: ToolsWork, settled: Promise<unknown>): Promise<ToolsOutcome> {
-  const graceMs = PHASE_DEFAULTS.toolSettleGraceMs;
+async function toolsTimedOut(
+  work: ToolsWork,
+  settled: Promise<unknown>,
+  graceMs: number,
+): Promise<ToolsOutcome> {
   const inTime = await settlesWithin(settled, graceMs);
   const running = inTime ? 0 : work.running();
   if (running > 0) {
@@ -418,7 +431,7 @@ async function runToolsPhase(
     return { kind: 'done', plan, dispatched };
   } catch (err) {
     if (!args.clock.signal.aborted) throw err;
-    return toolsTimedOut(work, settled);
+    return toolsTimedOut(work, settled, args.clock.settleGraceMs);
   }
 }
 

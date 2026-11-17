@@ -7,7 +7,7 @@ import { type TextToolResult, errorResult, textResult } from '../registry.js';
 import { ABORTED_REQUEST_NOTE } from '../shared/abort-timeout.js';
 import type { BilledFields } from '../shared/call-ledger.js';
 import type { NoProgress } from './no-progress.js';
-import type { ExternalTimeout, PassPhase, PassTimeout } from './pass-clock.js';
+import type { DefaultedPhase, ExternalTimeout, KnobSource, PassTimeout } from './pass-clock.js';
 import type { RescueOutcome } from './rescue.js';
 import type { AgenticRun, KnobNames, LoopState } from './run.js';
 
@@ -123,9 +123,8 @@ export interface IterationTimeout {
 
 type Hint = (names: KnobNames, limitMs: number) => string;
 
-/** The default a bound reports when no knob bounded its phase, by phase (`phase-defaults.ts`). */
-const DEFAULT_HINTS: Readonly<Record<PassPhase, Hint>> = {
-  'tpm-wait': (n) => `Set \`${n.totalMs}\` per call or \`${n.totalEnv}\` to bound each iteration.`,
+/** The default a bound reports when no knob bounded its phase, by phase (`phase-defaults.ts`); the TPM wait has none. */
+const DEFAULT_HINTS: Readonly<Record<DefaultedPhase, Hint>> = {
   opening: (n, ms) =>
     `No chunk arrived within the ${ms} ms default for a request's opening. Set \`${n.totalMs}\` per call or \`${n.totalEnv}\` to bound each iteration yourself.`,
   stream: (n, ms) =>
@@ -137,7 +136,7 @@ const DEFAULT_HINTS: Readonly<Record<PassPhase, Hint>> = {
 };
 
 /** The knob that raises a bound a caller set. */
-const KNOB_HINTS: Readonly<Record<'iterationTimeoutMs' | 'stallMs', Hint>> = {
+const KNOB_HINTS: Readonly<Record<KnobSource, Hint>> = {
   iterationTimeoutMs: (n) => `Increase \`${n.totalMs}\` per call or set \`${n.totalEnv}\` higher.`,
   stallMs: (n) =>
     `Increase \`${n.stallMs}\` per call or set \`${n.stallEnv}\` higher. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.`,
