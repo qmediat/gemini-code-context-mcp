@@ -23,11 +23,6 @@
       "count": 4
     }
   },
-  "src/cache/cache-manager.ts": {
-    "max-lines-per-function": {
-      "count": 1
-    }
-  },
   "src/cache/files-uploader.ts": {
     "complexity": {
       "count": 2

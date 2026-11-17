@@ -704,52 +704,57 @@ export async function invalidateWorkspaceCache(args: {
       logger.debug(`cache delete (${safeForLog(ws.cacheId)}) failed: ${safeForLog(err)}`);
     }
   }
+  const fileIds = storedFileIds(args.manifest, args.workspaceRoot);
+  if (fileIds.length > 0) await releaseUploadedFiles(args.client, fileIds);
+  args.manifest.deleteWorkspace(args.workspaceRoot);
+}
 
-  // De-duplicate fileIds: the manifest's `files` table can have multiple
-  // (workspaceRoot, relpath) rows pointing at the SAME `fileId` when the
-  // uploader reused an existing upload via content-hash dedup (a tool whose
-  // workspace contains the same file at two paths, or a rebuild that found
-  // an existing in-batch dedup hit). Without `Set`, we'd `files.delete(X)`
-  // multiple times — wasteful API calls + 404 noise after the first delete.
-  const fileIds = Array.from(
+/**
+ * The workspace's Files API ids, each once: several file rows can point at one upload (the uploader's content-hash
+ * dedup, the same file at two paths), and a second `files.delete` of it is a wasted call and a 404.
+ */
+function storedFileIds(manifest: ManifestDb, workspaceRoot: string): string[] {
+  return Array.from(
     new Set(
-      args.manifest
-        .getFiles(args.workspaceRoot)
+      manifest
+        .getFiles(workspaceRoot)
         .map((r) => r.fileId)
         .filter((v): v is string => typeof v === 'string' && v.length > 0),
     ),
   );
-  if (fileIds.length > 0) {
-    const concurrency = Math.min(10, fileIds.length);
-    let idx = 0;
-    await Promise.all(
-      Array.from({ length: concurrency }, async () => {
-        while (idx < fileIds.length) {
-          const i = idx;
-          idx += 1;
-          const id = fileIds[i];
-          if (!id) continue;
-          // `files-uploader.ts:172` deliberately stores `uploaded.uri` (the
-          // `https://…/files/abc` form) rather than `uploaded.name` because
-          // Gemini's `fileData.fileUri` reference rejects the bare `files/abc`
-          // resource-name form at `caches.create` time. But `files.delete`
-          // wants the RESOURCE NAME, not the URI (different endpoint,
-          // different parameter expectation). Normalise here so deletes
-          // actually hit — otherwise B3's cost-leak fix silently no-ops.
-          const deleteName = toFileResourceName(id);
-          try {
-            await args.client.files.delete({ name: deleteName });
-          } catch (err) {
-            logger.debug(
-              `files.delete (${safeForLog(deleteName)}, stored as ${safeForLog(id)}) failed: ${safeForLog(err)}`,
-            );
-          }
-        }
-      }),
+}
+
+/** Releases the uploads through a pool of at most 10 concurrent deletes. */
+async function releaseUploadedFiles(client: GoogleGenAI, fileIds: string[]): Promise<void> {
+  const concurrency = Math.min(10, fileIds.length);
+  let idx = 0;
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (idx < fileIds.length) {
+        const i = idx;
+        idx += 1;
+        const id = fileIds[i];
+        if (!id) continue;
+        await releaseFile(client, id);
+      }
+    }),
+  );
+}
+
+/**
+ * Deletes one upload by its resource name. The manifest stores the `https://…/files/abc` URI (`fileData.fileUri`
+ * rejects the bare `files/abc` form at `caches.create`), while `files.delete` takes the resource name. A failure is
+ * logged and the purge goes on: Gemini deletes every upload 48 h after it was made.
+ */
+async function releaseFile(client: GoogleGenAI, id: string): Promise<void> {
+  const deleteName = toFileResourceName(id);
+  try {
+    await client.files.delete({ name: deleteName });
+  } catch (err) {
+    logger.debug(
+      `files.delete (${safeForLog(deleteName)}, stored as ${safeForLog(id)}) failed: ${safeForLog(err)}`,
     );
   }
-
-  args.manifest.deleteWorkspace(args.workspaceRoot);
 }
 
 /**
