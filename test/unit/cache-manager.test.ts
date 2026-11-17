@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import type { CachedContent, GoogleGenAI } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  type PreparedContext,
   invalidateWorkspaceCache,
   isStaleCacheError,
   markCacheStale,
@@ -130,6 +131,49 @@ describe('prepareContext', () => {
       truncated: false,
       memoHitCount: 0,
     };
+  }
+
+  /**
+   * The workspace row a previous call left: `cacheId`, living 30 minutes from `at`, under this call's fingerprint
+   * (`fh-1`, so the call may reuse it) unless `filesHash` names another (so the call rebuilds).
+   */
+  function seedRow(cacheId: string | null, filesHash = 'fh-1', at = Date.now()): void {
+    db.upsertWorkspace({
+      workspaceRoot,
+      filesHash,
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph-1',
+      cacheId,
+      cacheExpiresAt: at + 30 * 60 * 1000,
+      fileIds: [],
+      createdAt: at,
+      updatedAt: at,
+    });
+  }
+
+  /** An explicit-cache call on a workspace of one 8 000-byte file (above the token floor), TTL 3600 s. */
+  function prepare(client: GoogleGenAI): Promise<PreparedContext> {
+    return prepareContext({
+      client,
+      manifest: db,
+      scan: mkScan([{ relpath: 'kept.ts', size: 8_000 }]),
+      model: mkModel(),
+      systemPromptHash: 'sph-1',
+      ttlSeconds: 3600,
+      emitter: mkEmitter(),
+      allowCaching: true,
+    });
+  }
+
+  /** Runs `act` with `logger.warn` captured: its result and the warnings it logged. */
+  async function withWarnings<T>(act: () => Promise<T>): Promise<{ value: T; warnings: string[] }> {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const value = await act();
+      return { value, warnings: warn.mock.calls.map((call) => String(call[0])) };
+    } finally {
+      warn.mockRestore();
+    }
   }
 
   it('cache HIT: matching fingerprint + fresh expiry → no upload, no create', async () => {
@@ -857,42 +901,38 @@ describe('prepareContext', () => {
     },
   );
 
+  it('a stored empty cache id is no cache: a rebuild over it deletes nothing', async () => {
+    seedRow('', 'fh-OLD');
+    const client = mkClient({});
+
+    const result = await prepare(client);
+
+    expect(result.rebuilt).toBe(true);
+    expect(client.caches.delete).not.toHaveBeenCalled();
+  });
+
+  it('a create that names no cache warns that the files go inline and that an unnamed cache may be billed', async () => {
+    const client = mkClient({ cachesCreate: async () => ({ name: '' }) });
+
+    const { warnings } = await withWarnings(() => prepare(client));
+
+    expect(warnings).toEqual([
+      "cache build failed — falling back to inline parts: caches.create returned no cache name; a cache may exist on Google's side under no name this server can delete, billed until its TTL (3600 s)",
+    ]);
+  });
+
   /** A rebuild whose create succeeds and whose manifest write of the new cache fails; the warnings recorded. */
   async function prepareWithFailingCacheWrite() {
     const createdAtMs = Date.now();
-    db.upsertWorkspace({
-      workspaceRoot,
-      filesHash: 'fh-OLD',
-      model: 'gemini-3-pro-preview',
-      systemPromptHash: 'sph-1',
-      cacheId: 'cachedContents/previous',
-      cacheExpiresAt: createdAtMs + 30 * 60 * 1000,
-      fileIds: [],
-      createdAt: createdAtMs,
-      updatedAt: createdAtMs,
-    });
+    seedRow('cachedContents/previous', 'fh-OLD', createdAtMs);
     const write = db.upsertWorkspace.bind(db);
     vi.spyOn(db, 'upsertWorkspace').mockImplementation((row) => {
       if (row.cacheId !== null) throw new Error('SQLITE_FULL: database or disk is full');
       write(row);
     });
-    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const client = mkClient({ cachesCreate: async () => mkCreated(createdAtMs, 3600) });
-    try {
-      const result = await prepareContext({
-        client,
-        manifest: db,
-        scan: mkScan([{ relpath: 'kept.ts', size: 8_000 }]),
-        model: mkModel(),
-        systemPromptHash: 'sph-1',
-        ttlSeconds: 3600,
-        emitter: mkEmitter(),
-        allowCaching: true,
-      });
-      return { client, result, warnings: warn.mock.calls.map((call) => String(call[0])) };
-    } finally {
-      warn.mockRestore();
-    }
+    const { value: result, warnings } = await withWarnings(() => prepare(client));
+    return { client, result, warnings };
   }
 
   it('a manifest write that fails after the create deletes the new cache; the files go inline', async () => {

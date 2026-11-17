@@ -46,14 +46,16 @@ export interface RanCaching {
 }
 
 const CREATE_FAILED_NOTE =
-  "cachingMode 'explicit': the Context Cache could not be created (caches.create failed) — the files went without a cache; Gemini's implicit cache applies.";
+  "cachingMode 'explicit': the Context Cache could not be built or recorded — the files went without a cache; Gemini's implicit cache applies.";
 
 /**
  * The caching mode a prepared context actually ran with: a cache id means the
  * Context Cache served the call (`explicit`); inline-only means the files went
  * inline by choice (`implicit`) or by force (`inline`: no caching allowed, a
- * workspace under the cache floor); neither means `caches.create` failed and the
- * files went without a cache, which Gemini's implicit cache serves (`implicit`).
+ * workspace under the cache floor); neither means the Context Cache could not be
+ * built (`caches.create` failed or named no cache) or recorded in the manifest,
+ * and the files went without a cache, which Gemini's implicit cache serves
+ * (`implicit`).
  */
 export function cachingRan(
   prep: { readonly cacheId: string | null; readonly inlineOnly: boolean },

@@ -97,7 +97,8 @@ function rowToWorkspace(row: Record<string, unknown>): WorkspaceRow {
     filesHash: String(row.files_hash),
     model: String(row.model),
     systemPromptHash: String(row.system_prompt_hash ?? ''),
-    cacheId: (row.cache_id as string | null) ?? null,
+    // No cache id is null: a stored empty id reads as none, so no reader of the row tests for ''.
+    cacheId: typeof row.cache_id === 'string' && row.cache_id !== '' ? row.cache_id : null,
     cacheExpiresAt: (row.cache_expires_at as number | null) ?? null,
     fileIds,
     createdAt: Number(row.created_at),

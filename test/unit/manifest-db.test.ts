@@ -40,6 +40,23 @@ describe('ManifestDb', () => {
     });
   });
 
+  it('a workspace row stored with an empty cache id reads as no cache id', () => {
+    const at = Date.parse('2026-11-18T12:00:00.000Z');
+    db.upsertWorkspace({
+      workspaceRoot: '/tmp/empty-id',
+      filesHash: 'fh-empty',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph',
+      cacheId: '',
+      cacheExpiresAt: at + 60_000,
+      fileIds: [],
+      createdAt: at,
+      updatedAt: at,
+    });
+
+    expect(db.getWorkspace('/tmp/empty-id')?.cacheId).toBeNull();
+  });
+
   it('deduplicates file IDs by content hash', () => {
     const now = Date.now();
     db.upsertWorkspace({
