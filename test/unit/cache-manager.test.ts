@@ -924,25 +924,36 @@ describe('prepareContext', () => {
     ]);
   });
 
-  /** A rebuild whose create succeeds and whose manifest write of the new cache fails; the warnings recorded. */
   /**
-   * A rebuild over the row of `cachedContents/previous` whose create succeeds and whose manifest write of the new cache
-   * fails (with `everyWrite`, the failed-create row write fails too). `calls` lists, in order, each row write as
+   * How a traced rebuild goes: the row it finds (`cachedContents/previous` unless named; `null` a row without a cache),
+   * what the create answers (a cache named `cachedContents/created` by default) and which row writes fail.
+   */
+  interface RebuildTrace {
+    readonly previous?: string | null;
+    readonly create?: () => Promise<{ name?: string }>;
+    readonly writeFails?: (cacheId: string | null) => boolean;
+  }
+
+  /**
+   * A rebuild over the row `trace` names, under another fingerprint. `calls` lists, in order, each row write as
    * `write:<cacheId>` and each cache delete as `delete:<name>`; `outcome` is the call's result or its rejection.
    */
-  async function prepareWithFailingCacheWrite(everyWrite = false) {
+  async function traceRebuild(trace: RebuildTrace = {}) {
     const createdAtMs = Date.now();
-    seedRow('cachedContents/previous', 'fh-OLD', createdAtMs);
+    seedRow(
+      trace.previous === undefined ? 'cachedContents/previous' : trace.previous,
+      'fh-OLD',
+      createdAtMs,
+    );
     const calls: string[] = [];
     const write = db.upsertWorkspace.bind(db);
     vi.spyOn(db, 'upsertWorkspace').mockImplementation((row) => {
       calls.push(`write:${row.cacheId}`);
-      if (everyWrite || row.cacheId !== null)
-        throw new Error('SQLITE_FULL: database or disk is full');
+      if (trace.writeFails?.(row.cacheId)) throw new Error('SQLITE_FULL: database or disk is full');
       write(row);
     });
     const client = mkClient({
-      cachesCreate: async () => mkCreated(createdAtMs, 3600),
+      cachesCreate: trace.create ?? (async () => mkCreated(createdAtMs, 3600)),
       cachesDelete: async (params: unknown) =>
         calls.push(`delete:${(params as { name: string }).name}`),
     });
@@ -950,6 +961,16 @@ describe('prepareContext', () => {
       prepare(client).catch((error: unknown) => error),
     );
     return { client, outcome, calls, warnings };
+  }
+
+  /**
+   * A rebuild over the row of `cachedContents/previous` whose create succeeds and whose manifest write of the new cache
+   * fails (with `everyWrite`, the failed-create row write fails too), traced as `traceRebuild` traces it.
+   */
+  function prepareWithFailingCacheWrite(everyWrite = false) {
+    return traceRebuild({
+      writeFails: (cacheId) => everyWrite || cacheId !== null,
+    });
   }
 
   /** The prepared context of `prepareWithFailingCacheWrite`, which resolves unless every write fails. */
@@ -976,13 +997,14 @@ describe('prepareContext', () => {
     ]);
   });
 
-  it("a record failure fires the new cache's delete before the row is written without a cache", async () => {
+  it('a record failure deletes the new cache before the row write and the previous one after it', async () => {
     const { calls } = await preparedWithFailingCacheWrite();
 
     expect(calls).toEqual([
       'write:cachedContents/created',
       'delete:cachedContents/created',
       'write:null',
+      'delete:cachedContents/previous',
     ]);
   });
 
@@ -996,11 +1018,27 @@ describe('prepareContext', () => {
     });
   });
 
-  it('a record failure leaves the previous cache alone: only the new cache is deleted', async () => {
-    const { client } = await preparedWithFailingCacheWrite();
+  it('a record failure of a create named as the previous cache deletes that cache once, before the row write', async () => {
+    const { calls } = await traceRebuild({
+      create: async () => ({ name: 'cachedContents/previous' }),
+      writeFails: (cacheId) => cacheId !== null,
+    });
 
-    const deleted = vi.mocked(client.caches.delete).mock.calls.map((call) => call[0]);
-    expect(deleted).toEqual([{ name: 'cachedContents/created' }]);
+    expect(calls).toEqual([
+      'write:cachedContents/previous',
+      'delete:cachedContents/previous',
+      'write:null',
+    ]);
+  });
+
+  it('a rebuild whose create answers with the previous cache name keeps that cache: the row names it', async () => {
+    const { client, calls } = await traceRebuild({
+      create: async () => ({ name: 'cachedContents/previous' }),
+    });
+
+    expect(calls).toEqual(['write:cachedContents/previous']);
+    expect(client.caches.delete).not.toHaveBeenCalled();
+    expect(db.getWorkspace(workspaceRoot)?.cacheId).toBe('cachedContents/previous');
   });
 
   it('a record failure keeps the uploads: the row holds their ids, the context their parts', async () => {
@@ -1014,14 +1052,72 @@ describe('prepareContext', () => {
     });
   });
 
-  it('an unnamed create over a live cache drops the pointer and leaves the previous cache to its TTL', async () => {
-    seedRow('cachedContents/previous', 'fh-OLD');
-    const client = mkClient({ cachesCreate: async () => ({ name: '' }) });
+  it.each([
+    [
+      'a create that throws',
+      async (): Promise<{ name?: string }> => {
+        throw new Error('503 UNAVAILABLE');
+      },
+    ],
+    ['an unnamed create', async (): Promise<{ name?: string }> => ({ name: '' })],
+  ])(
+    '%s over a live cache deletes the previous cache after the row is written without one',
+    async (_, create) => {
+      const { calls } = await traceRebuild({ create });
 
-    await withWarnings(() => prepare(client));
+      expect(calls).toEqual(['write:null', 'delete:cachedContents/previous']);
+      expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+    },
+  );
 
+  it('a failed create whose row write throws deletes no cache: the row still names the previous one', async () => {
+    const { outcome, calls } = await traceRebuild({
+      create: async () => ({ name: '' }),
+      writeFails: () => true,
+    });
+
+    expect(String(outcome)).toContain('SQLITE_FULL');
+    expect(calls).toEqual(['write:null']);
+    expect(db.getWorkspace(workspaceRoot)?.cacheId).toBe('cachedContents/previous');
+  });
+
+  it('a failed create over a row without a cache deletes nothing', async () => {
+    const { client, calls } = await traceRebuild({
+      previous: null,
+      create: async () => ({ name: '' }),
+    });
+
+    expect(calls).toEqual(['write:null']);
     expect(client.caches.delete).not.toHaveBeenCalled();
-    expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+  });
+
+  it('a failed create deletes the cache the row named at its start, not one another call recorded meanwhile', async () => {
+    const { calls } = await traceRebuild({
+      create: async () => {
+        seedRow('cachedContents/other', 'fh-OTHER');
+        return { name: '' };
+      },
+    });
+
+    expect(calls).toEqual([
+      'write:cachedContents/other',
+      'write:null',
+      'delete:cachedContents/previous',
+    ]);
+  });
+
+  it("a failed create logs the previous cache's delete as a stale cache's", async () => {
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    try {
+      await traceRebuild({ create: async () => ({ name: '' }) });
+      await new Promise((settle) => setImmediate(settle));
+
+      expect(debug.mock.calls.map((call) => String(call[0]))).toContain(
+        'async-deleted stale cache cachedContents/previous (attempt 1)',
+      );
+    } finally {
+      debug.mockRestore();
+    }
   });
 
   it.each([

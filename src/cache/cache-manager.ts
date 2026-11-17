@@ -510,11 +510,7 @@ async function buildCache(
   return recordCreatedCache(build, created);
 }
 
-/**
- * Points the row at the new cache, then deletes the previous one. The delete is fired only after the row write and
- * without waiting: a delete that fails leaves an orphan on Google's side until its TTL (bounded by `cacheTtlSeconds`),
- * never a row that points at a deleted cache, and the caller never waits for it.
- */
+/** Points the row at the new cache, then deletes the previous one (`deleteReplacedCache`). */
 function recordCreatedCache(build: CacheBuild, created: CreatedCache): PreparedContext {
   const { opts, start, uploaded } = build;
   const { cacheId, cacheExpiresAt } = created;
@@ -529,8 +525,7 @@ function recordCreatedCache(build: CacheBuild, created: CreatedCache): PreparedC
   } catch (error) {
     return fallBackInline(build, { stage: 'record', cacheId, error });
   }
-  const previousCacheId = start.existing?.cacheId ?? null;
-  if (previousCacheId !== null) void bestEffortDeleteCache(opts.client, previousCacheId, 'stale');
+  deleteReplacedCache(opts.client, start, cacheId);
   return {
     cacheId,
     cacheExpiresAt,
@@ -581,7 +576,7 @@ async function createCache(build: CacheBuild): Promise<CreatedCache> {
 /**
  * The failed-create path: the warning, the row written without a cache (`updatedAt` the call's start), the uploaded
  * file parts inline. A cache created but not recorded is deleted before the row write, so its delete is fired even
- * when that write throws too.
+ * when that write throws too; the previous cache, which the row no longer names, is deleted after it.
  */
 function fallBackInline(build: CacheBuild, failure: CreateFailure): PreparedContext {
   const { opts, start, uploaded } = build;
@@ -593,6 +588,7 @@ function fallBackInline(build: CacheBuild, failure: CreateFailure): PreparedCont
     fileIds,
     updatedAt: start.now,
   });
+  deleteReplacedCache(opts.client, start, failure.stage === 'record' ? failure.cacheId : null);
   return {
     cacheId: null,
     cacheExpiresAt: null,
@@ -616,14 +612,32 @@ function reportCreateFailure(client: GoogleGenAI, failure: CreateFailure): void 
   void bestEffortDeleteCache(client, failure.cacheId, 'unrecorded');
 }
 
+/**
+ * Deletes the cache the row named at the call's start, which the call's own row write has just stopped naming. Called
+ * only after that write succeeded, and without waiting: a write that throws leaves the row naming its cache and that
+ * cache alive; a delete that fails leaves an orphan on Google's side until its TTL (bounded by `cacheTtlSeconds`).
+ * `accountedFor` is the cache the call already holds or deletes — the one the row now names, or a new cache whose
+ * `unrecorded` delete is fired — so a create answering with the previous cache's own name never deletes a cache the
+ * row names, nor one name twice.
+ */
+function deleteReplacedCache(
+  client: GoogleGenAI,
+  start: CallStart,
+  accountedFor: string | null,
+): void {
+  const previousCacheId = start.existing?.cacheId ?? null;
+  if (previousCacheId === null || previousCacheId === accountedFor) return;
+  void bestEffortDeleteCache(client, previousCacheId, 'stale');
+}
+
 /** The Files API ids of the uploads that have one. */
 function uploadedFileIds(uploaded: UploadResult): string[] {
   return uploaded.files.map((f) => f.fileId).filter((v): v is string => v !== null);
 }
 
 /**
- * Which cache a best-effort delete removes, as its log lines name it: the previous cache after the row was pointed at
- * the new one (`stale`), or a new cache whose row write failed (`unrecorded`).
+ * Which cache a best-effort delete removes, as its log lines name it: the previous cache once the row no longer names
+ * it, after a rebuild that succeeded or failed (`stale`), or a new cache whose row write failed (`unrecorded`).
  */
 type DeletedCacheKind = 'stale' | 'unrecorded';
 

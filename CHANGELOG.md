@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed, the cache stayed on Google's side, billed until its TTL, and the warning said the cache build had failed; the
   new cache is now deleted, the warning names the manifest write, the response's `cachingModeNote` says the cache
   could not be built or recorded, and the files go inline as before.
+- `ask` and `code` with `cachingMode: 'explicit'`: when rebuilding the Context Cache failed, the previous cache stayed on
+  Google's side, unreachable and billed until its TTL; it is now deleted, as after a successful rebuild.
 
 ## [1.25.0] - 2026-11-17
 

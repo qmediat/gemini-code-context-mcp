@@ -446,15 +446,14 @@ change.
 
 **Source:** the split of `doPrepareContext` (T51), 2026-11-17. Opened 2026-11-17.
 
-**Why:** three paths of `prepareContext` (`src/cache/cache-manager.ts`) write the workspace row with no cache id
+**Why:** two paths of `prepareContext` (`src/cache/cache-manager.ts`) write the workspace row with no cache id
 while the cache the previous row named stays alive on Google's side: the inline exit (`ask`'s `noCache`,
-`cachingMode: 'implicit'`, `code`'s `codeExecution`), the token-floor exit (a workspace now below `cacheMinTokens`),
-both through `prepareInline`, and the failed-create path (`fallBackInline`). Nothing deletes that cache and nothing
-can reuse it, since no row names it any more: it is billed until its TTL. For example: the row names a live cache and
-the next call passes `noCache: true`, or its workspace shrank below the floor, or its `caches.create` throws — the row
-is written with no cache id and no `caches.delete` is sent. Since T51 a create that answers without a cache name
-takes the failed-create path too: before, it went down the success path, which deleted the previous cache and stored
-the empty name or none; now the previous cache stays to its TTL like the others.
+`cachingMode: 'implicit'`, `code`'s `codeExecution`) and the token-floor exit (a workspace now below
+`cacheMinTokens`), both through `prepareInline`. Nothing deletes that cache and nothing can reuse it, since no row
+names it any more: it is billed until its TTL. For example: the row names a live cache and the next call passes
+`noCache: true`, or its workspace shrank below the floor — the row is written with no cache id and no `caches.delete`
+is sent. The failed-create path (`fallBackInline`) deletes the previous cache after its row write, as a successful
+rebuild does.
 
 **Scope:** a cost decision for the maintainers, one of two remedies: keep the pointer on these paths (the next
 caching call whose fingerprint matches reuses the cache until its TTL), or delete the cache when the pointer is

@@ -95,7 +95,7 @@ The server falls back to inline file parts (slower, more expensive) when:
 - The user passes `noCache: true` on `ask`
 - The workspace has zero matching files
 - **The workspace is under ~1 024 tokens** — Gemini requires a minimum cache size of 1 024 tokens; below that `caches.create` returns 400. We estimate token count from file sizes (~4 bytes/token) and skip the cache attempt silently when below the floor. Floor is configurable via `GEMINI_CODE_CONTEXT_CACHE_MIN_TOKENS`.
-- The Context Cache cannot be built or recorded: `caches.create` fails for any other reason (network, quota, model rejection) or answers without a cache name, or the manifest cannot record the new cache (which is then deleted) — we log a warning and degrade to inline parts so the query still succeeds, and the response's `cachingModeNote` says so.
+- The Context Cache cannot be built or recorded: `caches.create` fails for any other reason (network, quota, model rejection) or answers without a cache name, or the manifest cannot record the new cache (which is then deleted) — we log a warning and degrade to inline parts so the query still succeeds, and the response's `cachingModeNote` says so. The previous Context Cache of the workspace is deleted, as after a successful rebuild.
 
 ### Token-estimation caveat (minified / tightly-packed source)
 

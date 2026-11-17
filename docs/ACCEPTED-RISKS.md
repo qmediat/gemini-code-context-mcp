@@ -68,7 +68,7 @@ This list is the flip side of `docs/KNOWN-DEFICITS.md`: deficits are issues we'l
 
 **Source:** Grok code review, April 2026, of the rebuild order of that time (the old cache deleted before the create).
 
-**Risk claim:** A rebuild deletes the previous cache only after the new one is created and the workspace row points at it (`recordCreatedCache` in `src/cache/cache-manager.ts`). The delete is fired without waiting and retried three times (1 s, 3 s, 9 s) on transient errors; a delete that still fails is logged at warn and leaves the previous cache on Google's side, billed until its TTL. A create that fails, or answers without a cache name, takes the inline path and drops the row's pointer, leaving the previous cache to its TTL as well (`docs/FOLLOW-UP-PRS.md` T53).
+**Risk claim:** A rebuild deletes the previous cache only after the new one is created and the workspace row points at it (`recordCreatedCache` in `src/cache/cache-manager.ts`). The delete is fired without waiting and retried three times (1 s, 3 s, 9 s) on transient errors; a delete that still fails is logged at warn and leaves the previous cache on Google's side, billed until its TTL. A rebuild that fails — the create throws or answers without a cache name, or the manifest cannot record the new cache — drops the row's pointer and then deletes the previous cache the same way. The inline exits (`noCache`, implicit mode, a workspace below the token floor) drop the pointer and leave the previous cache to its TTL (`docs/FOLLOW-UP-PRS.md` T53).
 
 **Why we accept:** no request waits on the delete, the row never points at a deleted cache, and the cost of a delete that failed is one cache's storage for at most `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS` (default 3600 s).
 
