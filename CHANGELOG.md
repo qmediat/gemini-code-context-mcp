@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.25.1] - 2026-11-18
+
 ### Fixed
 
 - `ask` and `code` with `cachingMode: 'explicit'`: when Gemini created a Context Cache without a name, the question went
@@ -1973,7 +1975,8 @@ Integration-test-surfaced and review-surfaced fixes landed before the v1.0.0 rel
 - MIME type simplified to `text/plain` for all files.
 - Unit test coverage gaps for cache-manager / files-uploader / ttl-watcher / profile-loader / parseEdits tracked in [`docs/FOLLOW-UP-PRS.md`](docs/FOLLOW-UP-PRS.md).
 
-[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.25.0...HEAD
+[Unreleased]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.25.1...HEAD
+[1.25.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.25.0...v1.25.1
 [1.25.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.24.0...v1.25.0
 [1.24.0]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.1...v1.24.0
 [1.23.1]: https://github.com/qmediat/gemini-code-context-mcp/compare/v1.23.0...v1.23.1
