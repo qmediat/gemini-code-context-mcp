@@ -120,12 +120,13 @@ export function recordBilledCall(
   entry: LedgerEntry,
   billed: BilledUsage,
   durationMs: number,
+  label: string = entry.toolName,
 ): void {
   const settled = {
     cachedTokens: billed.cachedTokens,
     uncachedTokens: billed.uncachedTokens,
     costUsdMicro: toMicrosUsd(billed.costUsd),
-    durationMs,
+    durationMs: Math.max(1, durationMs),
     ...(entry.cachingMode === null
       ? {}
       : { cachingMode: entry.cachingMode, cachedContentTokenCount: billed.cachedTokens }),
@@ -144,7 +145,7 @@ export function recordBilledCall(
     manifest.finalizeBudgetReservation(reservationId, settled);
   } catch (finalizeErr) {
     logger.error(
-      `${entry.toolName}: finalizeBudgetReservation failed for id=${reservationId}; reservation row keeps the estimate (${settled.costUsdMicro} micros). Error: ${safeForLog(finalizeErr)}`,
+      `${label}: finalizeBudgetReservation failed for id=${reservationId}; the row keeps its reserved estimate, the billed ${settled.costUsdMicro} micros were not written. Error: ${safeForLog(finalizeErr)}`,
     );
   }
 }

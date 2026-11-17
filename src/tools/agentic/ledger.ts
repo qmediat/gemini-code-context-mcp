@@ -108,6 +108,7 @@ export function settleBilledPass(
   run: AgenticRun,
   pass: PassReservations,
   usage: UsageCounts,
+  label = 'ask_agentic',
 ): void {
   const billedInput = billedInputTokens(usage.promptTokenCount, pass.estimate);
   const billed = billedUsage(
@@ -126,6 +127,7 @@ export function settleBilledPass(
       ledgerEntryOf(run),
       billed,
       Date.now() - pass.startedAt,
+      label,
     );
   } catch (recordErr) {
     logger.error(

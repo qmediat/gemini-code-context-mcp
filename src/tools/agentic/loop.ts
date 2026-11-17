@@ -11,7 +11,6 @@ import {
   getTimeoutKind,
   isTimeoutAbort,
 } from '../shared/abort-timeout.js';
-import { seedRetryHint } from '../shared/throttle.js';
 import { type IterationResult, runAgenticIteration } from './iteration.js';
 import {
   NO_THROTTLE_RESERVATION,
@@ -126,7 +125,7 @@ async function throttledIteration(
 }
 
 /**
- * A failed iteration: both reservations are released and a Gemini 429's retry hint seeds the throttle.
+ * A failed iteration: both reservations are released (the 429 retry hint is seeded once, by the call's own catch).
  * A timeout becomes the structured TIMEOUT result naming the iteration (`timeoutKind` says whether the
  * stall or the total cap fired); any other failure gives `null`, for the caller to re-throw.
  */
@@ -138,7 +137,6 @@ function iterationFailure(
   flight: IterationFlight,
 ): TextToolResult | null {
   cancelPass(run.ctx, flight.reservationId, flight.throttleReservationId, 'ask_agentic');
-  seedRetryHint(run.ctx.throttle, run.resolved.resolved, iterErr);
   if (!isTimeoutAbort(iterErr)) return null;
   const kind = getTimeoutKind(iterErr) ?? 'total';
   const limitMs = kind === 'stall' ? iterTimeout.stallMs : iterTimeout.timeoutMs;
@@ -217,14 +215,14 @@ function endOfIteration(
  * settlement books. Returns the result that ends the call, or `null` to go on.
  */
 async function runIteration(run: AgenticRun, state: LoopState): Promise<TextToolResult | null> {
-  const perIterationCostUsd = passReservationUsd(run, PER_ITERATION_INPUT_TOKENS);
-  const reservation = reserveIteration(run, state, perIterationCostUsd);
+  const estimate = PER_ITERATION_INPUT_TOKENS;
+  const reservation = reserveIteration(run, state, passReservationUsd(run, estimate));
   if ('refused' in reservation) return reservation.refused;
   const iterTimeout = iterationTimeoutOf(run);
   const flight: IterationFlight = {
     reservationId: reservation.id,
     throttleReservationId: NO_THROTTLE_RESERVATION,
-    estimate: PER_ITERATION_INPUT_TOKENS,
+    estimate,
     dispatched: false,
     startedAt: Date.now(),
   };

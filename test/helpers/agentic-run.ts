@@ -55,6 +55,9 @@ export interface AgenticRunOptions {
   readonly throttleAnswers?: ReadonlyArray<ThrottleReserveAnswer | undefined>;
   /** What `cancelBudgetReservation` throws, when it should. */
   readonly cancelBudgetThrows?: unknown;
+  /** What `insertUsageMetric` / `finalizeBudgetReservation` throw, when they should. */
+  readonly insertUsageThrows?: unknown;
+  readonly finalizeThrows?: unknown;
   readonly env?: Readonly<Record<string, string>>;
   /** What the model resolves to. Default: Gemini 3 Pro (`gemini-3-pro-preview`). */
   readonly model?: ResolvedModel;
@@ -175,11 +178,15 @@ function recordingManifest(opts: AgenticRunOptions, trace: TraceEvent[]) {
   let calls = 0;
   return {
     reserveBudget: record('reserveBudget', () => opts.budgetAnswers?.[calls++] ?? { id: nextId++ }),
-    finalizeBudgetReservation: record('finalizeBudgetReservation'),
+    finalizeBudgetReservation: record('finalizeBudgetReservation', () => {
+      if (opts.finalizeThrows !== undefined) throw opts.finalizeThrows;
+    }),
     cancelBudgetReservation: record('cancelBudgetReservation', () => {
       if (opts.cancelBudgetThrows !== undefined) throw opts.cancelBudgetThrows;
     }),
-    insertUsageMetric: record('insertUsageMetric'),
+    insertUsageMetric: record('insertUsageMetric', () => {
+      if (opts.insertUsageThrows !== undefined) throw opts.insertUsageThrows;
+    }),
   };
 }
 

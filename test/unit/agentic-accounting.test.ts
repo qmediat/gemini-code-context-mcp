@@ -353,3 +353,41 @@ describe('ask_agentic accounting — apiCalls on a pass that never reached the m
     expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([[2]]);
   });
 });
+
+describe('ask_agentic accounting — a ledger write that fails', () => {
+  it('returns the answer and logs the error when the usage row cannot be written', async () => {
+    const { result, trace } = await runAgentic({
+      tpmThrottleLimit: 1_000_000,
+      insertUsageThrows: new Error('SQLITE_BUSY'),
+      script: [{ text: 'done', usage: { promptTokenCount: 7, candidatesTokenCount: 1 } }],
+    });
+
+    expect(result.isError).not.toBe(true);
+    expect(JSON.stringify(result.content)).toContain('done');
+    expect(trace.filter((e) => e.kind === 'log' && e.name === 'error')).toHaveLength(1);
+    expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 7]]);
+  });
+
+  it('says a failed finalize left the reserved estimate and names the pass: the loop and the forced pass apart', async () => {
+    const { trace } = await runAgentic({
+      ...ENFORCED,
+      finalizeThrows: new Error('SQLITE_BUSY'),
+      input: { maxIterations: 1 },
+      script: [
+        { ...READ_A, usage: { promptTokenCount: 3000, candidatesTokenCount: 5 } },
+        { text: 'forced', usage: { promptTokenCount: 4000, candidatesTokenCount: 9 } },
+      ],
+    });
+
+    const lines = trace
+      .filter((e) => e.kind === 'log' && e.name === 'error')
+      .map((e) => String(e.args[0]));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toMatch(
+      /^ask_agentic: finalizeBudgetReservation failed for id=1; the row keeps its reserved estimate, the billed \d+ micros were not written/,
+    );
+    expect(lines[1]).toMatch(
+      /^ask_agentic finalization: finalizeBudgetReservation failed for id=2/,
+    );
+  });
+});

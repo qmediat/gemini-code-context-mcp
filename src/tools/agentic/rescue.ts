@@ -290,7 +290,7 @@ async function attemptRescue(
     recordRescueFailure(run, finalErr, flight.apiCallSucceeded, outcome);
   } finally {
     if (flight.apiCallSucceeded) {
-      settleBilledPass(run, flight, outcome.usage);
+      settleBilledPass(run, flight, outcome.usage, 'ask_agentic finalization');
     } else {
       cancelPass(
         run.ctx,

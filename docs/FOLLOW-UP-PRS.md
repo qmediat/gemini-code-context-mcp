@@ -279,6 +279,16 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
+## T42. Billed work is booked on every failure path (the immediate next PR)
+
+**Source:** the last cross-model reading of PR #133 (2026-11-17), findings X1 and X2; both pre-date the split and are not fixed in it.
+
+**Why:** (1) an `ask_agentic` iteration whose model call completed and then timed out in its tool batch, or threw while its response was read, cancels both reservations: the billed spend is booked 0, where the forced-finalization pass books it (the reading's probe scenarios `iter-timeout-tools` and `iter-malformed`). (2) A failed usage-row insert is logged for `ask_agentic` but still throws out of `settleAnswer` for `ask` and `code`, so a paid answer is lost.
+
+**Scope:** one rule for the three tools. The completed call is settled through `settleBilledPass` on those exits (the flight is marked once the stream completed and keeps its usage; `iterationFailure` settles when marked, cancels otherwise); `recordBilledCall` treats the usage-row insert as best-effort after the answer exists (log and continue, as the finalize already does), with a test per tool and a test of a grep delayed past `iterationTimeoutMs` expecting the reported tokens finalised.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.

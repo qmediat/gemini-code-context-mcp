@@ -256,7 +256,7 @@ describe('ask_agentic call trace — a loop that ends without an answer', () => 
     ]);
   });
 
-  it('an iteration 429 seeds the retry hint once, before the call fails', async () => {
+  it('an iteration 429 seeds the retry hint once, in the call own catch, after its log line', async () => {
     const { result, trace } = await runAgentic({
       ...ENFORCED,
       script: [{ throws: new ApiError({ status: 429, message: 'quota "retryDelay": "7s"' }) }],
@@ -270,8 +270,8 @@ describe('ask_agentic call trace — a loop that ends without an answer', () => 
       STREAM,
       'ledger cancelBudgetReservation [1]',
       'throttle cancel [101]',
-      'throttle recordRetryHint ["gemini-3-pro-preview",7000]',
       'log error ["ask_agentic failed: quota \\"retryDelay\\": \\"7s\\""]',
+      'throttle recordRetryHint ["gemini-3-pro-preview",7000]',
     ]);
   });
 
