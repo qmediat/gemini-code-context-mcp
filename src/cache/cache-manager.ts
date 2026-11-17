@@ -650,9 +650,11 @@ function uploadedFileIds(uploaded: UploadResult): string[] {
 type DeletedCacheKind = 'stale' | 'unrecorded';
 
 /**
- * Best-effort async delete of a cache no workspace row names. Retries 3× with exponential back-off (1 s, 3 s, 9 s) for
- * transient errors. Logs at warn on permanent failure — orphaned caches auto-expire at Google's TTL so the worst case
- * is bounded storage cost. Called as `void bestEffortDeleteCache(...)`: the caller never waits for it.
+ * Best-effort async delete of a cache no workspace row names. Tries three times in all, waiting 1 s and then 3 s
+ * between attempts, for transient errors. A `NOT_FOUND` answer means the cache is already gone (expired, or deleted by
+ * another call): nothing is orphaned, so it is not warned. Logs at warn on a permanent failure — orphaned caches
+ * auto-expire at Google's TTL so the worst case is bounded storage cost. Called as `void bestEffortDeleteCache(...)`:
+ * the caller never waits for it.
  */
 async function bestEffortDeleteCache(
   client: GoogleGenAI,
@@ -666,9 +668,14 @@ async function bestEffortDeleteCache(
       logger.debug(`async-deleted ${kind} cache ${safeForLog(cacheId)} (attempt ${attempt + 1})`);
       return;
     } catch (err) {
-      // Retry transient errors; give up quickly on 4xx (cache already gone, perms, etc.)
       const msg = err instanceof Error ? err.message : String(err);
-      const isTransient = !msg.includes('NOT_FOUND') && !msg.includes('PERMISSION_DENIED');
+      if (msg.includes('NOT_FOUND')) {
+        logger.debug(
+          `${kind} cache ${safeForLog(cacheId)} was already gone (attempt ${attempt + 1})`,
+        );
+        return;
+      }
+      const isTransient = !msg.includes('PERMISSION_DENIED');
       if (!isTransient || attempt === delays.length - 1) {
         logger.warn(
           `async-delete of ${kind} cache ${safeForLog(cacheId)} permanently failed (attempt ${attempt + 1}): ${safeForLog(msg)}. Orphan will auto-expire at TTL.`,

@@ -1120,6 +1120,67 @@ describe('prepareContext', () => {
     }
   });
 
+  /** Drains the void-fired delete of a rebuild over `cachedContents/previous`, answered with `message`. */
+  async function staleDeleteAnswered(message: string): Promise<string[]> {
+    seedRow('cachedContents/previous', 'fh-OLD');
+    const client = mkClient({
+      cachesCreate: async () => mkCreated(Date.now(), 3600),
+      cachesDelete: async () => {
+        throw new Error(message);
+      },
+    });
+    const { warnings } = await withWarnings(async () => {
+      await prepare(client);
+      await new Promise((settle) => setImmediate(settle));
+    });
+    return warnings;
+  }
+
+  it('a stale delete answered NOT_FOUND is not warned: the cache is already gone', async () => {
+    expect(await staleDeleteAnswered('404 NOT_FOUND: cachedContents/previous')).toEqual([]);
+  });
+
+  it('a stale delete answered PERMISSION_DENIED is warned as an orphan', async () => {
+    const warnings = await staleDeleteAnswered('403 PERMISSION_DENIED');
+
+    expect(warnings).toEqual([
+      'async-delete of stale cache cachedContents/previous permanently failed (attempt 1): 403 PERMISSION_DENIED. Orphan will auto-expire at TTL.',
+    ]);
+  });
+
+  // The open decision of FOLLOW-UP T53, pinned as it is: an inline exit drops the pointer and deletes nothing.
+  it.each([
+    ['caching is not allowed', { allowCaching: false }, 'fh-1'],
+    ['the mode is implicit', { allowCaching: true, cachingMode: 'implicit' as const }, 'fh-1'],
+    ['the workspace is under the token floor', { allowCaching: true }, 'fh-OLD'],
+  ])(
+    'an inline exit over a live cache (%s) writes the row without it and deletes no cache',
+    async (_, mode, rowHash) => {
+      seedRow('cachedContents/live', rowHash);
+      const client = mkClient({});
+      const scan =
+        rowHash === 'fh-OLD'
+          ? mkScan([{ relpath: 'tiny.ts', size: 10 }])
+          : mkScan([{ relpath: 'kept.ts', size: 8_000 }]);
+
+      const result = await prepareContext({
+        client,
+        manifest: db,
+        scan,
+        model: mkModel(),
+        systemPromptHash: 'sph-1',
+        ttlSeconds: 3600,
+        emitter: mkEmitter(),
+        ...mode,
+      });
+      await new Promise((settle) => setImmediate(settle));
+
+      expect(result.inlineOnly).toBe(true);
+      expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+      expect(client.caches.delete).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ['an empty stored cache id is refused: a new cache is built', '', false],
     ['a stored cache id is reused', 'cachedContents/live', true],
