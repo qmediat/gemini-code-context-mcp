@@ -30,15 +30,14 @@ import {
   inspectAttachments,
   readAttachments,
 } from '../attachments.js';
-import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { prepareContext } from '../cache/cache-manager.js';
 import {
   CACHING_MODE_FALLBACK_DESCRIPTION,
   cachingModeFor,
   cachingRan,
 } from '../cache/caching-mode.js';
-import { resolveOutputCap } from '../gemini/long-decode.js';
+import { preflightModeFor, resolveOutputCap } from '../gemini/long-decode.js';
 import { resolveModel } from '../gemini/models.js';
-import { abortableSleep } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
@@ -52,18 +51,14 @@ import { type AskAgenticInput, askAgenticTool } from './ask-agentic.tool.js';
 import { type TextToolResult, type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import {
-  type LedgerEntry,
   billedUsage,
   recordBilledCall,
   settleFailedCall,
   usageFields,
 } from './shared/call-ledger.js';
-import {
-  CompletedRequests,
-  type DecodedResponse,
-  LONG_DECODE_CAP_DESCRIPTION,
-  runDecode,
-} from './shared/continuation.js';
+import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
+import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
+import { DispatchThrottle } from './shared/dispatch-throttle.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
@@ -78,6 +73,7 @@ import {
   OUTPUT_CAP_ERROR_CODE,
   THINKING_LEVEL_FIELD,
   THINKING_LEVEL_RESERVE,
+  answerFinish,
   emptyAtOutputCap,
 } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
@@ -377,20 +373,15 @@ async function executeAskBody(
   started: number,
 ): Promise<ReturnType<typeof textResult> | ReturnType<typeof errorResult>> {
   let reservationId: number | null = null;
-  // `-1` signals "no reservation held" (distinct from 0 which is a valid
-  // releaseId). Mirrors the pattern used by `reservationId`.
-  let throttleReservationId = -1;
   // Canonical resolved-model string, captured once after `resolveModel`
   // so the outer catch can feed retry hints into the same throttle bucket
   // `reserve` used. `model` at the top of execute is the request alias
   // ("latest-pro-thinking") — different key, different bucket.
   let resolvedModelKey: string | null = null;
-  // once a stream opened, a later transport failure is mid-stream: billed work, not to be re-sent
-  let streamOpened = false;
   // every request that completed is billed: the ledger settles from these, on an answer and on a failure alike
   const completed = new CompletedRequests();
-  // where the running decode's spend is booked; `null` before a decode starts and once the call has settled
-  let ledgerEntry: LedgerEntry | null = null;
+  // the running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent)
+  const tracking: DecodeTracking = { ledgerEntry: null, streamOpened: false };
   // the tier this call runs on once resolved (Vertex may force standard); before that, the requested one is reported
   let serviceTier: 'standard' | 'flex' | undefined;
   const reportedTier = (): 'standard' | 'flex' =>
@@ -410,6 +401,13 @@ async function executeAskBody(
     stallEnvVar: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
   });
   const abortSignal = timeoutController.signal;
+  // Each request of the decode holds its own TPM reservation; a failure drops the one held.
+  const dispatch = new DispatchThrottle({
+    throttle: ctx.throttle,
+    enabled: ctx.config.tpmThrottleLimit > 0,
+    signal: abortSignal,
+    emit: (message) => emitter.emit(message),
+  });
   try {
     // Workspace path validation lives INSIDE the try so a
     // `WorkspaceValidationError` is reported as a regular tool error
@@ -614,6 +612,8 @@ async function executeAskBody(
     // model has no advertised `inputTokenLimit`.
     let preflight: PreflightTokenResult | undefined;
     const contextWindow = resolved.inputTokenLimit;
+    // A decode that may take more than one request takes the exact count: its prompt is billed per request.
+    const preflightMode = preflightModeFor(input.preflightMode, outputCap);
     if (typeof contextWindow === 'number' && contextWindow > 0) {
       preflight = await countForPreflight(ctx.client, {
         files: scan.files,
@@ -623,7 +623,7 @@ async function executeAskBody(
         // already encodes user-supplied includeGlobs/excludeGlobs — no
         // separate globsHash axis needed in the cache key.
         filesHash: scan.filesHash,
-        ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
+        ...(preflightMode !== undefined ? { preflightMode } : {}),
         inputTokenLimit: contextWindow,
         extraTokens: attachmentTokens, // weighs on the heuristic-vs-exact decision, added to the count below
         // Thread the user's `timeoutMs` AbortSignal so a hung countTokens
@@ -871,6 +871,8 @@ async function executeAskBody(
         expectedOutputTokens: effectiveOutputCap,
         // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
         perRequestOutputTokens: outputCap.perRequest,
+        // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
+        countedInputTokens: preflight?.effectiveTokens,
         thinkingTokens: thinkingTokensForEstimate,
         coverMs: timeoutController.timeoutMs,
       });
@@ -908,49 +910,25 @@ async function executeAskBody(
     const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
     const requestedCachingMode = caching.mode;
 
-    const ctxPrep = await prepareContext({
-      client: ctx.client,
-      manifest: ctx.manifest,
-      scan,
-      model: resolved,
-      systemPromptHash,
-      systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
-      ttlSeconds: ctx.config.cacheTtlSeconds,
-      cacheMinTokens: ctx.config.cacheMinTokens,
-      emitter,
-      allowCaching: !input.noCache && scan.files.length > 0,
-      // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
-      signal: abortSignal,
-      // v1.13.0 — opt-in implicit caching path (skip caches.create).
-      cachingMode: requestedCachingMode,
-    });
-
-    // TPM throttle reservation — placed HERE (after `prepareContext`,
-    // immediately before `generateContent`) so the reservation's `tsMs`
-    // accurately reflects when tokens hit Gemini's quota counter. An
-    // earlier reserve (before `prepareContext`) would stamp `tsMs`
-    // minutes before actual dispatch on cold-cache calls; our window
-    // would then expire before Gemini's, leaving a gap where we admit
-    // concurrent calls that bust Gemini's per-minute quota. Trade-off:
-    // two concurrent cold-cache callers will both complete
-    // `prepareContext` before one backs off at `reserve` — mostly
-    // idempotent via file-hash dedup, minor upload duplication.
-    //
-    // Extracted into a helper so the stale-cache retry branch can
-    // cancel-and-re-reserve with an accurate tsMs rather than reusing a
-    // stale reservation stamped before the first (failed) dispatch.
-    const reserveForDispatch = async (): Promise<void> => {
-      if (ctx.config.tpmThrottleLimit <= 0) return;
-      const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
-      throttleReservationId = reservation.releaseId;
-      if (reservation.delayMs > 0) {
-        emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
-        // Abortable sleep — without this a 60s TPM throttle wait would block
-        // a 10s wall-clock timeout, defeating T19's whole-dispatch contract.
-        await abortableSleep(reservation.delayMs, abortSignal);
-      }
-    };
-    await reserveForDispatch();
+    // The context of the call: built here, and again by the stale-cache retry on a fresh cache.
+    const prepare = () =>
+      prepareContext({
+        client: ctx.client,
+        manifest: ctx.manifest,
+        scan,
+        model: resolved,
+        systemPromptHash,
+        systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
+        ttlSeconds: ctx.config.cacheTtlSeconds,
+        cacheMinTokens: ctx.config.cacheMinTokens,
+        emitter,
+        allowCaching: !input.noCache && scan.files.length > 0,
+        // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
+        signal: abortSignal,
+        // v1.13.0 — opt-in implicit caching path (skip caches.create).
+        cachingMode: requestedCachingMode,
+      });
+    const ctxPrep = await prepare();
 
     emitter.emit(
       usingThinkingLevel
@@ -1030,129 +1008,37 @@ async function executeAskBody(
       return [...inline, userTurn];
     };
 
-    // Track the prepared-context used for the FINAL successful call. Starts
-    // pointing at the initial ctxPrep; retry branch below reassigns to the
-    // rebuilt PreparedContext so post-call markHot + metadata reflect reality.
-    let activePrep = ctxPrep;
-    let retriedOnStaleCache = false;
-    let response: DecodedResponse;
-    // One decode: the request (or, on a long decode, the requests) for a prepared context. Only the OPENING of a
-    // request is retried — a mid-stream `TypeError: fetch failed` re-sent would duplicate the model's billable work
-    // and emit double "thinking: …" progress lines; a mid-stream failure propagates verbatim to the caller.
-    const openAttempts = networkAttempts(serviceTier); // a flex request is never re-sent
-    const decode = (prep: typeof ctxPrep, label: string): Promise<DecodedResponse> => {
-      ledgerEntry = {
-        workspaceRoot,
-        toolName: 'ask',
-        model: resolved.resolved,
-        serviceTier,
-        cachingMode: cachingRan(prep, caching).mode,
-      };
-      return runDecode({
+    // The decode — and, on a stale cache before any request completed, its one retry on a rebuilt cache. The TPM
+    // reservation is taken here, after `prepareContext` and immediately before the first request, so its timestamp
+    // is when the tokens reach Gemini's quota counter; only the OPENING of a request is retried (a mid-stream
+    // failure re-sent would bill the work again).
+    const decoded = await decodeOnContext(
+      {
         client: ctx.client,
-        model: resolved.resolved,
-        contents: buildContents(prep.cacheId, prep.inlineContents),
-        config: buildConfig(prep.cacheId),
-        openAttempts,
-        label,
+        booking: { workspaceRoot, toolName: 'ask', model: resolved.resolved, serviceTier },
+        cachingMode: (prep) => cachingRan(prep, caching).mode,
+        request: (prep) => ({
+          contents: buildContents(prep.cacheId, prep.inlineContents),
+          config: buildConfig(prep.cacheId),
+        }),
+        cache: {
+          ttlWatcher: ctx.ttlWatcher,
+          manifest: ctx.manifest,
+          ttlSeconds: ctx.config.cacheTtlSeconds,
+          prepare,
+        },
+        openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
         limits: { maxRequests: outputCap.maxRequests, cap: effectiveOutputCap },
-        collector: {
-          signal: abortSignal,
-          onThoughtChunk: (text) => {
-            // Surface the model's reasoning live as it arrives, throttled to ~1.5s by the collector so the
-            // MCP host's progress channel doesn't get flooded on long thinking bursts.
-            const trimmed = text.trim().slice(0, 80);
-            if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-          },
-          // Reset the stall watchdog on every chunk (text or thought) of every request: both prove the stream is
-          // alive. No-op when stall is disabled (env + per-call both unset).
-          onChunkReceived: () => timeoutController.recordChunk(),
-        },
-        onRequestOpened: () => {
-          streamOpened = true;
-        },
+        timeout: timeoutController,
+        emit: (message) => emitter.emit(message),
         completed,
-      });
-    };
-    try {
-      response = await decode(activePrep, 'ask');
-    } catch (err) {
-      // Self-heal: if Gemini rejected our cached content (evicted, expired,
-      // externally deleted), invalidate locally and retry ONCE with a fresh
-      // cache. Prevents users from seeing hard failures they'd otherwise need
-      // to clear/reindex manually. Budget: one retry; a second stale-cache
-      // error propagates with both errors chained via Error.cause.
-      if (activePrep.cacheId && isStaleCacheError(err)) {
-        logger.warn(
-          `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
-        );
-        try {
-          // Reset the cache pointer only — keep `files` rows so the rebuild
-          // can reuse uploaded files via content-hash dedup instead of
-          // re-uploading. The Gemini-side cache is already dead (that's
-          // what triggered this branch), so no `caches.delete` needed.
-          markCacheStale({ manifest: ctx.manifest, workspaceRoot });
-          const rebuilt = await prepareContext({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            scan,
-            model: resolved,
-            systemPromptHash,
-            systemInstruction: SYSTEM_INSTRUCTION_Q_AND_A,
-            ttlSeconds: ctx.config.cacheTtlSeconds,
-            cacheMinTokens: ctx.config.cacheMinTokens,
-            emitter,
-            allowCaching: !input.noCache && scan.files.length > 0,
-            // v1.12.1 — propagate signal into stale-cache rebuild too.
-            signal: abortSignal,
-            // v1.13.0 — keep cachingMode consistent across happy + retry paths.
-            cachingMode: requestedCachingMode,
-          });
-          // Cancel the original throttle reservation — its `tsMs` was
-          // stamped at first-dispatch time, which is now seconds in the
-          // past (the rebuild took real time). Re-reserve fresh so the
-          // retry's tsMs reflects when the retry call actually hits
-          // Gemini's quota counter. Without this, our window would expire
-          // locally before Gemini's, leaving a gap where concurrent
-          // callers bust the per-minute limit (PR #19 round-2 GPT review).
-          if (throttleReservationId !== -1) {
-            ctx.throttle.cancel(throttleReservationId);
-            throttleReservationId = -1;
-          }
-          await reserveForDispatch();
-          // Stale-cache retry: discard the partial response and run a brand-new decode with the rebuilt cache
-          // (a request has no resume across caches). Its openings are retried like the happy path's.
-          response = await decode(rebuilt, 'ask (stale-cache retry)');
-          activePrep = rebuilt;
-          retriedOnStaleCache = true;
-        } catch (retryErr) {
-          // Re-throw the retry's TimeoutError directly so the outer catch's
-          // `isTimeoutAbort` check sees it on the cause chain. Without this,
-          // wrapping with `cause: err` (the original stale-cache error)
-          // would mask the timeout — outer catch maps to UNKNOWN instead of
-          // TIMEOUT, breaking the contract on stale-cache+timeout paths.
-          if (isTimeoutAbort(retryErr)) throw retryErr;
-          // Otherwise preserve the ORIGINAL stale-cache error as `cause` so
-          // ops can root-cause diagnostics across both the first 404 and any
-          // rebuild-time failure.
-          // an HTTP error on the retry (a 429/503) IS the error: thrown as the SDK made it, so its status and the
-          // throttle's retry hint are read as usual; only a status-less failure is wrapped over the stale 404
-          if (statusOf(retryErr) !== undefined) throw retryErr;
-          throw new Error(
-            `ask retry after stale cache failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`,
-            { cause: err },
-          );
-        }
-      } else {
-        throw err;
-      }
-    }
-
-    if (activePrep.cacheId) {
-      ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
-    }
+        tracking,
+        throttle: dispatch,
+        estimatedInputTokens,
+      },
+      ctxPrep,
+    );
+    const { response, prep: activePrep, retriedOnStaleCache } = decoded;
 
     const text = response.text;
 
@@ -1166,16 +1052,6 @@ async function executeAskBody(
     // retry alike.
     const billed = billedUsage(completed.usage(), resolved.resolved, serviceTier);
 
-    // Finalise the throttle reservation with Gemini's actual
-    // `promptTokenCount` — includes cached tokens, which DO count against
-    // the per-minute quota (empirically confirmed 2026-04-20). If actual
-    // < estimate, subsequent reserves see the freed headroom; if >, they
-    // back off accordingly.
-    if (throttleReservationId !== -1) {
-      ctx.throttle.release(throttleReservationId, billed.promptTokens);
-      throttleReservationId = -1;
-    }
-
     // What the call billed, on the answer and on a stop without one alike.
     const billedFields = usageFields(billed, response.continuationHops);
 
@@ -1187,7 +1063,7 @@ async function executeAskBody(
     // Settled here, once: the outer catch then neither releases the reservation nor books the call again.
     const settledReservation = reservationId;
     reservationId = null;
-    ledgerEntry = null;
+    tracking.ledgerEntry = null;
     recordBilledCall(
       ctx.manifest,
       settledReservation,
@@ -1203,13 +1079,15 @@ async function executeAskBody(
     );
 
     // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
-    const starved = emptyAtOutputCap(response, billed.thinkingTokens);
+    const finish = answerFinish(response);
+    const starved = emptyAtOutputCap(response, billed.thinkingTokens, outputCap);
     if (starved !== null) {
       return errorResult(`ask: ${starved}`, {
         errorCode: OUTPUT_CAP_ERROR_CODE,
         retryable: false,
         resolvedModel: resolved.resolved,
         serviceTier,
+        finishReason: finish.finishReason,
         ...billedFields,
       });
     }
@@ -1232,6 +1110,9 @@ async function executeAskBody(
       thinkingBudget: effectiveThinkingBudget,
       thinkingLevel: input.thinkingLevel ?? null,
       ...billedFields,
+      // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
+      finishReason: finish.finishReason,
+      truncated: finish.truncated,
       cacheHit: activePrep.reused,
       cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
       retriedOnStaleCache,
@@ -1296,20 +1177,15 @@ async function executeAskBody(
     const failedUsage = settleFailedCall(ctx.manifest, {
       toolName: 'ask',
       reservationId,
-      entry: ledgerEntry,
+      entry: tracking.ledgerEntry,
       completed,
       durationMs: Date.now() - started,
     });
     reservationId = null;
-    // Drop the TPM reservation on any failure path. If Gemini actually
-    // consumed quota server-side before failing, the hint path above
-    // (T22a) compensates via `recordRetryHint` before we cancel. For
-    // non-429 errors (validation, transport), we under-count slightly
-    // but bounded — accepted trade-off documented in PR #19 round-2.
-    if (throttleReservationId !== -1) {
-      ctx.throttle.cancel(throttleReservationId);
-      throttleReservationId = -1;
-    }
+    // Drop the TPM reservation the failed request holds (the completed requests settled theirs). If Gemini consumed
+    // quota server-side before failing, the hint path above compensates via `recordRetryHint`; otherwise the
+    // window under-counts that one request, bounded.
+    dispatch.cancel();
     // Timeout-driven abort gets a dedicated errorCode so callers can
     // distinguish "Gemini was slow" from "schema invalid" / "auth failed".
     // v1.12.0 — `timeoutKind` ('total' | 'stall') distinguishes the
@@ -1337,7 +1213,7 @@ async function executeAskBody(
     }
     const httpStatus = statusOf(err);
     return errorResult(`ask failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err, streamOpened),
+      ...tierErrorMeta(err, tracking.streamOpened),
       serviceTier: reportedTier(),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       ...failedUsage,

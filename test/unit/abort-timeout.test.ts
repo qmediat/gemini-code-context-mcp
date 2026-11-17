@@ -132,6 +132,23 @@ describe('createTimeoutController', () => {
       vi.advanceTimersByTime(5000);
       expect(c.signal.aborted).toBe(false);
     });
+
+    it('pauseStall() stops the stall watchdog until the next chunk re-arms it', () => {
+      vi.useFakeTimers();
+      const c = createTimeoutController({
+        totalEnvVar: 'GEMINI_CODE_CONTEXT_TEST_TIMEOUT_MS',
+        stallMs: 1_000,
+        stallEnvVar: 'GEMINI_CODE_CONTEXT_TEST_STALL_MS',
+      });
+      c.recordChunk();
+      c.pauseStall(); // a request of the decode ended
+      vi.advanceTimersByTime(5_000); // the next request opens slowly
+      expect(c.signal.aborted).toBe(false);
+      c.recordChunk(); // its first chunk
+      vi.advanceTimersByTime(1_001);
+      expect(c.signal.aborted).toBe(true);
+      c.dispose();
+    });
   });
 });
 

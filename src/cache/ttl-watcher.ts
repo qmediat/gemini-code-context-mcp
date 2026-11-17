@@ -64,6 +64,18 @@ export class TtlWatcher {
     });
   }
 
+  /**
+   * A request is about to be sent on the cache: mark it hot and, when it expires within the refresh window
+   * (15 minutes), extend it now instead of at the next tick — so a decode of many requests, each opened through here,
+   * never sends one on a cache that expires before the request ends (a request of a decode lasts minutes). A failed
+   * refresh is logged and leaves the request to meet the cache as it is.
+   */
+  async keepAlive(workspaceRoot: string, cacheId: string, ttlSeconds: number): Promise<void> {
+    this.markHot(workspaceRoot, cacheId, ttlSeconds);
+    const entry = this.hot.get(workspaceRoot);
+    if (entry !== undefined) await this.refreshIfDue(entry, Date.now());
+  }
+
   private async tick(): Promise<void> {
     // Prevent overlap: if the previous tick is still running (slow Gemini
     // round-trips, throttle), skip this firing entirely rather than issuing
@@ -75,49 +87,49 @@ export class TtlWatcher {
     this.tickInProgress = true;
     try {
       const now = Date.now();
-      for (const [key, entry] of this.hot) {
+      for (const entry of [...this.hot.values()]) {
         if (now - entry.lastUsed > HOT_WINDOW_MS) {
-          this.hot.delete(key);
+          this.hot.delete(entry.workspaceRoot);
           continue;
         }
-        const ws = this.manifest.getWorkspace(entry.workspaceRoot);
-        if (!ws?.cacheId || ws.cacheId !== entry.cacheId) {
-          this.hot.delete(key);
-          continue;
-        }
-        if (ws.cacheExpiresAt !== null && ws.cacheExpiresAt - now > REFRESH_IF_EXPIRES_WITHIN_MS) {
-          continue; // plenty of time left
-        }
-        try {
-          await this.client.caches.update({
-            name: entry.cacheId,
-            config: { ttl: `${entry.ttlSeconds}s` },
-          });
-          const newExpires = now + entry.ttlSeconds * 1000;
-          this.manifest.upsertWorkspace({ ...ws, cacheExpiresAt: newExpires, updatedAt: now });
-          logger.debug(`refreshed TTL for ${safeForLog(entry.cacheId)}`);
-        } catch (err) {
-          // Evict the entry when Gemini reports the cache is gone (deleted
-          // externally, admin quota action, etc). Without this, we'd retry
-          // the update every TICK_MS forever and log-spam the 404.
-          if (isNotFoundError(err)) {
-            logger.debug(
-              `ttl refresh for ${entry.cacheId} returned not-found; dropping hot entry and nulling manifest cacheId`,
-            );
-            this.hot.delete(key);
-            this.manifest.upsertWorkspace({
-              ...ws,
-              cacheId: null,
-              cacheExpiresAt: null,
-              updatedAt: now,
-            });
-          } else {
-            logger.debug(`ttl refresh failed for ${safeForLog(entry.cacheId)}: ${safeForLog(err)}`);
-          }
-        }
+        await this.refreshIfDue(entry, now);
       }
     } finally {
       this.tickInProgress = false;
+    }
+  }
+
+  /** Extends the entry's cache when it expires within the refresh window; drops an entry whose cache is gone. */
+  private async refreshIfDue(entry: HotEntry, now: number): Promise<void> {
+    const ws = this.manifest.getWorkspace(entry.workspaceRoot);
+    if (!ws?.cacheId || ws.cacheId !== entry.cacheId) {
+      this.hot.delete(entry.workspaceRoot);
+      return;
+    }
+    if (ws.cacheExpiresAt !== null && ws.cacheExpiresAt - now > REFRESH_IF_EXPIRES_WITHIN_MS) {
+      return; // plenty of time left
+    }
+    try {
+      await this.client.caches.update({
+        name: entry.cacheId,
+        config: { ttl: `${entry.ttlSeconds}s` },
+      });
+      const newExpires = now + entry.ttlSeconds * 1000;
+      this.manifest.upsertWorkspace({ ...ws, cacheExpiresAt: newExpires, updatedAt: now });
+      logger.debug(`refreshed TTL for ${safeForLog(entry.cacheId)}`);
+    } catch (err) {
+      // Evict the entry when Gemini reports the cache is gone (deleted
+      // externally, admin quota action, etc). Without this, we'd retry
+      // the update every TICK_MS forever and log-spam the 404.
+      if (!isNotFoundError(err)) {
+        logger.debug(`ttl refresh failed for ${safeForLog(entry.cacheId)}: ${safeForLog(err)}`);
+        return;
+      }
+      logger.debug(
+        `ttl refresh for ${entry.cacheId} returned not-found; dropping hot entry and nulling manifest cacheId`,
+      );
+      this.hot.delete(entry.workspaceRoot);
+      this.manifest.upsertWorkspace({ ...ws, cacheId: null, cacheExpiresAt: null, updatedAt: now });
     }
   }
 }

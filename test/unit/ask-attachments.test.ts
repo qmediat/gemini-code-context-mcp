@@ -146,7 +146,7 @@ function buildCtx(configOverrides: Partial<ToolContext['config']> = {}): Harness
       insertUsageMetric: vi.fn(),
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     throttle: {
       reserve: vi.fn(() => ({ delayMs: 0, releaseId: 1 })),
       release: vi.fn(),

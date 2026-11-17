@@ -42,19 +42,25 @@ returns one answer.
 |---|---|
 | Default | No `maxOutputTokens`: one request, the model's own cap, the same cost as before |
 | Turn it on | `ask({ prompt, model: "gemini-4-hydrogen", thinkingLevel: "XHIGH", maxOutputTokens: 262144 })` |
-| Requests | At most `ceil(maxOutputTokens ÷ 65,536)`; the server stops there, or when the decoded tokens reach the cap |
-| Cost | Every continuation request bills the prompt again plus everything decoded before it ([cost-model.md](cost-model.md#long-decode-on-gemini-4)) |
-| Timeouts | `timeoutMs` and `stallMs` cover the whole call, every request |
+| Requests | At most `ceil(maxOutputTokens ÷ L)`, `L` the model's advertised per-request limit (65,536 on Hydrogen, 32,768 on Argon); the server also stops when the decoded tokens reach the cap, and when a request makes no progress (it returns the token it was sent with, or decodes nothing) |
+| Cost | Every continuation request bills the prompt again plus everything decoded before it ([cost-model.md](cost-model.md#long-decode-on-gemini-4)); the budget reservation takes the exact `countTokens` count of the prompt |
+| Between requests | A continuation request refused at its opening with 429 or 503 (nothing of it billed) is sent again with the same token after Google's retry hint (2 s, then 6 s, without one), at most 3 openings on `standard`, none on `flex`; each request holds its own TPM throttle reservation |
+| `timeoutMs` | Covers the whole call, every request. Its maximum, 30 minutes, fits about 7 to 9 requests at the measured pace (two requests took 375–482 s, 188–241 s a request): a larger cap may need more time than `timeoutMs` allows. When it fires the call returns `errorCode: TIMEOUT`; the requests that completed are billed and reported (token fields, `costEstimateUsd`, `continuationHops`) |
+| `stallMs` | Counts the gaps between the chunks of a request; the time before a continuation request's first chunk (its opening, its prefill) is not counted, as for the first request |
+| Stale cache | A context cache that expires after a request of the decode completed ends the call with an error and the completed requests billed: the decode is not restarted (a restart would bill every request again). Before each request, a cache that expires within 15 minutes is extended at once, so a request (minutes long) never starts on a cache about to expire |
 | Other models | A value above the model's limit is clamped to it, as before |
-| `ask_agentic` | Not covered: its loop calls the model without streaming, one bounded call per iteration |
+| Vertex AI | Not covered: long decode runs on the Gemini Developer API only. On Vertex (`GEMINI_USE_VERTEX=true`) the cap is clamped to the per-request limit, as on any other model |
+| `ask_agentic` | Not covered: its loop is its own — one model call per iteration, sent with `automaticContinuation: false` — and a `CONTINUATION` stop there is not continued |
 
 What the result carries:
 
 | Field | Meaning |
 |---|---|
-| `continuationHops` | The requests after the first; `0` for a call that ended in one request |
+| `continuationHops` | The continuation requests sent: `0` for a call that ended in one request |
 | `cachedTokens`, `uncachedTokens`, `outputTokens`, `thinkingTokens`, `costEstimateUsd` | Summed over every request: what the call billed |
-| `errorCode: OUTPUT_CAP` | The call stopped at the cap with no answer (`MAX_TOKENS`, or a long decode cut at its cap). The error carries the same token fields, `costEstimateUsd`, `continuationHops` and `retryable: false`. Remedy: on Gemini 4 ask for `maxOutputTokens` above 65,536; or lower `thinkingLevel` |
+| `finishReason` | The last request's finish reason (`STOP`, `MAX_TOKENS`, `CONTINUATION`, …), on every `ask` and `code` result |
+| `truncated` | `true` when the answer has text but stopped at the cap: `MAX_TOKENS`, or a long decode that ended on `CONTINUATION` at its limits. The answer is cut. `code` then leads its text with a `[truncated]` line: its edit list is incomplete and must not be applied as complete |
+| `errorCode: OUTPUT_CAP` | The call stopped at the cap with no answer (`MAX_TOKENS`, or a long decode cut at its cap). The error carries the same token fields, `costEstimateUsd`, `continuationHops`, `finishReason` and `retryable: false`. The message names the remedy for the cap that ran: below the model's per-request limit, raise `maxOutputTokens`; at the limit of a Gemini 4 model, ask above it (the decode continues); after a long decode, raise it above the cap that ran (up to 1,048,576); at the most the model allows, lower `thinkingLevel` / `thinkingBudget` |
 
 ## `ask_agentic` safety
 

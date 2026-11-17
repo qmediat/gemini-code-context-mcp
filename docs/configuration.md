@@ -6,7 +6,7 @@ All configuration is environment-variable-driven. Secrets live in `~/.config/qme
 
 The server picks the highest-trust source available, in this order:
 
-1. **Vertex AI** — `GEMINI_USE_VERTEX=true` + `GOOGLE_CLOUD_PROJECT` (+ optional `GOOGLE_CLOUD_LOCATION`, default `us-central1`). Auth relies on ADC (`gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`).
+1. **Vertex AI** — `GEMINI_USE_VERTEX=true` + `GOOGLE_CLOUD_PROJECT` (+ optional `GOOGLE_CLOUD_LOCATION`, default `us-central1`). Auth relies on ADC (`gcloud auth application-default login` or `GOOGLE_APPLICATION_CREDENTIALS`). Named limit: Gemini 4 long decode runs on the Gemini Developer API only — on Vertex a `maxOutputTokens` above the per-request limit is clamped to it, one request, as on any other model ([tools.md](tools.md#long-decode-on-gemini-4-ask-code)). The Vertex client is not pinned to an API version: the SDK's own default (or `GOOGLE_GENAI_API_VERSION`) applies there, while the API-key client is pinned to `v1beta`.
 2. **Credentials file** — `GEMINI_CREDENTIALS_PROFILE` env (default: `default`) names a profile in `~/.config/qmediat/credentials`. Written by `npx @qmediat.io/gemini-code-context-mcp init`.
 3. **Raw env key** — `GEMINI_API_KEY`. Works, but logs a warning. Prefer #2 unless you're running in CI.
 

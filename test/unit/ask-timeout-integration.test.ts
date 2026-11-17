@@ -92,7 +92,7 @@ function buildCtx(): {
       insertUsageMetric: vi.fn(),
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle,
   };

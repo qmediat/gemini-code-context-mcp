@@ -137,9 +137,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       insertUsageMetric: vi.fn(),
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: {
-      markHot: vi.fn(),
-    } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle: throttleSpy,
   };
@@ -393,7 +391,7 @@ describe('ask.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     mocks.scanWorkspace.mockResolvedValue({
       workspaceRoot: '/fake',
       filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
+      files: [{ relpath: 'a.ts', size: 100, contentHash: 'h1', absolutePath: '/fake/a.ts' }],
       skippedTooLarge: 0,
       excludedDirs: [],
       excludedDirsTotal: 0,

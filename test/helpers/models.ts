@@ -23,11 +23,15 @@ export const GEMINI_4_HYDROGEN: ResolvedModel = {
   supportsCaching: true,
 };
 
-/** Gemini 4 Argon: the reasoning tier, the one `code` runs. */
+/**
+ * Gemini 4 Argon: the reasoning tier, the one `code` runs. `models.list` advertises 32 768 output tokens a request
+ * for it (read again by the integration smoke), half of what one streaming request decodes.
+ */
 export const GEMINI_4_ARGON: ResolvedModel = {
   ...GEMINI_4_HYDROGEN,
   requested: 'gemini-4-argon',
   resolved: 'gemini-4-argon',
+  outputTokenLimit: 32_768,
   category: 'text-reasoning',
   capabilities: { ...GEMINI_4_HYDROGEN.capabilities, costTier: 'premium' },
 };

@@ -90,20 +90,66 @@ export const OUTPUT_CAP_ERROR_CODE = 'OUTPUT_CAP';
 /** The finish reasons of a call that ended at the output cap: one request's cap, or a long decode cut at its limits. */
 const AT_OUTPUT_CAP: ReadonlySet<unknown> = new Set(['MAX_TOKENS', 'CONTINUATION']);
 
+/** The part of a decoded response these checks read. */
+interface FinishedResponse {
+  readonly text: string;
+  readonly candidates?: readonly { finishReason?: unknown }[] | undefined;
+}
+
+/** The output cap that ran (`OutputCap`): its value, the model's per-request limit and the most a caller may ask. */
+export interface CapThatRan {
+  readonly effective: number;
+  readonly perRequest: number;
+  readonly ceiling: number;
+}
+
+/** How a call's answer ended: the last request's finish reason and whether the text was cut at the output cap. */
+export interface AnswerFinish {
+  readonly finishReason: string | null;
+  /** The answer has text and stopped at the cap (`MAX_TOKENS`, or a long decode ended at its limits on `CONTINUATION`). */
+  readonly truncated: boolean;
+}
+
+export function answerFinish(response: FinishedResponse): AnswerFinish {
+  const stopped = response.candidates?.[0]?.finishReason;
+  return {
+    finishReason: typeof stopped === 'string' ? stopped : null,
+    truncated: response.text.trim() !== '' && AT_OUTPUT_CAP.has(stopped),
+  };
+}
+
+const LOWER_THE_THINKING =
+  'lower the thinking: `thinkingLevel: "LOW"` / a smaller `thinkingBudget`';
+
+const tokenCount = (n: number): string => n.toLocaleString('en-US');
+
+/** What the caller can change after a stop at `cap`: raise the cap where the model allows more, else the thinking. */
+function capRemedy(cap: CapThatRan): string {
+  if (cap.effective < cap.perRequest) {
+    return `Raise \`maxOutputTokens\` (it was ${tokenCount(cap.effective)}; the model allows ${tokenCount(cap.perRequest)} per request), or ${LOWER_THE_THINKING}.`;
+  }
+  if (cap.effective >= cap.ceiling) {
+    return `The cap is the most this model allows (${tokenCount(cap.ceiling)}): ${LOWER_THE_THINKING}.`;
+  }
+  if (cap.effective === cap.perRequest) {
+    return `Ask for \`maxOutputTokens\` above ${tokenCount(cap.perRequest)} (up to ${tokenCount(cap.ceiling)}): on this model the decode then continues in further requests. Or ${LOWER_THE_THINKING}.`;
+  }
+  return `Raise \`maxOutputTokens\` above ${tokenCount(cap.effective)} (up to ${tokenCount(cap.ceiling)}), or ${LOWER_THE_THINKING}.`;
+}
+
 /**
  * A call that ended at the output cap with no answer: the model's thinking used the cap (thinking tokens count
  * against `maxOutputTokens`, and Gemini 4 Carbon / Hydrogen and the 3.x Pro models think without being asked), in
- * one request (`MAX_TOKENS`) or over a long decode stopped at the caller's cap (`CONTINUATION`). The message names
- * the cause and the remedies; `null` for any call that produced text or stopped for another reason.
+ * one request (`MAX_TOKENS`) or over a long decode stopped at its limits (`CONTINUATION`). The message names the
+ * cause and the remedy that fits the cap that ran; `null` for any call that produced text or stopped for another
+ * reason.
  */
 export function emptyAtOutputCap(
-  response: {
-    readonly text: string;
-    readonly candidates?: readonly { finishReason?: unknown }[] | undefined;
-  },
+  response: FinishedResponse,
   thinkingTokens: number,
+  cap: CapThatRan,
 ): string | null {
   const stopped = response.candidates?.[0]?.finishReason;
   if (response.text.trim() !== '' || !AT_OUTPUT_CAP.has(stopped)) return null;
-  return `the model stopped at the output cap before writing an answer (thinking used ${thinkingTokens} tokens of it; the call was billed). On a model with long decode (Gemini 4) ask for \`maxOutputTokens\` above its per-request output limit, so the decode continues in further requests; or lower the thinking: \`thinkingLevel: "LOW"\` / a smaller \`thinkingBudget\`.`;
+  return `the model stopped at the output cap before writing an answer (thinking used ${tokenCount(thinkingTokens)} tokens of it; the call was billed). ${capRemedy(cap)}`;
 }

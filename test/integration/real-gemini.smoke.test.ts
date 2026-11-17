@@ -32,6 +32,9 @@ import { scanWorkspace } from '../../src/indexer/workspace-scanner.js';
 import { ManifestDb } from '../../src/manifest/db.js';
 import { CompletedRequests, runDecode } from '../../src/tools/shared/continuation.js';
 
+/** What `models.list` advertises for Gemini 4 Argon a request (the unit fixture `GEMINI_4_ARGON` carries it). */
+const ARGON_OUTPUT_LIMIT = 32_768;
+
 const apiKey = process.env.GEMINI_API_KEY;
 const suite = apiKey ? describe : describe.skip;
 
@@ -43,6 +46,19 @@ suite('real Gemini API smoke (requires GEMINI_API_KEY)', () => {
     const models = await listAvailableModels(client, { force: true });
     expect(models.length).toBeGreaterThan(0);
     expect(models[0]?.id).toBeTruthy();
+  }, 30_000);
+
+  it('reads the per-request output limits of the Gemini 4 models from models.list (free)', async () => {
+    const models = await listAvailableModels(client, { force: true });
+    const limits = Object.fromEntries(
+      models
+        .filter((m) => /^gemini-4-(argon|hydrogen)$/.test(m.id))
+        .map((m) => [m.id, { out: m.outputTokenLimit, longDecode: m.longDecodeTokenLimit }]),
+    );
+    expect(limits).toEqual({
+      'gemini-4-argon': { out: ARGON_OUTPUT_LIMIT, longDecode: 1_048_576 },
+      'gemini-4-hydrogen': { out: 65_536, longDecode: 1_048_576 },
+    });
   }, 30_000);
 
   it("resolves 'latest-flash' alias against live registry", async () => {

@@ -71,7 +71,7 @@ function buildCtx(): {
       // v1.13.0: ask/code now read manifest.getFiles to seed the scan memo.
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle: {
       reserve: () => ({ delayMs: 0, releaseId: 1 }),
@@ -84,19 +84,32 @@ function buildCtx(): {
   return { ctx, generateContentStream };
 }
 
+/** A prepared context that reads an explicit cache. */
+const CACHED_CONTEXT = {
+  cacheId: 'cachedContents/old',
+  inlineContents: [],
+  reused: true,
+  rebuilt: false,
+  inlineOnly: false,
+  uploaded: { failedCount: 0, failures: [] },
+};
+
+/** The workspace every test scans unless it says otherwise: one 100-byte file. */
+const ONE_FILE_SCAN = {
+  workspaceRoot: '/fake',
+  filesHash: 'abc',
+  files: [{ relpath: 'a.ts', size: 100, contentHash: 'h', absolutePath: '/fake/a.ts' }],
+  skippedTooLarge: 0,
+  excludedDirs: [],
+  excludedDirsTotal: 0,
+  skippedNonSource: 0,
+  truncated: false,
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.validateWorkspacePath.mockReturnValue(undefined);
-  mocks.scanWorkspace.mockResolvedValue({
-    workspaceRoot: '/fake',
-    filesHash: 'abc',
-    files: [{ relpath: 'a.ts', size: 100, contentHash: 'h', absolutePath: '/fake/a.ts' }],
-    skippedTooLarge: 0,
-    excludedDirs: [],
-    excludedDirsTotal: 0,
-    skippedNonSource: 0,
-    truncated: false,
-  });
+  mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
   mocks.resolveModel.mockResolvedValue({
     requested: 'latest-pro',
     resolved: 'gemini-3-pro-preview',
@@ -112,12 +125,10 @@ beforeEach(() => {
     },
   });
   mocks.prepareContext.mockResolvedValue({
+    ...CACHED_CONTEXT,
     cacheId: null,
-    inlineContents: [],
     reused: false,
-    rebuilt: false,
     inlineOnly: true,
-    uploaded: { failedCount: 0, failures: [] },
   });
   mocks.isStaleCacheError.mockReturnValue(false);
 });
@@ -223,28 +234,54 @@ describe('ask — mid-stream failure semantics (T20 review CRITICAL fix)', () =>
   });
 });
 
-describe('ask — long decode on a Gemini 4 model', () => {
-  /** One request that thinks through the per-request limit and stops with CONTINUATION. */
-  const continuationStop = (token: string, prompt: number) =>
-    chunkedStream([
-      {
-        candidates: [
-          {
-            index: 0,
-            content: { role: 'model', parts: [{ text: `thinking ${token}`, thought: true }] },
-          },
-        ],
-      },
-      {
-        candidates: [{ index: 0, finishReason: 'CONTINUATION' as never, continuationToken: token }],
-        usageMetadata: {
-          promptTokenCount: prompt,
-          candidatesTokenCount: 3,
-          thoughtsTokenCount: 65_533,
+/** One request that thinks through the per-request limit and stops with CONTINUATION and `token`. */
+const continuationStop = (token: string, prompt: number) =>
+  chunkedStream([
+    {
+      candidates: [
+        {
+          index: 0,
+          content: { role: 'model', parts: [{ text: `thinking ${token}`, thought: true }] },
         },
+      ],
+    },
+    {
+      candidates: [{ index: 0, finishReason: 'CONTINUATION' as never, continuationToken: token }],
+      usageMetadata: {
+        promptTokenCount: prompt,
+        candidatesTokenCount: 3,
+        thoughtsTokenCount: 65_533,
+        totalTokenCount: prompt + 65_536,
       },
-    ]);
+    },
+  ]);
 
+/** A request that answers `text` and stops with `finishReason` (a token when it is CONTINUATION). */
+const answering = (text: string, finishReason: 'STOP' | 'CONTINUATION', prompt: number) =>
+  chunkedStream([
+    {
+      text,
+      candidates: [
+        {
+          index: 0,
+          finishReason: finishReason as never,
+          content: { role: 'model', parts: [{ text }] },
+          ...(finishReason === 'CONTINUATION' ? { continuationToken: 'tok-last' } : {}),
+        },
+      ],
+      usageMetadata: {
+        promptTokenCount: prompt,
+        candidatesTokenCount: 100,
+        thoughtsTokenCount: 0,
+        totalTokenCount: prompt + 100,
+      },
+    },
+  ]);
+
+/** Resolves after `ms` of real time. */
+const waitMs = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+
+describe('ask — long decode on a Gemini 4 model', () => {
   type StreamCall = { config: Record<string, unknown> };
   const configs = (mock: ReturnType<typeof vi.fn>): Record<string, unknown>[] =>
     mock.mock.calls.map((call) => (call[0] as StreamCall).config);
@@ -299,6 +336,7 @@ describe('ask — long decode on a Gemini 4 model', () => {
     // Hydrogen at 1.50 / 7.50 USD per 1M: the server's own estimate of the measured call.
     expect(result.structuredContent?.costEstimateUsd).toBe(1.0485);
     expect(result.structuredContent?.thinkingSummary).toBe('thinking tok-1\nmore thinking');
+    expect(result.structuredContent).toMatchObject({ finishReason: 'STOP', truncated: false });
     const [first, second] = configs(generateContentStream);
     expect(first).toMatchObject({ maxOutputTokens: 262_144, automaticContinuation: false });
     expect(first).not.toHaveProperty('continuationToken');
@@ -326,7 +364,10 @@ describe('ask — long decode on a Gemini 4 model', () => {
     expect(result.structuredContent?.thinkingTokens).toBe(131_066);
     expect(result.structuredContent?.uncachedTokens).toBe(265_536);
     expect(result.structuredContent?.costEstimateUsd).toBeGreaterThan(0);
-    expect(String(result.structuredContent?.responseText)).toContain('long decode');
+    expect(String(result.structuredContent?.responseText)).toContain(
+      'Raise `maxOutputTokens` above 131,072 (up to 1,048,576)',
+    );
+    expect(result.structuredContent?.finishReason).toBe('CONTINUATION');
   });
 
   it('a default call that stops at MAX_TOKENS with no text carries the usage and OUTPUT_CAP', async () => {
@@ -369,6 +410,98 @@ describe('ask — long decode on a Gemini 4 model', () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent?.errorCode).toBe('NETWORK_ERROR');
     expect(result.structuredContent?.retryable).toBe(false);
+  });
+});
+
+describe('ask — a long decode between its requests', () => {
+  beforeEach(() => {
+    mocks.resolveModel.mockResolvedValue(GEMINI_4_HYDROGEN);
+  });
+
+  it('flags an answer cut at the request limit: truncated, with its finish reason', async () => {
+    const { ctx, generateContentStream } = buildCtx();
+    generateContentStream
+      .mockImplementationOnce(continuationStop('tok-1', 100_000))
+      .mockImplementationOnce(answering('the first half of the answer', 'CONTINUATION', 165_661));
+
+    const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 131_072 }, ctx);
+
+    expect(generateContentStream).toHaveBeenCalledTimes(2);
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      finishReason: 'CONTINUATION',
+      truncated: true,
+      continuationHops: 1,
+    });
+  });
+
+  it('the stall watchdog does not count the gap before a continuation request opens', async () => {
+    const { ctx, generateContentStream } = buildCtx();
+    generateContentStream
+      .mockImplementationOnce(continuationStop('tok-1', 100_000))
+      .mockImplementationOnce(async () => {
+        await waitMs(1_600); // the opening and prefill of request 2: longer than stallMs
+        return answering('The answer.', 'STOP', 165_661)();
+      });
+
+    const result = await askTool.execute(
+      { prompt: 'review', maxOutputTokens: 262_144, stallMs: 1_000 },
+      ctx,
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent?.continuationHops).toBe(1);
+  });
+
+  it('a stall inside a continuation request still aborts the call', async () => {
+    const { ctx, generateContentStream } = buildCtx();
+    async function* stallsAfterOneChunk() {
+      yield { candidates: [{ index: 0, content: { role: 'model', parts: [{ text: 'a' }] } }] };
+      await waitMs(1_600);
+      yield { text: 'late', candidates: [{ index: 0, finishReason: 'STOP' }] };
+    }
+    generateContentStream
+      .mockImplementationOnce(continuationStop('tok-1', 100_000))
+      .mockImplementationOnce(async () => stallsAfterOneChunk());
+
+    const result = await askTool.execute(
+      { prompt: 'review', maxOutputTokens: 262_144, stallMs: 1_000 },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ errorCode: 'TIMEOUT', timeoutKind: 'stall' });
+  });
+
+  it('each request holds its own TPM reservation, settled at the input it reported', async () => {
+    const { ctx, generateContentStream } = buildCtx();
+    const reserved: number[] = [];
+    let nextId = 0;
+    const throttle = {
+      ...ctx.throttle,
+      reserve: (_model: string, tokens: number) => {
+        reserved.push(tokens);
+        nextId += 1;
+        return { delayMs: 0, releaseId: nextId };
+      },
+      release: vi.fn(),
+    };
+    generateContentStream
+      .mockImplementationOnce(continuationStop('tok-1', 99_712))
+      .mockImplementationOnce(answering('The answer.', 'STOP', 165_373));
+
+    const result = await askTool.execute(
+      { prompt: 'review', maxOutputTokens: 262_144 },
+      { ...ctx, throttle },
+    );
+
+    expect(result.isError).toBeFalsy();
+    // request 1: the estimate; request 2: request 1's prompt plus the 65 536 tokens it decoded
+    expect(reserved.slice(1)).toEqual([99_712 + 65_536]);
+    expect(throttle.release.mock.calls).toEqual([
+      [1, 99_712],
+      [2, 165_373],
+    ]);
   });
 });
 
@@ -445,47 +578,138 @@ describe('ask — the ledger of a decode that fails', () => {
     expect(result.structuredContent).not.toHaveProperty('costEstimateUsd');
   });
 
-  it('a continuation that meets a stale cache keeps its completed request billed beside the retry', async () => {
+  it('a stale cache at a continuation request ends the call: no restart, the completed request billed', async () => {
     const { ctx, generateContentStream } = budgetedCtx();
     const stale = new Error('CachedContent not found');
     mocks.isStaleCacheError.mockImplementation((err: unknown) => err === stale);
-    mocks.prepareContext.mockResolvedValueOnce({
-      cacheId: 'cachedContents/old',
-      inlineContents: [],
-      reused: true,
-      rebuilt: false,
-      inlineOnly: false,
-      uploaded: { failedCount: 0, failures: [] },
-    });
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
     generateContentStream
       .mockImplementationOnce(firstRequest)
+      .mockRejectedValueOnce(stale)
+      .mockImplementation(answering('a restarted decode', 'STOP', 100_000));
+
+    const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 262_144 }, ctx);
+
+    expect(generateContentStream).toHaveBeenCalledTimes(2);
+    expect(result.isError).toBe(true);
+    expect(String(result.structuredContent?.responseText)).toContain('not restarted');
+    expect(manifestOf(ctx).finalizeBudgetReservation).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ costUsdMicro: FIRST_REQUEST_MICROS }),
+    );
+    expect(result.structuredContent).toMatchObject({
+      uncachedTokens: 100_000,
+      continuationHops: 1,
+    });
+    expect(mocks.markCacheStale).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stale cache at the first request is rebuilt and the decode run once more', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    const stale = new Error('CachedContent not found');
+    mocks.isStaleCacheError.mockImplementation((err: unknown) => err === stale);
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
+    generateContentStream
+      .mockRejectedValueOnce(stale)
+      .mockImplementationOnce(answering('The answer.', 'STOP', 1_000));
+
+    const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 262_144 }, ctx);
+
+    expect(generateContentStream).toHaveBeenCalledTimes(2);
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent?.retriedOnStaleCache).toBe(true);
+    // 1 000 × 1.50 + 100 × 7.50 = 0.00225 USD
+    expect(manifestOf(ctx).finalizeBudgetReservation).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ costUsdMicro: 2_250 }),
+    );
+  });
+
+  it('a 500 000-token prompt at a cap of 1 048 576 whose cache goes stale at request 16 bills within its reservation', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    const prompt = 500_000;
+    mocks.scanWorkspace.mockResolvedValueOnce({
+      ...ONE_FILE_SCAN,
+      filesHash: 'big',
+      files: [{ relpath: 'a.ts', size: prompt * 4, contentHash: 'h', absolutePath: '/fake/a.ts' }],
+    });
+    (ctx.client.models as unknown as { countTokens: unknown }).countTokens = vi
+      .fn()
+      .mockResolvedValue({ totalTokens: prompt });
+    const stale = new Error('CachedContent not found');
+    mocks.isStaleCacheError.mockImplementation((err: unknown) => err === stale);
+    mocks.prepareContext.mockResolvedValue(CACHED_CONTEXT);
+    let sent = 0;
+    generateContentStream.mockImplementation(async () => {
+      sent += 1;
+      if (sent === 16) throw stale;
+      // request k bills the prompt, what was decoded before it and 125 tokens more
+      const k = (sent - 1) % 16;
+      return continuationStop(`tok-${sent}`, prompt + k * 65_536 + (k > 0 ? 125 : 0))();
+    });
+
+    const result = await askTool.execute(
+      { prompt: 'review', maxOutputTokens: 1_048_576, thinkingLevel: 'LOW' },
+      ctx,
+    );
+
+    expect(result.isError).toBe(true);
+    const reservedMicros = (ctx.manifest.reserveBudget as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0].estimatedCostMicros as number;
+    const billedMicros = manifestOf(ctx).finalizeBudgetReservation.mock.calls[0]?.[1]
+      .costUsdMicro as number;
+    expect(billedMicros).toBeGreaterThan(0);
+    expect(billedMicros).toBeLessThanOrEqual(reservedMicros);
+    // one decode's worth of requests at most: the 15 that completed and the one the stale cache refused
+    expect(generateContentStream).toHaveBeenCalledTimes(16);
+  });
+
+  it('keeps the cache of a long decode alive before every request it sends', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
+    const events: string[] = [];
+    (ctx.ttlWatcher.keepAlive as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+      events.push('keepAlive');
+    });
+    generateContentStream
       .mockImplementationOnce(async () => {
-        throw stale;
+        events.push('request 1');
+        return continuationStop('tok-1', 100_000)();
       })
-      .mockImplementationOnce(
-        chunkedStream([
-          {
-            text: 'The answer.',
-            candidates: [{ index: 0, finishReason: 'STOP' as never }],
-            usageMetadata: {
-              promptTokenCount: 1_000,
-              candidatesTokenCount: 100,
-              thoughtsTokenCount: 0,
-            },
-          },
-        ]),
-      );
+      .mockImplementationOnce(async () => {
+        events.push('request 2');
+        return answering('The answer.', 'STOP', 165_661)();
+      });
 
     const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 262_144 }, ctx);
 
     expect(result.isError).toBeFalsy();
-    expect(result.structuredContent?.retriedOnStaleCache).toBe(true);
-    // The retry's answer (1 000 × 1.50 + 100 × 7.50 = 0.00225 USD) and the abandoned decode's completed request.
-    expect(manifestOf(ctx).finalizeBudgetReservation).toHaveBeenCalledWith(
-      1,
-      expect.objectContaining({ costUsdMicro: FIRST_REQUEST_MICROS + 2_250 }),
+    expect(events).toEqual(['keepAlive', 'request 1', 'keepAlive', 'request 2']);
+    expect(ctx.ttlWatcher.keepAlive).toHaveBeenCalledWith(
+      expect.any(String),
+      'cachedContents/old',
+      3_600,
     );
-    expect(result.structuredContent?.uncachedTokens).toBe(101_000);
-    expect(result.structuredContent?.continuationHops).toBe(0);
+  });
+
+  it('a failure after the decode answered counts the continuation requests it sent, not one more', async () => {
+    const { ctx, generateContentStream } = budgetedCtx();
+    mocks.prepareContext.mockResolvedValueOnce(CACHED_CONTEXT);
+    let answered = false;
+    async function* answerThenMark() {
+      yield* await answering('The answer.', 'STOP', 165_661)();
+      answered = true;
+    }
+    generateContentStream
+      .mockImplementationOnce(firstRequest)
+      .mockImplementationOnce(async () => answerThenMark());
+    (ctx.ttlWatcher.markHot as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      if (answered) throw new Error('watcher down');
+    });
+
+    const result = await askTool.execute({ prompt: 'review', maxOutputTokens: 262_144 }, ctx);
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent?.continuationHops).toBe(1);
   });
 });

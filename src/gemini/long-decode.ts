@@ -9,6 +9,7 @@
  */
 
 import { categorizeModel, isTextGenCategory } from './model-taxonomy.js';
+import type { PreflightInput } from './token-counter.js';
 
 /** The most a Gemini 4 decode can produce over all its requests. */
 export const LONG_DECODE_TOTAL_TOKENS = 1_048_576;
@@ -28,6 +29,13 @@ export function longDecodeTokenLimitOf(modelId: string): number | null {
   return isTextGenCategory(categorizeModel(modelId)) ? LONG_DECODE_TOTAL_TOKENS : null;
 }
 
+/**
+ * Input a continuation request bills beyond the prompt and the tokens decoded before it. Measured on
+ * gemini-4-hydrogen in two runs: +125 tokens (99 712-token prompt, request 2 billed 165 373) and +89; reserved at
+ * twice the larger, rounded up.
+ */
+export const CONTINUATION_REQUEST_OVERHEAD_TOKENS = 256;
+
 /** The output cap of one call: what goes on the wire and how many requests the decode may take. */
 export interface OutputCap {
   /** `maxOutputTokens` on the wire; `undefined` sends none and the model applies its own default. */
@@ -36,6 +44,8 @@ export interface OutputCap {
   readonly effective: number;
   /** The model's advertised per-request output limit. */
   readonly perRequest: number;
+  /** The most a caller may ask for: the long-decode total on a model with long decode, else `perRequest`. */
+  readonly ceiling: number;
   /** The requests the decode may take: 1 unless the cap is above the per-request limit on a long-decode model. */
   readonly maxRequests: number;
 }
@@ -70,7 +80,28 @@ export function resolveOutputCap(inputs: OutputCapInputs): OutputCap {
         ? perRequest
         : undefined;
   const effective = wire ?? perRequest;
-  return { wire, effective, perRequest, maxRequests: maxDecodeRequests(effective, perRequest) };
+  return {
+    wire,
+    effective,
+    perRequest,
+    ceiling,
+    maxRequests: maxDecodeRequests(effective, perRequest),
+  };
+}
+
+/** The preflight's count modes (`preflightMode` of `ask` and `code`). */
+export type PreflightMode = NonNullable<PreflightInput['preflightMode']>;
+
+/**
+ * The count mode the preflight runs in. A decode that may take more than one request bills its prompt once per
+ * request, so the budget reservation takes the exact count (`countTokens`) whatever mode was asked for; a
+ * one-request call keeps the caller's mode.
+ */
+export function preflightModeFor(
+  requested: PreflightMode | undefined,
+  cap: OutputCap,
+): PreflightMode | undefined {
+  return cap.maxRequests > 1 ? 'exact' : requested;
 }
 
 /** The requests a decode of `cap` tokens may take when each request decodes up to `perRequest` tokens. */
@@ -79,16 +110,22 @@ export function maxDecodeRequests(cap: number, perRequest: number): number {
   return Math.max(1, Math.ceil(cap / perRequest));
 }
 
+/** The most one streaming request of a model with per-request limit `perRequest` decodes (M). */
+function streamRequestTokens(perRequest: number): number {
+  return Math.max(perRequest, LONG_DECODE_STREAM_REQUEST_TOKENS);
+}
+
 /**
  * The input tokens the continuation requests bill again, at most, for a prompt of `promptTokens` tokens:
  *
  *   R = ceil(C / L)                               requests (the client stops there; L = the per-request limit)
  *   M = max(L, 65 536)                            the most one streaming request decodes
- *   re-billed input = Σ_{k=1..R−1} (P + min(k·M, C))
+ *   O = CONTINUATION_REQUEST_OVERHEAD_TOKENS      what a continuation request bills beyond the two terms below
+ *   re-billed input = Σ_{k=1..R−1} (P + min(k·M, C) + O)
  *
- * Request k sends the prompt P again plus the tokens decoded before it, which are at most k·M and never more than
- * the cap C. The first request's prompt is not part of this sum. The decoded tokens themselves are at most C:
- * `maxOutputTokens` = C travels on every request.
+ * Request k sends the prompt P again plus the tokens decoded before it, which are at most k·M and below the cap C
+ * (the client opens no request once the decoded tokens reached C). The first request's prompt is not part of this
+ * sum.
  */
 export function continuationInputTokens(
   promptTokens: number,
@@ -96,10 +133,25 @@ export function continuationInputTokens(
   perRequest: number,
 ): number {
   const requests = maxDecodeRequests(cap, perRequest);
-  const perRequestCeiling = Math.max(perRequest, LONG_DECODE_STREAM_REQUEST_TOKENS);
+  const perRequestCeiling = streamRequestTokens(perRequest);
   let total = 0;
   for (let k = 1; k < requests; k++) {
-    total += promptTokens + Math.min(k * perRequestCeiling, cap);
+    total +=
+      promptTokens + Math.min(k * perRequestCeiling, cap) + CONTINUATION_REQUEST_OVERHEAD_TOKENS;
   }
   return total;
+}
+
+/**
+ * The most a decode of cap C produces (thinking and answer). One request honours `maxOutputTokens` = C. Over several
+ * requests C stays the bound only while Google holds `maxOutputTokens` over the whole chain, which the client cannot
+ * check: it stops after a request ends, once the decoded tokens reached C, so a server that holds the cap per
+ * request lets the last request run up to one request's decode past it — at most C + M − 1, and never more than
+ * R requests of M.
+ */
+export function decodedTokensBound(cap: number, perRequest: number): number {
+  const requests = maxDecodeRequests(cap, perRequest);
+  if (requests === 1) return cap;
+  const perRequestCeiling = streamRequestTokens(perRequest);
+  return Math.min(requests * perRequestCeiling, cap + perRequestCeiling - 1);
 }

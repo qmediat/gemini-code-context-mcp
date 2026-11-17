@@ -10,7 +10,7 @@
 import { ApiError } from '@google/genai';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ModelCategoryMismatchError } from '../../src/gemini/model-taxonomy.js';
-import { codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
+import { TRUNCATED_EDITS_NOTE, codeInputSchema, codeTool } from '../../src/tools/code.tool.js';
 import type { ToolContext } from '../../src/tools/registry.js';
 import type { TpmReservation, TpmThrottle } from '../../src/tools/shared/throttle.js';
 import { GEMINI_4_ARGON, GEMINI_4_HYDROGEN } from '../helpers/models.js';
@@ -118,7 +118,7 @@ function buildCtx(opts: BuildCtxOptions = {}): {
       insertUsageMetric: vi.fn(),
       getFiles: vi.fn(() => []),
     } as unknown as ToolContext['manifest'],
-    ttlWatcher: { markHot: vi.fn() } as unknown as ToolContext['ttlWatcher'],
+    ttlWatcher: { markHot: vi.fn(), keepAlive: vi.fn() } as unknown as ToolContext['ttlWatcher'],
     progressToken: undefined,
     throttle: throttleSpy,
   };
@@ -128,20 +128,23 @@ function buildCtx(opts: BuildCtxOptions = {}): {
 
 const methodSequence = (spy: ThrottleSpy): string[] => spy.calls.map((c) => c.method);
 
+/** The workspace every test scans: one 100-byte file (a long decode's exact preflight count reads it). */
+const ONE_FILE_SCAN = {
+  workspaceRoot: '/fake',
+  filesHash: 'abc',
+  files: [{ relpath: 'a.ts', size: 100, contentHash: 'h1', absolutePath: '/fake/a.ts' }],
+  skippedTooLarge: 0,
+  excludedDirs: [],
+  excludedDirsTotal: 0,
+  skippedNonSource: 0,
+  truncated: false,
+};
+
 describe('code.tool.ts throttle call sequence (T22b regression)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.validateWorkspacePath.mockReturnValue(undefined);
-    mocks.scanWorkspace.mockResolvedValue({
-      workspaceRoot: '/fake',
-      filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
-      skippedTooLarge: 0,
-      excludedDirs: [],
-      excludedDirsTotal: 0,
-      skippedNonSource: 0,
-      truncated: false,
-    });
+    mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
     mocks.resolveModel.mockResolvedValue({
       requested: 'latest-pro-thinking',
       resolved: 'gemini-3-pro-preview',
@@ -276,16 +279,7 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.validateWorkspacePath.mockReturnValue(undefined);
-    mocks.scanWorkspace.mockResolvedValue({
-      workspaceRoot: '/fake',
-      filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
-      skippedTooLarge: 0,
-      excludedDirs: [],
-      excludedDirsTotal: 0,
-      skippedNonSource: 0,
-      truncated: false,
-    });
+    mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
     mocks.resolveModel.mockResolvedValue({
       requested: 'latest-pro-thinking',
       resolved: 'gemini-3-pro-preview',
@@ -394,6 +388,81 @@ describe('code.tool.ts maxOutputTokens precedence (v1.4.0)', () => {
     expect(result.structuredContent?.uncachedTokens).toBe(67_536);
   });
 
+  describe('on Gemini 4 Argon, which advertises 32 768 output tokens a request', () => {
+    /** Request 1 of an Argon decode: it stops with CONTINUATION at the advertised per-request limit. */
+    const argonStop = {
+      candidates: [{ index: 0, finishReason: 'CONTINUATION', continuationToken: 'tok-1' }],
+      usageMetadata: {
+        promptTokenCount: 1_000,
+        candidatesTokenCount: 0,
+        thoughtsTokenCount: 32_768,
+      },
+    };
+
+    it('sends a cap above 32 768 unclamped and continues the decode past it', async () => {
+      mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_ARGON);
+      const { ctx } = buildCtx();
+      const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      generateContent.mockResolvedValueOnce(argonStop).mockResolvedValueOnce({
+        text: 'done',
+        candidates: [{ index: 0, finishReason: 'STOP' }],
+        usageMetadata: {
+          promptTokenCount: 33_893,
+          candidatesTokenCount: 4,
+          thoughtsTokenCount: 10,
+        },
+      });
+
+      const result = await codeTool.execute({ task: 'refactor', maxOutputTokens: 65_536 }, ctx);
+
+      expect(generateContent).toHaveBeenCalledTimes(2);
+      expect(lastGenerateContentCall(generateContent)).toMatchObject({
+        maxOutputTokens: 65_536,
+        continuationToken: 'tok-1',
+      });
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        continuationHops: 1,
+        finishReason: 'STOP',
+        truncated: false,
+      });
+    });
+
+    it('says an edit list cut at the request limit is incomplete, in the text and the result', async () => {
+      mocks.resolveModel.mockResolvedValueOnce(GEMINI_4_ARGON);
+      const { ctx } = buildCtx();
+      const generateContent = ctx.client.models.generateContent as unknown as ReturnType<
+        typeof vi.fn
+      >;
+      const cutEdits =
+        '**FILE: a.ts**\n```ts\nOLD:\nconst a = 1;\nNEW:\nconst a = 2;\n```\n**FILE: b.ts**';
+      generateContent.mockResolvedValueOnce(argonStop).mockResolvedValueOnce({
+        text: cutEdits,
+        candidates: [{ index: 0, finishReason: 'CONTINUATION', continuationToken: 'tok-2' }],
+        usageMetadata: {
+          promptTokenCount: 33_893,
+          candidatesTokenCount: 32_768,
+          thoughtsTokenCount: 0,
+        },
+      });
+
+      const result = await codeTool.execute({ task: 'refactor', maxOutputTokens: 65_536 }, ctx);
+
+      expect(generateContent).toHaveBeenCalledTimes(2);
+      expect(result.isError).toBeFalsy();
+      expect(result.structuredContent).toMatchObject({
+        finishReason: 'CONTINUATION',
+        truncated: true,
+        editCount: 1,
+      });
+      const text = result.content?.[0]?.type === 'text' ? result.content[0].text : '';
+      expect(text.startsWith(TRUNCATED_EDITS_NOTE)).toBe(true);
+      expect(text).toContain(cutEdits);
+    });
+  });
+
   describe('the ledger of a decode that fails', () => {
     /** A context with a daily cap: the call holds budget reservation 1. */
     const budgeted = () => {
@@ -486,16 +555,7 @@ describe('code.tool.ts model default (1.18.0): the configured default, like ask 
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.validateWorkspacePath.mockReturnValue(undefined);
-    mocks.scanWorkspace.mockResolvedValue({
-      workspaceRoot: '/fake',
-      filesHash: 'abc',
-      files: [{ path: 'a.ts', size: 100, hash: 'h1' }],
-      skippedTooLarge: 0,
-      excludedDirs: [],
-      excludedDirsTotal: 0,
-      skippedNonSource: 0,
-      truncated: false,
-    });
+    mocks.scanWorkspace.mockResolvedValue(ONE_FILE_SCAN);
     mocks.resolveModel.mockImplementation(async (requested: string) => {
       if (requested === 'latest-flash') throw mismatch('gemini-3-flash-preview');
       return reasoning(requested, requested !== 'latest-pro-nothink');

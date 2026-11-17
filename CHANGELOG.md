@@ -12,14 +12,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Long decode on Gemini 4** (`ask`, `code`): a `maxOutputTokens` above the per-request limit (65,536) is sent as
   asked on Gemini 4 Argon, Carbon and Hydrogen, up to 1,048,576. A response that stops with
   `finishReason: CONTINUATION` is continued with the same request and Google's continuation token until the model
-  stops or the cap is reached, at most `ceil(maxOutputTokens ÷ 65,536)` requests; the result is one answer with one
-  thinking summary, its token fields and `costEstimateUsd` summed over the requests, and `continuationHops` (`0` for
-  a call that ended in one request). Measured on gemini-4-hydrogen at `XHIGH`: review prompts of 99,712 and 153,906
-  tokens that stopped at 65,533 thinking tokens with no answer now answer in two requests (1.0485 and 1.3164 USD).
-  Without `maxOutputTokens` a call is one request, as before. `ask_agentic` is not covered.
+  stops or the cap is reached, at most `ceil(maxOutputTokens ÷ L)` requests (`L` the model's advertised per-request
+  limit: 65,536 on Hydrogen, 32,768 on Argon); the result is one answer with one thinking summary, its token fields
+  and `costEstimateUsd` summed over the requests, and `continuationHops` (`0` for a call that ended in one request).
+  Measured on gemini-4-hydrogen at `XHIGH`: review prompts of 99,712 and 153,906 tokens that stopped at 65,533
+  thinking tokens with no answer now answer in two requests (1.0485 and 1.3164 USD). Without `maxOutputTokens` a call
+  is one request, as before. Named limits: `ask_agentic` (its own loop, one model call per iteration) and the Vertex AI
+  backend (the cap is clamped to the per-request limit there) are not covered. A request that makes no progress —
+  it returns the continuation token it was sent with, or decodes nothing — ends the decode instead of being sent again
+  up to the request limit. A continuation request refused at its opening with 429 or 503 (nothing of it billed) is
+  sent again with the same token after Google's retry hint, at most three openings on `standard`, none on `flex`.
+  `timeoutMs` (30 minutes at most) fits about 7 to 9 requests at the measured pace; when it fires the completed
+  requests are billed and reported. `stallMs` does not count the time before a continuation request's first chunk.
+- `finishReason` and `truncated` on every `ask` and `code` result: `truncated: true` when the answer has text but
+  stopped at the output cap (`MAX_TOKENS`, or a long decode that ended on `CONTINUATION`) — the answer is cut. `code`
+  then leads its text with a `[truncated]` line: its edit list is incomplete and must not be applied as complete.
 - `errorCode: OUTPUT_CAP` for a call that stops at the output cap with no answer (`MAX_TOKENS`, or a long decode cut
-  at its cap); the error carries the billed token fields, `costEstimateUsd` and `continuationHops`, and names the
-  remedies (a cap above the per-request limit on Gemini 4, or a lower thinking level).
+  at its cap); the error carries the billed token fields, `costEstimateUsd`, `continuationHops` and `finishReason`,
+  and names the remedy for the cap that ran: raise `maxOutputTokens` below the model's per-request limit, ask above
+  the limit on a Gemini 4 model, raise it above the cap after a long decode, or lower the thinking level when the cap
+  is the most the model allows.
 
 ### Changed
 
@@ -28,10 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `code` drive the continuation themselves so they can count the requests and bound them, and `ask_agentic` keeps one
   request per model call.
 - `GEMINI_DAILY_BUDGET_USD`: the reservation of a long decode adds the input every continuation request bills again
-  (the prompt plus what was decoded before it); the formula is in `docs/cost-model.md`.
+  (the prompt plus what was decoded before it, plus 256 tokens a request for what the API bills beyond them), and its
+  output covers one request's decode past the cap where the cap is not a multiple of a request's decode; the formula
+  is in `docs/cost-model.md`. The reservation's prompt is the larger of the bytes ÷ 4 heuristic and the preflight's
+  count, and a decode that may take more than one request takes the exact `countTokens` count whatever
+  `preflightMode` asked for.
 - `ask` / `code`: a call that fails after one or more of its requests completed (a continuation request that fails, a
-  continuation that meets a stale cache) keeps what those requests billed in the daily budget ledger and releases only
-  the rest of its reservation; the error carries their token fields, `costEstimateUsd` and `continuationHops`.
+  timeout) keeps what those requests billed in the daily budget ledger and releases only the rest of its
+  reservation; the error carries their token fields, `costEstimateUsd` and `continuationHops`.
+- `ask` / `code`: a context cache that expires after a request of a long decode completed ends the call with an error
+  and the completed requests billed — the decode is no longer restarted on a rebuilt cache, which billed every request
+  again under a reservation sized for one decode. A stale cache at the first request is still rebuilt and the call
+  sent once more. Before each request of a decode, the cache it reads is marked hot and, when it expires within 15
+  minutes, extended at once (the TTL watcher's own tick runs every 5 minutes).
+- `ask` / `code`: each request of a long decode holds its own TPM throttle reservation (the prompt plus what was
+  decoded before it), settled at the input it reported.
 
 - Development only: `npm run check:supports` compares `server.json` (`version` and every `packages[].version`) and the
   root of `package-lock.json` (`version`, and `packages[""].version` where the lockfile has that map) with

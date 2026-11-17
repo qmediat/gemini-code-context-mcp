@@ -12,16 +12,15 @@ import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 import type { Content, GenerateContentConfig, ThinkingConfig, ThinkingLevel } from '@google/genai';
 import { z } from 'zod';
-import { isStaleCacheError, markCacheStale, prepareContext } from '../cache/cache-manager.js';
+import { prepareContext } from '../cache/cache-manager.js';
 import {
   CACHING_MODE_FALLBACK_DESCRIPTION,
   cachingModeFor,
   cachingRan,
 } from '../cache/caching-mode.js';
-import { resolveOutputCap } from '../gemini/long-decode.js';
+import { preflightModeFor, resolveOutputCap } from '../gemini/long-decode.js';
 import { ModelCategoryMismatchError } from '../gemini/model-taxonomy.js';
 import { resolveModel } from '../gemini/models.js';
-import { abortableSleep } from '../gemini/retry.js';
 import { type PreflightTokenResult, countForPreflight } from '../gemini/token-counter.js';
 import { buildScanMemo, scanWorkspace } from '../indexer/workspace-scanner.js';
 import {
@@ -35,18 +34,14 @@ import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
 import { createTimeoutController, getTimeoutKind, isTimeoutAbort } from './shared/abort-timeout.js';
 import {
-  type LedgerEntry,
   billedUsage,
   recordBilledCall,
   settleFailedCall,
   usageFields,
 } from './shared/call-ledger.js';
-import {
-  CompletedRequests,
-  type DecodedResponse,
-  LONG_DECODE_CAP_DESCRIPTION,
-  runDecode,
-} from './shared/continuation.js';
+import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
+import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
+import { DispatchThrottle } from './shared/dispatch-throttle.js';
 import {
   SERVICE_TIER_DESCRIPTION,
   ServiceTierError,
@@ -61,6 +56,7 @@ import {
   OUTPUT_CAP_ERROR_CODE,
   THINKING_LEVEL_FIELD,
   THINKING_LEVEL_RESERVE,
+  answerFinish,
   emptyAtOutputCap,
 } from './shared/thinking.js';
 import { isGemini429, parseRetryDelayMs } from './shared/throttle.js';
@@ -213,6 +209,10 @@ export interface ParsedEdit {
   new: string;
 }
 
+/** Leads the text result of an answer cut at the output cap (`truncated: true`): its edit list is incomplete. */
+export const TRUNCATED_EDITS_NOTE =
+  '[truncated] The answer stopped at the output cap before the model finished it (see `finishReason`): the edit list below is cut — do not apply it as complete. Raise `maxOutputTokens` or lower the thinking, and ask again.';
+
 const EDIT_REGEX =
   /\*\*FILE: (.+?)\*\*\s*\n```[^\n]*\n(?:OLD:\s*\n([\s\S]*?)\n)?NEW:\s*\n([\s\S]*?)\n```/g;
 
@@ -330,17 +330,13 @@ async function executeCodeBody(
   const thinkingBudget = usingThinkingLevel ? undefined : (input.thinkingBudget ?? 16_384);
 
   let reservationId: number | null = null;
-  // `-1` signals "no reservation held". Mirror of ask.tool.ts.
-  let throttleReservationId = -1;
   // Canonical resolved-model string for retry-hint seeding (T22a).
   // See ask.tool.ts for rationale.
   let resolvedModelKey: string | null = null;
-  // once a stream opened, a later transport failure is mid-stream: billed work, not to be re-sent
-  let streamOpened = false;
   // every request that completed is billed: the ledger settles from these, on an answer and on a failure alike
   const completed = new CompletedRequests();
-  // where the running decode's spend is booked; `null` before a decode starts and once the call has settled
-  let ledgerEntry: LedgerEntry | null = null;
+  // the running decode's booking and whether a stream opened (a later failure is then billed work, not re-sent)
+  const tracking: DecodeTracking = { ledgerEntry: null, streamOpened: false };
   let modelAudit: Record<string, unknown> = {};
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
@@ -352,6 +348,13 @@ async function executeCodeBody(
     stallEnvVar: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
   });
   const abortSignal = timeoutController.signal;
+  // Each request of the decode holds its own TPM reservation; a failure drops the one held.
+  const dispatch = new DispatchThrottle({
+    throttle: ctx.throttle,
+    enabled: ctx.config.tpmThrottleLimit > 0,
+    signal: abortSignal,
+    emit: (message) => emitter.emit(message),
+  });
   try {
     // Workspace validation inside try → reported as a regular tool error
     // (errorResult, "code failed: …") rather than an unhandled exception
@@ -506,6 +509,8 @@ async function executeCodeBody(
     // success-path metadata can surface preflight provenance.
     let preflight: PreflightTokenResult | undefined;
     const contextWindow = resolved.inputTokenLimit;
+    // A decode that may take more than one request takes the exact count: its prompt is billed per request.
+    const preflightMode = preflightModeFor(input.preflightMode, outputCap);
     if (typeof contextWindow === 'number' && contextWindow > 0) {
       preflight = await countForPreflight(ctx.client, {
         files: scan.files,
@@ -513,7 +518,7 @@ async function executeCodeBody(
         model: resolved.resolved,
         // `filesHash` is post-glob-filter — no separate globsHash needed.
         filesHash: scan.filesHash,
-        ...(input.preflightMode !== undefined ? { preflightMode: input.preflightMode } : {}),
+        ...(preflightMode !== undefined ? { preflightMode } : {}),
         inputTokenLimit: contextWindow,
         // See ask.tool.ts for AbortSignal contract — abort propagates as
         // `AbortError` to outer catch (mapped to `errorCode: 'TIMEOUT'`).
@@ -557,6 +562,8 @@ async function executeCodeBody(
         expectedOutputTokens: effectiveOutputCap,
         // A cap above the per-request limit (long decode) adds the input every continuation request bills again.
         perRequestOutputTokens: outputCap.perRequest,
+        // The preflight's count, when it ran: the reservation takes the larger of it and the bytes/4 heuristic.
+        countedInputTokens: preflight?.effectiveTokens,
         thinkingTokens: thinkingTokensForEstimate,
         coverMs: timeoutController.timeoutMs,
       });
@@ -591,46 +598,29 @@ async function executeCodeBody(
     const caching = cachingModeFor(input.cachingMode ?? ctx.config.cachingMode, resolved, emitter);
     const requestedCachingMode = caching.mode;
 
-    const ctxPrep = await prepareContext({
-      client: ctx.client,
-      manifest: ctx.manifest,
-      scan,
-      model: resolved,
-      systemPromptHash,
-      systemInstruction: SYSTEM_INSTRUCTION_CODE,
-      ttlSeconds: ctx.config.cacheTtlSeconds,
-      cacheMinTokens: ctx.config.cacheMinTokens,
-      emitter,
-      // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
-      // which Gemini rejects together with cachedContent. Force inline path
-      // when codeExecution is requested so we have actual inline file parts
-      // to embed alongside the prompt.
-      allowCaching: scan.files.length > 0 && !codeExecution,
-      // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
-      signal: abortSignal,
-      // v1.13.0 — opt-in implicit caching path (skip caches.create).
-      cachingMode: requestedCachingMode,
-    });
-
-    // TPM throttle — placed AFTER `prepareContext`, immediately before
-    // `generateContent`, so the reservation's `tsMs` accurately reflects
-    // when tokens hit Gemini's quota counter. See ask.tool.ts for the
-    // full rationale and the cold-cache-timing concern it fixes.
-    //
-    // Extracted into a helper so the stale-cache retry branch can
-    // cancel-and-re-reserve with an accurate tsMs rather than reusing a
-    // stale reservation.
-    const reserveForDispatch = async (): Promise<void> => {
-      if (ctx.config.tpmThrottleLimit <= 0) return;
-      const reservation = ctx.throttle.reserve(resolved.resolved, estimatedInputTokens);
-      throttleReservationId = reservation.releaseId;
-      if (reservation.delayMs > 0) {
-        emitter.emit(`throttle: waiting ${Math.ceil(reservation.delayMs / 1000)}s for TPM window…`);
-        // Abortable — wall-clock timeout (T19) must beat throttle delay.
-        await abortableSleep(reservation.delayMs, abortSignal);
-      }
-    };
-    await reserveForDispatch();
+    // The context of the call: built here, and again by the stale-cache retry on a fresh cache.
+    const prepare = () =>
+      prepareContext({
+        client: ctx.client,
+        manifest: ctx.manifest,
+        scan,
+        model: resolved,
+        systemPromptHash,
+        systemInstruction: SYSTEM_INSTRUCTION_CODE,
+        ttlSeconds: ctx.config.cacheTtlSeconds,
+        cacheMinTokens: ctx.config.cacheMinTokens,
+        emitter,
+        // codeExecution requires `tools:[{codeExecution:{}}]` on generateContent,
+        // which Gemini rejects together with cachedContent. Force inline path
+        // when codeExecution is requested so we have actual inline file parts
+        // to embed alongside the prompt.
+        allowCaching: scan.files.length > 0 && !codeExecution,
+        // v1.12.1 — let `timeoutMs` interrupt the upload phase too.
+        signal: abortSignal,
+        // v1.13.0 — opt-in implicit caching path (skip caches.create).
+        cachingMode: requestedCachingMode,
+      });
+    const ctxPrep = await prepare();
 
     const userPrompt = expectEdits
       ? `${input.task}\n\nRespond with your rationale and OLD/NEW diff blocks per the system instruction.`
@@ -706,107 +696,35 @@ async function executeCodeBody(
         ? userPrompt
         : [...inline, { role: 'user', parts: [{ text: userPrompt }] }];
 
-    let activePrep = ctxPrep;
-    let retriedOnStaleCache = false;
-    let response: DecodedResponse;
-    // One decode for a prepared context — see ask.tool.ts: only the OPENING of a request is retried, a mid-stream
-    // failure propagates (a re-send would bill the work again).
-    const openAttempts = networkAttempts(serviceTier); // a flex request is never re-sent
-    const decode = (prep: typeof ctxPrep, label: string): Promise<DecodedResponse> => {
-      ledgerEntry = {
-        workspaceRoot,
-        toolName: 'code',
-        model: resolved.resolved,
-        serviceTier,
-        cachingMode: cachingRan(prep, caching).mode,
-      };
-      return runDecode({
+    // The decode and its one stale-cache retry — the shared path of `ask` and `code` (see ask.tool.ts).
+    const decoded = await decodeOnContext(
+      {
         client: ctx.client,
-        model: resolved.resolved,
-        contents: buildContents(prep.cacheId, prep.inlineContents),
-        config: buildConfig(prep.cacheId),
-        openAttempts,
-        label,
+        booking: { workspaceRoot, toolName: 'code', model: resolved.resolved, serviceTier },
+        // `cachingRan`: a codeExecution call is forced inline and never builds a cache.
+        cachingMode: (prep) => cachingRan(prep, caching).mode,
+        request: (prep) => ({
+          contents: buildContents(prep.cacheId, prep.inlineContents),
+          config: buildConfig(prep.cacheId),
+        }),
+        cache: {
+          ttlWatcher: ctx.ttlWatcher,
+          manifest: ctx.manifest,
+          ttlSeconds: ctx.config.cacheTtlSeconds,
+          prepare,
+        },
+        openAttempts: networkAttempts(serviceTier), // a flex request is never re-sent
         limits: { maxRequests: outputCap.maxRequests, cap: effectiveOutputCap },
-        collector: {
-          signal: abortSignal,
-          onThoughtChunk: (text) => {
-            const trimmed = text.trim().slice(0, 80);
-            if (trimmed.length > 0) emitter.emit(`thinking: ${trimmed}…`);
-          },
-          // The stall watchdog resets on every chunk of every request.
-          onChunkReceived: () => timeoutController.recordChunk(),
-        },
-        onRequestOpened: () => {
-          streamOpened = true;
-        },
+        timeout: timeoutController,
+        emit: (message) => emitter.emit(message),
         completed,
-      });
-    };
-    try {
-      response = await decode(activePrep, 'code');
-    } catch (err) {
-      if (activePrep.cacheId && isStaleCacheError(err)) {
-        logger.warn(
-          `Gemini rejected cached content ${activePrep.cacheId}; invalidating and retrying once.`,
-        );
-        try {
-          // Reset cache pointer only — preserve `files` rows so the rebuild
-          // reuses uploaded files via content-hash dedup instead of double-
-          // uploading. The Gemini-side cache is already dead.
-          markCacheStale({ manifest: ctx.manifest, workspaceRoot });
-          const rebuilt = await prepareContext({
-            client: ctx.client,
-            manifest: ctx.manifest,
-            scan,
-            model: resolved,
-            systemPromptHash,
-            systemInstruction: SYSTEM_INSTRUCTION_CODE,
-            ttlSeconds: ctx.config.cacheTtlSeconds,
-            cacheMinTokens: ctx.config.cacheMinTokens,
-            emitter,
-            allowCaching: scan.files.length > 0 && !codeExecution,
-            // v1.12.1 — propagate signal into stale-cache rebuild too.
-            signal: abortSignal,
-            // v1.13.0 — keep cachingMode consistent across happy + retry paths.
-            cachingMode: requestedCachingMode,
-          });
-          // Cancel stale reservation (tsMs was stamped before first
-          // dispatch, now seconds old after rebuild) and re-reserve so
-          // the retry's tsMs matches actual dispatch time. Mirror of
-          // ask.tool.ts — see rationale there.
-          if (throttleReservationId !== -1) {
-            ctx.throttle.cancel(throttleReservationId);
-            throttleReservationId = -1;
-          }
-          await reserveForDispatch();
-          // Stale-cache retry — discard the partial response and run a fresh decode; its openings are retried
-          // like the happy path's.
-          response = await decode(rebuilt, 'code (stale-cache retry)');
-          activePrep = rebuilt;
-          retriedOnStaleCache = true;
-        } catch (retryErr) {
-          // Re-throw timeout directly so the outer catch's `isTimeoutAbort`
-          // sees it. Wrapping with `cause: err` (the original stale-cache
-          // error) would mask the timeout; outer catch would map to UNKNOWN
-          // instead of TIMEOUT.
-          if (isTimeoutAbort(retryErr)) throw retryErr;
-          if (statusOf(retryErr) !== undefined) throw retryErr; // an HTTP error on the retry is the error itself
-          throw new Error(
-            `code retry after stale cache failed: ${
-              retryErr instanceof Error ? retryErr.message : String(retryErr)
-            }`,
-            { cause: err },
-          );
-        }
-      } else {
-        throw err;
-      }
-    }
-
-    if (activePrep.cacheId) {
-      ctx.ttlWatcher.markHot(workspaceRoot, activePrep.cacheId, ctx.config.cacheTtlSeconds);
-    }
+        tracking,
+        throttle: dispatch,
+        estimatedInputTokens,
+      },
+      ctxPrep,
+    );
+    const { response, prep: activePrep, retriedOnStaleCache } = decoded;
 
     const text = response.text;
     const edits = expectEdits ? parseEdits(text) : [];
@@ -833,13 +751,6 @@ async function executeCodeBody(
     // retry alike.
     const billed = billedUsage(completed.usage(), resolved.resolved, serviceTier);
 
-    // Finalise TPM throttle reservation with actual input tokens
-    // (cached + uncached — both count toward Gemini's per-minute quota).
-    if (throttleReservationId !== -1) {
-      ctx.throttle.release(throttleReservationId, billed.promptTokens);
-      throttleReservationId = -1;
-    }
-
     // What the call billed, on the answer and on a stop without one alike.
     const billedFields = usageFields(billed, response.continuationHops);
 
@@ -852,7 +763,7 @@ async function executeCodeBody(
     // Settled here, once: the outer catch then neither releases the reservation nor books the call again.
     const settledReservation = reservationId;
     reservationId = null;
-    ledgerEntry = null;
+    tracking.ledgerEntry = null;
     recordBilledCall(
       ctx.manifest,
       settledReservation,
@@ -868,12 +779,14 @@ async function executeCodeBody(
     );
 
     // Settled and billed above; an empty answer at the cap is a failure the caller can act on, never a success.
-    const starved = emptyAtOutputCap(response, billed.thinkingTokens);
+    const finish = answerFinish(response);
+    const starved = emptyAtOutputCap(response, billed.thinkingTokens, outputCap);
     if (starved !== null) {
       return errorResult(`code: ${starved}`, {
         errorCode: OUTPUT_CAP_ERROR_CODE,
         retryable: false,
         ...modelAudit,
+        finishReason: finish.finishReason,
         ...billedFields,
       });
     }
@@ -904,6 +817,9 @@ async function executeCodeBody(
       cacheRebuilt: activePrep.rebuilt || retriedOnStaleCache,
       retriedOnStaleCache,
       ...billedFields,
+      // `truncated`: the answer stopped at the output cap (MAX_TOKENS, or a long decode at its limits) — it is cut
+      finishReason: finish.finishReason,
+      truncated: finish.truncated,
       durationMs,
       edits: edits.map((e) => ({
         file: e.file,
@@ -939,7 +855,7 @@ async function executeCodeBody(
       ...(executionOutput.length > 0 ? { executionOutput } : {}),
     };
 
-    return textResult(text, structured);
+    return textResult(finish.truncated ? `${TRUNCATED_EDITS_NOTE}\n\n${text}` : text, structured);
   } catch (err) {
     logger.error(`code failed: ${safeForLog(err)}`);
     // T22a + v1.3.2 — seed the throttle's retry-hint from Gemini 429
@@ -954,16 +870,13 @@ async function executeCodeBody(
     const failedUsage = settleFailedCall(ctx.manifest, {
       toolName: 'code',
       reservationId,
-      entry: ledgerEntry,
+      entry: tracking.ledgerEntry,
       completed,
       durationMs: Date.now() - started,
     });
     reservationId = null;
-    // Drop TPM reservation on failure — mirror of ask.tool.ts rationale.
-    if (throttleReservationId !== -1) {
-      ctx.throttle.cancel(throttleReservationId);
-      throttleReservationId = -1;
-    }
+    // Drop the TPM reservation the failed request holds — see ask.tool.ts.
+    dispatch.cancel();
     // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
     if (isTimeoutAbort(err)) {
       const ms = timeoutController.timeoutMs;
@@ -987,7 +900,7 @@ async function executeCodeBody(
     }
     const httpStatus = statusOf(err);
     return errorResult(`code failed: ${err instanceof Error ? err.message : String(err)}`, {
-      ...tierErrorMeta(err, streamOpened),
+      ...tierErrorMeta(err, tracking.streamOpened),
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       serviceTier: input.serviceTier ?? ctx.config.serviceTier, // before the model is resolved: the requested tier
       ...modelAudit,

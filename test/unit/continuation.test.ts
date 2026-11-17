@@ -1,6 +1,14 @@
-import type { GenerateContentResponse } from '@google/genai';
+import { ApiError, type GenerateContentResponse, type GoogleGenAI } from '@google/genai';
 import { describe, expect, it, vi } from 'vitest';
-import { type OpenDecodeRequest, collectDecode } from '../../src/tools/shared/continuation.js';
+import type { ManifestDb } from '../../src/manifest/db.js';
+import { settleFailedCall } from '../../src/tools/shared/call-ledger.js';
+import {
+  CompletedRequests,
+  type DecodeCall,
+  type OpenDecodeRequest,
+  collectDecode,
+  runDecode,
+} from '../../src/tools/shared/continuation.js';
 import { chunkedStream } from '../helpers/stream-mock.js';
 
 /** One request's stream: a thought, the request's text (if any), and its end with the given finish reason. */
@@ -9,6 +17,8 @@ function request(opts: {
   text?: string;
   finishReason: 'CONTINUATION' | 'STOP' | 'MAX_TOKENS';
   token?: string;
+  /** A checkpoint token on a chunk before the end, with no finish reason (the SDK emits them partway through). */
+  checkpoint?: string;
   thoughts: number;
   output: number;
   prompt: number;
@@ -16,7 +26,11 @@ function request(opts: {
   const chunks: Array<Partial<GenerateContentResponse>> = [
     {
       candidates: [
-        { index: 0, content: { role: 'model', parts: [{ text: opts.thought, thought: true }] } },
+        {
+          index: 0,
+          content: { role: 'model', parts: [{ text: opts.thought, thought: true }] },
+          ...(opts.checkpoint !== undefined ? { continuationToken: opts.checkpoint } : {}),
+        },
       ],
     },
   ];
@@ -31,6 +45,7 @@ function request(opts: {
       {
         index: 0,
         finishReason: opts.finishReason as never,
+        content: { role: 'model', parts: [] },
         ...(opts.token !== undefined ? { continuationToken: opts.token } : {}),
       },
     ],
@@ -160,5 +175,224 @@ describe('collectDecode', () => {
     expect(decoded.continuationHops).toBe(0);
     expect(decoded.text).toBe('done');
     expect(decoded.usageMetadata?.promptTokenCount).toBe(50);
+  });
+});
+
+describe('collectDecode — progress and checkpoints', () => {
+  /** A stop with CONTINUATION that decoded `decoded` tokens and returned `token`. */
+  const stopWith = (token: string, decoded: number) =>
+    request({
+      thought: 't',
+      finishReason: 'CONTINUATION',
+      token,
+      thoughts: decoded,
+      output: 0,
+      prompt: 500_000,
+    });
+
+  it('stops when a request returns the token it was opened with: two requests, not the request limit', async () => {
+    const { open, tokens } = opener(...Array.from({ length: 16 }, () => stopWith('same', 65_536)));
+    const decoded = await collectDecode(open, { maxRequests: 16, cap: 1_048_576 }, {});
+    expect(tokens).toEqual([undefined, 'same']);
+    expect(decoded.continuationHops).toBe(1);
+    expect(decoded.candidates?.[0]?.finishReason).toBe('CONTINUATION');
+  });
+
+  it('stops when a request decoded no token, whatever token it returned', async () => {
+    const { open, tokens } = opener(stopWith('a', 65_536), stopWith('b', 0), stopWith('c', 65_536));
+    const decoded = await collectDecode(open, { maxRequests: 16, cap: 1_048_576 }, {});
+    expect(tokens).toEqual([undefined, 'a']);
+    expect(decoded.continuationHops).toBe(1);
+  });
+
+  it('continues with the final token of a request that also passed a checkpoint', async () => {
+    const { open, tokens } = opener(
+      request({
+        thought: 'plan',
+        finishReason: 'CONTINUATION',
+        checkpoint: 'ck-1',
+        token: 'tok-1',
+        thoughts: 65_536,
+        output: 0,
+        prompt: 1_000,
+      }),
+      request({
+        thought: 'more',
+        text: 'answer',
+        finishReason: 'STOP',
+        checkpoint: 'ck-2',
+        thoughts: 10,
+        output: 1,
+        prompt: 66_661,
+      }),
+    );
+    const decoded = await collectDecode(open, LIMITS, {});
+    expect(tokens).toEqual([undefined, 'tok-1']);
+    expect(decoded.text).toBe('answer');
+    expect(decoded.candidates?.[0]?.finishReason).toBe('STOP');
+  });
+
+  it('continues with the checkpoint token when the CONTINUATION stop itself carries none', async () => {
+    const { open, tokens } = opener(
+      request({
+        thought: 'plan',
+        finishReason: 'CONTINUATION',
+        checkpoint: 'ck-1',
+        thoughts: 65_536,
+        output: 0,
+        prompt: 1_000,
+      }),
+      request({
+        thought: 'more',
+        text: 'done',
+        finishReason: 'STOP',
+        thoughts: 1,
+        output: 1,
+        prompt: 2,
+      }),
+    );
+    await collectDecode(open, LIMITS, {});
+    expect(tokens).toEqual([undefined, 'ck-1']);
+  });
+
+  it('calls the hooks between the requests with the usage and the next input', async () => {
+    const after: Array<number | undefined> = [];
+    const before: number[] = [];
+    const { open } = opener(stop('a'), stop('b'), stop('c'));
+    await collectDecode(
+      open,
+      { maxRequests: 3, cap: 1_048_576 },
+      {},
+      {
+        afterRequest: (usage) => after.push(usage?.promptTokenCount),
+        beforeContinuation: async (inputTokens) => {
+          before.push(inputTokens);
+        },
+      },
+    );
+    expect(after).toEqual([1_000, 1_000, 1_000]);
+    // the first request's prompt plus every token decoded so far
+    expect(before).toEqual([1_000 + 65_536, 1_000 + 2 * 65_536]);
+  });
+});
+
+describe('runDecode — the openings of a long decode', () => {
+  /** A decode call over a client whose `generateContentStream` is the given mock. */
+  const decodeCall = (
+    generateContentStream: ReturnType<typeof vi.fn>,
+    overrides: Partial<DecodeCall> = {},
+  ): DecodeCall => ({
+    client: { models: { generateContentStream } } as unknown as GoogleGenAI,
+    model: 'gemini-4-hydrogen',
+    contents: 'review',
+    config: { maxOutputTokens: 262_144 },
+    openAttempts: 3,
+    label: 'test',
+    limits: { maxRequests: 4, cap: 262_144 },
+    collector: { signal: new AbortController().signal },
+    onRequestOpened: () => {},
+    completed: new CompletedRequests(),
+    ...overrides,
+  });
+  const tokensSent = (mock: ReturnType<typeof vi.fn>): unknown[] =>
+    mock.mock.calls.map(
+      (call) => (call[0] as { config: { continuationToken?: string } }).config.continuationToken,
+    );
+  const answer = request({
+    thought: 'more',
+    text: 'done',
+    finishReason: 'STOP',
+    thoughts: 10,
+    output: 2,
+    prompt: 66_661,
+  });
+  const quota = () =>
+    new ApiError({
+      message: '{"error":{"code":429,"details":[{"retryDelay":"1s"}]}}',
+      status: 429,
+    });
+
+  it('reopens a continuation request refused with 429 after the hint, with the same token', async () => {
+    const stream = vi
+      .fn()
+      .mockImplementationOnce(chunkedStream(stop('tok-1')))
+      .mockRejectedValueOnce(quota())
+      .mockImplementationOnce(chunkedStream(answer));
+    const call = decodeCall(stream);
+    const started = Date.now();
+    const decoded = await runDecode(call);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(950);
+    expect(tokensSent(stream)).toEqual([undefined, 'tok-1', 'tok-1']);
+    expect(decoded.text).toBe('done');
+    expect(call.completed.count).toBe(2);
+    expect(call.completed.continuationHops()).toBe(1);
+  });
+
+  it('reopens a continuation request refused with 503 after the base wait', async () => {
+    const overloaded = Object.assign(new Error('The model is overloaded'), { status: 503 });
+    const stream = vi
+      .fn()
+      .mockImplementationOnce(chunkedStream(stop('tok-1')))
+      .mockRejectedValueOnce(overloaded)
+      .mockImplementationOnce(chunkedStream(answer));
+    const decoded = await runDecode(decodeCall(stream));
+    expect(tokensSent(stream)).toEqual([undefined, 'tok-1', 'tok-1']);
+    expect(decoded.text).toBe('done');
+  });
+
+  it('retries a continuation opening that failed in transit with the same token', async () => {
+    const stream = vi
+      .fn()
+      .mockImplementationOnce(chunkedStream(stop('tok-1')))
+      .mockRejectedValueOnce(new TypeError('fetch failed'))
+      .mockImplementationOnce(chunkedStream(answer));
+    const call = decodeCall(stream);
+    const decoded = await runDecode(call);
+    expect(tokensSent(stream)).toEqual([undefined, 'tok-1', 'tok-1']);
+    expect(decoded.continuationHops).toBe(1);
+    expect(call.completed.continuationHops()).toBe(1);
+  });
+
+  it('never reopens a refused first request, nor a continuation on a one-attempt (flex) call', async () => {
+    const first = vi.fn().mockRejectedValueOnce(quota());
+    await expect(runDecode(decodeCall(first))).rejects.toBeInstanceOf(ApiError);
+    expect(first).toHaveBeenCalledTimes(1);
+
+    const flex = vi
+      .fn()
+      .mockImplementationOnce(chunkedStream(stop('tok-1')))
+      .mockRejectedValueOnce(quota());
+    await expect(runDecode(decodeCall(flex, { openAttempts: 1 }))).rejects.toBeInstanceOf(ApiError);
+    expect(flex).toHaveBeenCalledTimes(2);
+  });
+
+  it('an abort between two requests sends no further request and counts none on the failed call', async () => {
+    const controller = new AbortController();
+    const reason = new DOMException('Timed out after 1000 ms (total wall-clock)', 'TimeoutError');
+    async function* firstThenAbort(): AsyncGenerator<GenerateContentResponse> {
+      for (const chunk of stop('tok-1')) yield chunk as GenerateContentResponse;
+      controller.abort(reason);
+    }
+    const stream = vi.fn().mockImplementationOnce(async () => firstThenAbort());
+    const call = decodeCall(stream, { collector: { signal: controller.signal } });
+    await expect(runDecode(call)).rejects.toBe(reason);
+    expect(stream).toHaveBeenCalledTimes(1);
+
+    const manifest = { insertUsageMetric: vi.fn() } as unknown as ManifestDb;
+    const failed = settleFailedCall(manifest, {
+      toolName: 'ask',
+      reservationId: null,
+      entry: {
+        workspaceRoot: '/w',
+        toolName: 'ask',
+        model: 'gemini-4-hydrogen',
+        serviceTier: undefined,
+        cachingMode: 'implicit',
+      },
+      completed: call.completed,
+      durationMs: 1,
+    });
+    expect(failed?.continuationHops).toBe(0);
+    expect(failed?.thinkingTokens).toBe(65_533);
   });
 });

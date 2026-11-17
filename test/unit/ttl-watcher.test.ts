@@ -88,6 +88,32 @@ describe('TtlWatcher', () => {
     expect(after?.cacheExpiresAt).toBeGreaterThan(now + 5 * 60 * 1000);
   });
 
+  it('keepAlive extends a cache that expires within the window at once, without waiting for a tick', async () => {
+    const now = Date.now();
+    // 3 min left: the next tick (every 5 min) could come after the cache expired
+    const watcher = seedHot({ now, ttlMs: 3 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+
+    await watcher.keepAlive(ws, cacheId, 3600);
+
+    expect(client.caches.update).toHaveBeenCalledWith({ name: cacheId, config: { ttl: '3600s' } });
+    expect(db.getWorkspace(ws)?.cacheExpiresAt).toBeGreaterThan(now + 3_500_000);
+  });
+
+  it('keepAlive leaves a cache with plenty of time as it is, and marks it hot', async () => {
+    const now = Date.now();
+    const watcher = seedHot({ now, ttlMs: 30 * 60 * 1000, ttlSeconds: 3600 });
+    const client = (watcher as unknown as { client: GoogleGenAI }).client;
+    const hot = (watcher as unknown as { hot: Map<string, { lastUsed: number }> }).hot;
+    const entry = hot.get(ws);
+    if (entry) entry.lastUsed = now - 9 * 60 * 1000;
+
+    await watcher.keepAlive(ws, cacheId, 3600);
+
+    expect(client.caches.update).not.toHaveBeenCalled();
+    expect(hot.get(ws)?.lastUsed).toBeGreaterThanOrEqual(now);
+  });
+
   it('skips refresh when plenty of TTL is left', async () => {
     const now = Date.now();
     // 30 min until expiry → outside refresh window (15 min).

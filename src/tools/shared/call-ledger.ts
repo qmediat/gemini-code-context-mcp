@@ -140,7 +140,8 @@ export function recordBilledCall(
 
 /**
  * Settles the ledger of a failed call. With no request completed the reservation is released whole; after one or
- * more, the ledger keeps what they billed and the result gets their usage and the continuation requests sent.
+ * more, the ledger keeps what they billed and the result gets their usage and the continuation requests whose
+ * stream opened.
  * A ledger write that throws is logged and never replaces the call's own error.
  */
 export function settleFailedCall(manifest: ManifestDb, failed: FailedCall): UsageFields | null {
@@ -160,7 +161,7 @@ export function settleFailedCall(manifest: ManifestDb, failed: FailedCall): Usag
       `${failed.toolName}: the usage of ${failed.completed.count} completed request(s) could not be recorded. Error: ${String(recordErr)}`,
     );
   }
-  return usageFields(billed, failed.completed.continuationHops(true));
+  return usageFields(billed, failed.completed.continuationHops());
 }
 
 function releaseReservation(
