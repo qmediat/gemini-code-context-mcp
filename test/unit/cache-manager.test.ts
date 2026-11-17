@@ -7,9 +7,12 @@
  *   - allowCaching=false → inline-from-disk path, no Files API call.
  *   - Cache REBUILD when files_hash / model / systemPromptHash differ.
  *   - Pre-rebuild cache deletion when an existing cache_id is present.
- *   - In-process mutex coalescing: two concurrent prepareContext calls share one build.
+ *   - In-process mutex coalescing: two concurrent prepareContext calls share one build; a rejected
+ *     build is not served to the next call.
+ *   - A create that fails, names no cache, or cannot be recorded: what is deleted, kept and warned.
  *
- * Also covers `isStaleCacheError` heuristic (regex coverage) and `markCacheStale`.
+ * Also covers `isStaleCacheError` heuristic (regex coverage), `markCacheStale` and the
+ * workspace purge (`invalidateWorkspaceCache`).
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -922,21 +925,42 @@ describe('prepareContext', () => {
   });
 
   /** A rebuild whose create succeeds and whose manifest write of the new cache fails; the warnings recorded. */
-  async function prepareWithFailingCacheWrite() {
+  /**
+   * A rebuild over the row of `cachedContents/previous` whose create succeeds and whose manifest write of the new cache
+   * fails (with `everyWrite`, the failed-create row write fails too). `calls` lists, in order, each row write as
+   * `write:<cacheId>` and each cache delete as `delete:<name>`; `outcome` is the call's result or its rejection.
+   */
+  async function prepareWithFailingCacheWrite(everyWrite = false) {
     const createdAtMs = Date.now();
     seedRow('cachedContents/previous', 'fh-OLD', createdAtMs);
+    const calls: string[] = [];
     const write = db.upsertWorkspace.bind(db);
     vi.spyOn(db, 'upsertWorkspace').mockImplementation((row) => {
-      if (row.cacheId !== null) throw new Error('SQLITE_FULL: database or disk is full');
+      calls.push(`write:${row.cacheId}`);
+      if (everyWrite || row.cacheId !== null)
+        throw new Error('SQLITE_FULL: database or disk is full');
       write(row);
     });
-    const client = mkClient({ cachesCreate: async () => mkCreated(createdAtMs, 3600) });
-    const { value: result, warnings } = await withWarnings(() => prepare(client));
-    return { client, result, warnings };
+    const client = mkClient({
+      cachesCreate: async () => mkCreated(createdAtMs, 3600),
+      cachesDelete: async (params: unknown) =>
+        calls.push(`delete:${(params as { name: string }).name}`),
+    });
+    const { value: outcome, warnings } = await withWarnings(() =>
+      prepare(client).catch((error: unknown) => error),
+    );
+    return { client, outcome, calls, warnings };
+  }
+
+  /** The prepared context of `prepareWithFailingCacheWrite`, which resolves unless every write fails. */
+  async function preparedWithFailingCacheWrite() {
+    const { outcome, ...rest } = await prepareWithFailingCacheWrite();
+    if (outcome instanceof Error) throw outcome;
+    return { result: outcome as PreparedContext, ...rest };
   }
 
   it('a manifest write that fails after the create deletes the new cache; the files go inline', async () => {
-    const { client, result } = await prepareWithFailingCacheWrite();
+    const { client, result } = await preparedWithFailingCacheWrite();
 
     expect(client.caches.delete).toHaveBeenCalledWith({ name: 'cachedContents/created' });
     expect(result.cacheId).toBeNull();
@@ -944,12 +968,113 @@ describe('prepareContext', () => {
     expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
   });
 
-  it('a manifest write that fails after the create is warned as the manifest write, not the build', async () => {
-    const { warnings } = await prepareWithFailingCacheWrite();
+  it('a manifest write that fails after the create is warned with the cache it deletes and the cause', async () => {
+    const { warnings } = await preparedWithFailingCacheWrite();
 
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]).toMatch(/^recording cache cachedContents\/created in the manifest failed/);
-    expect(warnings[0]).toContain('SQLITE_FULL');
+    expect(warnings).toEqual([
+      'recording cache cachedContents/created in the manifest failed — deleting it, falling back to inline parts: SQLITE_FULL: database or disk is full',
+    ]);
+  });
+
+  it("a record failure fires the new cache's delete before the row is written without a cache", async () => {
+    const { calls } = await preparedWithFailingCacheWrite();
+
+    expect(calls).toEqual([
+      'write:cachedContents/created',
+      'delete:cachedContents/created',
+      'write:null',
+    ]);
+  });
+
+  it('a record failure still deletes the new cache when the row write without a cache fails too', async () => {
+    const { client, outcome } = await prepareWithFailingCacheWrite(true);
+
+    expect(outcome).toBeInstanceOf(Error);
+    expect(String(outcome)).toContain('SQLITE_FULL');
+    expect(client.caches.delete).toHaveBeenCalledExactlyOnceWith({
+      name: 'cachedContents/created',
+    });
+  });
+
+  it('a record failure leaves the previous cache alone: only the new cache is deleted', async () => {
+    const { client } = await preparedWithFailingCacheWrite();
+
+    const deleted = vi.mocked(client.caches.delete).mock.calls.map((call) => call[0]);
+    expect(deleted).toEqual([{ name: 'cachedContents/created' }]);
+  });
+
+  it('a record failure keeps the uploads: the row holds their ids, the context their parts', async () => {
+    const { result } = await preparedWithFailingCacheWrite();
+
+    const uri = `https://generativelanguage.googleapis.com/v1beta/files/${join(workspaceRoot, 'kept.ts')}`;
+    expect(db.getWorkspace(workspaceRoot)?.fileIds).toEqual([uri]);
+    expect(result.inlineOnly).toBe(false);
+    expect(result.inlineContents[0]?.parts).toContainEqual({
+      fileData: { fileUri: uri, mimeType: 'text/plain' },
+    });
+  });
+
+  it('an unnamed create over a live cache drops the pointer and leaves the previous cache to its TTL', async () => {
+    seedRow('cachedContents/previous', 'fh-OLD');
+    const client = mkClient({ cachesCreate: async () => ({ name: '' }) });
+
+    await withWarnings(() => prepare(client));
+
+    expect(client.caches.delete).not.toHaveBeenCalled();
+    expect(db.getWorkspace(workspaceRoot)?.cacheId).toBeNull();
+  });
+
+  it.each([
+    ['an empty stored cache id is refused: a new cache is built', '', false],
+    ['a stored cache id is reused', 'cachedContents/live', true],
+  ])('the reuse test on a matching row: %s', async (_, cacheId, reused) => {
+    seedRow(cacheId);
+    const client = mkClient({});
+
+    const result = await prepare(client);
+
+    expect(result.reused).toBe(reused);
+    expect(client.caches.create).toHaveBeenCalledTimes(reused ? 0 : 1);
+  });
+
+  it('a build that rejects leaves no in-flight entry: the next call builds again', async () => {
+    let uploads = 0;
+    const client = mkClient({
+      filesUpload: async () => {
+        uploads += 1;
+        if (uploads === 1) throw new Error('400 INVALID_ARGUMENT: bad file');
+        return { uri: 'https://generativelanguage.googleapis.com/v1beta/files/retry' };
+      },
+    });
+
+    const { value: first } = await withWarnings(() =>
+      prepare(client).catch((error: unknown) => error),
+    );
+    const second = await prepare(client);
+
+    expect(String(first)).toMatch(/^Error: Upload failed for 1\/1 files/);
+    expect(second.cacheId).toBe('cachedContents/new');
+    expect(uploads).toBe(2);
+  });
+
+  it('the stored expiry counts from the clock after the create answered, not from the call start', async () => {
+    const startMs = Date.parse('2026-11-18T12:00:00.000Z');
+    let nowMs = startMs;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+    try {
+      const client = mkClient({
+        cachesCreate: async () => {
+          nowMs += 90_000;
+          return mkCreated(nowMs, 3600);
+        },
+      });
+
+      await prepare(client);
+
+      expect(db.getWorkspace(workspaceRoot)?.cacheExpiresAt).toBe(startMs + 90_000 + 3_600_000);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   // v1.14.0 round-1 review fix (F1, Copilot HIGH): the in-flight coalescing
@@ -1239,6 +1364,38 @@ describe('invalidateWorkspaceCache', () => {
 
     const released = client.files.delete.mock.calls.map((call) => call[0].name);
     expect(released.sort()).toEqual([...fileIds].sort());
+  });
+
+  it('purging releases the uploads through a pool of 10 concurrent deletes', async () => {
+    seedUploads(
+      'cachedContents/purged',
+      Array.from({ length: 25 }, (_, i) => `files/p${i}`),
+    );
+    let inFlight = 0;
+    let mostInFlight = 0;
+    const client = mkPurgeClient();
+    client.files.delete.mockImplementation(async () => {
+      inFlight += 1;
+      mostInFlight = Math.max(mostInFlight, inFlight);
+      await new Promise((settle) => setImmediate(settle));
+      inFlight -= 1;
+      return {};
+    });
+
+    await purge(client);
+
+    expect(client.files.delete).toHaveBeenCalledTimes(25);
+    expect(mostInFlight).toBe(10);
+  });
+
+  it('purging skips a stored empty cache id and an empty file id', async () => {
+    seedUploads('', ['', 'files/kept']);
+    const client = mkPurgeClient();
+
+    await purge(client);
+
+    expect(client.caches.delete).not.toHaveBeenCalled();
+    expect(client.files.delete).toHaveBeenCalledExactlyOnceWith({ name: 'files/kept' });
   });
 
   it('a workspace without a cache has its files released and no cache deleted', async () => {
