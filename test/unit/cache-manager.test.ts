@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import type { CachedContent, GoogleGenAI } from '@google/genai';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  invalidateWorkspaceCache,
   isStaleCacheError,
   markCacheStale,
   prepareContext,
@@ -1100,5 +1101,122 @@ describe('markCacheStale', () => {
 
   it('no-op when workspace row missing', () => {
     expect(() => markCacheStale({ manifest: db, workspaceRoot: '/nonexistent' })).not.toThrow();
+  });
+});
+
+describe('invalidateWorkspaceCache', () => {
+  const ws = '/test/purged';
+  let tmp: string;
+  let manifest: ManifestDb;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'gcctx-purge-'));
+    manifest = new ManifestDb(join(tmp, 'manifest.db'));
+  });
+
+  afterEach(() => {
+    manifest.close();
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** A workspace row holding `cacheId`, with one uploaded file row per stored identifier. */
+  function seedUploads(cacheId: string | null, fileIds: string[]): void {
+    const at = Date.parse('2026-11-17T12:00:00.000Z');
+    manifest.upsertWorkspace({
+      workspaceRoot: ws,
+      filesHash: 'fh',
+      model: 'gemini-3-pro-preview',
+      systemPromptHash: 'sph',
+      cacheId,
+      cacheExpiresAt: cacheId === null ? null : at + 3_600_000,
+      fileIds,
+      createdAt: at,
+      updatedAt: at,
+    });
+    fileIds.forEach((fileId, i) => {
+      manifest.upsertFile({
+        workspaceRoot: ws,
+        relpath: `src/f${i}.ts`,
+        contentHash: `h${i}`,
+        fileId,
+        uploadedAt: at,
+        expiresAt: at + 47 * 3_600_000,
+      });
+    });
+  }
+
+  function mkPurgeClient(fail = false) {
+    const settle = async () => {
+      if (fail) throw new Error('503 UNAVAILABLE');
+      return {};
+    };
+    return { caches: { delete: vi.fn(settle) }, files: { delete: vi.fn(settle) } };
+  }
+
+  function purge(client: ReturnType<typeof mkPurgeClient>): Promise<void> {
+    return invalidateWorkspaceCache({
+      client: client as unknown as GoogleGenAI,
+      manifest,
+      workspaceRoot: ws,
+    });
+  }
+
+  it('purging a workspace deletes its cache and drops its manifest rows', async () => {
+    seedUploads('cachedContents/purged', ['files/a1']);
+    const client = mkPurgeClient();
+
+    await purge(client);
+
+    expect(client.caches.delete).toHaveBeenCalledExactlyOnceWith({ name: 'cachedContents/purged' });
+    expect(manifest.getWorkspace(ws)).toBeNull();
+    expect(manifest.getFiles(ws)).toEqual([]);
+  });
+
+  it('purging releases each uploaded file once, by its resource name', async () => {
+    const uri = 'https://generativelanguage.googleapis.com/v1beta/files/abc-1?alt=media';
+    seedUploads('cachedContents/purged', [uri, 'files/def-2', uri, 'opaque-id']);
+    const client = mkPurgeClient();
+
+    await purge(client);
+
+    const released = client.files.delete.mock.calls.map((call) => call[0]);
+    expect(released).toHaveLength(3);
+    expect(released).toEqual(
+      expect.arrayContaining([
+        { name: 'files/abc-1' },
+        { name: 'files/def-2' },
+        { name: 'opaque-id' },
+      ]),
+    );
+  });
+
+  it('a workspace without a cache has its files released and no cache deleted', async () => {
+    seedUploads(null, ['files/only']);
+    const client = mkPurgeClient();
+
+    await purge(client);
+
+    expect(client.caches.delete).not.toHaveBeenCalled();
+    expect(client.files.delete).toHaveBeenCalledExactlyOnceWith({ name: 'files/only' });
+    expect(manifest.getWorkspace(ws)).toBeNull();
+  });
+
+  it('failed deletes are logged and the purge still drops the manifest rows', async () => {
+    seedUploads('cachedContents/purged', ['files/a1', 'files/b2']);
+    const client = mkPurgeClient(true);
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+    try {
+      await purge(client);
+
+      expect(client.files.delete).toHaveBeenCalledTimes(2);
+      expect(debug.mock.calls.map((call) => String(call[0]))).toEqual([
+        'cache delete (cachedContents/purged) failed: 503 UNAVAILABLE',
+        'files.delete (files/a1, stored as files/a1) failed: 503 UNAVAILABLE',
+        'files.delete (files/b2, stored as files/b2) failed: 503 UNAVAILABLE',
+      ]);
+      expect(manifest.getWorkspace(ws)).toBeNull();
+    } finally {
+      debug.mockRestore();
+    }
   });
 });
