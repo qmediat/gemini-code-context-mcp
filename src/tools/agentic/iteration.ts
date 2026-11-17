@@ -6,7 +6,7 @@
  */
 
 import type { Content, FunctionCall, GenerateContentConfig, Part } from '@google/genai';
-import { abortable, abortableSleep, throwIfAborted, withNetworkRetry } from '../../gemini/retry.js';
+import { abortable, abortableSleep, withNetworkRetry } from '../../gemini/retry.js';
 import type { MatchConfig } from '../../indexer/globs.js';
 import { logger } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
@@ -307,7 +307,7 @@ function toolResponseTokensOf(finalResponseParts: Part[]): number {
 /** How an iteration ended: with its result, or at the bound of its tools phase. */
 export type IterationOutcome =
   | { readonly kind: 'done'; readonly iteration: IterationResult }
-  | { readonly kind: 'tools-timed-out'; readonly running: number; readonly neverStarted: number };
+  | { readonly kind: 'tools-timed-out'; readonly running: number };
 
 /** How the tools phase ended: the batch's results, or the bound — with the work still running after the grace. */
 type ToolsOutcome =
@@ -316,7 +316,7 @@ type ToolsOutcome =
       readonly plan: DispatchPlan;
       readonly dispatched: DispatchedToolResult[];
     }
-  | { readonly kind: 'timed-out'; readonly running: number; readonly neverStarted: number };
+  | { readonly kind: 'timed-out'; readonly running: number };
 
 /** The tools phase's work as it runs: path resolution in flight, then the batch. */
 class ToolsWork {
@@ -335,7 +335,7 @@ class ToolsWork {
   }
 }
 
-/** Resolve the plan, then run its batch — never once the clock fired. */
+/** Resolve the plan, then run its batch: once the clock fired its workers take no call (`startToolBatch`). */
 async function planAndRun(
   functionCallParts: FunctionCallPart[],
   args: IterationArgs,
@@ -344,7 +344,6 @@ async function planAndRun(
   work.resolving = true;
   const plan = await planDispatch(functionCallParts, args);
   work.resolving = false;
-  throwIfAborted(args.clock.signal);
   work.batch = startToolBatch(
     args.workspaceRoot,
     plan.toDispatch,
@@ -382,7 +381,7 @@ async function toolsTimedOut(work: ToolsWork, settled: Promise<unknown>): Promis
   const running = inTime ? 0 : work.running();
   if (running > 0) {
     logger.warn(
-      `ask_agentic: ${running} tool call(s) still running ${graceMs} ms after the iteration's bound; their results will be dropped`,
+      `ask_agentic: ${running} tool call(s) still running ${graceMs} ms after the iteration's bound (${work.neverStarted()} never started); their results will be dropped`,
     );
     settled.then(
       () =>
@@ -391,7 +390,7 @@ async function toolsTimedOut(work: ToolsWork, settled: Promise<unknown>): Promis
         logger.debug(`ask_agentic: a tool batch failed after its bound: ${String(err)}`),
     );
   }
-  return { kind: 'timed-out', running, neverStarted: work.neverStarted() };
+  return { kind: 'timed-out', running };
 }
 
 /** Path resolution and the batch, raced as one against the pass's clock. */
@@ -431,7 +430,7 @@ export async function runAgenticIteration(args: IterationArgs): Promise<Iteratio
     return { kind: 'done', iteration: finalTextIteration(response, parts, usage, thinkingSummary) };
   }
   const tools = await runToolsPhase(functionCallParts, args);
-  if (tools.kind === 'timed-out') return { ...tools, kind: 'tools-timed-out' };
+  if (tools.kind === 'timed-out') return { kind: 'tools-timed-out', running: tools.running };
   args.conversation.push({ role: 'model', parts });
   mergeDispatched(tools.dispatched, tools.plan, functionCallParts, args.filesReadSet);
   const finalResponseParts = tools.plan.responseParts.filter((p): p is Part => p !== null);

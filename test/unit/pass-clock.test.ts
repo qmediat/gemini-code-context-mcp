@@ -66,8 +66,12 @@ describe('pass clock — timers', () => {
     const clock = createPassClock({ iterationMs: 10_000, stallMs: 500 }, DEFAULTS);
     clock.enter('opening');
     clock.recordChunk();
+    const unbounded = createPassClock(NO_KNOB, DEFAULTS);
+    unbounded.enter('opening');
 
     clock.dispose();
+    unbounded.dispose();
+    unbounded.enter('tools');
     clock.dispose();
     clock.enter('tools');
     clock.recordChunk();
@@ -197,6 +201,7 @@ describe('pass clock — what fires', () => {
     clock.enter('opening');
     vi.advanceTimersByTime(150);
     clock.recordChunk();
+    expect(vi.getTimerCount()).toBe(0);
     clock.enter('tools');
     vi.advanceTimersByTime(10_000);
     clock.dispose();

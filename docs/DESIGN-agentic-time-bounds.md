@@ -131,7 +131,7 @@ interface PassClock {              // not a TimeoutController: it has no pauseSt
 }
 type IterationOutcome =            // what an iteration returns to the loop
   | { readonly kind: 'done'; readonly iteration: IterationResult }
-  | { readonly kind: 'tools-timed-out'; readonly running: number; readonly neverStarted: number };
+  | { readonly kind: 'tools-timed-out'; readonly running: number };  // the warn line also names the calls never started
 ```
 
 The rules, in order: **`T` is the pass's wall clock** — armed at creation, over every phase; **`S` bounds the gaps of
@@ -289,6 +289,8 @@ a sleep longer than the knob. Each test is red on `main` where its cell changes.
 13. the fallback's hint names `timeoutMs` / `stallMs`, never `iterationTimeoutMs` (D8).
 
 `ask-agentic.test.ts:2207` (F2) changes to end at the timer instead of after the slow executor.
+`test/unit/agentic-tools-abort.test.ts`: each executor rejects with the signal's reason once it fired — the walks at
+every directory and before every entry, `read_file` before and during its read.
 `test/unit/pass-clock.test.ts` (the clock, fake timers): at most two timers alive in any phase; the stall timer armed only between
 chunks of `stream`; `enter` clears the previous phase's timer; the reason carries phase and source; `dispose` after a
 fire is idempotent (D10 closes by construction: the stall is phase-scoped).

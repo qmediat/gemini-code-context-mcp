@@ -26,6 +26,8 @@ const tools = vi.hoisted(() => ({
   started: [] as string[],
   /** A path whose sandbox resolution never returns. */
   hangPath: null as string | null,
+  /** With `hang`: the one argument whose call hangs; `null` hangs every call. */
+  hangArg: null as string | null,
 }));
 
 vi.mock('../../src/tools/agentic/phase-defaults.js', () => ({ PHASE_DEFAULTS: bounds }));
@@ -51,7 +53,9 @@ vi.mock('../../src/tools/agentic/workspace-tools.js', async () => {
     async (...args: A): Promise<R> => {
       tools.started.push(name);
       const signal = args.find((arg): arg is AbortSignal => arg instanceof AbortSignal);
-      if (tools.mode === 'hang') return new Promise<R>(() => undefined);
+      const hangs =
+        tools.mode === 'hang' && (tools.hangArg === null || args.includes(tools.hangArg));
+      if (hangs) return new Promise<R>(() => undefined);
       if (tools.mode === 'honour') {
         return new Promise<R>((_, reject) => {
           signal?.addEventListener('abort', () => reject(signal.reason));
@@ -77,11 +81,14 @@ afterEach(() => {
     finalizationMs: 60,
     toolSettleGraceMs: 30,
   });
-  Object.assign(tools, { mode: 'run', slowMs: 0, started: [], hangPath: null });
+  Object.assign(tools, { mode: 'run', slowMs: 0, started: [], hangPath: null, hangArg: null });
 });
 
 const ENFORCED = { dailyBudgetUsd: 10, tpmThrottleLimit: 1_000_000 } as const;
 const GREP = { calls: [{ name: 'grep', args: { pattern: 'needle' } }] };
+const THREE_GREPS = {
+  calls: ['a', 'b', 'c'].map((pattern) => ({ name: 'grep', args: { pattern } })),
+};
 const HARD_TIMEOUT_MS = 8_000;
 
 /** The booking calls of a run: finalised and cancelled budget reservations, released and cancelled TPM ones. */
@@ -203,15 +210,7 @@ describe('ask_agentic bounds — the tools phase', () => {
       tools.mode = 'honour';
       const { result } = await timedOutRun({
         env: { GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY: '1' },
-        script: [
-          {
-            calls: [
-              { name: 'grep', args: { pattern: 'a' } },
-              { name: 'grep', args: { pattern: 'b' } },
-              { name: 'grep', args: { pattern: 'c' } },
-            ],
-          },
-        ],
+        script: [THREE_GREPS],
       });
 
       expect(result.structuredContent?.timeoutPhase).toBe('tools');
@@ -236,7 +235,10 @@ describe('ask_agentic bounds — the tools phase', () => {
     'a tools timeout is not retryable while an executor that ignores the signal still runs, and says how many',
     async () => {
       tools.mode = 'hang';
-      const { result, trace } = await timedOutRun({ script: [GREP] });
+      const { result, trace } = await timedOutRun({
+        env: { GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY: '1' },
+        script: [THREE_GREPS],
+      });
 
       expect(result.structuredContent).toMatchObject({
         timeoutPhase: 'tools',
@@ -245,8 +247,24 @@ describe('ask_agentic bounds — the tools phase', () => {
       });
       const warnings = callsTo(trace, 'log', 'warn').map(([line]) => String(line));
       expect(warnings).toContain(
-        "ask_agentic: 1 tool call(s) still running 30 ms after the iteration's bound; their results will be dropped",
+        "ask_agentic: 1 tool call(s) still running 30 ms after the iteration's bound (2 never started); their results will be dropped",
       );
+    },
+    HARD_TIMEOUT_MS,
+  );
+});
+
+describe('ask_agentic bounds — the work still running', () => {
+  it(
+    'counts only the executors still running: one settled, one hung',
+    async () => {
+      Object.assign(tools, { mode: 'hang', hangArg: 'b' });
+      const { result } = await timedOutRun({
+        script: [{ calls: ['a', 'b'].map((pattern) => ({ name: 'grep', args: { pattern } })) }],
+      });
+
+      expect(tools.started).toEqual(['grep', 'grep']);
+      expect(result.structuredContent).toMatchObject({ retryable: false, toolCallsRunning: 1 });
     },
     HARD_TIMEOUT_MS,
   );
