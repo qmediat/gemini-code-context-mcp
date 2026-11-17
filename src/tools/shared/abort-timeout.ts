@@ -47,7 +47,8 @@ export const ABORTED_REQUEST_NOTE =
 
 const ABSOLUTE_MAX_MS = 1_800_000; // 30 min — conservative ceiling for total
 const ABSOLUTE_MIN_MS = 1_000; // 1 s — anything shorter is a unit-conversion bug
-const STALL_ABSOLUTE_MAX_MS = 600_000; // 10 min — a stall watchdog longer than this is just a slow total cap
+/** 10 min — a stall watchdog longer than this is just a slow total cap; the longest `stallMs` a schema accepts. */
+export const STALL_ABSOLUTE_MAX_MS = 600_000;
 
 export interface TimeoutController {
   /** Pass into SDK config or `withNetworkRetry({signal})`. */
@@ -84,7 +85,7 @@ export interface TimeoutController {
    */
   recordChunk(): void;
   /**
-   * Stop the stall timer until the next `recordChunk()`. Called when one request of a decode has streamed to its
+   * Stop the stall timer until the next `recordChunk()`. Called when one request of a long decode has streamed to its
    * end: the gap before the next request's first chunk (its opening, its prefill) is exempt like the first
    * request's, and the first chunk re-arms the watchdog. No-op when the stall watchdog is disabled.
    */
@@ -102,11 +103,37 @@ export interface CreateTimeoutControllerOpts {
   stallEnvVar: string;
 }
 
+/** The tools whose two timeout knobs this module names: `timeoutMs` and `stallMs`. */
+export type TimedTool = 'ask' | 'code';
+
+/** The env vars of a tool's two knobs, under the names its controller's options take. */
+export type ToolTimeoutEnv = Pick<CreateTimeoutControllerOpts, 'totalEnvVar' | 'stallEnvVar'>;
+
+/** The one place the env vars of `ask`'s and `code`'s knobs are named: their controllers, their timeout messages and
+ * `ask`'s fallback read them here. */
+export const TOOL_TIMEOUT_ENV: Readonly<Record<TimedTool, Readonly<ToolTimeoutEnv>>> =
+  Object.freeze({
+    ask: Object.freeze({
+      totalEnvVar: 'GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS',
+      stallEnvVar: 'GEMINI_CODE_CONTEXT_ASK_STALL_MS',
+    }),
+    code: Object.freeze({
+      totalEnvVar: 'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
+      stallEnvVar: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
+    }),
+  });
+
 function readEnvMs(envVarName: string): number {
   const raw = process.env[envVarName];
   if (raw === undefined || raw.length === 0) return 0;
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** `requested` clamped into `[ABSOLUTE_MIN_MS, maxMs]`, or `null` when it is not a positive finite number. */
+function clampedMs(requested: number, maxMs: number): number | null {
+  if (!Number.isFinite(requested) || requested <= 0) return null;
+  return Math.max(ABSOLUTE_MIN_MS, Math.min(maxMs, Math.floor(requested)));
 }
 
 /**
@@ -118,9 +145,38 @@ export function resolveTotalTimeoutMs(
   totalMs: number | undefined,
   totalEnvVar: string,
 ): number | null {
-  const requested = totalMs !== undefined ? totalMs : readEnvMs(totalEnvVar);
-  if (!Number.isFinite(requested) || requested <= 0) return null;
-  return Math.max(ABSOLUTE_MIN_MS, Math.min(ABSOLUTE_MAX_MS, Math.floor(requested)));
+  return clampedMs(totalMs !== undefined ? totalMs : readEnvMs(totalEnvVar), ABSOLUTE_MAX_MS);
+}
+
+/** The stall watchdog a controller built from `stallMs` / `stallEnvVar` keeps, in ms, or `null` when it keeps none. */
+export function resolveStallTimeoutMs(
+  stallMs: number | undefined,
+  stallEnvVar: string,
+): number | null {
+  return clampedMs(stallMs !== undefined ? stallMs : readEnvMs(stallEnvVar), STALL_ABSOLUTE_MAX_MS);
+}
+
+/**
+ * The abort reason of a fired limit: a `TimeoutError` whose message names the kind ("total wall-clock" / "stall — no
+ * chunk received") and whose `timeoutKind` property carries it, so `getTimeoutKind` never depends on the copy.
+ * `extra` adds properties a caller reads besides the kind.
+ */
+export function timeoutReason(
+  limitMs: number,
+  kind: TimeoutKind,
+  extra: Readonly<Record<string, unknown>> = {},
+): DOMException {
+  const suffix = kind === 'stall' ? '(stall — no chunk received)' : '(total wall-clock)';
+  const reason = new DOMException(`Timed out after ${limitMs} ms ${suffix}`, 'TimeoutError');
+  Object.assign(reason, { timeoutKind: kind, ...extra });
+  return reason;
+}
+
+/** A timer that does not hold the event loop open. */
+export function unrefTimer(ms: number, fire: () => void): NodeJS.Timeout {
+  const timer = setTimeout(fire, ms);
+  timer.unref?.();
+  return timer;
 }
 
 /**
@@ -137,128 +193,71 @@ export function resolveTotalTimeoutMs(
  *   - `timeoutMs` (total): `[1_000, 1_800_000]` ms (1 s to 30 min).
  *   - `stallMs`: `[1_000, 600_000]` ms (1 s to 10 min).
  *   Out-of-range positive values are clamped silently.
- *
- * Single API: only the structured-options form is supported. The previous
- * v1.6.0–v1.11.0 2-arg signature was retired in v1.12.0 — all internal
- * callers (`ask`, `code`, `ask_agentic`) now pass options.
  */
 export function createTimeoutController(opts: CreateTimeoutControllerOpts): TimeoutController {
-  const totalEffective = resolveTotalTimeoutMs(opts.totalMs, opts.totalEnvVar) ?? 0;
+  const totalMs = resolveTotalTimeoutMs(opts.totalMs, opts.totalEnvVar);
+  const stallMs = resolveStallTimeoutMs(opts.stallMs, opts.stallEnvVar);
+  if (totalMs === null && stallMs === null) return disabledController();
+  return composedController(totalMs, stallMs);
+}
 
-  // Resolve stall watchdog.
-  const stallRequested = opts.stallMs !== undefined ? opts.stallMs : readEnvMs(opts.stallEnvVar);
-  const stallEffective =
-    Number.isFinite(stallRequested) && stallRequested > 0
-      ? Math.max(ABSOLUTE_MIN_MS, Math.min(STALL_ABSOLUTE_MAX_MS, Math.floor(stallRequested)))
-      : 0;
+/** The per-call knobs of `ask` / `code`; an unset one falls back to the tool's env var. */
+export interface ToolTimeoutKnobs {
+  readonly timeoutMs?: number | undefined;
+  readonly stallMs?: number | undefined;
+}
 
-  if (totalEffective === 0 && stallEffective === 0) {
-    return disabledController();
-  }
+/** The controller of an `ask` / `code` call: its per-call knobs, else the tool's env vars (`TOOL_TIMEOUT_ENV`). */
+export function toolTimeoutController(tool: TimedTool, knobs: ToolTimeoutKnobs): TimeoutController {
+  return createTimeoutController({
+    ...(knobs.timeoutMs !== undefined ? { totalMs: knobs.timeoutMs } : {}),
+    ...(knobs.stallMs !== undefined ? { stallMs: knobs.stallMs } : {}),
+    ...TOOL_TIMEOUT_ENV[tool],
+  });
+}
 
+/**
+ * The controller of at least one limit. The total timer arms at creation. The stall timer arms at the FIRST
+ * `recordChunk()`, not at creation: the pre-stream phase (workspace scan, countTokens preflight, Files API upload, the
+ * TLS handshake of `generateContentStream`) is local I/O and SDK setup, not a Gemini-side stall — `timeoutMs` bounds
+ * it. After the first chunk the timer resets on every chunk (text or thought); a gap longer than `stallMs` aborts with
+ * kind `stall`. A stream that opens but never yields a chunk is bounded by `timeoutMs` only. Whichever timer fires
+ * clears the other.
+ */
+function composedController(totalMs: number | null, stallMs: number | null): TimeoutController {
   const controller = new AbortController();
   let totalTimer: NodeJS.Timeout | null = null;
   let stallTimer: NodeJS.Timeout | null = null;
   let disposed = false;
-
-  if (totalEffective > 0) {
-    totalTimer = setTimeout(() => {
-      const reason = new DOMException(
-        `Timed out after ${totalEffective} ms (total wall-clock)`,
-        'TimeoutError',
-      );
-      // Embed the kind on the reason itself — message-string matching
-      // (the v1.12.0-pre approach) is brittle to any future copy changes.
-      Object.assign(reason, { timeoutKind: 'total' as const });
-      controller.abort(reason);
-      // Stall timer is now moot — clear it.
-      if (stallTimer !== null) clearTimeout(stallTimer);
-    }, totalEffective);
-    totalTimer.unref?.();
-  }
-
-  // Stall watchdog (Phase 4, v1.12.0).
-  //
-  // The stall timer arms on the FIRST `recordChunk()` call (typically
-  // when `collectStream` begins iterating chunks). It does NOT arm on
-  // controller creation — counting the pre-stream phase (workspace scan,
-  // countTokens preflight, Files API eager upload, TLS handshake to
-  // generateContentStream) as "stall budget" is wrong: that latency is
-  // local I/O and SDK setup, not Gemini-side stall. If the user wants
-  // to bound that phase, they set `timeoutMs` (the wall-clock cost cap),
-  // which DOES include pre-stream time.
-  //
-  // After the first chunk, the timer resets on every subsequent chunk
-  // (text or thought — both prove the stream is alive). Gap > stallMs
-  // → abort with kind="stall".
-  //
-  // Edge case: if the stream opens but never yields any chunk
-  // (e.g. SDK fetch hangs after returning the response), `recordChunk`
-  // is never called, the stall watchdog never arms, and only `timeoutMs`
-  // can rescue. Documented limitation; users wanting that safety net
-  // should set both `stallMs` and `timeoutMs`.
-  const armStallTimer = (): NodeJS.Timeout => {
-    const t = setTimeout(() => {
-      const reason = new DOMException(
-        `Timed out after ${stallEffective} ms (stall — no chunk received)`,
-        'TimeoutError',
-      );
-      Object.assign(reason, { timeoutKind: 'stall' as const });
-      controller.abort(reason);
-      if (totalTimer !== null) clearTimeout(totalTimer);
-    }, stallEffective);
-    t.unref?.();
-    return t;
+  const clearTimers = (): void => {
+    if (totalTimer !== null) clearTimeout(totalTimer);
+    if (stallTimer !== null) clearTimeout(stallTimer);
+    totalTimer = null;
+    stallTimer = null;
   };
-
-  if (stallEffective > 0) {
-    return {
-      signal: controller.signal,
-      timeoutMs: totalEffective > 0 ? totalEffective : null,
-      stallMs: stallEffective,
-      dispose: () => {
-        disposed = true;
-        if (totalTimer !== null) {
-          clearTimeout(totalTimer);
-          totalTimer = null;
-        }
-        if (stallTimer !== null) {
-          clearTimeout(stallTimer);
-          stallTimer = null;
-        }
-      },
-      recordChunk: () => {
-        // Defense-in-depth: refuse to re-arm after dispose() clears
-        // timers, and don't re-arm a fired controller.
-        if (disposed || controller.signal.aborted) return;
-        if (stallTimer !== null) clearTimeout(stallTimer);
-        stallTimer = armStallTimer();
-      },
-      pauseStall: () => {
-        if (stallTimer === null) return;
-        clearTimeout(stallTimer);
-        stallTimer = null;
-      },
-    };
-  }
-
-  // total-only path (no stall watchdog).
+  const fire = (limitMs: number, kind: TimeoutKind) => () => {
+    controller.abort(timeoutReason(limitMs, kind));
+    clearTimers();
+  };
+  if (totalMs !== null) totalTimer = unrefTimer(totalMs, fire(totalMs, 'total'));
   return {
     signal: controller.signal,
-    timeoutMs: totalEffective,
-    stallMs: null,
+    timeoutMs: totalMs,
+    stallMs,
     dispose: () => {
       disposed = true;
-      if (totalTimer !== null) {
-        clearTimeout(totalTimer);
-        totalTimer = null;
-      }
+      clearTimers();
     },
     recordChunk: () => {
-      /* stall disabled — no-op */
+      // never re-armed after dispose() or after a limit fired
+      if (stallMs === null || disposed || controller.signal.aborted) return;
+      if (stallTimer !== null) clearTimeout(stallTimer);
+      stallTimer = unrefTimer(stallMs, fire(stallMs, 'stall'));
     },
     pauseStall: () => {
-      /* stall disabled — no-op */
+      if (stallTimer === null) return;
+      clearTimeout(stallTimer);
+      stallTimer = null;
     },
   };
 }
@@ -332,22 +331,22 @@ export interface TimedOutCall {
 
 /** What a timeout of an `ask` / `code` call reports: the limit that fired and the message naming its knob. */
 export function timedOutCall(
-  tool: 'ask' | 'code',
+  tool: TimedTool,
   err: unknown,
   controller: TimeoutController,
 ): TimedOutCall {
-  const env = `GEMINI_CODE_CONTEXT_${tool.toUpperCase()}`;
+  const env = TOOL_TIMEOUT_ENV[tool];
   if (getTimeoutKind(err) === 'stall') {
     return {
       kind: 'stall',
       limitMs: controller.stallMs,
-      message: `${tool} timed out — no chunk received for ${controller.stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`${env}_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. ${ABORTED_REQUEST_NOTE}`,
+      message: `${tool} timed out — no chunk received for ${controller.stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`${env.stallEnvVar}\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. ${ABORTED_REQUEST_NOTE}`,
     };
   }
   return {
     kind: 'total',
     limitMs: controller.timeoutMs,
-    message: `${tool} timed out after ${controller.timeoutMs ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`${env}_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. ${ABORTED_REQUEST_NOTE}`,
+    message: `${tool} timed out after ${controller.timeoutMs ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`${env.totalEnvVar}\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. ${ABORTED_REQUEST_NOTE}`,
   };
 }
 

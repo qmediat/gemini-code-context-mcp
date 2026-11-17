@@ -1,23 +1,29 @@
 /**
  * One iteration of the `ask_agentic` loop: one streamed `generateContent` and, when the model asked for function
- * calls, one parallel batch of tool executions whose responses are appended to the conversation.
+ * calls, one parallel batch of tool executions whose responses are appended to the conversation. Every phase reads its
+ * bound from the pass's clock: each request's opening and its stream through the SDK's abort signal, the tools phase
+ * (path resolution and the batch, raced as one) through `abortable`, the workers' check before each call and the
+ * executors' checkpoints, which also report their progress to the clock.
  */
 
 import type { Content, FunctionCall, GenerateContentConfig, Part } from '@google/genai';
-import { withNetworkRetry } from '../../gemini/retry.js';
+import { abortable, abortableSleep, withNetworkRetry } from '../../gemini/retry.js';
 import type { MatchConfig } from '../../indexer/globs.js';
 import { logger } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
 import { type CollectedResponse, collectStream } from '../shared/stream-collector.js';
 import {
   type DispatchedToolResult,
+  type ToolBatch,
   type ToolCall,
-  dispatchToolCallsParallel,
   resolveToolExecutionConcurrency,
+  startToolBatch,
 } from './dispatch.js';
 import { type PassCall, completeCall } from './ledger.js';
+import type { PassClock } from './pass-clock.js';
 import { type UsageCounts, thinkingSummaryOf } from './response.js';
 import { resolveInsideWorkspace } from './sandbox.js';
+import { type ToolWatch, checkpoint } from './workspace-tools.js';
 
 export interface IterationResult {
   /** Text from the final model turn (no function calls) — or null when
@@ -54,18 +60,17 @@ export interface IterationArgs {
   workspaceRoot: string;
   filesReadSet: Set<string>;
   maxFilesRead: number;
-  /** Per-iteration timeout signal (T19). Threads into withNetworkRetry + SDK config. */
-  abortSignal: AbortSignal;
+  /** The pass's clock: its signal threads into `withNetworkRetry`, the SDK config and the tools phase; each request
+   * enters `opening`, and so does a retry's announcement, so the backoff before a request runs under a fresh default;
+   * every chunk reaches `recordChunk`; the tools phase is entered the moment the call completed and its executors'
+   * progress reaches `recordProgress`. */
+  clock: PassClock;
   /** The pass's model call: marked completed once the stream ended, then given the usage read (`completeCall`). */
   call: PassCall;
   /** User glob filters (v1.9.0+). Honoured by all four agentic executors so
    * a fallback from `ask` (which already applies the same globs to its
    * eager scanner) preserves filter semantics — no privacy regression. */
   matchConfig: MatchConfig;
-  /** Reset the per-iteration stall watchdog on every stream chunk (T33,
-   * v1.16.2). Wired from the loop's `iterTimeout.recordChunk`. No-op when
-   * stall is disabled. */
-  recordChunk: () => void;
   /** Surface live thought-chunk previews via the MCP progress channel
    * (T33, v1.16.2). Mirrors the ask/code streaming UX. */
   onThoughtChunk: (text: string) => void;
@@ -117,17 +122,21 @@ interface DispatchPlan {
  * (`completeCall`).
  */
 async function streamIteration(args: IterationArgs): Promise<CollectedResponse> {
-  const { ctx, resolvedModel, conversation, baseConfig, abortSignal } = args;
+  const { ctx, resolvedModel, conversation, baseConfig, clock } = args;
+  const abortSignal = clock.signal;
   const stream = await withNetworkRetry(
-    () =>
-      ctx.client.models.generateContentStream({
+    () => {
+      clock.enter('opening');
+      return ctx.client.models.generateContentStream({
         model: resolvedModel,
         contents: conversation,
         config: { ...baseConfig, abortSignal },
-      }),
+      });
+    },
     {
       signal: abortSignal,
       onRetry: (attempt, err) => {
+        clock.enter('opening');
         logger.warn(
           `ask_agentic: retrying generateContent after transient network failure (attempt ${attempt}): ${
             err instanceof Error ? err.message : String(err)
@@ -139,7 +148,7 @@ async function streamIteration(args: IterationArgs): Promise<CollectedResponse> 
   return collectStream(stream, {
     signal: abortSignal,
     onThoughtChunk: args.onThoughtChunk,
-    onChunkReceived: args.recordChunk,
+    onChunkReceived: () => clock.recordChunk(),
   });
 }
 
@@ -209,9 +218,36 @@ async function capRefusal(
   };
 }
 
+/** The tools phase's work as it runs: path resolution in flight, then the batch. Each call is counted once: refused at
+ * the `maxFilesRead` cap, running, or never started. */
+class ToolsWork {
+  resolving = false;
+  /** The calls refused at the `maxFilesRead` cap so far: answered, never an executor's. */
+  refused = 0;
+  batch: ToolBatch | null = null;
+
+  constructor(private readonly calls: number) {}
+
+  /** What still runs: a path resolution in flight counts as one call. */
+  running(): number {
+    return (this.resolving ? 1 : 0) + (this.batch?.running() ?? 0);
+  }
+
+  /** The calls no executor took, as the batch counts them: before it exists, every call neither refused nor in path
+   * resolution. */
+  neverStarted(): number {
+    if (this.batch !== null) return this.batch.neverStarted();
+    return this.calls - this.refused - (this.resolving ? 1 : 0);
+  }
+}
+
+/** The calls of a model turn, each refused at the `maxFilesRead` cap (counted on `work`) or planned for dispatch; a
+ * checkpoint follows each path resolution. */
 async function planDispatch(
   functionCallParts: FunctionCallPart[],
   args: IterationArgs,
+  work: ToolsWork,
+  watch: ToolWatch,
 ): Promise<DispatchPlan> {
   const plan: DispatchPlan = {
     signatures: [],
@@ -229,30 +265,16 @@ async function planDispatch(
     };
     plan.signatures.push(call);
     const refusal = await capRefusal(fc, call, args);
+    checkpoint(watch);
     if (refusal !== null) {
       plan.responseParts[i] = refusal;
+      work.refused += 1;
       continue;
     }
     plan.dispatchIndexMap.push(i);
     plan.toDispatch.push({ name: call.name, args: call.args });
   }
   return plan;
-}
-
-/**
- * Check abort AFTER tool execution — local file I/O / large grep regex /
- * huge directory walk can take real wall-clock time, and without this
- * check a 5s iterationTimeoutMs could be ignored for the duration of a
- * multi-second tool call. The next iteration would then start with the
- * signal already aborted, but the user's expectation is that the timeout
- * fires AS SOON AS the deadline passes.
- */
-function throwIfIterationAborted(abortSignal: AbortSignal): void {
-  if (abortSignal.aborted) {
-    throw abortSignal.reason instanceof Error
-      ? abortSignal.reason
-      : new DOMException('Operation aborted', 'AbortError');
-  }
 }
 
 /** A successful `read_file` adds its sandbox-resolved `relpath` — this closes the alias-bypass on
@@ -317,45 +339,135 @@ function toolResponseTokensOf(finalResponseParts: Part[]): number {
   }
 }
 
+/** How an iteration ended: with its result, or at the bound of its tools phase. */
+export type IterationOutcome =
+  | { readonly kind: 'done'; readonly iteration: IterationResult }
+  | { readonly kind: 'tools-timed-out'; readonly running: number };
+
+/** How the tools phase ended: the batch's results, or the bound — with the work still running after the grace. */
+type ToolsOutcome =
+  | {
+      readonly kind: 'done';
+      readonly plan: DispatchPlan;
+      readonly dispatched: DispatchedToolResult[];
+    }
+  | { readonly kind: 'timed-out'; readonly running: number };
+
+/** Resolve the plan, then run its batch: once the clock fired its workers take no call (`startToolBatch`). */
+async function planAndRun(
+  functionCallParts: FunctionCallPart[],
+  args: IterationArgs,
+  work: ToolsWork,
+): Promise<{ plan: DispatchPlan; dispatched: DispatchedToolResult[] }> {
+  const watch = { signal: args.clock.signal, onProgress: () => args.clock.recordProgress() };
+  work.resolving = true;
+  let plan: DispatchPlan;
+  try {
+    plan = await planDispatch(functionCallParts, args, work, watch);
+  } finally {
+    work.resolving = false;
+  }
+  work.batch = startToolBatch(
+    args.workspaceRoot,
+    plan.toDispatch,
+    resolveToolExecutionConcurrency(),
+    args.matchConfig,
+    watch,
+  );
+  return { plan, dispatched: await work.batch.settled };
+}
+
+/** `true` when `settled` settles within `graceMs`; the grace's timer is cleared when it does. */
+async function settlesWithin(settled: Promise<unknown>, graceMs: number): Promise<boolean> {
+  const grace = new AbortController();
+  const inTime = settled.then(
+    () => true,
+    () => true,
+  );
+  const late = abortableSleep(graceMs, grace.signal).then(
+    () => false,
+    () => false,
+  );
+  const result = await Promise.race([inTime, late]);
+  grace.abort();
+  return result;
+}
+
 /**
- * Run one iteration. The model's response (including the function calls) is recorded so the next
- * turn has full context — Gemini requires the full call-response pair to stay in the conversation.
- * The non-capped calls are dispatched in parallel; the concurrency resolves per call from the env
- * override (`GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`), default 10. Remaining `null` slots
- * shouldn't happen in practice (every call gets either a short-circuit or a dispatched response),
- * but are skipped rather than sending a malformed turn to Gemini.
+ * The tools phase after its bound fired: the executors still running are given `graceMs` (the clock's `settleGraceMs`)
+ * to settle; what still runs then is counted and said, and whatever it returns later is dropped — it never reaches the
+ * conversation, the files-read set or the ledger.
  */
-export async function runAgenticIteration(args: IterationArgs): Promise<IterationResult> {
+async function toolsTimedOut(
+  work: ToolsWork,
+  settled: Promise<unknown>,
+  graceMs: number,
+): Promise<ToolsOutcome> {
+  const inTime = await settlesWithin(settled, graceMs);
+  const running = inTime ? 0 : work.running();
+  if (running > 0) {
+    logger.warn(
+      `ask_agentic: ${running} tool call(s) still running ${graceMs} ms after the iteration's bound (${work.neverStarted()} never started); their results will be dropped`,
+    );
+    settled.then(
+      () =>
+        logger.debug('ask_agentic: a tool batch settled after its bound; its results were dropped'),
+      (err: unknown) =>
+        logger.debug(`ask_agentic: a tool batch failed after its bound: ${String(err)}`),
+    );
+  }
+  return { kind: 'timed-out', running };
+}
+
+/** Path resolution and the batch, raced as one against the pass's clock. */
+async function runToolsPhase(
+  functionCallParts: FunctionCallPart[],
+  args: IterationArgs,
+): Promise<ToolsOutcome> {
+  const work = new ToolsWork(functionCallParts.length);
+  const settled = planAndRun(functionCallParts, args, work);
+  try {
+    const { plan, dispatched } = await abortable(settled, args.clock.signal);
+    return { kind: 'done', plan, dispatched };
+  } catch (err) {
+    if (!args.clock.signal.aborted) throw err;
+    return toolsTimedOut(work, settled, args.clock.settleGraceMs);
+  }
+}
+
+/**
+ * Run one iteration. The model's response (including the function calls) is recorded so the next turn has full
+ * context — Gemini requires the full call-response pair to stay in the conversation; both turns are appended only when
+ * the tools phase answered. The non-capped calls are dispatched in parallel; the concurrency resolves per call from the
+ * env override (`GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY`), default 10. Remaining `null` slots shouldn't happen in
+ * practice (every call gets either a short-circuit or a dispatched response), but are skipped rather than sending a
+ * malformed turn to Gemini.
+ */
+export async function runAgenticIteration(args: IterationArgs): Promise<IterationOutcome> {
   const response = await streamIteration(args);
   const usage = completeCall(args.call, response);
+  args.clock.enter('tools');
   const parts: Part[] = response.candidates?.[0]?.content?.parts ?? [];
   const functionCallParts = parts.filter((p): p is FunctionCallPart =>
     Boolean(p.functionCall && typeof p.functionCall.name === 'string'),
   );
   const thinkingSummary = thinkingSummaryOf(parts);
   if (functionCallParts.length === 0) {
-    return finalTextIteration(response, parts, usage, thinkingSummary);
+    return { kind: 'done', iteration: finalTextIteration(response, parts, usage, thinkingSummary) };
   }
-
+  const tools = await runToolsPhase(functionCallParts, args);
+  if (tools.kind === 'timed-out') return { kind: 'tools-timed-out', running: tools.running };
   args.conversation.push({ role: 'model', parts });
-  const plan = await planDispatch(functionCallParts, args);
-  const dispatched = await dispatchToolCallsParallel(
-    args.workspaceRoot,
-    plan.toDispatch,
-    resolveToolExecutionConcurrency(),
-    args.matchConfig,
-  );
-  throwIfIterationAborted(args.abortSignal);
-  mergeDispatched(dispatched, plan, functionCallParts, args.filesReadSet);
-
-  const finalResponseParts = plan.responseParts.filter((p): p is Part => p !== null);
+  mergeDispatched(tools.dispatched, tools.plan, functionCallParts, args.filesReadSet);
+  const finalResponseParts = tools.plan.responseParts.filter((p): p is Part => p !== null);
   args.conversation.push({ role: 'user', parts: finalResponseParts });
-  return {
+  const iteration: IterationResult = {
     finalText: null,
     functionCallCount: functionCallParts.length,
-    signatures: plan.signatures,
+    signatures: tools.plan.signatures,
     usage,
     thinkingSummary,
     toolResponseTokens: toolResponseTokensOf(finalResponseParts),
   };
+  return { kind: 'done', iteration };
 }

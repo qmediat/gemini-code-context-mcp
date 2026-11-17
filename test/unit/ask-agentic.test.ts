@@ -68,10 +68,11 @@ const mocks = vi.hoisted(() => ({
   resolveModel: vi.fn(),
   // F2: opt-in latency injection for `grepExecutor`. Default 0 = pass-through
   // for all existing tests. Per-test override (set in the test body, reset
-  // in `beforeEach`) wraps the real executor with `setTimeout`-based delay
-  // so we can drive the post-dispatch abort check (`throwIfIterationAborted`
-  // in `src/tools/agentic/iteration.ts`) without faking timers.
+  // in `beforeEach`) wraps the real executor with a `setTimeout`-based delay
+  // that ignores the abort signal — an executor the tools bound cannot stop.
   grepExecutorDelayMs: 0,
+  // Set when a delayed grep's delay is over: the order of the result and the executor's return.
+  grepDelayOver: false,
 }));
 
 vi.mock('../../src/indexer/workspace-validation.js', () => ({
@@ -95,6 +96,7 @@ vi.mock('../../src/tools/agentic/workspace-tools.js', async () => {
       await new Promise<void>((resolve) => {
         setTimeout(resolve, delay);
       });
+      mocks.grepDelayOver = true;
     }
     return actual.grepExecutor(...args);
   };
@@ -268,6 +270,7 @@ beforeEach(() => {
   // Reset the F2 grep-latency override so a test that opted-in does not
   // bleed into the next case (`vi.hoisted` state survives between tests).
   mocks.grepExecutorDelayMs = 0;
+  mocks.grepDelayOver = false;
   mocks.validateWorkspacePath.mockReturnValue(undefined);
   mocks.resolveModel.mockResolvedValue({
     requested: 'latest-pro-thinking',
@@ -2204,15 +2207,9 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
     expect(elapsedMs).toBeLessThan(5_000);
   });
 
-  it('surfaces TIMEOUT when the iteration timer fires DURING tool execution (F2 — post-dispatch abort check)', async () => {
-    // Production guards against a slow tool overrunning the deadline in
-    // `throwIfIterationAborted` (`src/tools/agentic/iteration.ts`): after `dispatchToolCallsParallel`
-    // returns, if the signal aborted during dispatch we re-throw
-    // `signal.reason` so the catch path maps it to TIMEOUT. None of the
-    // other tests reach the THROW arm of that branch — test 1 dispatches
-    // a fast `read_file`, test 4 hangs on the SDK call before dispatch
-    // ever happens. Without this case, deleting that check would not
-    // fail any test, silently uncapping per-iteration deadlines.
+  it('ends at the iteration timer DURING tool execution, before an executor that ignores the signal returns (F2)', async () => {
+    // The tools phase is raced against the pass's clock (`runToolsPhase`, `src/tools/agentic/iteration.ts`): the
+    // bound ends the batch, the executor still running after the 1 s grace is counted, and its late result dropped.
     const root = mkdtempSync(join(tmpdir(), 'gcctx-askagent-timeout-tool-'));
     writeFileSync(join(root, 'a.ts'), 'export const x = 1;');
 
@@ -2221,48 +2218,36 @@ describe('ask_agentic loop — iterationTimeoutMs TIMEOUT mapping (T19)', () => 
       dailyBudgetUsd: 100,
     });
     generateContent.mockReset();
-    // Iteration 1: model issues a single grep call. Our `vi.mock` wrapper
-    // for `grepExecutor` (top of file) sleeps `mocks.grepExecutorDelayMs`
-    // before delegating to the real executor — long enough that the
-    // 1 s iter timeout fires mid-dispatch. `setTimeout` here is NOT
-    // wired to `abortSignal`, so the dispatch completes naturally; the
-    // post-dispatch `abortSignal.aborted` check is what triggers
-    // the throw.
+    // Iteration 1: model issues a single grep call; the wrapped `grepExecutor` (top of file) sleeps past the 1 s
+    // iteration timeout plus the 1 s grace, on a timer the abort signal does not reach.
     generateContent.mockResolvedValueOnce(
       buildResponse({ functionCalls: [{ id: 'g1', name: 'grep', args: { pattern: 'x' } }] }),
     );
-    mocks.grepExecutorDelayMs = 1_500; // > iterationTimeoutMs
+    mocks.grepExecutorDelayMs = 3_000;
 
-    const startedAt = Date.now();
     const result = await askAgenticTool.execute(
       { prompt: 'q', workspace: root, iterationTimeoutMs: 1_000 },
       ctx,
     );
-    const elapsedMs = Date.now() - startedAt;
 
-    expect(result.isError).toBe(true);
-    expect(result.structuredContent?.errorCode).toBe('TIMEOUT');
-    expect(result.structuredContent?.timeoutMs).toBe(1_000);
-    expect(result.structuredContent?.iteration).toBe(1);
-    // The SDK was called once (model issued the grep call); the abort fired during the ~1.5 s dispatch.
+    expect(mocks.grepDelayOver).toBe(false);
+    expect(result.structuredContent).toMatchObject({
+      errorCode: 'TIMEOUT',
+      timeoutMs: 1_000,
+      timeoutKind: 'total',
+      timeoutPhase: 'tools',
+      timeoutSource: 'iterationTimeoutMs',
+      iteration: 1,
+      retryable: false,
+      toolCallsRunning: 1,
+    });
     expect(generateContent).toHaveBeenCalledTimes(1);
-    // Single iteration → single reservation → finalised (not cancelled): the
-    // model call completed before the tool batch, so its work is billed even
-    // though the iteration threw on the post-dispatch abort check.
+    // The model call completed before the tool batch: the pass is finalised (not cancelled) at the bound.
     expect(manifest.finalizeBudgetReservation).toHaveBeenCalledTimes(1);
     expect(manifest.finalizeBudgetReservation).toHaveBeenCalledWith(1, expect.any(Object));
     expect(manifest.cancelBudgetReservation).not.toHaveBeenCalled();
-    // tpmEnforced=false here (no `tpmThrottleLimit` override → defaults to 0
-    // in `buildCtx`), so `throttle.reserve` never ran and `throttle.cancel`
-    // has nothing to release. F3 covers the throttle-cancel path.
+    // tpmEnforced=false here (no `tpmThrottleLimit` override → defaults to 0 in `buildCtx`).
     expect(throttle.cancel).not.toHaveBeenCalled();
-    // Timing sanity: must have actually waited for the slow executor
-    // (≥ ~1.5 s). If this falls below 1.5 s the wrapper isn't being
-    // invoked and the test is silently a no-op. Lower bound is 1450ms
-    // (~3 % slack) for the same `setTimeout` precision reason documented
-    // in the F3 / end-to-end tests above.
-    expect(elapsedMs).toBeGreaterThanOrEqual(1_450);
-    expect(elapsedMs).toBeLessThan(5_000);
   });
 
   it('end-to-end: real timer fires on a hung generateContent and surfaces TIMEOUT', async () => {

@@ -43,12 +43,16 @@ import { runLoop } from './agentic/loop.js';
 import { runRescue } from './agentic/rescue.js';
 import { maxIterationsResult } from './agentic/results.js';
 import {
+  AGENTIC_KNOB_NAMES,
   type AgenticRun,
+  type KnobNames,
   type LoopState,
   type ResolvedModel,
   baseConfigOf,
+  messageKnobNames,
   newLoopState,
   passBudgetOf,
+  resolveAgenticKnobs,
   runLimitsOf,
 } from './agentic/run.js';
 import { resolveWorkspaceRoot } from './agentic/sandbox.js';
@@ -74,21 +78,36 @@ export const askAgenticTool: ToolDefinition<AskAgenticInput> = {
     "Surgical fallback for repos that exceed `ask`'s model input-token limit (~1M tokens for Gemini Pro), OR when you only need a handful of files (cheaper than eager-uploading a large repo). Gemini uses sandboxed file-access tools (`list_directory`, `find_files`, `read_file`, `grep`) to read only what it needs across multiple iterations (default 20). Cost profile: more API round trips than `ask`, but total tokens usually much smaller on big repos. **Wall-clock is structurally slower than `ask`** — each iteration pays ~30-60s of HIGH-thinking latency, so a 20-iter call can take 10-20 minutes. For the fast path, use `ask`. For oversize repos or focused investigation, use `ask_agentic`.",
   schema: askAgenticInputSchema,
 
-  async execute(input, ctx) {
-    const started = Date.now();
-    const workspaceRoot = resolve(input.workspace ?? process.cwd());
-    const model = input.model ?? ctx.config.defaultModel ?? 'latest-pro-thinking';
-    return executeAskAgenticBody(input, ctx, workspaceRoot, model, started);
-  },
+  execute: (input, ctx) => runAskAgentic(input, ctx, AGENTIC_KNOB_NAMES),
 };
 
-/** One `ask_agentic` call as `execute` received it. */
-interface AgenticCall {
+/**
+ * One `ask_agentic` call. `knobNames` are the knobs its timeout messages name: `ask_agentic`'s own, or `ask`'s when
+ * the call is `ask`'s fallback (its `timeoutMs` / `stallMs` became this call's `iterationTimeoutMs` / `stallMs`).
+ */
+export function runAskAgentic(
+  input: AskAgenticInput,
+  ctx: ToolContext,
+  knobNames: KnobNames,
+): Promise<TextToolResult> {
+  const started = Date.now();
+  const rawWorkspaceRoot = resolve(input.workspace ?? process.cwd());
+  const model = input.model ?? ctx.config.defaultModel ?? 'latest-pro-thinking';
+  return executeAskAgenticBody({ input, ctx, rawWorkspaceRoot, model, started, knobNames });
+}
+
+/** One `ask_agentic` call as `runAskAgentic` received it. */
+interface CallRequest {
   input: AskAgenticInput;
   ctx: ToolContext;
   rawWorkspaceRoot: string;
   model: string;
   started: number;
+  knobNames: KnobNames;
+}
+
+/** The call with its progress channel. */
+interface AgenticCall extends CallRequest {
   emitter: ProgressEmitter;
 }
 
@@ -165,8 +184,9 @@ function startRun(
   if (refusal !== null) return { refused: refusal };
   const baseConfig = baseConfigOf(input);
   emitter.emit('starting agentic loop…');
-  const budget = passBudgetOf(input, ctx);
-  const { started } = call;
+  const knobs = resolveAgenticKnobs(input);
+  const budget = passBudgetOf(input, ctx, knobs);
+  const { started, knobNames } = call;
   return {
     run: {
       input,
@@ -179,6 +199,8 @@ function startRun(
       matchConfig,
       baseConfig,
       budget,
+      knobs,
+      knobNames: messageKnobNames(knobNames, knobs),
     },
   };
 }
@@ -232,17 +254,12 @@ function failedCall(err: unknown, ctx: ToolContext, progress: CallProgress) {
   });
 }
 
-async function executeAskAgenticBody(
-  input: AskAgenticInput,
-  ctx: ToolContext,
-  rawWorkspaceRoot: string,
-  model: string,
-  started: number,
-): Promise<TextToolResult> {
+async function executeAskAgenticBody(request: CallRequest): Promise<TextToolResult> {
+  const { ctx } = request;
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   const progress: CallProgress = { resolved: undefined, loop: undefined };
   try {
-    return await answerAgentic({ input, ctx, rawWorkspaceRoot, model, started, emitter }, progress);
+    return await answerAgentic({ ...request, emitter }, progress);
   } catch (err) {
     return failedCall(err, ctx, progress);
   } finally {

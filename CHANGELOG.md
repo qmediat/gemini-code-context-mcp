@@ -7,8 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ask_agentic`: every phase of a pass now has a bound. A phase that could hang forever now ends with `TIMEOUT` after
+  its default: 600 s for each request's opening (until its first chunk; a request sent again after a network failure
+  gets the whole 600 s, and so does the backoff before it), 600 s for a stream that sends nothing (a `stall`), 120 s
+  without progress in an iteration's path resolution and tool batch — the executors report progress at every directory,
+  file and read, so a long healthy `grep` batch over a large workspace runs on — and 600 s for each request of the
+  forced-finalization pass (`rescueErrorCode: 'TIMEOUT'`). A default applies only where no knob bounds the phase:
+  `iterationTimeoutMs` (or `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`) bounds every phase of an iteration,
+  `stallMs` (or `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`) the gaps of a stream only. The TPM wait keeps the throttle's own
+  delay. Before, with neither knob set — and with only `stallMs` for everything but a stream's gaps — such a phase never
+  ended and held the pass's daily-budget and TPM reservations.
+- `ask_agentic`: `iterationTimeoutMs` ends a tool batch at the bound, not when the batch returns; no queued tool call
+  starts once a bound fired, the executors get the abort signal, and a late result is dropped. A `TIMEOUT` is
+  `retryable: false` when tool calls still run 1 s after the bound (`toolCallsRunning` says how many).
+- `ask`'s fallback to `ask_agentic` (`onWorkspaceTooLarge: 'fallback-to-agentic'`) forwards `stallMs` as the loop's
+  `stallMs`, no longer as a per-iteration wall clock: a healthy stream or a tool batch longer than `stallMs` answers.
+  With only `stallMs` set a pass has no wall clock — a stream that keeps sending ends at the model's output cap, a tool
+  batch that keeps reporting progress when its walk ends; a caller who wants a wall clock per iteration sets
+  `iterationTimeoutMs` (`timeoutMs` on `ask`).
+  `timeoutMs` still becomes `iterationTimeoutMs`. `iterTimeoutSource` is now always `'timeoutMs'` (the values
+  `'stallMs'` and `'min(timeoutMs,stallMs)'` are gone), and the result reports the forwarded `stallMs`.
+- `ask_agentic`'s timeout messages no longer say "default disabled"; a bound that fired at its default names the
+  default and the knob that sets it.
+
+### Added
+
+- `ask_agentic`: a `TIMEOUT` result carries `timeoutPhase` (`tpm-wait`, `opening`, `stream`, `tools`) and
+  `timeoutSource` (`iterationTimeoutMs`, `stallMs`, `default`, or `external` — a timeout the SDK raised itself: the
+  message quotes it and names no bound of the call); `timeoutKind` keeps its two values (`stall` is a stream's gap
+  only). The forced-finalization pass's `AGENTIC_MAX_ITERATIONS` with `rescueErrorCode: 'TIMEOUT'` carries
+  `timeoutPhase` (`tpm-wait`, `finalization`) and `timeoutSource` too, and its message names the knob that raises the
+  bound. `ask`'s fallback lifts both to the top of its result, beside `timeoutKind`.
+
 ### Fixed
 
+- `ask_agentic`: a tool batch longer than `stallMs` no longer ends the call as a false `stall`; the stall watchdog
+  watches the stream only.
+- `ask_agentic`: a tool batch, or a path resolution at the `maxFilesRead` cap, that never returns no longer hangs the
+  call: it ends at `iterationTimeoutMs`, else after 120 s without progress, with the pass booked.
+- `ask`'s fallback to `ask_agentic` uses `ask`'s knobs as `ask` resolved them — per call, else
+  `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` / `GEMINI_CODE_CONTEXT_ASK_STALL_MS` (the env vars were ignored) — stops `ask`'s
+  own timer at the hand-off, and its timeout messages name `timeoutMs` / `stallMs`, not `iterationTimeoutMs`. Where
+  `ask` set no knob of a kind, `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` / `_STALL_MS` still bound the loop,
+  and the message names that variable, not an `ask` one that set nothing.
 - `ask_agentic`: a 429 on a loop iteration seeds the throttle's retry hint once, not twice. `ask`, `code` and
   `ask_agentic` seed the hint through one function, once per error.
 - `ask_agentic`: a loop iteration whose response carries no `usageMetadata` is booked and released at its estimate
@@ -32,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phrases "true upper bound" / "true cap" are gone.
 - `ask` and `code`: an answer whose usage row cannot be written (a busy or failing database) is returned, and the
   failed write is logged; the paid answer used to be lost behind an error.
+
+### Security
+
+- `ask_agentic`: `list_directory`, `find_files` and `grep` no longer show a file on the secret denylist that `read_file`
+  refuses — a basename such as `.env`, `.env.local`, `credentials.json`, `secrets.yaml` or `service-account.json`, or a
+  name ending in `.pem`, `.key` or another secret extension, in any case. Before, since these tools shipped with
+  `ask_agentic`, `list_directory` listed such files with their sizes, `find_files` listed those its source rules admit
+  (`credentials.json`, `secrets.json`, `secrets.yaml`, …), and `grep` returned their matching lines. The three tools and
+  `read_file` now read one denylist.
 
 ## [1.24.0] - 2026-11-17
 

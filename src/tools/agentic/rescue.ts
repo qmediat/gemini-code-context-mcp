@@ -9,19 +9,21 @@
  * v1.14.2: the rescue pass is NOT gated on `maxTotalInputTokens`. It is the documented exit path for "loop ran out
  * of iterations without final text" and blocking it on rescue's own potential overshoot defeats the v1.14.1 feature —
  * an operator running near the cap would never get the synthesised answer the rescue is designed to produce. Rescue
- * cost remains bounded by the `dailyBudgetUsd` reservation, wall-clock by `iterationTimeoutMs`. Cap-overshoot is
- * signalled via `overBudget: true` on the result so callers can detect the trade.
+ * cost remains bounded by the `dailyBudgetUsd` reservation, wall-clock by `iterationTimeoutMs` — else by the
+ * finalization default (`phase-defaults.ts`). Cap-overshoot is signalled via `overBudget: true` on the result so
+ * callers can detect the trade.
  *
- * The rescue calls `generateContent`, not the stream, and its timeout has no stall watchdog. Its call is marked
- * completed the moment `generateContent` returned (`completeCall`, the idiom of the loop iteration), before the
- * response is read.
+ * The rescue calls `generateContent`, not the stream: its pass clock has the phases `tpm-wait` and `finalization` —
+ * entered by each request and by a retry's announcement, so each request, its backoff included, gets the whole default
+ * — and no stream gap to watch. Its call is marked completed the moment `generateContent` returned (`completeCall`, the
+ * idiom of the loop iteration), before the response is read.
  */
 
 import type { GenerateContentConfig, GenerateContentResponse } from '@google/genai';
 import { ApiError, FunctionCallingConfigMode } from '@google/genai';
 import { withNetworkRetry } from '../../gemini/retry.js';
 import { logger } from '../../utils/logger.js';
-import { createTimeoutController, isTimeoutAbort } from '../shared/abort-timeout.js';
+import { isTimeoutAbort } from '../shared/abort-timeout.js';
 import type { BilledFields } from '../shared/call-ledger.js';
 import { isGemini429, seedRetryHint } from '../shared/throttle.js';
 import { SYSTEM_INSTRUCTION_FINALIZATION } from './instructions.js';
@@ -35,10 +37,10 @@ import {
   reservePass,
   waitForTpm,
 } from './ledger.js';
+import { type PassClock, type PassTimeout, createPassClock, passTimeoutOf } from './pass-clock.js';
 import { type UsageCounts, thinkingSummaryOf } from './response.js';
 import {
   type AgenticRun,
-  ITERATION_TIMEOUT_ENV,
   type LoopState,
   PER_ITERATION_INPUT_TOKENS,
   passReservationUsd,
@@ -50,7 +52,7 @@ import {
  * without log scraping. Strict union — extend here when adding new error
  * classes.
  *
- * - 'TIMEOUT'    — iterationTimeoutMs fired (isTimeoutAbort)
+ * - 'TIMEOUT'    — iterationTimeoutMs, else the finalization default, fired (isTimeoutAbort)
  * - 'RATE_LIMIT' — Google 429 (isGemini429: ApiError + status===429)
  * - 'INTERNAL'   — the call completed (await returned), but reading its
  *                  response threw — the pass is booked, but the caller
@@ -90,6 +92,8 @@ export interface RescueOutcome {
   skipReason: 'daily-budget' | null;
   /** The pass's billed fields when its call completed and it was booked; `null` when it was skipped or cancelled. */
   billed: BilledFields | null;
+  /** What ended the pass when it timed out (`errorCode: 'TIMEOUT'`), read from its clock; `null` otherwise. */
+  timeout: PassTimeout | null;
 }
 
 /** The parts of the finalization call that outlive its `try`. */
@@ -145,12 +149,14 @@ function callFinalization(
   run: AgenticRun,
   state: LoopState,
   baseConfigNoTools: GenerateContentConfig,
-  signal: AbortSignal,
+  clock: PassClock,
 ): Promise<GenerateContentResponse> {
   const model = run.resolved.resolved;
+  const { signal } = clock;
   return withNetworkRetry(
-    () =>
-      run.ctx.client.models.generateContent({
+    () => {
+      clock.enter('finalization');
+      return run.ctx.client.models.generateContent({
         model,
         contents: state.conversation,
         config: {
@@ -161,10 +167,12 @@ function callFinalization(
           },
           abortSignal: signal,
         },
-      }),
+      });
+    },
     {
       signal,
       onRetry: (attempt, retryErr) => {
+        clock.enter('finalization');
         logger.warn(`ask_agentic finalization: retry attempt ${attempt}: ${errorText(retryErr)}`);
       },
     },
@@ -228,15 +236,17 @@ function rescueFailureCode(
 }
 
 /** The rescue's generateContent can also 429 — its retry hint seeds the throttle cache for future
- * ask_agentic / ask / code calls, the same way the per-iteration catch does. */
+ * ask_agentic / ask / code calls, the same way the per-iteration catch does. A timeout records what fired. */
 function recordRescueFailure(
   run: AgenticRun,
   finalErr: unknown,
+  clock: PassClock,
   callCompleted: boolean,
   outcome: RescueOutcome,
 ): void {
   const finalRetryDelayMs = seedRetryHint(run.ctx.throttle, run.resolved.resolved, finalErr);
   outcome.errorCode = rescueFailureCode(finalErr, finalRetryDelayMs, callCompleted);
+  if (outcome.errorCode === 'TIMEOUT') outcome.timeout = passTimeoutOf(clock, finalErr);
   outcome.errorMessage =
     finalErr instanceof Error ? finalErr.message.slice(0, 500) : String(finalErr).slice(0, 500);
 }
@@ -247,7 +257,7 @@ async function dispatchRescue(
   run: AgenticRun,
   state: LoopState,
   flight: RescueFlight,
-  signal: AbortSignal,
+  clock: PassClock,
   outcome: RescueOutcome,
 ): Promise<void> {
   if (run.budget.tpmEnforced) {
@@ -257,18 +267,18 @@ async function dispatchRescue(
       run,
       flight,
       flight.estimate,
-      signal,
+      clock.signal,
       (seconds) => `finalization throttle: waiting ${seconds}s for TPM window…`,
     );
   }
   const { tools: _unusedTools, ...baseConfigNoTools } = run.baseConfig;
   outcome.attempted = true;
-  const response = await callFinalization(run, state, baseConfigNoTools, signal);
+  const response = await callFinalization(run, state, baseConfigNoTools, clock);
   const usage = completeCall(flight.call, response);
   readFinalization(response, usage, outcome);
 }
 
-/** Run the pass under its own timeout; close it by its call (`closePass`): booked when the call completed, both
+/** Run the pass under its own clock; close it by its call (`closePass`): booked when the call completed, both
  * reservations cancelled when it did not. */
 async function attemptRescue(
   run: AgenticRun,
@@ -278,13 +288,7 @@ async function attemptRescue(
   outcome: RescueOutcome,
 ): Promise<void> {
   run.emitter.emit('running forced-finalization pass (tools disabled)');
-  const finalizationTimeout = createTimeoutController({
-    ...(run.input.iterationTimeoutMs !== undefined
-      ? { totalMs: run.input.iterationTimeoutMs }
-      : {}),
-    totalEnvVar: ITERATION_TIMEOUT_ENV,
-    stallEnvVar: '',
-  });
+  const clock = createPassClock(run.knobs);
   const flight: RescueFlight = {
     reservationId,
     throttleReservationId: NO_THROTTLE_RESERVATION,
@@ -293,12 +297,12 @@ async function attemptRescue(
     call: callNotMade(),
   };
   try {
-    await dispatchRescue(run, state, flight, finalizationTimeout.signal, outcome);
+    await dispatchRescue(run, state, flight, clock, outcome);
   } catch (finalErr) {
-    recordRescueFailure(run, finalErr, flight.call.completed, outcome);
+    recordRescueFailure(run, finalErr, clock, flight.call.completed, outcome);
   } finally {
     outcome.billed = closePass(run, flight, flight.call, 'ask_agentic finalization');
-    finalizationTimeout.dispose();
+    clock.dispose();
   }
 }
 
@@ -316,6 +320,7 @@ export async function runRescue(run: AgenticRun, state: LoopState): Promise<Resc
     errorMessage: null,
     skipReason: null,
     billed: null,
+    timeout: null,
   };
   const estimate = finalizationEstimateOf(state);
   const reservationId = reserveRescue(run, passReservationUsd(run, estimate), outcome);

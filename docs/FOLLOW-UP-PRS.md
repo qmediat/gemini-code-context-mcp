@@ -292,7 +292,9 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T44. The time bounds of an agentic call — one table, one mechanism (the immediate next PR)
+## ~~T44.~~ ✅ SHIPPED 2026-11-17 — The time bounds of an agentic call — one table, one mechanism
+
+**Shipped as:** the design note `docs/DESIGN-agentic-time-bounds.md` — today's bounds and the target as one table per path, the five open questions decided — and one mechanism: a `PassClock` per pass (`src/tools/agentic/pass-clock.ts`), one `AbortController`, the pass deadline (`iterationTimeoutMs`) and the current phase's timer (at most two), entered at `tpm-wait`, `opening`, `stream` (the first chunk), `tools` (the call completed) and `finalization`; a phase's default (`phase-defaults.ts`: 600 s for each request's opening, a stream's silence and each request of the forced pass, 120 s without executor progress for the tools) applies only where no knob bounds it; `stallMs` watches a stream's gaps only. The tools phase — `planDispatch` and the batch raced as one — ends at its bound: the workers take no queued call once it fired, the executors get the pass's watch — its signal and its progress report, read together at each checkpoint (the walks of `find_files` / `grep` / `list_directory` per directory and entry, `read_file` around its read, which the signal aborts), a late result is dropped, and the `TIMEOUT` is `retryable: false` with `toolCallsRunning` when tool calls still run after a 1 s grace. The result carries `timeoutPhase` and `timeoutSource` (no new `timeoutKind`), and one hint table names the knob — `ask_agentic`'s, or `ask`'s on its fallback. `ask`'s fallback (`src/tools/ask-agentic-fallback.ts`) forwards the knobs `ask` resolved (per call, else its env vars) — `timeoutMs` → `iterationTimeoutMs`, `stallMs` → `stallMs` — disposes `ask`'s controller at the hand-off and lifts both new fields. The money rule is unchanged: a bound in the tools phase books the completed pass at the bound, one before the stream's end books 0. Unbounded on purpose: the setup (workspace open, model resolution — Q5). The model's regex in `grep` runs synchronously and no timer can end it: T45. The scope below is the entry as written.
 
 **Source:** PR #134 (T42), 2026-11-17. Opened 2026-11-17. Three patches in that PR changed these bounds — the stall watchdog paused at an iteration's stream end, then a 120 s tool-batch ceiling (`timeoutKind: 'tool-batch'`) with the `ask` fallback forwarding `stallMs` as `stallMs` — and each opened another gap in the same mechanism; the PR went back to the bounds of 1.24.0 and this entry carries them.
 
@@ -318,6 +320,36 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 **Why:** `ask`, `code` and `ask_agentic` book a request whose stream opened and was then aborted or failed at 0 and give its reservations back (`docs/cost-model.md`, *What is booked when a call fails*). Whether Google bills such a request is not measured, and Google does not document it as far as we found. If it does, `GEMINI_DAILY_BUDGET_USD` and the TPM window are not a bound for it: at most the request's whole input plus what it decoded before the abort is left out of the ledger (*What the daily budget does not bound*), and a `TIMEOUT` is `retryable: true`.
 
 **Scope:** one or two paid calls whose stream is aborted after its first chunks (a `stallMs` or `timeoutMs` that fires mid-decode), comparing the usage page of the key's project and the `usageMetadata` of the partial stream with a completed call. Then decide: book such a request at the estimate (its input, plus the decoded tokens when known), so the budget is a bound again, or keep 0; say which in `docs/cost-model.md` and in `ABORTED_REQUEST_NOTE` (`src/tools/shared/abort-timeout.ts`).
+
+---
+
+## T45. A time bound on the model's regex in `grep`, and `grep`'s walk past its match cap
+
+**Source:** the design note of T44 (`docs/DESIGN-agentic-time-bounds.md`, *Not in scope*, D12), 2026-11-17. Opened 2026-11-17.
+
+**Why:** `grep` compiles the model's pattern and runs it synchronously on every line of every file it walks (`grepLines`, `src/tools/agentic/workspace-tools.ts`). A pattern with catastrophic backtracking (`(a+)+$` on a long line) blocks the event loop inside `regex.test`: no timer of the pass clock can fire, so neither `iterationTimeoutMs` nor the tools default ends the call, and every other call the server is serving stalls with it. Separately, the walk goes on reading every file after it has 100 matches (it only counts them), so a common pattern over a large workspace reads the whole tree.
+
+**Scope:** one of — (a) run the matching in a worker thread with a deadline the pass clock can terminate (`worker_threads`, the pattern and the file text passed in; the cost is a thread per grep); (b) a linear-time engine for the model's pattern (RE2 through `re2-wasm` / `node-re2`, a dependency, and some JavaScript syntax refused — backreferences, lookarounds); (c) refuse patterns a static check marks as super-linear (`safe-regex2` / `recheck`; a heuristic with false positives and negatives) and cap the line length matched. Decide with a measurement of each on a large workspace; then stop the walk once the match cap is reached, reporting `truncated` and a total that says "at least". Its own PR.
+
+---
+
+## T46. One secret-file list for the eager path and the agentic path
+
+**Source:** found while fixing the agentic executors' secret denylist, 2026-11-17. Opened 2026-11-17.
+
+**Why:** the eager path of `ask` / `code` excludes by default the files `docs/security.md` names (`.netrc`, `.pypirc`, `.npmrc`, `.pgpass`, `.git-credentials`, `credentials`) and the secret directories; the agentic sandbox's list is longer (`credentials.json`, `secrets.json`, `secrets.yaml`, `secrets.yml`, `service-account.json`, the dot-env names `.env`, `.env.local`, `.env.development`, `.env.production`, `.env.test` and `.env.staging`, `.htpasswd`, and the key extensions `.pem`, `.key`, …; `src/tools/agentic/sandbox.ts`). So a workspace holding `credentials.json` has it uploaded by `ask` / `code` while `ask_agentic` refuses it.
+
+**Scope:** decide whether the indexer's default excludes take the agentic list (unconditional, as the existing ones are — `includeGlobs` cannot re-enable them); it changes which files `ask` / `code` upload and the workspace hash of a workspace that holds such a file — a public contract, the maintainer's decision; then one list both paths read.
+
+---
+
+## T47. Split `src/tools/ask.tool.ts` into modules
+
+**Source:** the review of PR #135 (2026-11-17). Opened 2026-11-17.
+
+**Why:** the file is 55 KB, one tool in one module. Beside the change set of PR #135 it did not fit the review packet of one of the automated reviewers (Grok), so that PR was reviewed with that packet's cap raised inside the model's window. PR #135 also touched the file (the `ask_agentic` fallback moved out to `src/tools/ask-agentic-fallback.ts`), so by Rule 2 of `docs/SYSTEMIC.md` the rest of its baseline entries (`complexity` 1, `max-depth` 2, `max-lines-per-function` 1, and its 214 duplicated lines, most of them shared with `src/tools/code.tool.ts`) leave in the next PR.
+
+**Scope:** split it by concern, as T39 did for `ask_agentic` (the input schema and the registration as the entry; the preflight and the workspace guard, the cache and context preparation, the request and its long decode, the settlement, the results as modules), and move what `ask` and `code` repeat into `src/tools/shared/`; no behaviour change, the existing tests green unchanged, a differential probe of the tool's results on `main` against the branch. The immediate next PR after #135.
 
 ---
 

@@ -37,7 +37,7 @@ import { estimatePreCallCostUsd, toMicrosUsd } from '../utils/cost-estimator.js'
 import { logger, safeForLog } from '../utils/logger.js';
 import { createProgressEmitter } from '../utils/progress.js';
 import { type ToolDefinition, errorResult, textResult } from './registry.js';
-import { createTimeoutController, isTimeoutAbort, timedOutCall } from './shared/abort-timeout.js';
+import { isTimeoutAbort, timedOutCall, toolTimeoutController } from './shared/abort-timeout.js';
 import { type DecodeTracking, decodeOnContext } from './shared/context-decode.js';
 import { CompletedRequests, LONG_DECODE_CAP_DESCRIPTION } from './shared/continuation.js';
 import { DispatchThrottle } from './shared/dispatch-throttle.js';
@@ -343,12 +343,7 @@ async function executeCodeBody(
   const emitter = createProgressEmitter(ctx.server, ctx.progressToken);
   // T19 + Phase 4 — composite controller (wall-clock + stall watchdog).
   // See ask.tool.ts for rationale; same shape here.
-  const timeoutController = createTimeoutController({
-    ...(input.timeoutMs !== undefined ? { totalMs: input.timeoutMs } : {}),
-    totalEnvVar: 'GEMINI_CODE_CONTEXT_CODE_TIMEOUT_MS',
-    ...(input.stallMs !== undefined ? { stallMs: input.stallMs } : {}),
-    stallEnvVar: 'GEMINI_CODE_CONTEXT_CODE_STALL_MS',
-  });
+  const timeoutController = toolTimeoutController('code', input);
   const abortSignal = timeoutController.signal;
   // Each request of the decode holds its own TPM reservation; a failure drops the one held.
   const dispatch = new DispatchThrottle({
