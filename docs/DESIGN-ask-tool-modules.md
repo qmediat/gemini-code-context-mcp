@@ -537,13 +537,19 @@ Each type arrives with the commit of its first reader, never in a later one.
 | 6 | shared: the scan, the output cap, the input estimate, the preflight's count | R2, R3; both tools | `ScanFilters`, `InputEstimate`, `PreflightRequest`, `PreflightCount` |
 | 7 | shared: the budget reservation | R4; both tools | `ReservationRequest`, `ReservationOutcome` |
 | 8 | shared: the context | R5; `eager-answer.ts`; both tools | `ContextSpec`, `CallContext` |
-| 9 | shared: the decode, the settlement, the scan's fields | R6-R9; both tools; both files leave `jscpd-baseline.json` | `DecodeSpec`, `DecodeRun`, `SettledDecode` |
+| 9 | shared: the decode, the settlement, the scan's fields | R6-R9; both tools. Measured after it: `ask.tool.ts` 213 → 93 lines in a repeat, `code.tool.ts` 171 → 82 — what is left are four call sites the later commits reshape (below) | `DecodeSpec`, `DecodeRun`, `SettledDecode` |
 | 10 | `ask`: thinking and request in `ask/thinking.ts`, `ask/request.ts` | step 9's thinking, step 12 | `AskThinking` |
 | 11 | `ask`: the model step and the attachments as stage steps | `ask/call.ts`, `ask/setup.ts`, `attachAsk` | `AskCall`, `AskResolved`, `AskAttached`, `StepOutcome` |
 | 12 | `ask`: the guard and the fallback in `ask/guard.ts` | step 8; the fallback handed back pending (`{ handOff }`) | `AskScanned`, `AskCounted` |
 | 13 | `ask`: the results; the entry as orchestrator | `ask/results.ts`; `ask.tool.ts` leaves `eslint-suppressions.json` | `AskSized`, `AskPrepared` |
 | 14 | `code`: the orchestrator over its own steps | `code.tool.ts` leaves `eslint-suppressions.json` | `CodeModelReached` |
 | 15 | docs | `docs/architecture.md` (`src/tools/ask/`, the three new shared modules), T47 closed in `docs/FOLLOW-UP-PRS.md`, this note's status | — |
+
+The repeats left after commit 9 are call sites, not mechanisms: the import blocks of the shared modules, the
+`ServiceTierError` branch of the model step (11 lines), the opening of the workspace guard after `countPreflight`
+(18 lines), and the calls of `decodeEagerCall` and `settleDecoded` with what surrounds them (27 and 14 lines). The
+ratchet admits no new file into `jscpd-baseline.json`, so none of them may move into an `ask/` module as it is: commits
+11-14 give each a shared form or a shape of its tool's own, and both files leave `jscpd-baseline.json` by commit 14.
 
 No CHANGELOG entry: nothing a user sees changes.
 
