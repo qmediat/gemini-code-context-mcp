@@ -24,11 +24,8 @@
     }
   },
   "src/cache/cache-manager.ts": {
-    "complexity": {
-      "count": 1
-    },
     "max-lines-per-function": {
-      "count": 2
+      "count": 1
     }
   },
   "src/cache/files-uploader.ts": {
