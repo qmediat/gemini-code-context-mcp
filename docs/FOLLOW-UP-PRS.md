@@ -472,6 +472,7 @@ differ — both upload, both create a cache, both delete the previous cache, and
 writer: the other cache is untracked until its TTL. For example: the row names `cachedContents/old`, and `ask` and
 `code` start at once; both read that row, both create a cache, both send `caches.delete` for `cachedContents/old`,
 and the row ends on the cache of the second to write.
+The cache a build deletes can also be the one a concurrent call of that cache's own fingerprint is still decoding on: before that call has completed a request its stale-cache retry rebuilds, after one (a later request of a long decode) it fails with its completed requests billed; the per-workspace build lock of the Scope is what would close it.
 `ttlSeconds` is not in the key, and need not be: it is a process-wide setting, `config.cacheTtlSeconds`
 (`src/config.ts:217`, read from `GEMINI_CODE_CONTEXT_CACHE_TTL_SECONDS`), which the one caller passes unchanged
 (`src/tools/shared/eager-answer.ts:69`), so two calls in one process cannot ask for different TTLs. The same race
@@ -499,6 +500,20 @@ rebuilds it.
 **Scope:** a decision for the maintainers, one of two rules: store Google's `expireTime` when the create's answer
 carries one (as the watcher does), or keep the local count and give the reuse test a margin. Either way the create
 and the watcher store the same clock; a test of the rule red on the code before; a CHANGELOG line.
+
+---
+
+## T56. The tests are not type-checked
+
+**Source:** the review of PR #138, 2026-11-18. Opened 2026-11-18.
+
+**Why:** `tsconfig.json` excludes `test`, so `npm run typecheck` checks no test file. A throw-away config that
+includes `test/unit/cache-manager.test.ts` reports two errors there: `mkModel` lacks `longDecodeTokenLimit`, and a
+`resolveCreate?.()` call is narrowed to not callable. The review of that PR also found untyped mocks whose assertions
+did not type-check.
+
+**Scope:** a `tsconfig` for the tests and a `typecheck:test` step in `npm run typecheck` and in CI, the existing
+errors fixed file by file.
 
 ---
 
