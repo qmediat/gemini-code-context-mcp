@@ -49,15 +49,15 @@ export function callNotMade(): PassCall {
 }
 
 /**
- * Mark a pass's model call completed, then read its usage into it: the mark comes first, so a read that throws leaves
- * a call that is booked (at the estimate). Returns the usage read.
+ * Mark a pass's model call completed, then read the response's usage into it: the mark comes first — before
+ * `usageMetadata` is touched — so a read that throws leaves a call that is booked (at the estimate). Returns the usage.
  */
 export function completeCall(
   call: PassCall,
-  usageMetadata: GenerateContentResponse['usageMetadata'],
+  response: { readonly usageMetadata?: GenerateContentResponse['usageMetadata'] | undefined },
 ): UsageCounts {
   call.completed = true;
-  call.usage = usageCounts(usageMetadata);
+  call.usage = usageCounts(response.usageMetadata);
   return call.usage;
 }
 

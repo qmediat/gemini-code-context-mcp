@@ -296,6 +296,27 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
     ]);
   });
 
+  it('is booked at its estimate when reading its usage throws', async () => {
+    const response = {
+      candidates: [{ content: { parts: [{ text: 'x' }] } }],
+      get usageMetadata(): never {
+        throw new Error('usage unreadable');
+      },
+    };
+    const { result, trace } = await runAgentic({
+      ...ENFORCED,
+      input: { maxIterations: 1 },
+      script: [{ ...READ_A, usage: null }, { raw: response }],
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      rescueErrorCode: 'INTERNAL',
+      ...reportedFields(50_000, 0, 0),
+    });
+    expect(callsTo(trace, 'throttle', 'release')[1]).toEqual([102, 50_000]);
+    expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([]);
+  });
+
   it('adds its tokens, thinking included, to the loop totals of the forced answer', async () => {
     const { result } = await runAgentic({
       input: { maxIterations: 1 },

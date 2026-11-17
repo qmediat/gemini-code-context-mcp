@@ -264,7 +264,7 @@ async function dispatchRescue(
   const { tools: _unusedTools, ...baseConfigNoTools } = run.baseConfig;
   outcome.attempted = true;
   const response = await callFinalization(run, state, baseConfigNoTools, signal);
-  const usage = completeCall(flight.call, response.usageMetadata);
+  const usage = completeCall(flight.call, response);
   readFinalization(response, usage, outcome);
 }
 

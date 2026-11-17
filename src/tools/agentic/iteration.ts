@@ -331,7 +331,7 @@ function toolResponseTokensOf(finalResponseParts: Part[]): number {
 export async function runAgenticIteration(args: IterationArgs): Promise<IterationResult> {
   const response = await streamIteration(args);
   args.pauseStall();
-  const usage = completeCall(args.call, response.usageMetadata);
+  const usage = completeCall(args.call, response);
   const parts: Part[] = response.candidates?.[0]?.content?.parts ?? [];
   const functionCallParts = parts.filter((p): p is FunctionCallPart =>
     Boolean(p.functionCall && typeof p.functionCall.name === 'string'),
