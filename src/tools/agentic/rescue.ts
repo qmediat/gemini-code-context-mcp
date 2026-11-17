@@ -1,0 +1,329 @@
+/**
+ * The forced-finalization rescue: the loop exhausted `maxIterations` without an organic final-text turn, so ONE more
+ * `generateContent` runs with `toolConfig.functionCallingConfig.mode = NONE` — the model is prohibited from emitting
+ * more function calls (Gemini API spec: NONE = "equivalent to sending a request without any function declarations")
+ * and must answer in text using the conversation it has already accumulated. This converts what was previously an
+ * opaque error into a synthesized text answer derived from the tool responses gathered so far. If the forced call
+ * itself fails (timeout, network, budget exhausted, empty text), the caller still gets a structured failure signal.
+ *
+ * v1.14.2: the rescue pass is NOT gated on `maxTotalInputTokens`. It is the documented exit path for "loop ran out
+ * of iterations without final text" and blocking it on rescue's own potential overshoot defeats the v1.14.1 feature —
+ * an operator running near the cap would never get the synthesised answer the rescue is designed to produce. Rescue
+ * cost remains bounded by the `dailyBudgetUsd` reservation, wall-clock by `iterationTimeoutMs`. Cap-overshoot is
+ * signalled via `overBudget: true` on the result so callers can detect the trade.
+ *
+ * The rescue keeps the v1.15.0 P3 non-streaming `apiCallSucceeded` contract: it calls `generateContent`, not the
+ * stream, and its timeout has no stall watchdog.
+ */
+
+import type { GenerateContentConfig, GenerateContentResponse } from '@google/genai';
+import { ApiError, FunctionCallingConfigMode } from '@google/genai';
+import { withNetworkRetry } from '../../gemini/retry.js';
+import { logger } from '../../utils/logger.js';
+import { createTimeoutController, isTimeoutAbort } from '../shared/abort-timeout.js';
+import { isGemini429, parseRetryDelayMs } from '../shared/throttle.js';
+import { SYSTEM_INSTRUCTION_FINALIZATION } from './instructions.js';
+import {
+  NO_THROTTLE_RESERVATION,
+  type RescueReservations,
+  cancelPass,
+  reservePass,
+  settleBilledRescue,
+  waitForTpm,
+} from './ledger.js';
+import { type UsageCounts, thinkingSummaryOf, usageCounts } from './response.js';
+import {
+  type AgenticRun,
+  ITERATION_TIMEOUT_ENV,
+  type LoopState,
+  PER_ITERATION_INPUT_TOKENS,
+  passReservationUsd,
+} from './run.js';
+
+/**
+ * P4 (v1.15.0): caller-visible rescue failure-class signal, surfaced as
+ * `structuredContent.rescueErrorCode` so wrappers can branch retry behaviour
+ * without log scraping. Strict union — extend here when adding new error
+ * classes.
+ *
+ * - 'TIMEOUT'    — iterationTimeoutMs fired (isTimeoutAbort)
+ * - 'RATE_LIMIT' — Google 429 (isGemini429: ApiError + status===429)
+ * - 'INTERNAL'   — `apiCallSucceeded === true` (await returned, but
+ *                  post-await processing threw — billed by Google,
+ *                  finalize budget per P3, but caller sees structured
+ *                  failure). Distinguishes "API ok, our code bug" from
+ *                  "API failure" so wrappers don't blindly retry our
+ *                  parse bugs.
+ * - 'API_ERROR'  — `instanceof ApiError` with status≠429 (4xx other
+ *                  than 429, or 5xx). Wrapper should NOT retry 4xx
+ *                  (fix the payload) but MAY retry 5xx with backoff.
+ * - 'NETWORK'    — fetch-layer / DNS / TCP / pre-dispatch SDK error.
+ *                  Real transient connectivity case; safe to retry.
+ * - 'EMPTY_TEXT' — set in success path: API returned, but extracted
+ *                  text was empty after .trim(). Budget IS finalized.
+ */
+export type RescueErrorCode =
+  | 'TIMEOUT'
+  | 'RATE_LIMIT'
+  | 'INTERNAL'
+  | 'API_ERROR'
+  | 'NETWORK'
+  | 'EMPTY_TEXT';
+
+/** What the finalization pass produced. */
+export interface RescueOutcome {
+  /** The answer, trimmed; empty when the pass produced none. */
+  text: string;
+  usage: UsageCounts;
+  thinkingSummary: string | null;
+  /** Whether the finalization `generateContent` call was dispatched (regardless of outcome) — `apiCalls`
+   * counts it even when a mid-flight timeout or a pre-response network failure left the usage at 0. */
+  attempted: boolean;
+  /** `null` when the rescue produced text (the answer then carries `convergenceForced: true`) or was skipped. */
+  errorCode: RescueErrorCode | null;
+  /** The failure's message, cut to 500 characters; `null` unless the call threw. */
+  errorMessage: string | null;
+  /** v1.14.2 Fix 5: WHY the rescue pass was skipped — 'daily-budget' when `reserveBudget` rejected. */
+  skipReason: 'daily-budget' | null;
+}
+
+/** The parts of the finalization call that outlive its `try`: whether the API call returned. */
+interface RescueFlight extends RescueReservations {
+  /** P3 (v1.15.0): set IMMEDIATELY after the API call returns, before any post-await processing could
+   * throw. Cleanup is routed by it, not by the try/catch boundary: a parse error after a successful
+   * API call still finalizes the budget (the tokens were billed). */
+  apiCallSucceeded: boolean;
+}
+
+const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/**
+ * v1.14.2: dynamic estimate for the rescue pass — the actual size of the last observed iteration
+ * (+5k margin for SYSTEM_INSTRUCTION_FINALIZATION + thinking-config overhead) instead of the static
+ * `PER_ITERATION_INPUT_TOKENS` baseline. Used by BOTH the daily-budget reservation AND the
+ * TPM-throttle reservation so cost and rate-limit gates stay symmetric (the daily budget stays a true
+ * upper bound). Fallback to the static estimate when the loop produced no usage record.
+ *
+ * v1.15.0 (P5): also folds in `lastToolResponseTokens` — the tool-response Parts appended to
+ * `conversation` AFTER the last iteration's `generateContent` returned. The rescue's prompt replays
+ * the entire accumulated conversation, so its actual size ≈ last-iter prompt + the tool responses
+ * appended after; without them a final iteration that read several large files concurrently could
+ * under-reserve TPM by 100k+ tokens and 429 mid-flight.
+ */
+function finalizationEstimateOf(state: LoopState): number {
+  return state.lastIterationPromptTokens > 0
+    ? state.lastIterationPromptTokens + state.lastToolResponseTokens + 5_000
+    : PER_ITERATION_INPUT_TOKENS;
+}
+
+/** The pass's budget reservation id, or `null` — not enforced, or refused (then `outcome.skipReason`). */
+function reserveRescue(run: AgenticRun, costUsd: number, outcome: RescueOutcome): number | null {
+  if (!run.budget.dailyBudgetEnforced) return null;
+  const reserve = reservePass(run, costUsd);
+  if (!('rejected' in reserve)) return reserve.id;
+  const spent = (reserve.spentMicros / 1_000_000).toFixed(4);
+  run.emitter.emit(
+    `skipping forced-finalization pass — daily budget cap reached (spent $${spent})`,
+  );
+  logger.warn(
+    `ask_agentic: skipping forced-finalization pass — daily budget cap reached (spent $${spent})`,
+  );
+  outcome.skipReason = 'daily-budget';
+  return null;
+}
+
+/**
+ * The finalization call. G2 fix: `tools` (function declarations) are omitted — per Gemini API spec,
+ * `mode: NONE` is "equivalent to sending a request without any function declarations"; sending the
+ * declarations alongside NONE wastes ~150-300 input tokens and contradicts the spec we depend on.
+ */
+function callFinalization(
+  run: AgenticRun,
+  state: LoopState,
+  baseConfigNoTools: GenerateContentConfig,
+  signal: AbortSignal,
+): Promise<GenerateContentResponse> {
+  const model = run.resolved.resolved;
+  return withNetworkRetry(
+    () =>
+      run.ctx.client.models.generateContent({
+        model,
+        contents: state.conversation,
+        config: {
+          ...baseConfigNoTools,
+          systemInstruction: SYSTEM_INSTRUCTION_FINALIZATION,
+          toolConfig: {
+            functionCallingConfig: { mode: FunctionCallingConfigMode.NONE },
+          },
+          abortSignal: signal,
+        },
+      }),
+    {
+      signal,
+      onRetry: (attempt, retryErr) => {
+        logger.warn(`ask_agentic finalization: retry attempt ${attempt}: ${errorText(retryErr)}`);
+      },
+    },
+  );
+}
+
+/** Read the returned response. An empty text is a rescue failure mode (model dispatched, returned a
+ * candidate with no extractable text) — distinct from timeouts / 429s / network errors. */
+function readFinalization(response: GenerateContentResponse, outcome: RescueOutcome): void {
+  outcome.usage = usageCounts(response.usageMetadata);
+  const parts = response.candidates?.[0]?.content?.parts ?? [];
+  outcome.text = (response.text ?? parts.map((p) => p.text ?? '').join('')).trim();
+  outcome.thinkingSummary = thinkingSummaryOf(parts);
+  if (outcome.text.length === 0) {
+    outcome.errorCode = 'EMPTY_TEXT';
+  }
+}
+
+/**
+ * Classify a rescue failure for caller-facing telemetry. Order matters — earlier branches signal the
+ * most user-actionable remediation:
+ *   1. TIMEOUT — checked first because a 429 surfaced via an aborted-fetch can race the timeout signal.
+ *   2. RATE_LIMIT — wait the retry-hint window then retry (429).
+ *   3. INTERNAL — `apiCallSucceeded` means the await returned cleanly; any throw past that point is
+ *      processing logic our side, not Gemini's API — investigate, do not retry blindly.
+ *   4. API_ERROR — Gemini returned a non-429 4xx/5xx; distinct from NETWORK so wrappers don't retry
+ *      400 INVALID_ARGUMENT forever.
+ *   5. NETWORK — fetch-layer / DNS / TCP / SDK pre-dispatch; safe to retry.
+ */
+function rescueFailureCode(
+  finalErr: unknown,
+  retryDelayMs: number | null,
+  apiCallSucceeded: boolean,
+): RescueErrorCode {
+  if (isTimeoutAbort(finalErr)) {
+    logger.warn('ask_agentic finalization: timed out after maxIterations exhaustion');
+    return 'TIMEOUT';
+  }
+  if (isGemini429(finalErr)) {
+    logger.warn(
+      `ask_agentic finalization: 429 rate-limit (retryDelay=${retryDelayMs ?? 'unknown'}ms)`,
+    );
+    return 'RATE_LIMIT';
+  }
+  if (apiCallSucceeded) {
+    logger.warn(`ask_agentic finalization: post-await processing failed: ${errorText(finalErr)}`);
+    return 'INTERNAL';
+  }
+  if (finalErr instanceof ApiError) {
+    logger.warn(
+      `ask_agentic finalization: Gemini API returned ${finalErr.status ?? 'unknown'}: ${finalErr.message.slice(0, 200)}`,
+    );
+    return 'API_ERROR';
+  }
+  logger.warn(`ask_agentic finalization: network failure: ${errorText(finalErr)}`);
+  return 'NETWORK';
+}
+
+/** v1.14.2 Fix 4: the rescue's generateContent can also 429 — its retry hint seeds the throttle
+ * cache for future ask_agentic / ask / code calls, the same way the per-iteration catch does. */
+function recordRescueFailure(
+  run: AgenticRun,
+  finalErr: unknown,
+  apiCallSucceeded: boolean,
+  outcome: RescueOutcome,
+): void {
+  const finalRetryDelayMs = isGemini429(finalErr) ? parseRetryDelayMs(finalErr.message) : null;
+  if (finalRetryDelayMs !== null) {
+    run.ctx.throttle.recordRetryHint(run.resolved.resolved, finalRetryDelayMs);
+  }
+  outcome.errorCode = rescueFailureCode(finalErr, finalRetryDelayMs, apiCallSucceeded);
+  outcome.errorMessage =
+    finalErr instanceof Error ? finalErr.message.slice(0, 500) : String(finalErr).slice(0, 500);
+}
+
+/** Dispatch the finalization call and read its answer. The API attempt is marked before dispatch (after
+ * the throttle wait, so a throttle-wait abort doesn't count it). */
+async function dispatchRescue(
+  run: AgenticRun,
+  state: LoopState,
+  flight: RescueFlight,
+  signal: AbortSignal,
+  outcome: RescueOutcome,
+): Promise<void> {
+  if (run.budget.tpmEnforced) {
+    // The dynamic estimate, the same value and margin as the daily-budget reserve: over-reserve =
+    // transient throttle wait (harmless); under-reserve = 429 risk; the bias is intentional.
+    await waitForTpm(
+      run,
+      flight,
+      flight.estimate,
+      signal,
+      (seconds) => `finalization throttle: waiting ${seconds}s for TPM window…`,
+    );
+  }
+  const { tools: _unusedTools, ...baseConfigNoTools } = run.baseConfig;
+  outcome.attempted = true;
+  const response = await callFinalization(run, state, baseConfigNoTools, signal);
+  flight.apiCallSucceeded = true;
+  readFinalization(response, outcome);
+}
+
+/** Run the pass under its own timeout; settle by `apiCallSucceeded`: finalize + release when the call
+ * returned, cancel both reservations when it never reached Google's billing. */
+async function attemptRescue(
+  run: AgenticRun,
+  state: LoopState,
+  reservationId: number | null,
+  estimate: number,
+  outcome: RescueOutcome,
+): Promise<void> {
+  run.emitter.emit('running forced-finalization pass (tools disabled)');
+  const finalizationTimeout = createTimeoutController({
+    ...(run.input.iterationTimeoutMs !== undefined
+      ? { totalMs: run.input.iterationTimeoutMs }
+      : {}),
+    totalEnvVar: ITERATION_TIMEOUT_ENV,
+    stallEnvVar: '',
+  });
+  const flight: RescueFlight = {
+    reservationId,
+    throttleReservationId: NO_THROTTLE_RESERVATION,
+    estimate,
+    startedAt: Date.now(),
+    apiCallSucceeded: false,
+  };
+  try {
+    await dispatchRescue(run, state, flight, finalizationTimeout.signal, outcome);
+  } catch (finalErr) {
+    recordRescueFailure(run, finalErr, flight.apiCallSucceeded, outcome);
+  } finally {
+    if (flight.apiCallSucceeded) {
+      settleBilledRescue(run, flight, outcome.usage);
+    } else {
+      cancelPass(
+        run.ctx,
+        flight.reservationId,
+        flight.throttleReservationId,
+        'ask_agentic finalization',
+      );
+    }
+    finalizationTimeout.dispose();
+  }
+}
+
+/** Run the forced-finalization pass after the loop exhausted `maxIterations`. */
+export async function runRescue(run: AgenticRun, state: LoopState): Promise<RescueOutcome> {
+  run.emitter.emit(
+    `maxIterations (${run.limits.maxIterations}) reached — running forced-finalization pass`,
+  );
+  const outcome: RescueOutcome = {
+    text: '',
+    usage: { promptTokenCount: 0, candidatesTokenCount: 0, thoughtsTokenCount: 0 },
+    thinkingSummary: null,
+    attempted: false,
+    errorCode: null,
+    errorMessage: null,
+    skipReason: null,
+  };
+  const estimate = finalizationEstimateOf(state);
+  const reservationId = reserveRescue(run, passReservationUsd(run.budget, estimate), outcome);
+  if (reservationId !== null || !run.budget.dailyBudgetEnforced) {
+    await attemptRescue(run, state, reservationId, estimate, outcome);
+  }
+  return outcome;
+}

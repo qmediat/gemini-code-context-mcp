@@ -247,7 +247,9 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T39. Split `src/tools/ask-agentic.tool.ts` into modules — the next PR after #131
+## ~~T39.~~ ✅ SHIPPED 2026-11-17 — Split `src/tools/ask-agentic.tool.ts` into modules
+
+**Shipped as:** the tool file is the entry (the input schema, the registration, the call); the loop, the iteration, the dispatcher, the forced-finalization pass, the ledger calls, the no-progress detector, the results and the instructions are modules under `src/tools/agentic/` (`docs/architecture.md`); the largest file of the tool is now `src/tools/agentic/workspace-tools.ts` (30 KB, unchanged), the entry is 18 KB. No behaviour change: the tests are unchanged, the published input schema is the fixture's, and the file's `eslint-suppressions.json` entry is gone — every unit is within the structure limits. The scope below is the entry as written.
 
 **Source:** the reviews of PR #131 (2026-11-17).
 

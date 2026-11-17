@@ -45,6 +45,22 @@ Thin wrapper over the `@google/genai` SDK:
 - `settle-call.ts` — how `ask` and `code` settle: `settleAnswer` books the answered call (`call-ledger.ts`) and returns the `OUTPUT_CAP` error fields of a stop at the cap with no answer, `settleFailure` seeds the throttle with a 429's retry hint, books what the completed requests billed and drops the TPM reservation. A completed request that reported no usage is billed at the input it was estimated to send (`billedInputTokens`, the rule `ask_agentic` and the TPM settle share).
 - `context-decode.ts` — `decodeOnContext`, the decode of `ask` and `code` on their prepared context: the ledger booking, the cache kept alive before every request (`TtlWatcher.keepAlive` extends one that expires within 15 minutes), the stall watchdog paused between requests, a TPM reservation per request (`dispatch-throttle.ts`), and the one stale-cache retry — only while no request of the decode has completed.
 
+### `src/tools/agentic/`
+
+The modules of `ask_agentic`. `src/tools/ask-agentic.tool.ts` is the entry: the input schema, the registration, and the call — the workspace opened, the model resolved, the loop run, then the forced-finalization pass when the loop ran out of iterations.
+
+- `run.ts` — the typed state of one call: `AgenticRun` (the model, the limits, the request config, what each pass's reservation is priced from) and `LoopState` (the conversation and what the loop accumulates); the defaults (20 iterations, 1,000,000 input tokens, 40 files).
+- `loop.ts` — the iteration loop: per iteration a daily-budget reservation, a timeout (wall-clock and stall), a TPM reservation, the iteration, its settlement, then the guards that end the loop — the answer, the cumulative input-token budget, the no-progress detector.
+- `iteration.ts` — one iteration: the streamed `generateContent`, the `maxFilesRead` cap on `read_file` calls, the parallel tool batch, and the tool responses appended to the conversation in call order.
+- `dispatch.ts` — the dispatcher: one executor per tool name, an executor's failure returned to the model as a recoverable `response.error`, up to `GEMINI_CODE_CONTEXT_AGENTIC_TOOL_CONCURRENCY` calls at once (default 10).
+- `rescue.ts` — the forced-finalization pass: one `generateContent` with function calling disabled, its reservations sized from the last iteration, and the class of its failure (`rescueErrorCode`).
+- `ledger.ts` — the budget ledger and TPM throttle calls: each pass reserves, then books what it billed or cancels what never reached Google.
+- `no-progress.ts` — the no-progress detector: a call signature repeated five times with no new file read between the repeats.
+- `results.ts` — every result once the loop has started: the answer (organic or forced) and the errors that end the loop, each with `apiCalls`.
+- `response.ts` — what a model response carries, read the same way for an iteration and for the finalization pass: its token counts and its thought summary.
+- `instructions.ts` — the system instructions of the loop and of the finalization pass, and the four tool declarations.
+- `sandbox.ts` and `workspace-tools.ts` — the workspace jail and the four executors (`list_directory`, `find_files`, `read_file`, `grep`).
+
 ### `src/indexer/`
 
 Walks a workspace directory:
