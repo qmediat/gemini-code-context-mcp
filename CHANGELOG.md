@@ -87,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`credentials.json`, `secrets.json`, `secrets.yaml`, …), and `grep` returned their matching lines. The three tools and
   `read_file` now read one denylist.
 
+### Notes
+
+- Minor release. `errorCode`, `timeoutKind` and every result field that existed keep their values and meaning. What an
+  existing caller can observe: an `ask_agentic` call that hung with no knob set now ends with `TIMEOUT` at a default; a
+  `TIMEOUT` can be `retryable: false` (tool calls of the iteration still run); on `ask`'s fallback `stallMs` no longer
+  ends a healthy iteration, and `iterTimeoutSource` no longer takes the values `'stallMs'` and
+  `'min(timeoutMs,stallMs)'`; `list_directory`, `find_files` and `grep` no longer show a file on the secret denylist.
+
 ## [1.24.0] - 2026-11-17
 
 ### Added
