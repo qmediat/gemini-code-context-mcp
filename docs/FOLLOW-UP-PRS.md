@@ -405,6 +405,24 @@ times without a failure.
 
 ---
 
+## T51. A cache create that returns no name is a failed create
+
+**Source:** the cross-model reading of T47's branch, 2026-11-17 (the request `code` builds). Opened 2026-11-17.
+
+**Why:** `doPrepareContext` (`src/cache/cache-manager.ts`) keeps whatever name `caches.create` returned. An empty
+name is stored as the cache id: `code` then sends the bare prompt with the inline config and no workspace files
+(its contents test `cacheId !== null`, its config tests a truthy id). A create that returns no name at all gives a
+context with no cache id and no inline files, on `ask` and `code` alike. Google has not been seen to return either;
+nothing checks.
+
+**Scope:** a create without a usable name takes the failed-create path that exists (the warning, the manifest
+without a cache id, the files inline); a test red on the code before; a `### Fixed` line in the CHANGELOG. The fix
+changes `doPrepareContext`, 181 lines and in `eslint-suppressions.json`: by Rule 2 of `docs/SYSTEMIC.md` it leaves
+the baseline in the same PR — split by concern, with a differential probe of `prepareContext`'s results and
+manifest writes on `main` and the branch. The immediate next PR after T47.
+
+---
+
 ## ~~T14.~~ ✅ OBSOLETE 2026-11-14 (the import is gone with T15) — Biome rule — restrict `zod-to-json-schema` imports to `registry.ts`
 
 **Source:** Gemini code review of PR #5 (Apr 2026), accepted but low-priority.

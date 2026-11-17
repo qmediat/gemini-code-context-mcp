@@ -597,8 +597,7 @@ Each type arrives with the commit of its first reader, never in a later one.
 | 13 | `ask`: the results; the entry as orchestrator | `ask/results.ts`; `ask.tool.ts` leaves `eslint-suppressions.json` | `AskSized`, `AskPrepared` |
 | 14 | `code`: the orchestrator over its own steps | `code.tool.ts` leaves `eslint-suppressions.json` | `CodeModelReached` |
 | 15 | docs | `docs/architecture.md` (`src/tools/ask/`, the three new shared modules), T47 closed in `docs/FOLLOW-UP-PRS.md`, this note's status | — |
-| 16 | cache: an empty cache name is no cache | the fix above, its test, its CHANGELOG line | — |
-| 17 | the pass after the cross-model reading | the level's reported budget restored (`reportedBudget`); `workspaceRefusal` in `shared/workspace-refusal.ts`, read by `ask_agentic` and `reindex` too; `levelThinkingConfig`; `RequestBuilder`; the shared steps on `EagerMachinery`; one `StepOutcome` for both tools; `PreparedAttachments` in `ask/call.ts` (no import cycle); unit tests of the rules the probe and the suite missed | `ReservationTrail`, `EagerMachinery`, `RequestBuilder`, `WorkspaceTool` |
+| 16 | the pass after the cross-model reading | the level's reported budget restored (`reportedBudget`); `workspaceRefusal` in `shared/workspace-refusal.ts`, read by `ask_agentic` and `reindex` too; `levelThinkingConfig`; `RequestBuilder`; the shared steps on `EagerMachinery`; one `StepOutcome` for both tools; `PreparedAttachments` in `ask/call.ts` (no import cycle); unit tests of the rules the probe and the suite missed | `ReservationTrail`, `EagerMachinery`, `RequestBuilder`, `WorkspaceTool` |
 
 After commit 9 five call sites still repeated: the import blocks of the shared modules, the `ServiceTierError` branch
 of the model step, the opening of the workspace guard after `countPreflight`, and the calls of `decodeEagerCall` and
