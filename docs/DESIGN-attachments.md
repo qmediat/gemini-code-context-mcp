@@ -74,11 +74,12 @@ and maps to `TIMEOUT`. The ledger settles what Gemini billed.
 - `src/attachments.ts` — `inspectAttachments(paths, workspaceRoot)`, `readAttachments(attachments, signal)`,
   `countAttachmentTokens(client, model, parts, signal)`, the constants, `AttachmentError`,
   `AttachmentTokensUncountedError`. Functions ≤ 40 lines.
-- `src/tools/ask.tool.ts` — the `attachments` parameter; `attachmentsOrRefusal` (vision gate, then
+- `src/tools/ask/` — the `attachments` parameter (`input.ts`); `attachAsk` (`attachments.ts`: vision gate, then
   `prepareAttachments`: inspect → read → count) right after the model and the tier are resolved, before the scan;
-  `inlineRequestRefusal` after the scan; the count in the preflight comparison, the budget estimate
-  (`extraInputTokens`) and the throttle reservation; the parts in the user turn (`[...parts, { text: prompt }]`, the
-  bare prompt string only on a cache hit without attachments); `structuredContent.attachments` + `attachmentTokens`.
+  `inlineRequestRefusal` after the scan (`scanAsk`); the count in the preflight comparison (`guardAsk`), the budget
+  estimate (`extraInputTokens`, `sizeAsk`) and the throttle reservation; the parts in the user turn (`request.ts`:
+  `[...parts, { text: prompt }]`, the bare prompt string only on a cache hit without attachments);
+  `structuredContent.attachments` + `attachmentTokens` (`attachmentMetadata`).
 - `src/utils/cost-estimator.ts` — `extraInputTokens` on the pre-call estimate.
 - `src/gemini/model-taxonomy.ts` — Flash-Lite models count as vision-capable (Google lists image and PDF input;
   `countTokens` on 2.5 Flash-Lite accepted both on 2026-10-01).

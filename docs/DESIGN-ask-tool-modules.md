@@ -1,6 +1,7 @@
 # Design — the split of `src/tools/ask.tool.ts` into modules
 
-Status: accepted, corrected after its architecture review ([FOLLOW-UP-PRS.md T47](./FOLLOW-UP-PRS.md)). No behaviour change: every result, message, field, key
+Status: implemented ([FOLLOW-UP-PRS.md T47](./FOLLOW-UP-PRS.md)); the module map, the data model and the baselines below
+are the code as it stands, the sections "Today" the analysis it was written from. No behaviour change: every result, message, field, key
 order, ledger and throttle call stays as it is on `main`; a differential probe proves it ([§ Proof plan](#proof-plan)).
 The sections "Today" describe `main` at `074212c`; line numbers are of that tree.
 
@@ -125,20 +126,23 @@ is left of `code` for the next PR is layout only — its schema, parsers and ste
 
 | File | Holds | Exports |
 |---|---|---|
-| `src/tools/ask.tool.ts` (entry) | the registration; `executeAskBody` as the orchestrator (`try` / `catch` / `finally`) over three phase functions: setup (steps 2-5), sizing (6-10), answer (11-15) | `askTool: ToolDefinition<AskInput>`; re-exports `askInputSchema`, `type AskInput` — nothing else |
+| `src/tools/ask.tool.ts` (entry) | the registration; `executeAskBody` as the orchestrator (`try` / `catch` / `finally`) over the stage steps, run in order: the workspace refusal (step 2), `resolveAsk` (3), `attachAsk` (4), `scanAsk` (5-7), `guardAsk` (8), `sizeAsk` (9-10), `answerAsk` (11-15); `endOf` returns a step's end — a refusal, or the fallback's pending promise, unawaited | `askTool: ToolDefinition<AskInput>`; re-exports `askInputSchema`, `type AskInput` — nothing else |
 | `src/tools/ask/input.ts` | the input schema, moved verbatim | `askInputSchema`, `type AskInput` |
 | `src/tools/ask/instruction.ts` | `ask`'s system instruction, moved verbatim: the attachments' size refusal and the request both read it | `SYSTEM_INSTRUCTION_Q_AND_A` |
-| `src/tools/ask/call.ts` | the call's stages (below), each arriving with the commit of its first reader | `AskCall`, `AskResolved`, `AskAttached`, `AskScanned`, `AskCounted`, `AskSized`, `AskPrepared`, `StepOutcome<T>` — to the `ask/` modules and the entry only |
-| `src/tools/ask/setup.ts` | the model and its tier (step 3) | `resolveAsk(call: AskCall): Promise<StepOutcome<AskResolved>>` |
+| `src/tools/ask/call.ts` | the call's stages (below), each arriving with the commit of its first reader | `AskCall`, `AskResolved`, `AskAttached`, `AskScanned`, `AskCounted`, `AskSized`, `StepOutcome<T>` — to the `ask/` modules and the entry only |
+| `src/tools/ask/setup.ts` | the model and its tier (step 3); the scan, the thinking-budget refusal, the input estimate and the inline-size refusal (steps 5-7) | `resolveAsk(call: AskCall): Promise<StepOutcome<AskResolved>>`; `scanAsk(call: AskAttached): Promise<StepOutcome<AskScanned>>` |
 | `src/tools/ask/attachments.ts` | step 4 and the inline-size refusal, moved (`:243-357`) | `PreparedAttachments`; `attachAsk(call: AskResolved): Promise<StepOutcome<AskAttached>>`; `inlineRequestRefusal(prepared: PreparedAttachments, files: readonly ScannedFile[], prompt: string, serviceTier: ServiceTierName): TextToolResult \| undefined`; `attachmentMetadata(prepared: PreparedAttachments): Record<string, unknown>` |
 | `src/tools/ask/guard.ts` | step 8 for `ask`: the count's verdict, the two `WORKSPACE_TOO_LARGE` results, the fallback handed back pending | `guardAsk(call: AskScanned): Promise<StepOutcome<AskCounted>>` |
 | `src/tools/ask/thinking.ts` | step 9's thinking: the normalised budget, the wire config, the progress line; the reservation's thinking stays `shared/thinking.ts`'s `thinkingReserve` (`:118`), called with the level and `thinkingBudgetField` | `AskThinking`; `askThinking(input: AskInput, cap: OutputCap): AskThinking`; `thinkingConfigOf(t: AskThinking): ThinkingConfig`; `thinkingBudgetField(t: AskThinking): number \| null`; `generatingLine(t: AskThinking): string` |
+| `src/tools/ask/sizing.ts` | steps 9-10: the cap that runs, the thinking under it, the reservation | `sizeAsk(call: AskCounted): StepOutcome<AskSized>` |
 | `src/tools/ask/request.ts` | step 12 | `askRequest(call: AskSized): (prep: PreparedContext) => ContextRequest` |
-| `src/tools/ask/results.ts` | every `ask` result from step 10 on and F's | `budgetRejectResult(call: AskSized, message: string): TextToolResult`; `outputCapResult(stop: OutputCapStop): TextToolResult`; `answerResult(call: AskPrepared, decoded: ContextDecode, settled: SettledDecode): TextToolResult`; `failedResult(failure: FailedEagerCall<ModelReached>): TextToolResult` |
+| `src/tools/ask/answer.ts` | steps 11-15: the context, the generating line, the decode, the settlement, the result | `answerAsk(call: AskSized): Promise<TextToolResult>` |
+| `src/tools/ask/results.ts` | every `ask` result from step 10 on and F's | `budgetRejectResult(call: AskSized, message: string): TextToolResult`; `outputCapResult(stop: OutputCapStop): TextToolResult`; `answerResult(call: AskSized, decoded: ContextDecode, settled: SettledDecode): TextToolResult`; `failedResult(failure: FailedEagerCall<ModelReached>): TextToolResult` |
 | `src/tools/shared/eager-call.ts` (new) | the machinery of one `ask` / `code` call and its failure path: what the failure reads, its settlement and classification | `ModelReached`, `FailureTrail<M>`, `EagerCallRequest`, `EagerCall<M>`, `FailedEagerCall<M>`; `openEagerCall<M extends ModelReached>(request: EagerCallRequest, ctx: ToolContext): EagerCall<M>`; `settleFailedEager<M extends ModelReached>(call: EagerCall<M>, ctx: ToolContext, err: unknown): FailedEagerCall<M>`; `closeEagerCall(call: EagerCall<ModelReached>): void` |
-| `src/tools/shared/eager-steps.ts` (new) | the steps before the context that both tools run the same way | `workspaceRefusal(tool: TimedTool, root: string): TextToolResult \| null`; `scanForCall(call: EagerCall<ModelReached>, ctx: ToolContext, filters: ScanFilters): Promise<ScanResult>`; `EAGER_OUTPUT_FALLBACK_TOKENS`; `eagerOutputCap(requested: number \| undefined, ctx: ToolContext, resolved: ResolvedModel): OutputCap`; `estimateInput(scan: ScanResult, prompt: string, extraTokens: number): InputEstimate`; `countPreflight(call: EagerCall<ModelReached>, ctx: ToolContext, req: PreflightRequest): Promise<PreflightCount \| null>`; `reserveCallBudget(call: EagerCall<ModelReached>, ctx: ToolContext, req: ReservationRequest): ReservationOutcome` |
-| `src/tools/shared/eager-answer.ts` (new) | the context, the decode and the settlement of an answer, the scan's result fields | `prepareCallContext(call: EagerCall<ModelReached>, ctx: ToolContext, spec: ContextSpec): Promise<CallContext>`; `decodeEagerCall(call: EagerCall<ModelReached>, ctx: ToolContext, spec: DecodeSpec, context: CallContext): Promise<ContextDecode>`; `settleDecoded(call: EagerCall<ModelReached>, ctx: ToolContext, decoded: ContextDecode, run: DecodeRun): SettledDecode`; `warnTruncatedScan(call: EagerCall<ModelReached>, ctx: ToolContext, scan: ScanResult): void`; `scanFields(scan: ScanResult, prep: PreparedContext): Record<string, unknown>` |
-| `src/tools/code.tool.ts` | the schema, the parsers, `resolveCodeModel` (unchanged); `executeCodeBody` as an orchestrator over the shared pieces and its own steps: `resolveCode`, `guardCode`, `codeRequest`, `codeArtifacts`, `codeAnswerResult`, `codeFailedResult` | unchanged: `codeTool`, `codeInputSchema`, `CodeInput`, `parseEdits`, `parseCodeBlocks`, `truncatedNote`, the two notes |
+| `src/tools/shared/eager-steps.ts` (new) | the steps before the context that both tools run the same way; the sized call the reservation, the decode and the settlement read | `workspaceRefusal(tool: TimedTool, root: string): TextToolResult \| null`; `scanForCall(call: EagerCall<ModelReached>, ctx: ToolContext, filters: ScanFilters): Promise<ScanResult>`; `EAGER_OUTPUT_FALLBACK_TOKENS`; `eagerOutputCap(requested: number \| undefined, ctx: ToolContext, resolved: ResolvedModel): OutputCap`; `estimateInput(scan: ScanResult, prompt: string, extraTokens: number): InputEstimate`; `countPreflight(call: EagerCall<ModelReached>, ctx: ToolContext, req: PreflightRequest): Promise<PreflightCount \| null>`; `preflightFields(count: PreflightCount \| null): Record<string, unknown>`; `overWindow(count: PreflightCount \| null, ctx: ToolContext): OverWindow \| null`; `reserveCallBudget(call: EagerCall<ModelReached>, ctx: ToolContext, sized: SizedCall, req: ReservationRequest): ReservationOutcome` |
+| `src/tools/shared/eager-answer.ts` (new) | the context, the decode and the settlement of an answer, the scan's result fields | `prepareCallContext(call: EagerCall<ModelReached>, ctx: ToolContext, spec: ContextSpec): Promise<CallContext>`; `decodeEagerCall(call: EagerCall<ModelReached>, ctx: ToolContext, sized: SizedCall, request: (prep: PreparedContext) => ContextRequest, context: CallContext): Promise<ContextDecode>`; `settleDecoded(call: EagerCall<ModelReached>, ctx: ToolContext, decoded: ContextDecode, sized: SizedCall, caching: CachingModeChoice): SettledDecode`; `warnTruncatedScan(call: EagerCall<ModelReached>, ctx: ToolContext, scan: ScanResult): void`; `scanFields(scan: ScanResult, prep: PreparedContext): Record<string, unknown>` |
+| `src/tools/shared/service-tier.ts` | gains the tier step both tools run | `serviceTierOrRefusal(perCall: ServiceTierName \| undefined, config: { serviceTier, vertex }): ServiceTierName \| ServiceTierError` |
+| `src/tools/code.tool.ts` | the schema, the parsers, `resolveCodeModel` (unchanged); `executeCodeBody` as an orchestrator over the shared pieces and its own steps, run in order: `resolveCode`, `guardCode` (the scan, the refusals, the count and the verdict), `sizeCode`, `answerCode`; beside them `codeRequest` (with `codeConfig`, `codeThinkingConfig`), `codeArtifacts`, `codeAnswerResult`, `codeFailedResult`; its stages `CodeCall` → `CodeResolved` → `CodeCounted` → `CodeSized` and `CodeStep<T>`, none exported | unchanged: `codeTool`, `codeInputSchema`, `CodeInput`, `parseEdits`, `parseCodeBlocks`, `truncatedNote`, the two notes |
 | `src/tools/ask-agentic-fallback.ts` | unchanged but one line: `AskInput` imported from `./ask/input.js` | unchanged |
 
 The schema moves to `ask/input.ts`, as T39 put `ask_agentic`'s in `agentic/input.ts`: the steps and the fallback read
@@ -232,10 +236,11 @@ export interface ErroredEagerCall<M extends ModelReached> extends FailureCommon<
 }
 
 // src/tools/shared/eager-steps.ts
+/** Read from either tool's input as it is. */
 export interface ScanFilters {
-  readonly includeGlobs: readonly string[] | undefined;
-  readonly excludeGlobs: readonly string[] | undefined;
-  readonly forceRescan: boolean | undefined;
+  readonly includeGlobs?: readonly string[] | undefined;
+  readonly excludeGlobs?: readonly string[] | undefined;
+  readonly forceRescan?: boolean | undefined;
 }
 export interface InputEstimate {
   readonly workspaceBytes: number;
@@ -258,14 +263,24 @@ export interface PreflightCount {
   readonly contextWindow: number;
   readonly threshold: number;
 }
-export interface ReservationRequest {
+/** The guard's verdict over the window: what each tool's `WORKSPACE_TOO_LARGE` refusal reports. */
+export interface OverWindow {
+  readonly counted: PreflightTokenResult;
+  readonly contextWindow: number;
+  readonly threshold: number;
+  readonly pctDisplay: number;           // workspaceGuardRatio as a whole percent
+}
+/** Built once per call; read by the reservation, the decode and the settlement. */
+export interface SizedCall {
   readonly resolved: ResolvedModel;
   readonly serviceTier: ServiceTierName;
   readonly estimate: InputEstimate;
+  readonly count: PreflightCount | null; // its effectiveTokens: the counted input the reservation and the TPM take
+  readonly bounded: BoundedOutputCap;    // the cap that runs and its cut
+}
+export interface ReservationRequest {
   readonly promptChars: number;
   readonly extraInputTokens: number;
-  readonly cap: OutputCap;               // the cap that runs
-  readonly countedInputTokens: number | undefined;
   readonly thinkingTokens: number;
 }
 export type ReservationOutcome =
@@ -286,20 +301,6 @@ export interface CallContext {
   /** Builds the context again: the stale-cache retry calls it. */
   readonly prepare: () => Promise<PreparedContext>;
   readonly prepared: PreparedContext;
-}
-export interface DecodeSpec {
-  readonly resolved: ResolvedModel;
-  readonly serviceTier: ServiceTierName;
-  readonly request: (prep: PreparedContext) => ContextRequest;
-  readonly cap: OutputCap;               // the cap that runs
-  readonly estimate: InputEstimate;
-  readonly countedInputTokens: number | undefined;
-}
-export interface DecodeRun {
-  readonly resolved: ResolvedModel;
-  readonly serviceTier: ServiceTierName;
-  readonly caching: CachingModeChoice;
-  readonly bounded: BoundedOutputCap;
 }
 export interface SettledDecode {
   readonly settled: SettledAnswer;
@@ -331,12 +332,10 @@ export interface AskCounted extends AskScanned {
   /** `null`: the model advertises no input limit; the guard did not run. */
   readonly count: PreflightCount | null;
 }
+/** A `SizedCall` as it stands: the reservation, the decode and the settlement read the stage itself. */
 export interface AskSized extends AskCounted {
   readonly bounded: BoundedOutputCap;
   readonly thinking: AskThinking;
-}
-export interface AskPrepared extends AskSized {
-  readonly context: CallContext;
 }
 /** A step's outcome: the next stage; the result that ends the call (a refusal); or the fallback, still pending,
  * which the entry returns unawaited (order-sensitive point 3). */
@@ -374,8 +373,32 @@ model resolved deliberately omits (`code :855`, `:864`: `modelAudit` is `{}` unt
 | `jscpd-baseline.json` | `src/tools/ask.tool.ts`: 213 | all: R1-R10 are gone |
 | `jscpd-baseline.json` | `src/tools/code.tool.ts`: 171 | all: its repeats are R1-R10 only |
 
-The total of `jscpd-baseline.json` falls from 2,599 to 2,215 lines. No new file enters either baseline. The test files'
-entries do not move: no test changes.
+The total of `jscpd-baseline.json` falls from 2,599 to 2,215 lines, `eslint-suppressions.json` from 89 suppressions in
+31 files to 81 in 29. No new file enters either baseline. The test files' entries do not move: no test changes.
+
+Measured on the finished split (bytes, lines; the longest unit, in lines as ESLint counts them):
+
+| File | Bytes | Lines | Longest unit |
+|---|---|---|---|
+| `src/tools/ask.tool.ts` | 4,135 | 97 | `executeAskBody` 37 |
+| `src/tools/ask/input.ts` | 11,850 | 123 | — (the schema) |
+| `src/tools/ask/instruction.ts` | 1,130 | 20 | — |
+| `src/tools/ask/call.ts` | 2,691 | 67 | — (types) |
+| `src/tools/ask/setup.ts` | 3,246 | 67 | `resolveAsk` 20 |
+| `src/tools/ask/attachments.ts` | 5,487 | 137 | `attachAsk` 33 |
+| `src/tools/ask/guard.ts` | 4,600 | 88 | `guardAsk` 27 |
+| `src/tools/ask/sizing.ts` | 1,700 | 39 | `sizeAsk` 25 |
+| `src/tools/ask/thinking.ts` | 4,561 | 80 | `generatingLine` 12 |
+| `src/tools/ask/request.ts` | 2,440 | 44 | `askRequest` 23 |
+| `src/tools/ask/answer.ts` | 1,576 | 35 | `answerAsk` 16 |
+| `src/tools/ask/results.ts` | 5,047 | 126 | `decodeFields`, `failedResult` 20 |
+| `src/tools/shared/eager-call.ts` | 8,020 | 200 | `settleFailedEager` 31 |
+| `src/tools/shared/eager-steps.ts` | 12,326 | 291 | `reserveCallBudget` 40 |
+| `src/tools/shared/eager-answer.ts` | 7,422 | 196 | `decodeEagerCall` 40 |
+| `src/tools/code.tool.ts` | 37,797 | 814 | `executeCodeBody` 34 |
+
+`code.tool.ts` is over the 600 lines of Q4's tipping fact: its steps, typed stages and result groups now stand apart
+inside the file, which is what `src/tools/code/` (the next PR, layout only) moves.
 
 ### Order-sensitive points a naive extraction breaks
 
@@ -391,7 +414,9 @@ entries do not move: no test changes.
    `abort-timeout.ts:247-250`), the emitter stopped. A rejection of the fallback bypasses `ask`'s catch: no `ask failed`
    line, no settlement, the caller sees the rejection. The split keeps exactly that boundary: `guardAsk` hands the
    pending promise back as its own outcome (`{ handOff }`), never awaiting it, and the entry returns it from inside its
-   `try` without awaiting, in the same run of microtasks.
+   `try` without awaiting, in the same run of microtasks: between `guardAsk`'s return and the entry's `finally` lie
+   only microtask turns, and the agentic call's first await (`resolveWorkspaceRoot`'s `realpath`, `sandbox.ts:174`)
+   settles on a later turn of the event loop.
 4. F settles first, then classifies: the error line, `settleFailure` (the retry hint, the ledger, the TPM reservation),
    then the timeout's progress line (`:965-990`). `settleFailedEager` keeps that order.
 5. `OUTPUT_CAP` returns before the truncated-scan warning (`:901` before `:905`).
@@ -407,7 +432,8 @@ entries do not move: no test changes.
 ### Error policy
 
 Unchanged. No new `catch`: a step ends the call by returning `{ end }`, and every throw reaches the one failure path as
-today — but the fallback's rejection, which bypasses it as today (point 3). `recordBilledCall` and `releaseReservation`
+today — but the fallback's rejection, which bypasses it as today (point 3). The tier step's `catch` of a
+`ServiceTierError` is the tools' own, moved into `serviceTierOrRefusal`, which rethrows any other error. `recordBilledCall` and `releaseReservation`
 stay the only places that catch a ledger write.
 
 ### Performance budget
@@ -545,11 +571,24 @@ Each type arrives with the commit of its first reader, never in a later one.
 | 14 | `code`: the orchestrator over its own steps | `code.tool.ts` leaves `eslint-suppressions.json` | `CodeModelReached` |
 | 15 | docs | `docs/architecture.md` (`src/tools/ask/`, the three new shared modules), T47 closed in `docs/FOLLOW-UP-PRS.md`, this note's status | — |
 
-The repeats left after commit 9 are call sites, not mechanisms: the import blocks of the shared modules, the
-`ServiceTierError` branch of the model step (11 lines), the opening of the workspace guard after `countPreflight`
-(18 lines), and the calls of `decodeEagerCall` and `settleDecoded` with what surrounds them (27 and 14 lines). The
-ratchet admits no new file into `jscpd-baseline.json`, so none of them may move into an `ask/` module as it is: commits
-11-14 give each a shared form or a shape of its tool's own, and both files leave `jscpd-baseline.json` by commit 14.
+After commit 9 five call sites still repeated: the import blocks of the shared modules, the `ServiceTierError` branch
+of the model step, the opening of the workspace guard after `countPreflight`, and the calls of `decodeEagerCall` and
+`settleDecoded` with what surrounds them. The ratchet admits no new file into `jscpd-baseline.json`, so each has a
+shared form or a shape of its tool's own, read by both tools in the commit that needed it:
+
+| Repeat | Gone through |
+|---|---|
+| the import blocks | the stage steps: the entry imports the `ask/` steps and the call's machinery, the `ask/` modules the shared pieces they call |
+| the `ServiceTierError` branch | `serviceTierOrRefusal` (`shared/service-tier.ts`): the tier or the error as a value; each tool composes its refusal |
+| the guard's opening | `overWindow` (`shared/eager-steps.ts`): the count, the window, the threshold, the percent shown; each tool composes its refusal. The scan's filters are read from either tool's input as it is (`ScanFilters`) |
+| the decode and the settlement | `SizedCall` (`shared/eager-steps.ts`), built once per call and read by `reserveCallBudget`, `decodeEagerCall` and `settleDecoded` (`AskSized` is one; `code` builds its own); the request builder is each tool's (`askRequest`, `codeRequest`) |
+
+Both tool files left `jscpd-baseline.json` with commit 12. Beside them, the count's provenance fields — the same three in
+both answers — are `preflightFields`, read by both. `AskPrepared` was not needed: nothing after the context reads it
+(the result reads the decode and the settlement), so the stages end at `AskSized`. The steps between the stages are
+named after the phases they run: `scanAsk` (steps 5-7) sits beside `resolveAsk` in `setup.ts`, `sizeAsk` and
+`answerAsk` have modules of their own, so the entry imports no shared step but the workspace refusal and the call's
+machinery.
 
 No CHANGELOG entry: nothing a user sees changes.
 

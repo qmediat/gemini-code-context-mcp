@@ -343,7 +343,10 @@ Shipped 2026-04-27. `src/server.ts` tracks each `CallToolRequestSchema` handler'
 
 ---
 
-## T47. Split `src/tools/ask.tool.ts` into modules
+## ~~T47.~~ ✅ SHIPPED 2026-11-17 — Split `src/tools/ask.tool.ts` into modules
+
+**Shipped as:** the tool file is the entry (the registration and the call: opened, its stage steps run in order, the failure result, closed; 4 KB, 97 lines); the model step, the attachments, the scan, the guard and the `ask_agentic` fallback (handed back pending, returned unawaited), the sizing, the thinking, the request, the answer and the results are modules under `src/tools/ask/` (`docs/architecture.md`); what `ask` and `code` repeated is one piece in `src/tools/shared/` read by both (`eager-call.ts`, `eager-steps.ts`, `eager-answer.ts`, `serviceTierOrRefusal` in `service-tier.ts`), and `code`'s `executeCodeBody` is an orchestrator over those pieces and its own steps in `src/tools/code.tool.ts`. No behaviour change: the existing tests green unchanged, and a differential probe of 194 scenarios (`docs/DESIGN-ask-tool-modules.md`, "Proof plan") traces every result, message, field order, ledger and throttle call identically on `main` and on every commit. Both tool files left `eslint-suppressions.json` and `jscpd-baseline.json` (the repeats 2,599 → 2,215 lines, the suppressions 89 → 81); every unit of the entry, `ask/` and the shared pieces is within the structure limits. The scope below is the entry as written.
+
 
 **Source:** the review of PR #135 (2026-11-17). Opened 2026-11-17.
 
