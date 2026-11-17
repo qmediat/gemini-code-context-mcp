@@ -22,7 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AGENTIC_MAX_ITERATIONS`) carries that pass's `cachedTokens`, `uncachedTokens`, `outputTokens`, `thinkingTokens`
   and `costEstimateUsd`.
 - `ask_agentic`: the stall watchdog (`stallMs`) stops when an iteration's stream ended; a tool batch longer than
-  `stallMs` used to fail the whole call as a stall. `iterationTimeoutMs` still bounds the batch.
+  `stallMs` used to fail the whole call as a stall. The batch keeps one bound whatever is set: `iterationTimeoutMs`,
+  else a 120 s ceiling that ends the call as `TIMEOUT` with `timeoutKind: 'tool-batch'`, the pass booked. A timeout
+  now ends the wait for the batch the moment it fires: a tool call that never returned used to hang the call even
+  with `iterationTimeoutMs` set.
+- `ask` with `onWorkspaceTooLarge: 'fallback-to-agentic'`: `stallMs` is passed to `ask_agentic` as its stall
+  watchdog, and only `timeoutMs` becomes the per-iteration cap; `stallMs` used to become that cap, so a tool batch
+  longer than `stallMs` failed the fallback. The result reports `iterTimeoutMs` / `iterTimeoutSource: 'timeoutMs'`
+  when `timeoutMs` was set and `stallMs` when it was.
+- `ask_agentic`: the message of an iteration `TIMEOUT` whose pass was booked says it is booked at the result's token
+  and cost fields; it used to say the request was booked 0 beside those fields.
+- `ask_agentic`: a pass whose usage could not be read (the read threw after its model call completed) is booked at
+  its whole reservation — the input estimate plus the reserved output and thinking tokens; it used to be booked at
+  the input estimate alone.
 - Docs and timeout messages: whether Google bills a request aborted after its stream opened is not measured; the server
   books it 0, so for such a request the daily budget and the TPM window are not a bound. `docs/cost-model.md` names
   this and the `ask_agentic` iteration's fixed 50,000-token estimate (*What the daily budget does not bound*); the

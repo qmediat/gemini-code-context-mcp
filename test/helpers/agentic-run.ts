@@ -208,6 +208,7 @@ function recordingManifest(opts: AgenticRunOptions, trace: TraceEvent[]) {
     insertUsageMetric: record('insertUsageMetric', () => {
       if (opts.insertUsageThrows !== undefined) throw opts.insertUsageThrows;
     }),
+    getFiles: vi.fn(() => []),
   };
 }
 
@@ -245,6 +246,8 @@ function contextOf(opts: AgenticRunOptions, trace: TraceEvent[], calls: ModelCal
       forceMaxOutputTokens: false,
       workspaceGuardRatio: 0.9,
       defaultModel: 'latest-pro-thinking',
+      serviceTier: 'standard',
+      vertex: false,
     },
     client: { models: scriptedModel(opts.script, trace, calls) },
     manifest: recordingManifest(opts, trace),
@@ -275,7 +278,21 @@ async function withEnv<T>(
 }
 
 /** Run one `ask_agentic` call with `opts` and return its result and everything it did, in order. */
-export async function runAgentic(opts: AgenticRunOptions): Promise<AgenticRunRecord> {
+export function runAgentic(opts: AgenticRunOptions): Promise<AgenticRunRecord> {
+  return runScripted(opts, (workspace, ctx) =>
+    askAgenticTool.execute({ prompt: 'q', workspace, ...opts.input } as AskAgenticInput, ctx),
+  );
+}
+
+/**
+ * Run one tool call against the scripted model in a scratch workspace (`execute` is given its path and the context)
+ * and return its result and everything it did, in order: `runAgentic` for `ask_agentic`, or a call that reaches it
+ * another way (the `ask` fallback).
+ */
+export async function runScripted(
+  opts: AgenticRunOptions,
+  execute: (workspace: string, ctx: ToolContext) => Promise<TextToolResult>,
+): Promise<AgenticRunRecord> {
   const trace: TraceEvent[] = [];
   const modelCalls: ModelCall[] = [];
   const workspace = writeWorkspace(opts.files ?? DEFAULT_FILES);
@@ -287,8 +304,7 @@ export async function runAgentic(opts: AgenticRunOptions): Promise<AgenticRunRec
   vi.mocked(resolveModel).mockResolvedValue(opts.model ?? GEMINI_3_PRO);
   try {
     const ctx = contextOf(opts, trace, modelCalls);
-    const input = { prompt: 'q', workspace, ...opts.input } as AskAgenticInput;
-    const result = await withEnv(opts.env ?? {}, () => askAgenticTool.execute(input, ctx));
+    const result = await withEnv(opts.env ?? {}, () => execute(workspace, ctx));
     return { result, trace, modelCalls };
   } finally {
     for (const spy of spies) spy.mockRestore();

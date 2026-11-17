@@ -105,6 +105,20 @@ export function budgetRejected(
   );
 }
 
+/** What raises each limit an iteration can time out on. */
+const KNOB_HINT: Readonly<Record<TimeoutKind, string>> = {
+  stall:
+    'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.',
+  total:
+    'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.',
+  'tool-batch':
+    'The tool batch ran past the ceiling that bounds it when no iteration timeout is set. Set `iterationTimeoutMs` per call or `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` (up to 30 min) to bound the iteration, its tool batch included, with your own limit.',
+};
+
+/** What the message of an iteration booked before it timed out says of its cost. */
+const BOOKED_ITERATION_NOTE =
+  "The iteration's model call had completed: it is booked at the token and cost fields this result reports.";
+
 /** How an iteration timed out: the controller that fired, which of its limits, and whether the call was dispatched. */
 export interface IterationTimeout {
   controller: TimeoutController;
@@ -130,16 +144,14 @@ export interface IterationTimeout {
  * timeout-during-generateContent (dispatch happened). If it is false, the timeout fired during
  * abortableSleep and this iter never reached the API: subtract 1 to keep apiCalls authoritative.
  * An iteration booked before it timed out (its stream had ended: the timeout fired in its tool batch)
- * reports its billed fields, as a failed `ask` / `code` call reports its completed requests'.
+ * reports its billed fields, as a failed `ask` / `code` call reports its completed requests', and its message says
+ * so; the abort note is for an iteration whose call was cancelled (`billed: null`).
  */
 export function iterationTimedOut(iterations: number, timeout: IterationTimeout): TextToolResult {
   const { controller, kind, limitMs } = timeout;
-  const knobHint =
-    kind === 'stall'
-      ? 'Increase `stallMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS` higher; default disabled. Stall fires when the stream goes silent — usually a dead socket or a Gemini server-side hiccup.'
-      : 'Increase `iterationTimeoutMs` per call or set `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` higher; default disabled.';
+  const costNote = timeout.billed === null ? ABORTED_REQUEST_NOTE : BOOKED_ITERATION_NOTE;
   return errorResult(
-    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${knobHint} ${ABORTED_REQUEST_NOTE}`,
+    `ask_agentic: iteration ${iterations} timed out (${kind}) after ${limitMs ?? '?'}ms. ${KNOB_HINT[kind]} ${costNote}`,
     {
       errorCode: 'TIMEOUT',
       timeoutMs: controller.timeoutMs,

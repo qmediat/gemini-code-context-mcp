@@ -850,12 +850,10 @@ async function executeCodeBody(
     // v1.12.0 — `timeoutKind` distinguishes wall-clock cap from stall watchdog.
     if (isTimeoutAbort(err)) {
       const timedOut = timedOutCall('code', err, timeoutController);
-      emitter.emit(
-        `code: aborted after ${timedOut.limitMs ?? '?'}ms ${timedOut.kind ?? 'timeout'}`,
-      );
+      emitter.emit(`code: aborted after ${timedOut.limitMs ?? '?'}ms ${timedOut.kind}`);
       return errorResult(timedOut.message, {
         errorCode: 'TIMEOUT',
-        timeoutKind: timedOut.kind ?? 'total',
+        timeoutKind: timedOut.kind,
         timeoutMs: timeoutController.timeoutMs,
         stallMs: timeoutController.stallMs,
         retryable: true,

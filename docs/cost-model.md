@@ -194,8 +194,9 @@ Result: N concurrent tool calls cannot collectively overshoot the cap with what 
 
 One rule for `ask`, `code` and `ask_agentic`: **a request is billed once its model call completed** — its stream
 reached its end, or (the `ask_agentic` forced-finalization pass) `generateContent` returned. A completed request stays
-in the ledger whatever fails after it, at the usage it reported, or at the input it was estimated to send when no usage
-could be read. A request that did not complete — refused, failed at its opening, failed or aborted mid-stream, even
+in the ledger whatever fails after it, at the usage it reported, or at the input it was estimated to send when it
+reported none; an `ask_agentic` pass whose usage could not be read (the read threw) is booked at its whole reservation —
+the input estimate and the reserved output and thinking tokens. A request that did not complete — refused, failed at its opening, failed or aborted mid-stream, even
 after chunks that carried usage — is booked at 0 and its reservations come back: Google reports usage on a stream's
 last chunk, and a stream is never re-sent. Whether Google bills a request aborted after its stream opened is not
 measured ([below](#what-the-daily-budget-does-not-bound)). Once an answer exists, writing its ledger row is
@@ -219,8 +220,8 @@ UNKNOWN`) whenever it gives no answer; the table names its `finalizationSkipReas
 | Timeout during the TPM wait | released, unless an earlier request of the call completed: then booked at what those billed | both reservations released | `TIMEOUT`, with the completed requests' usage fields (`ask` / `code`); loop iteration: `TIMEOUT`, its `apiCalls` not counting the pass; forced pass: `rescueErrorCode: 'TIMEOUT'`, `apiCalls` not counting it |
 | Refused or failed at the opening (429, 4xx, 5xx, network after retries) | as above | both released | the error, with the completed requests' usage fields (`ask` / `code`); loop iteration: `UNKNOWN`; forced pass: `rescueErrorCode` `'RATE_LIMIT'`, `'API_ERROR'` or `'NETWORK'` |
 | Failed or timed out before the call completed (mid-stream; the forced pass before `generateContent` returned) | as above: the request is not booked | both released | as above, or `TIMEOUT`; forced pass: its `rescueErrorCode` |
-| Call completed, then reading the response threw | booked | booked at the usage read, the estimate when none was; TPM released at that input | the error with the booked usage; loop iteration: `UNKNOWN` with the pass's fields; forced pass: `rescueErrorCode: 'INTERNAL'` with them |
-| Stream completed, then the iteration timed out in its tool batch | — | booked at the reported usage; TPM released at it | `TIMEOUT` for the iteration with the pass's fields, `apiCalls` counts it |
+| Call completed, then reading the response threw | booked | booked at the usage read; at the input estimate when the response reported none; at the whole reservation (input estimate, reserved output and thinking) when reading the usage threw; TPM released at the input booked | the error with the booked usage; loop iteration: `UNKNOWN` with the pass's fields; forced pass: `rescueErrorCode: 'INTERNAL'` with them |
+| Stream completed, then the iteration timed out in its tool batch (`iterationTimeoutMs`, else the 120 s batch ceiling, `timeoutKind: 'tool-batch'`) | — | booked at the reported usage; TPM released at it | `TIMEOUT` for the iteration with the pass's fields, `apiCalls` counts it; the message says the pass is booked |
 | Forced pass answered with no text | — | booked; TPM released at the billed input | `rescueErrorCode: 'EMPTY_TEXT'` with the pass's fields |
 | Answer, ledger write failed | logged, answer returned | logged, answer returned | the answer |
 | Answer | booked; the rest of the reservation released | booked; TPM released at the billed input | the answer with its usage |
@@ -239,7 +240,7 @@ UNKNOWN`) whenever it gives no answer; the table names its `finalizationSkipReas
   (and 4,096 output plus 4,096 thinking tokens that are not capped on the wire, T38), whatever the conversation's size.
   An iteration that sends more can be settled above its reservation — on Gemini 3 Pro with the default output
   reservation and little output, from about 87,000 prompt tokens — and one whose usage could not be read is booked
-  at 50,000, below what it sent. The forced
+  at its reservation, which can be below what it sent. The forced
   pass reserves the last iteration's prompt plus the tool responses after it (plus 5,000), so its estimate follows the
   conversation.
 

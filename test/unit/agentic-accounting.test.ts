@@ -42,6 +42,8 @@ const MODEL = 'gemini-3-pro-preview';
 const ENFORCED = { dailyBudgetUsd: 10, tpmThrottleLimit: 1_000_000 } as const;
 const COVER_MS = 60_000;
 const READ_A = { calls: [{ name: 'read_file', args: { path: 'a.ts' } }] };
+/** The output and the thinking tokens a pass reserves for by default (`maxOutputTokens` unset). */
+const RESERVED_OUTPUT = 4096;
 
 /** The cost of a pass with these token counts, in USD. */
 function passCostUsd(uncached: number, output: number, thinking: number): number {
@@ -296,7 +298,7 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
     ]);
   });
 
-  it('is booked at its estimate when reading its usage throws', async () => {
+  it('is booked at its whole reservation when reading its usage throws', async () => {
     const response = {
       candidates: [{ content: { parts: [{ text: 'x' }] } }],
       get usageMetadata(): never {
@@ -311,7 +313,7 @@ describe('ask_agentic accounting — the forced-finalization pass', () => {
 
     expect(result.structuredContent).toMatchObject({
       rescueErrorCode: 'INTERNAL',
-      ...reportedFields(50_000, 0, 0),
+      ...reportedFields(50_000, RESERVED_OUTPUT, RESERVED_OUTPUT),
     });
     expect(callsTo(trace, 'throttle', 'release')[1]).toEqual([102, 50_000]);
     expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([]);
@@ -486,6 +488,11 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
       responseText: expect.stringContaining('iteration 1 timed out (total) after 1000ms'),
       ...reportedFields(3000, 200, 50),
     });
+    const message = String(result.structuredContent?.responseText);
+    expect(message).not.toContain('booked 0');
+    expect(message).toContain(
+      "The iteration's model call had completed: it is booked at the token and cost fields this result reports.",
+    );
     expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual(
       finalizedAt(3000, 200, 50),
     );
@@ -494,7 +501,7 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
     expect(callsTo(trace, 'throttle', 'cancel')).toEqual([]);
   });
 
-  it('books the call at its estimate when its usage could not be read', async () => {
+  it('books the call at its whole reservation when its usage could not be read: input, output and thinking', async () => {
     const response = {
       candidates: [{ content: { parts: [{ text: 'x' }] } }],
       usageMetadata: {
@@ -507,8 +514,16 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
 
     expect(result.isError).toBe(true);
     expect(callsTo(trace, 'ledger', 'finalizeBudgetReservation')).toEqual(
-      finalizedAt(50_000, 0, 0),
+      finalizedAt(50_000, RESERVED_OUTPUT, RESERVED_OUTPUT),
     );
+    const [reserved] = callsTo(trace, 'ledger', 'reserveBudget')[0] as [
+      { estimatedCostMicros: number },
+    ];
+    const [, booked] = callsTo(trace, 'ledger', 'finalizeBudgetReservation')[0] as [
+      number,
+      { costUsdMicro: number },
+    ];
+    expect(booked.costUsdMicro).toBe(reserved.estimatedCostMicros);
     expect(callsTo(trace, 'throttle', 'release')).toEqual([[101, 50_000]]);
     expect(callsTo(trace, 'ledger', 'cancelBudgetReservation')).toEqual([]);
   });
@@ -554,7 +569,7 @@ describe('ask_agentic accounting — an iteration that fails after its model cal
       errorCode: 'UNKNOWN',
       retryable: false,
       responseText: 'ask_agentic failed: usage unreadable',
-      ...reportedFields(50_000, 0, 0),
+      ...reportedFields(50_000, RESERVED_OUTPUT, RESERVED_OUTPUT),
     });
   });
 });

@@ -8,6 +8,7 @@ import { withNetworkRetry } from '../../gemini/retry.js';
 import type { MatchConfig } from '../../indexer/globs.js';
 import { logger } from '../../utils/logger.js';
 import type { ToolContext } from '../registry.js';
+import { timeoutAbortReason } from '../shared/abort-timeout.js';
 import { type CollectedResponse, collectStream } from '../shared/stream-collector.js';
 import {
   type DispatchedToolResult,
@@ -66,9 +67,12 @@ export interface IterationArgs {
    * v1.16.2). Wired from the loop's `iterTimeout.recordChunk`. No-op when
    * stall is disabled. */
   recordChunk: () => void;
-  /** Stop the stall watchdog once the stream ended: the tool batch that follows sends no chunk, and only the total
-   * timeout bounds it. The next stream's first chunk re-arms the watchdog. */
+  /** Stop the stall watchdog once the stream ended: the tool batch that follows sends no chunk. The controller is this
+   * iteration's own and no stream follows in it, so nothing re-arms the watchdog; the batch is bounded by the
+   * iteration timeout, else by `toolBatchCeilingMs`. */
   pauseStall: () => void;
+  /** The ceiling of the tool batch when no iteration timeout bounds it; `null` when one does. */
+  toolBatchCeilingMs: number | null;
   /** Surface live thought-chunk previews via the MCP progress channel
    * (T33, v1.16.2). Mirrors the ask/code streaming UX. */
   onThoughtChunk: (text: string) => void;
@@ -242,20 +246,44 @@ async function planDispatch(
   return plan;
 }
 
+/** The error an aborted iteration ends with: the signal's reason (the timeout that fired). */
+function abortErrorOf(abortSignal: AbortSignal): Error {
+  return abortSignal.reason instanceof Error
+    ? abortSignal.reason
+    : new DOMException('Operation aborted', 'AbortError');
+}
+
 /**
- * Check abort AFTER tool execution — local file I/O / large grep regex /
- * huge directory walk can take real wall-clock time, and without this
- * check a 5s iterationTimeoutMs could be ignored for the duration of a
- * multi-second tool call. The next iteration would then start with the
- * signal already aborted, but the user's expectation is that the timeout
- * fires AS SOON AS the deadline passes.
+ * Wait for the tool batch, bounded: the iteration's abort signal ends the wait the moment it fires, and `ceilingMs`
+ * (when no iteration timeout bounds the iteration) ends it with a `tool-batch` timeout. The executors take no signal
+ * (file system calls), so a batch past its bound is left to settle on its own and its result is discarded.
  */
-function throwIfIterationAborted(abortSignal: AbortSignal): void {
-  if (abortSignal.aborted) {
-    throw abortSignal.reason instanceof Error
-      ? abortSignal.reason
-      : new DOMException('Operation aborted', 'AbortError');
-  }
+function boundedBatch<T>(
+  batch: Promise<T>,
+  signal: AbortSignal,
+  ceilingMs: number | null,
+): Promise<T> {
+  if (signal.aborted) return Promise.reject(abortErrorOf(signal));
+  return new Promise<T>((resolve, reject) => {
+    const ceiling =
+      ceilingMs === null
+        ? null
+        : setTimeout(
+            () => finish(() => reject(timeoutAbortReason('tool-batch', ceilingMs))),
+            ceilingMs,
+          );
+    const onAbort = (): void => finish(() => reject(abortErrorOf(signal)));
+    function finish(settle: () => void): void {
+      if (ceiling !== null) clearTimeout(ceiling);
+      signal.removeEventListener('abort', onAbort);
+      settle();
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    batch.then(
+      (value) => finish(() => resolve(value)),
+      (err: unknown) => finish(() => reject(err)),
+    );
+  });
 }
 
 /** A successful `read_file` adds its sandbox-resolved `relpath` — this closes the alias-bypass on
@@ -343,13 +371,16 @@ export async function runAgenticIteration(args: IterationArgs): Promise<Iteratio
 
   args.conversation.push({ role: 'model', parts });
   const plan = await planDispatch(functionCallParts, args);
-  const dispatched = await dispatchToolCallsParallel(
-    args.workspaceRoot,
-    plan.toDispatch,
-    resolveToolExecutionConcurrency(),
-    args.matchConfig,
+  const dispatched = await boundedBatch(
+    dispatchToolCallsParallel(
+      args.workspaceRoot,
+      plan.toDispatch,
+      resolveToolExecutionConcurrency(),
+      args.matchConfig,
+    ),
+    args.abortSignal,
+    args.toolBatchCeilingMs,
   );
-  throwIfIterationAborted(args.abortSignal);
   mergeDispatched(dispatched, plan, functionCallParts, args.filesReadSet);
 
   const finalResponseParts = plan.responseParts.filter((p): p is Part => p !== null);

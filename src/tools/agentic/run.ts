@@ -14,6 +14,7 @@ import type { BilledFields } from '../shared/call-ledger.js';
 import type { AskAgenticInput } from './input.js';
 import { SYSTEM_INSTRUCTION_AGENTIC, buildFunctionDeclarations } from './instructions.js';
 import type { SignatureCounts } from './no-progress.js';
+import type { UsageCounts } from './response.js';
 
 export type ResolvedModel = Awaited<ReturnType<typeof resolveModel>>;
 
@@ -33,6 +34,15 @@ export const PER_ITERATION_INPUT_TOKENS = 50_000;
 
 /** The env var that bounds an iteration (and the finalization pass) when the call sets no `iterationTimeoutMs`. */
 export const ITERATION_TIMEOUT_ENV = 'GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS';
+
+/**
+ * The longest an iteration's tool batch may run when no iteration timeout bounds it (`timeoutKind: 'tool-batch'`).
+ * The executors bound what they return (a read ≤ 1 MB, ≤ 100 grep matches, ≤ 200 entries, a walk ≤ 20 levels) but
+ * not how long they take: a grep with few matches reads every file of the workspace, and a hung file system call never
+ * returns. Two minutes leaves a whole-tree grep of a large local workspace room to finish and still ends a hung batch;
+ * `iterationTimeoutMs` (up to 30 min) replaces it.
+ */
+export const TOOL_BATCH_CEILING_MS = 120_000;
 
 export interface RunLimits {
   maxIterations: number;
@@ -142,18 +152,27 @@ export function passBudgetOf(input: AskAgenticInput, ctx: ToolContext): PassBudg
   };
 }
 
+/** The tokens one pass is reserved for: its input estimate, and `budget.outputTokens` of output and of thinking. */
+export function passReservedUsage(run: AgenticRun, inputTokens: number): UsageCounts {
+  return {
+    promptTokenCount: inputTokens,
+    candidatesTokenCount: run.budget.outputTokens,
+    thoughtsTokenCount: run.budget.outputTokens,
+  };
+}
+
 /** One pass's reservation for the resolved model, at the rates in force from now until its timeout. */
 export function passReservationUsd(run: AgenticRun, inputTokens: number): number {
-  const { budget } = run;
+  const reserved = passReservedUsage(run, inputTokens);
   return estimateReservationUsd(
     {
       model: run.resolved.resolved,
-      uncachedInputTokens: inputTokens,
+      uncachedInputTokens: reserved.promptTokenCount,
       cachedInputTokens: 0,
-      outputTokens: budget.outputTokens,
-      thinkingTokens: budget.outputTokens,
+      outputTokens: reserved.candidatesTokenCount,
+      thinkingTokens: reserved.thoughtsTokenCount,
     },
-    budget.coverMs,
+    run.budget.coverMs,
   );
 }
 

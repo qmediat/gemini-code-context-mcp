@@ -49,6 +49,37 @@ const ABSOLUTE_MAX_MS = 1_800_000; // 30 min — conservative ceiling for total
 const ABSOLUTE_MIN_MS = 1_000; // 1 s — anything shorter is a unit-conversion bug
 const STALL_ABSOLUTE_MAX_MS = 600_000; // 10 min — a stall watchdog longer than this is just a slow total cap
 
+/**
+ * The limit a timeout names: the total wall-clock cap, the stall watchdog, or the ceiling an `ask_agentic` tool batch
+ * keeps when no iteration timeout bounds it. Callers surface it as `timeoutKind` so orchestrators can apply different
+ * policies (e.g. retry on stall but not on total).
+ */
+export type TimeoutKind = 'total' | 'stall' | 'tool-batch';
+
+/** Each kind's suffix on its abort reason's message, the fallback `getTimeoutKind` reads when the property is gone. */
+const KIND_SUFFIX: Readonly<Record<TimeoutKind, string>> = {
+  total: '(total wall-clock)',
+  stall: '(stall — no chunk received)',
+  'tool-batch': '(tool batch)',
+};
+
+/** Whether `value` names one of the timeout kinds. */
+export function isTimeoutKind(value: unknown): value is TimeoutKind {
+  return typeof value === 'string' && Object.hasOwn(KIND_SUFFIX, value);
+}
+
+/**
+ * The abort reason of a timeout: a `TimeoutError` (what `isTimeoutAbort` recognises) carrying its kind as the
+ * `timeoutKind` property and as its message's suffix.
+ */
+export function timeoutAbortReason(kind: TimeoutKind, limitMs: number): DOMException {
+  const reason = new DOMException(
+    `Timed out after ${limitMs} ms ${KIND_SUFFIX[kind]}`,
+    'TimeoutError',
+  );
+  return Object.assign(reason, { timeoutKind: kind });
+}
+
 export interface TimeoutController {
   /** Pass into SDK config or `withNetworkRetry({signal})`. */
   readonly signal: AbortSignal;
@@ -163,14 +194,7 @@ export function createTimeoutController(opts: CreateTimeoutControllerOpts): Time
 
   if (totalEffective > 0) {
     totalTimer = setTimeout(() => {
-      const reason = new DOMException(
-        `Timed out after ${totalEffective} ms (total wall-clock)`,
-        'TimeoutError',
-      );
-      // Embed the kind on the reason itself — message-string matching
-      // (the v1.12.0-pre approach) is brittle to any future copy changes.
-      Object.assign(reason, { timeoutKind: 'total' as const });
-      controller.abort(reason);
+      controller.abort(timeoutAbortReason('total', totalEffective));
       // Stall timer is now moot — clear it.
       if (stallTimer !== null) clearTimeout(stallTimer);
     }, totalEffective);
@@ -199,12 +223,7 @@ export function createTimeoutController(opts: CreateTimeoutControllerOpts): Time
   // should set both `stallMs` and `timeoutMs`.
   const armStallTimer = (): NodeJS.Timeout => {
     const t = setTimeout(() => {
-      const reason = new DOMException(
-        `Timed out after ${stallEffective} ms (stall — no chunk received)`,
-        'TimeoutError',
-      );
-      Object.assign(reason, { timeoutKind: 'stall' as const });
-      controller.abort(reason);
+      controller.abort(timeoutAbortReason('stall', stallEffective));
       if (totalTimer !== null) clearTimeout(totalTimer);
     }, stallEffective);
     t.unref?.();
@@ -322,8 +341,8 @@ export function isTimeoutAbort(err: unknown): boolean {
 
 /** A timed-out `ask` / `code` call as its result reports it. */
 export interface TimedOutCall {
-  /** The limit that fired; `null` for a timeout that names none. */
-  readonly kind: TimeoutKind | null;
+  /** The limit that fired: `stall`, or `total` for every other timeout (`ask` / `code` keep no third limit). */
+  readonly kind: TimeoutKind;
   /** That limit in ms, `null` when it was not configured. */
   readonly limitMs: number | null;
   /** The error message: what fired, the knob that raises it, and what the abort means for the cost. */
@@ -336,33 +355,25 @@ export function timedOutCall(
   err: unknown,
   controller: TimeoutController,
 ): TimedOutCall {
-  const kind = getTimeoutKind(err);
   const env = `GEMINI_CODE_CONTEXT_${tool.toUpperCase()}`;
-  if (kind === 'stall') {
+  if (getTimeoutKind(err) === 'stall') {
     return {
-      kind,
+      kind: 'stall',
       limitMs: controller.stallMs,
       message: `${tool} timed out — no chunk received for ${controller.stallMs ?? '?'}ms (stall watchdog). Increase \`stallMs\` per call or set \`${env}_STALL_MS\` higher; default disabled. Stall watchdog is heartbeat-aware — it does NOT fire while the model is streaming chunks. A fired stall is usually a dead socket or a server-side hang. ${ABORTED_REQUEST_NOTE}`,
     };
   }
   return {
-    kind,
+    kind: 'total',
     limitMs: controller.timeoutMs,
     message: `${tool} timed out after ${controller.timeoutMs ?? '?'}ms (total wall-clock). Increase \`timeoutMs\` per call or set \`${env}_TIMEOUT_MS\` higher; default disabled. Consider \`stallMs\` instead — a heartbeat-aware watchdog that does NOT fire while the model is actively thinking. ${ABORTED_REQUEST_NOTE}`,
   };
 }
 
 /**
- * Distinguish a wall-clock-cap timeout from a stall-watchdog timeout.
- * Callers surface this in error structuredContent (`timeoutKind`) so
- * orchestrators can apply different policies (e.g. retry on stall but
- * not on total).
- *
- * Returns `'total'` | `'stall'` | `null` (last when the error isn't a
- * timeout, OR is a timeout from a different source).
+ * The kind of limit a timeout names (`TimeoutKind`), read from the first `TimeoutError` of the `cause` chain; `null`
+ * when the error is not a timeout.
  */
-export type TimeoutKind = 'total' | 'stall';
-
 export function getTimeoutKind(err: unknown): TimeoutKind | null {
   let current: unknown = err;
   const seen = new Set<unknown>();
@@ -370,24 +381,21 @@ export function getTimeoutKind(err: unknown): TimeoutKind | null {
     if (!(current instanceof Error)) return null;
     if (seen.has(current)) return null;
     seen.add(current);
-    if (current.name === 'TimeoutError') {
-      // Prefer the structured `timeoutKind` property on the abort reason
-      // (set by `createTimeoutController` since v1.12.0). Property-based
-      // dispatch is robust against future message-copy changes.
-      const kind = (current as { timeoutKind?: unknown }).timeoutKind;
-      if (kind === 'total' || kind === 'stall') return kind;
-      // Fall back to message inspection ONLY for messages produced by
-      // older v1.12.0-pre code paths (or third-party TimeoutErrors that
-      // happen to use this exact wording). Anchored on the parenthetical
-      // suffix `createTimeoutController` writes — narrow enough to avoid
-      // collisions with arbitrary error text.
-      if (current.message.endsWith('(stall — no chunk received)')) return 'stall';
-      if (current.message.endsWith('(total wall-clock)')) return 'total';
-      // Backward compat: pre-v1.12.0 messages didn't include the suffix
-      // — treat as `'total'` (the only kind that existed then).
-      return 'total';
-    }
+    if (current.name === 'TimeoutError') return kindOfTimeoutError(current);
     current = (current as { cause?: unknown }).cause;
   }
   return null;
+}
+
+/**
+ * The kind a `TimeoutError` names: its `timeoutKind` property, else the suffix its message ends with (a reason built
+ * before the property existed), else `total` — the one kind a timeout without either could name.
+ */
+function kindOfTimeoutError(timeout: Error): TimeoutKind {
+  const kind = (timeout as { timeoutKind?: unknown }).timeoutKind;
+  if (isTimeoutKind(kind)) return kind;
+  const bySuffix = (Object.keys(KIND_SUFFIX) as TimeoutKind[]).find((k) =>
+    timeout.message.endsWith(KIND_SUFFIX[k]),
+  );
+  return bySuffix ?? 'total';
 }
