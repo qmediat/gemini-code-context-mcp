@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `ask_agentic`: every phase of a pass now has a bound. A phase that could hang forever now ends with `TIMEOUT` after
-  its default: 600 s for a request's opening (until its first chunk), 600 s for a stream that sends nothing (a
-  `stall`), 120 s for an iteration's path resolution and tool batch, and 600 s for the forced-finalization pass
+  its default: 600 s for each request's opening (until its first chunk; a request sent again after a network failure
+  gets the whole 600 s), 600 s for a stream that sends nothing (a `stall`), 120 s without progress in an iteration's
+  path resolution and tool batch — the executors report progress at every directory, file and read, so a long healthy
+  `grep` batch over a large workspace runs on — and 600 s for each request of the forced-finalization pass
   (`rescueErrorCode: 'TIMEOUT'`). A default applies only where no knob bounds the phase: `iterationTimeoutMs` (or
   `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS`) bounds every phase of an iteration, `stallMs` (or
   `GEMINI_CODE_CONTEXT_AGENTIC_STALL_MS`) the gaps of a stream only. The TPM wait keeps the throttle's own delay. Before,
@@ -30,18 +32,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `ask_agentic`: a `TIMEOUT` result carries `timeoutPhase` (`tpm-wait`, `opening`, `stream`, `tools`) and
-  `timeoutSource` (`iterationTimeoutMs`, `stallMs`, `default`); `timeoutKind` keeps its two values (`stall` is a
-  stream's gap only). `ask`'s fallback lifts both to the top of its result, beside `timeoutKind`.
+  `timeoutSource` (`iterationTimeoutMs`, `stallMs`, `default`, or `external` — a timeout the SDK raised itself: the
+  message quotes it and names no bound of the call); `timeoutKind` keeps its two values (`stall` is a stream's gap
+  only). The forced-finalization pass's `AGENTIC_MAX_ITERATIONS` with `rescueErrorCode: 'TIMEOUT'` carries
+  `timeoutPhase` (`tpm-wait`, `finalization`) and `timeoutSource` too, and its message names the knob that raises the
+  bound. `ask`'s fallback lifts both to the top of its result, beside `timeoutKind`.
 
 ### Fixed
 
 - `ask_agentic`: a tool batch longer than `stallMs` no longer ends the call as a false `stall`; the stall watchdog
   watches the stream only.
 - `ask_agentic`: a tool batch, or a path resolution at the `maxFilesRead` cap, that never returns no longer hangs the
-  call: it ends at `iterationTimeoutMs`, else at the 120 s default, with the pass booked.
+  call: it ends at `iterationTimeoutMs`, else after 120 s without progress, with the pass booked.
 - `ask`'s fallback to `ask_agentic` uses `ask`'s knobs as `ask` resolved them — per call, else
   `GEMINI_CODE_CONTEXT_ASK_TIMEOUT_MS` / `GEMINI_CODE_CONTEXT_ASK_STALL_MS` (the env vars were ignored) — stops `ask`'s
-  own timer at the hand-off, and its timeout messages name `timeoutMs` / `stallMs`, not `iterationTimeoutMs`.
+  own timer at the hand-off, and its timeout messages name `timeoutMs` / `stallMs`, not `iterationTimeoutMs`. Where
+  `ask` set no knob of a kind, `GEMINI_CODE_CONTEXT_AGENTIC_ITERATION_TIMEOUT_MS` / `_STALL_MS` still bound the loop,
+  and the message names that variable, not an `ask` one that set nothing.
 - `ask_agentic`: a 429 on a loop iteration seeds the throttle's retry hint once, not twice. `ask`, `code` and
   `ask_agentic` seed the hint through one function, once per error.
 - `ask_agentic`: a loop iteration whose response carries no `usageMetadata` is booked and released at its estimate

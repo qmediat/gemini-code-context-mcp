@@ -2,13 +2,15 @@
  * Tool executor dispatcher — takes a FunctionCall, routes to the right
  * executor, maps `SandboxError` → `response.error` (recoverable signal), and
  * runs one iteration's calls in parallel under the concurrency cap. Every
- * executor gets the pass's abort signal; once it fired, no queued call starts.
+ * executor gets the pass's watch (its abort signal, its progress report); once
+ * the signal fired, no queued call starts.
  */
 
 import type { MatchConfig } from '../../indexer/globs.js';
 import { logger, safeForLog } from '../../utils/logger.js';
 import { SandboxError } from './sandbox.js';
 import {
+  type ToolWatch,
   findFilesExecutor,
   grepExecutor,
   listDirectoryExecutor,
@@ -84,34 +86,34 @@ type Executor = (
   workspaceRoot: string,
   args: Record<string, unknown>,
   matchConfig: MatchConfig,
-  signal: AbortSignal | undefined,
+  watch: ToolWatch | undefined,
 ) => Promise<ToolResponse>;
 
 /** A line number the model sent, or `undefined` when it is not a finite number. */
 const finiteLine = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 
-const runListDirectory: Executor = async (workspaceRoot, args, matchConfig, signal) => {
+const runListDirectory: Executor = async (workspaceRoot, args, matchConfig, watch) => {
   const path = String(args.path ?? '.');
   return (await listDirectoryExecutor(
     workspaceRoot,
     path,
     matchConfig,
-    signal,
+    watch,
   )) as unknown as ToolResponse;
 };
 
-const runFindFiles: Executor = async (workspaceRoot, args, matchConfig, signal) => {
+const runFindFiles: Executor = async (workspaceRoot, args, matchConfig, watch) => {
   const pattern = String(args.pattern ?? '');
   return (await findFilesExecutor(
     workspaceRoot,
     pattern,
     matchConfig,
-    signal,
+    watch,
   )) as unknown as ToolResponse;
 };
 
-const runReadFile: Executor = async (workspaceRoot, args, matchConfig, signal) => {
+const runReadFile: Executor = async (workspaceRoot, args, matchConfig, watch) => {
   const path = String(args.path ?? '');
   const startLine = finiteLine(args.startLine);
   const endLine = finiteLine(args.endLine);
@@ -121,11 +123,11 @@ const runReadFile: Executor = async (workspaceRoot, args, matchConfig, signal) =
     startLine,
     endLine,
     matchConfig,
-    signal,
+    watch,
   )) as unknown as ToolResponse;
 };
 
-const runGrep: Executor = async (workspaceRoot, args, matchConfig, signal) => {
+const runGrep: Executor = async (workspaceRoot, args, matchConfig, watch) => {
   const pattern = String(args.pattern ?? '');
   const pathPrefix =
     typeof args.pathPrefix === 'string' && args.pathPrefix.length > 0 ? args.pathPrefix : undefined;
@@ -134,7 +136,7 @@ const runGrep: Executor = async (workspaceRoot, args, matchConfig, signal) => {
     pattern,
     pathPrefix,
     matchConfig,
-    signal,
+    watch,
   )) as unknown as ToolResponse;
 };
 
@@ -177,7 +179,7 @@ export async function dispatchToolCall(
   name: string,
   args: Record<string, unknown>,
   matchConfig: MatchConfig,
-  signal?: AbortSignal,
+  watch?: ToolWatch,
 ): Promise<DispatchedToolResult> {
   try {
     const executor = EXECUTORS.get(name);
@@ -188,7 +190,7 @@ export async function dispatchToolCall(
         isError: true,
       };
     }
-    const response = await executor(workspaceRoot, args, matchConfig, signal);
+    const response = await executor(workspaceRoot, args, matchConfig, watch);
     return { name, response, isError: false };
   } catch (err) {
     const message = failureMessage(err);
@@ -213,16 +215,17 @@ export interface ToolBatch {
 }
 
 /**
- * Run up to `concurrency` dispatches in parallel, preserving call order. A worker takes the next call only while
- * `signal` has not fired, so no queued call starts after it; a running executor gets the signal.
+ * Run up to `concurrency` dispatches in parallel, preserving call order. A worker takes the next call only while the
+ * watch's signal has not fired, so no queued call starts after it; a running executor gets the watch.
  */
 export function startToolBatch(
   workspaceRoot: string,
   calls: readonly ToolCall[],
   concurrency: number,
   matchConfig: MatchConfig,
-  signal: AbortSignal,
+  watch: ToolWatch & { readonly signal: AbortSignal },
 ): ToolBatch {
+  const { signal } = watch;
   const results: DispatchedToolResult[] = new Array(calls.length);
   let next = 0;
   let running = 0;
@@ -239,7 +242,7 @@ export function startToolBatch(
           call.name,
           call.args,
           matchConfig,
-          signal,
+          watch,
         );
       } finally {
         running -= 1;

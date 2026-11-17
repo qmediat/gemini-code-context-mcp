@@ -17,11 +17,13 @@ import { getTimeoutKind } from '../../src/tools/shared/abort-timeout.js';
 const DEFAULTS: PhaseDefaults = {
   openingMs: 1_000,
   streamGapMs: 2_000,
-  toolsMs: 3_000,
+  toolsIdleMs: 3_000,
   finalizationMs: 4_000,
   toolSettleGraceMs: 10,
 };
 const NO_KNOB: AgenticKnobs = { iterationMs: null, stallMs: null };
+/** The tools phase ended at its default. */
+const TOOLS_AT_DEFAULT = { phase: 'tools', kind: 'total', source: 'default', limitMs: 3_000 };
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -125,22 +127,18 @@ describe('pass clock — what fires', () => {
     expect(clock.signal.aborted).toBe(false);
     vi.advanceTimersByTime(1);
 
-    expect(clock.timedOut).toEqual({
-      phase: 'tools',
-      kind: 'total',
-      source: 'default',
-      limitMs: 3_000,
-    });
+    expect(clock.timedOut).toEqual(TOOLS_AT_DEFAULT);
   });
 
-  it('a chunk outside the stream arms nothing', () => {
+  it('a chunk in the tools phase re-arms nothing: the tools bound counts from the phase entry', () => {
     const clock = createPassClock({ iterationMs: null, stallMs: 100 }, DEFAULTS);
     clock.enter('tools');
+    vi.advanceTimersByTime(2_000);
     clock.recordChunk();
-    vi.advanceTimersByTime(2_999);
+    vi.advanceTimersByTime(1_000);
 
-    expect(clock.signal.aborted).toBe(false);
     expect(clock.phase).toBe('tools');
+    expect(clock.timedOut).toEqual(TOOLS_AT_DEFAULT);
   });
 
   it('reports a silent stream with no knob as a stall at the gap default', () => {
@@ -212,6 +210,91 @@ describe('pass clock — what fires', () => {
       source: 'iterationTimeoutMs',
       limitMs: 150,
     });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('pass clock — executor progress', () => {
+  it('defers the tools bound: it fires after its silence, counted from the last progress', () => {
+    const clock = createPassClock(NO_KNOB, DEFAULTS);
+    clock.enter('tools');
+    vi.advanceTimersByTime(2_000);
+    clock.recordProgress();
+    vi.advanceTimersByTime(2_999);
+    expect(clock.signal.aborted).toBe(false);
+    vi.advanceTimersByTime(1);
+
+    expect(clock.timedOut).toEqual(TOOLS_AT_DEFAULT);
+  });
+
+  it('keeps a progressing tools phase alive past its bound, with one timer', () => {
+    const clock = createPassClock(NO_KNOB, DEFAULTS);
+    clock.enter('tools');
+    for (let tick = 0; tick < 10; tick += 1) {
+      vi.advanceTimersByTime(1_000);
+      clock.recordProgress();
+    }
+
+    expect(clock.signal.aborted).toBe(false);
+    expect(vi.getTimerCount()).toBe(1);
+  });
+
+  it('extends nothing in any other phase', () => {
+    const opening = createPassClock(NO_KNOB, DEFAULTS);
+    opening.enter('opening');
+    vi.advanceTimersByTime(900);
+    opening.recordProgress();
+    vi.advanceTimersByTime(100);
+    const finalization = createPassClock(NO_KNOB, DEFAULTS);
+    finalization.enter('finalization');
+    vi.advanceTimersByTime(3_900);
+    finalization.recordProgress();
+    vi.advanceTimersByTime(100);
+
+    expect(opening.timedOut).toMatchObject({ phase: 'opening', limitMs: 1_000 });
+    expect(finalization.timedOut).toMatchObject({ phase: 'finalization', limitMs: 4_000 });
+  });
+
+  it('extends nothing under iterationTimeoutMs: the deadline stays a wall clock, the only timer', () => {
+    const clock = createPassClock({ iterationMs: 2_000, stallMs: null }, DEFAULTS);
+    clock.enter('tools');
+    vi.advanceTimersByTime(1_500);
+    clock.recordProgress();
+    expect(vi.getTimerCount()).toBe(1);
+    vi.advanceTimersByTime(500);
+
+    expect(clock.timedOut).toMatchObject({ phase: 'tools', source: 'iterationTimeoutMs' });
+  });
+
+  it('keeps one timer in the tools phase while progress re-arms its bound, a stall knob set', () => {
+    const clock = createPassClock({ iterationMs: null, stallMs: 100 }, DEFAULTS);
+    clock.enter('opening');
+    clock.recordChunk();
+    clock.enter('tools');
+    const counts: number[] = [];
+    for (let tick = 0; tick < 5; tick += 1) {
+      vi.advanceTimersByTime(2_500);
+      clock.recordProgress();
+      counts.push(vi.getTimerCount());
+    }
+
+    expect(counts).toEqual([1, 1, 1, 1, 1]);
+    expect(clock.signal.aborted).toBe(false);
+  });
+
+  it('does nothing after a fire or after dispose', () => {
+    const fired = createPassClock(NO_KNOB, DEFAULTS);
+    fired.enter('tools');
+    vi.advanceTimersByTime(3_000);
+    fired.recordProgress();
+    const disposed = createPassClock(NO_KNOB, DEFAULTS);
+    disposed.enter('tools');
+    disposed.dispose();
+    disposed.recordProgress();
+    vi.advanceTimersByTime(10_000);
+
+    expect(fired.timedOut).toMatchObject({ phase: 'tools', limitMs: 3_000 });
+    expect(disposed.signal.aborted).toBe(false);
     expect(vi.getTimerCount()).toBe(0);
   });
 });

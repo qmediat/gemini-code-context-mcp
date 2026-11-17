@@ -37,6 +37,9 @@ export interface ScriptedTurn {
   readonly hang?: boolean;
   /** The call answers after this many ms. */
   readonly delayMs?: number;
+  /** The call answers after this many ms unless its abort signal fires first: it then rejects with the signal's reason,
+   * as the SDK's request does. */
+  readonly abortableDelayMs?: number;
   /** The stream yields the response, then fails with this before its end (`generateContentStream` only). */
   readonly failsMidStream?: unknown;
   /** The stream yields the response, then sends nothing until its abort signal fires (`generateContentStream` only). */
@@ -163,6 +166,10 @@ function scriptedModel(script: readonly ScriptedTurn[], trace: TraceEvent[], cal
     if (turn === undefined) throw new Error('script exhausted');
     if (turn.hang) return untilAborted(abortSignal);
     if (turn.delayMs !== undefined) await new Promise((r) => setTimeout(r, turn.delayMs));
+    if (turn.abortableDelayMs !== undefined) {
+      const delay = new Promise((r) => setTimeout(r, turn.abortableDelayMs));
+      await Promise.race([delay, untilAborted(abortSignal)]);
+    }
     if (turn.throws !== undefined) throw turn.throws;
     return {
       response: buildModelResponse(turn),

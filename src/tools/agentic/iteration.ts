@@ -1,8 +1,9 @@
 /**
  * One iteration of the `ask_agentic` loop: one streamed `generateContent` and, when the model asked for function
  * calls, one parallel batch of tool executions whose responses are appended to the conversation. Every phase reads its
- * bound from the pass's clock: the request's opening and its stream through the SDK's abort signal, the tools phase
- * (path resolution and the batch, raced as one) through `abortable` and the workers' check before each call.
+ * bound from the pass's clock: each request's opening and its stream through the SDK's abort signal, the tools phase
+ * (path resolution and the batch, raced as one) through `abortable`, the workers' check before each call and the
+ * executors' checkpoints, which also report their progress to the clock.
  */
 
 import type { Content, FunctionCall, GenerateContentConfig, Part } from '@google/genai';
@@ -23,6 +24,7 @@ import type { PassClock } from './pass-clock.js';
 import { PHASE_DEFAULTS } from './phase-defaults.js';
 import { type UsageCounts, thinkingSummaryOf } from './response.js';
 import { resolveInsideWorkspace } from './sandbox.js';
+import { type ToolWatch, checkpoint } from './workspace-tools.js';
 
 export interface IterationResult {
   /** Text from the final model turn (no function calls) — or null when
@@ -59,8 +61,9 @@ export interface IterationArgs {
   workspaceRoot: string;
   filesReadSet: Set<string>;
   maxFilesRead: number;
-  /** The pass's clock: its signal threads into `withNetworkRetry`, the SDK config and the tools phase; every chunk
-   * reaches `recordChunk`; the tools phase is entered the moment the call completed. */
+  /** The pass's clock: its signal threads into `withNetworkRetry`, the SDK config and the tools phase; each request
+   * enters `opening`; every chunk reaches `recordChunk`; the tools phase is entered the moment the call completed and
+   * its executors' progress reaches `recordProgress`. */
   clock: PassClock;
   /** The pass's model call: marked completed once the stream ended, then given the usage read (`completeCall`). */
   call: PassCall;
@@ -122,12 +125,14 @@ async function streamIteration(args: IterationArgs): Promise<CollectedResponse> 
   const { ctx, resolvedModel, conversation, baseConfig, clock } = args;
   const abortSignal = clock.signal;
   const stream = await withNetworkRetry(
-    () =>
-      ctx.client.models.generateContentStream({
+    () => {
+      clock.enter('opening');
+      return ctx.client.models.generateContentStream({
         model: resolvedModel,
         contents: conversation,
         config: { ...baseConfig, abortSignal },
-      }),
+      });
+    },
     {
       signal: abortSignal,
       onRetry: (attempt, err) => {
@@ -212,9 +217,12 @@ async function capRefusal(
   };
 }
 
+/** The calls of a model turn, each refused at the `maxFilesRead` cap or planned for dispatch; a checkpoint follows each
+ * path resolution. */
 async function planDispatch(
   functionCallParts: FunctionCallPart[],
   args: IterationArgs,
+  watch: ToolWatch,
 ): Promise<DispatchPlan> {
   const plan: DispatchPlan = {
     signatures: [],
@@ -232,6 +240,7 @@ async function planDispatch(
     };
     plan.signatures.push(call);
     const refusal = await capRefusal(fc, call, args);
+    checkpoint(watch);
     if (refusal !== null) {
       plan.responseParts[i] = refusal;
       continue;
@@ -318,7 +327,8 @@ type ToolsOutcome =
     }
   | { readonly kind: 'timed-out'; readonly running: number };
 
-/** The tools phase's work as it runs: path resolution in flight, then the batch. */
+/** The tools phase's work as it runs: path resolution in flight, then the batch. Each call is counted once: running, or
+ * never started. */
 class ToolsWork {
   resolving = false;
   batch: ToolBatch | null = null;
@@ -330,8 +340,10 @@ class ToolsWork {
     return (this.resolving ? 1 : 0) + (this.batch?.running() ?? 0);
   }
 
+  /** The calls no executor took: before the batch, every call but the one whose path resolution is in flight. */
   neverStarted(): number {
-    return this.batch === null ? this.calls : this.batch.neverStarted();
+    if (this.batch !== null) return this.batch.neverStarted();
+    return this.calls - (this.resolving ? 1 : 0);
   }
 }
 
@@ -341,15 +353,16 @@ async function planAndRun(
   args: IterationArgs,
   work: ToolsWork,
 ): Promise<{ plan: DispatchPlan; dispatched: DispatchedToolResult[] }> {
+  const watch = { signal: args.clock.signal, onProgress: () => args.clock.recordProgress() };
   work.resolving = true;
-  const plan = await planDispatch(functionCallParts, args);
+  const plan = await planDispatch(functionCallParts, args, watch);
   work.resolving = false;
   work.batch = startToolBatch(
     args.workspaceRoot,
     plan.toDispatch,
     resolveToolExecutionConcurrency(),
     args.matchConfig,
-    args.clock.signal,
+    watch,
   );
   return { plan, dispatched: await work.batch.settled };
 }

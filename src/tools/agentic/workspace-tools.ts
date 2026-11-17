@@ -25,6 +25,7 @@ import { join } from 'node:path';
 import { throwIfAborted } from '../../gemini/retry.js';
 import { type MatchConfig, defaultMatchConfig, isPathExcluded } from '../../indexer/globs.js';
 import { isSourceFile } from '../../indexer/source-files.js';
+import { logger } from '../../utils/logger.js';
 import { SandboxError, resolveInsideWorkspace, secretListOf } from './sandbox.js';
 
 type ResolvedPath = Awaited<ReturnType<typeof resolveInsideWorkspace>>;
@@ -43,6 +44,23 @@ type ResolvedPath = Awaited<ReturnType<typeof resolveInsideWorkspace>>;
  */
 function resolveMatchConfig(matchConfig: MatchConfig | undefined): MatchConfig {
   return matchConfig ?? defaultMatchConfig({});
+}
+
+/** What an executor reports to, and is stopped by: the pass that runs it. */
+export interface ToolWatch {
+  /** Fires when a bound of the pass fired: the executor then rejects with its reason at its next checkpoint. */
+  readonly signal?: AbortSignal;
+  /** Called at every checkpoint the executor passes: progress, which defers the tools phase's bound on silence. */
+  readonly onProgress?: () => void;
+}
+
+/**
+ * A checkpoint of an executor's work — every place it reads the signal: rejects with the signal's reason once it
+ * fired, else reports progress. Reading the signal and reporting progress are one call, so they cannot drift apart.
+ */
+export function checkpoint(watch: ToolWatch | undefined): void {
+  throwIfAborted(watch?.signal);
+  watch?.onProgress?.();
 }
 
 /**
@@ -186,9 +204,9 @@ interface Listing {
 async function directoryEntries(
   target: ResolvedPath,
   relPath: string,
-  signal: AbortSignal | undefined,
+  watch: ToolWatch | undefined,
 ): Promise<Dirent<string>[]> {
-  throwIfAborted(signal);
+  checkpoint(watch);
   try {
     return await readdir(target.absolutePath, { withFileTypes: true, encoding: 'utf8' });
   } catch (err) {
@@ -254,13 +272,13 @@ async function listEntry(
  * List immediate children of `relPath` (non-recursive). Default-excluded dirs and denylisted filenames are omitted; the
  * model sees only paths it is allowed to ask for via `read_file` / `grep`. The requested directory itself is checked
  * against the caller's `excludeGlobs` first — with a message that names no path, so success vs `NOT_FOUND` is no oracle
- * for an excluded directory's existence. `signal` is read before each entry.
+ * for an excluded directory's existence. A checkpoint (`watch`) precedes the read and each entry.
  */
 export async function listDirectoryExecutor(
   workspaceRoot: string,
   relPath: string,
   matchConfig?: MatchConfig,
-  signal?: AbortSignal,
+  watch?: ToolWatch,
 ): Promise<ListDirectoryResult> {
   const target = await resolveInsideWorkspace(workspaceRoot, relPath);
   const config = resolveMatchConfig(matchConfig);
@@ -268,8 +286,8 @@ export async function listDirectoryExecutor(
     throw new SandboxError('EXCLUDED_DIR', 'directory is excluded by configured policy', relPath);
   }
   const listing: Listing = { entries: [], total: 0 };
-  for (const entry of await directoryEntries(target, relPath, signal)) {
-    throwIfAborted(signal);
+  for (const entry of await directoryEntries(target, relPath, watch)) {
+    checkpoint(watch);
     await listEntry(target, entry, config, listing);
   }
   return {
@@ -287,7 +305,7 @@ export async function listDirectoryExecutor(
 /** One recursive walk of `find_files` or `grep`: what it filters with, what it visits, when it stops. */
 interface TreeWalk {
   readonly config: MatchConfig;
-  readonly signal: AbortSignal | undefined;
+  readonly watch: ToolWatch | undefined;
   /** Real (symlink-resolved) directories already walked: a directory loop (`dir/self -> dir`) is walked once. */
   readonly seenReal: Set<string>;
   /** Called with each file the policy lets the model see: defaults and user excludes, an include extension or `#!`. */
@@ -299,11 +317,11 @@ interface TreeWalk {
 
 function treeWalk(
   config: MatchConfig,
-  signal: AbortSignal | undefined,
+  watch: ToolWatch | undefined,
   visitFile: TreeWalk['visitFile'],
   full: TreeWalk['full'] = () => false,
 ): TreeWalk {
-  return { config, signal, seenReal: new Set<string>(), visitFile, full, depthExceeded: false };
+  return { config, watch, seenReal: new Set<string>(), visitFile, full, depthExceeded: false };
 }
 
 /** A directory's entries, or `null` when it was walked already (a symlink loop) or cannot be read. */
@@ -348,7 +366,8 @@ async function walkEntry(
 
 /**
  * Walk a tree depth-first, at most `MAX_WALK_DEPTH` levels below its start (deeper directories set `depthExceeded`).
- * `signal` is read at every directory and before every entry: once it fired the walk rejects with its reason.
+ * A checkpoint (`walk.watch`) at every directory and before every entry: once the signal fired the walk rejects with
+ * its reason.
  */
 async function walkTree(
   walk: TreeWalk,
@@ -361,11 +380,11 @@ async function walkTree(
     walk.depthExceeded = true;
     return;
   }
-  throwIfAborted(walk.signal);
+  checkpoint(walk.watch);
   const entries = await enterDirectory(walk, currentAbs);
   for (const entry of entries ?? []) {
     if (walk.full()) return;
-    throwIfAborted(walk.signal);
+    checkpoint(walk.watch);
     await walkEntry(walk, entry, { abs: currentAbs, rel: currentRel, depth });
   }
 }
@@ -389,7 +408,7 @@ export async function findFilesExecutor(
   workspaceRoot: string,
   pattern: string,
   matchConfig?: MatchConfig,
-  signal?: AbortSignal,
+  watch?: ToolWatch,
 ): Promise<FindFilesResult> {
   if (typeof pattern !== 'string' || pattern.trim().length === 0) {
     throw new SandboxError('INVALID_INPUT', 'pattern is empty', pattern);
@@ -397,7 +416,7 @@ export async function findFilesExecutor(
   const regex = globToRegExp(pattern.trim());
   const matches: string[] = [];
   let totalMatches = 0;
-  const walk = treeWalk(resolveMatchConfig(matchConfig), signal, async (_absFile, relFile) => {
+  const walk = treeWalk(resolveMatchConfig(matchConfig), watch, async (_absFile, relFile) => {
     if (!regex.test(relFile)) return;
     totalMatches += 1;
     if (matches.length < MAX_FIND_MATCHES) matches.push(relFile);
@@ -493,12 +512,12 @@ function tooLargeToRead(relpath: string, totalBytes: number): ReadFileResult {
 async function readWhole(
   absolutePath: string,
   relPath: string,
-  signal: AbortSignal | undefined,
+  watch: ToolWatch | undefined,
 ): Promise<Buffer> {
   try {
-    return await readFile(absolutePath, { signal });
+    return await readFile(absolutePath, { signal: watch?.signal });
   } catch (err) {
-    throwIfAborted(signal);
+    checkpoint(watch);
     throw new SandboxError('NOT_FOUND', `read failed: ${String(err)}`, relPath);
   }
 }
@@ -530,7 +549,7 @@ function capToReadBytes(content: string): string {
   const decoder = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
   const cappedText = decoder.decode(cappedBuf);
   const lastNewline = cappedText.lastIndexOf('\n');
-  return lastNewline > 0 ? cappedText.slice(0, lastNewline) : cappedText.replace(/�+$/, '');
+  return lastNewline > 0 ? cappedText.slice(0, lastNewline) : cappedText.replace(/\uFFFD+$/, '');
 }
 
 /** The slice of a file's text a `read_file` returns, with what the model needs to ask for the next slice. */
@@ -566,7 +585,7 @@ function readSlice(
  * Read a file with bounded bytes + lines. Every response includes enough metadata (`totalLines`, `totalBytes`,
  * `truncated`, `truncationReason`) for the model to request the next slice intelligently. `startLine` / `endLine` are
  * 1-indexed inclusive; omit both → the first `DEFAULT_READ_LINE_LIMIT` lines, up to `MAX_READ_BYTES`, whichever hits
- * first. `signal` is read before the read and aborts it.
+ * first. A checkpoint (`watch`) precedes the read and follows it; the signal aborts the read itself.
  */
 export async function readFileExecutor(
   workspaceRoot: string,
@@ -574,14 +593,15 @@ export async function readFileExecutor(
   startLine?: number,
   endLine?: number,
   matchConfig?: MatchConfig,
-  signal?: AbortSignal,
+  watch?: ToolWatch,
 ): Promise<ReadFileResult> {
   const target = await resolveInsideWorkspace(workspaceRoot, relPath);
   await assertReadable(target, relPath, resolveMatchConfig(matchConfig));
-  throwIfAborted(signal);
+  checkpoint(watch);
   const totalBytes = await regularFileSize(target, relPath);
   if (totalBytes > HARD_FILE_SIZE_LIMIT) return tooLargeToRead(target.relpath, totalBytes);
-  const buffer = await readWhole(target.absolutePath, relPath, signal);
+  const buffer = await readWhole(target.absolutePath, relPath, watch);
+  checkpoint(watch);
   return readSlice(target.relpath, buffer, { startLine, endLine }, totalBytes);
 }
 
@@ -678,21 +698,27 @@ function grepLines(text: string, relpath: string, regex: RegExp, found: GrepFoun
   }
 }
 
-/** Grep one visible file: a file over the read size limit, or one that cannot be stated or read, is skipped. */
+/**
+ * Grep one visible file: a file over the read size limit, or one that cannot be stated or read, is skipped. A read the
+ * signal aborted rejects with the signal's reason (the checkpoint after it), never as a skipped file.
+ */
 async function grepFile(
   absFile: string,
   relFile: string,
   regex: RegExp,
   found: GrepFound,
-  signal: AbortSignal | undefined,
+  watch: ToolWatch | undefined,
 ): Promise<void> {
   let text: string;
   try {
     if ((await stat(absFile)).size > HARD_FILE_SIZE_LIMIT) return;
-    text = await readFile(absFile, { encoding: 'utf8', signal });
-  } catch {
+    text = await readFile(absFile, { encoding: 'utf8', signal: watch?.signal });
+  } catch (err) {
+    checkpoint(watch);
+    logger.debug(`ask_agentic grep: skipped a file that could not be read: ${String(err)}`);
     return;
   }
+  checkpoint(watch);
   grepLines(text, relFile, regex, found);
 }
 
@@ -707,7 +733,7 @@ export async function grepExecutor(
   pattern: string,
   pathPrefix?: string,
   matchConfig?: MatchConfig,
-  signal?: AbortSignal,
+  watch?: ToolWatch,
 ): Promise<GrepResult> {
   const regex = grepRegex(pattern);
   const config = resolveMatchConfig(matchConfig);
@@ -715,8 +741,8 @@ export async function grepExecutor(
   const found: GrepFound = { matches: [], total: 0, respBytes: 0 };
   const walk = treeWalk(
     config,
-    signal,
-    (absFile, relFile) => grepFile(absFile, relFile, regex, found, signal),
+    watch,
+    (absFile, relFile) => grepFile(absFile, relFile, regex, found, watch),
     () => found.respBytes >= MAX_RESPONSE_BYTES,
   );
   await walkTree(walk, start.abs, start.rel, 0);

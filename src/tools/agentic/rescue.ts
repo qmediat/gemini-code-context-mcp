@@ -13,8 +13,8 @@
  * finalization default (`phase-defaults.ts`). Cap-overshoot is signalled via `overBudget: true` on the result so
  * callers can detect the trade.
  *
- * The rescue calls `generateContent`, not the stream: its pass clock has the phases `tpm-wait` and `finalization`, no
- * stream gap to watch. Its call is marked completed the moment `generateContent` returned (`completeCall`, the idiom of
+ * The rescue calls `generateContent`, not the stream: its pass clock has the phases `tpm-wait` and `finalization` —
+ * entered by each request, so a retried request gets the whole default — and no stream gap to watch. Its call is marked completed the moment `generateContent` returned (`completeCall`, the idiom of
  * the loop iteration), before the response is read.
  */
 
@@ -36,7 +36,7 @@ import {
   reservePass,
   waitForTpm,
 } from './ledger.js';
-import { type PassClock, createPassClock } from './pass-clock.js';
+import { type PassClock, type PassTimeout, createPassClock, passTimeoutOf } from './pass-clock.js';
 import { type UsageCounts, thinkingSummaryOf } from './response.js';
 import {
   type AgenticRun,
@@ -91,6 +91,8 @@ export interface RescueOutcome {
   skipReason: 'daily-budget' | null;
   /** The pass's billed fields when its call completed and it was booked; `null` when it was skipped or cancelled. */
   billed: BilledFields | null;
+  /** What ended the pass when it timed out (`errorCode: 'TIMEOUT'`), read from its clock; `null` otherwise. */
+  timeout: PassTimeout | null;
 }
 
 /** The parts of the finalization call that outlive its `try`. */
@@ -146,12 +148,14 @@ function callFinalization(
   run: AgenticRun,
   state: LoopState,
   baseConfigNoTools: GenerateContentConfig,
-  signal: AbortSignal,
+  clock: PassClock,
 ): Promise<GenerateContentResponse> {
   const model = run.resolved.resolved;
+  const { signal } = clock;
   return withNetworkRetry(
-    () =>
-      run.ctx.client.models.generateContent({
+    () => {
+      clock.enter('finalization');
+      return run.ctx.client.models.generateContent({
         model,
         contents: state.conversation,
         config: {
@@ -162,7 +166,8 @@ function callFinalization(
           },
           abortSignal: signal,
         },
-      }),
+      });
+    },
     {
       signal,
       onRetry: (attempt, retryErr) => {
@@ -229,15 +234,17 @@ function rescueFailureCode(
 }
 
 /** The rescue's generateContent can also 429 — its retry hint seeds the throttle cache for future
- * ask_agentic / ask / code calls, the same way the per-iteration catch does. */
+ * ask_agentic / ask / code calls, the same way the per-iteration catch does. A timeout records what fired. */
 function recordRescueFailure(
   run: AgenticRun,
   finalErr: unknown,
+  clock: PassClock,
   callCompleted: boolean,
   outcome: RescueOutcome,
 ): void {
   const finalRetryDelayMs = seedRetryHint(run.ctx.throttle, run.resolved.resolved, finalErr);
   outcome.errorCode = rescueFailureCode(finalErr, finalRetryDelayMs, callCompleted);
+  if (outcome.errorCode === 'TIMEOUT') outcome.timeout = passTimeoutOf(clock, finalErr);
   outcome.errorMessage =
     finalErr instanceof Error ? finalErr.message.slice(0, 500) : String(finalErr).slice(0, 500);
 }
@@ -263,9 +270,8 @@ async function dispatchRescue(
     );
   }
   const { tools: _unusedTools, ...baseConfigNoTools } = run.baseConfig;
-  clock.enter('finalization');
   outcome.attempted = true;
-  const response = await callFinalization(run, state, baseConfigNoTools, clock.signal);
+  const response = await callFinalization(run, state, baseConfigNoTools, clock);
   const usage = completeCall(flight.call, response);
   readFinalization(response, usage, outcome);
 }
@@ -291,7 +297,7 @@ async function attemptRescue(
   try {
     await dispatchRescue(run, state, flight, clock, outcome);
   } catch (finalErr) {
-    recordRescueFailure(run, finalErr, flight.call.completed, outcome);
+    recordRescueFailure(run, finalErr, clock, flight.call.completed, outcome);
   } finally {
     outcome.billed = closePass(run, flight, flight.call, 'ask_agentic finalization');
     clock.dispose();
@@ -312,6 +318,7 @@ export async function runRescue(run: AgenticRun, state: LoopState): Promise<Resc
     errorMessage: null,
     skipReason: null,
     billed: null,
+    timeout: null,
   };
   const estimate = finalizationEstimateOf(state);
   const reservationId = reserveRescue(run, passReservationUsd(run, estimate), outcome);

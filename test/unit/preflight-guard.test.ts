@@ -500,12 +500,13 @@ describe('ask → ask_agentic fallback: the knobs it forwards and the timeouts i
   });
 
   it.each([
-    ['tpm-wait', 'total', 'timeoutMs'],
+    ['tpm-wait', 'total', 'iterationTimeoutMs'],
     ['opening', 'total', 'default'],
     ['stream', 'stall', 'stallMs'],
     ['tools', 'total', 'default'],
+    ['opening', 'total', 'external'],
   ])(
-    'lifts the kind, the phase and the source of a timeout in its %s phase',
+    'lifts the kind, the phase and the source of a timeout in its %s phase (%s, %s)',
     async (phase, kind, source) => {
       const { structured } = await fallBack(
         {},

@@ -54,11 +54,42 @@ export const AGENTIC_KNOB_NAMES: KnobNames = Object.freeze({
   stallEnv: AGENTIC_STALL_ENV,
 });
 
+/** Where a knob that is set came from: the call's own field, or its env var. */
+export type KnobOrigin = 'call' | 'env';
+
+/** The call's knobs as resolved, with the origin of each one (`null` when it is unset). */
+export interface ResolvedKnobs extends AgenticKnobs {
+  readonly iterationFrom: KnobOrigin | null;
+  readonly stallFrom: KnobOrigin | null;
+}
+
+const originOf = (ms: number | null, perCall: number | undefined): KnobOrigin | null => {
+  if (ms === null) return null;
+  return perCall !== undefined ? 'call' : 'env';
+};
+
 /** The call's knobs, resolved once: per call, else the env var, clamped as every timeout knob is. */
-export function resolveAgenticKnobs(input: AskAgenticInput): AgenticKnobs {
+export function resolveAgenticKnobs(input: AskAgenticInput): ResolvedKnobs {
+  const iterationMs = resolveTotalTimeoutMs(input.iterationTimeoutMs, ITERATION_TIMEOUT_ENV);
+  const stallMs = resolveStallTimeoutMs(input.stallMs, AGENTIC_STALL_ENV);
   return {
-    iterationMs: resolveTotalTimeoutMs(input.iterationTimeoutMs, ITERATION_TIMEOUT_ENV),
-    stallMs: resolveStallTimeoutMs(input.stallMs, AGENTIC_STALL_ENV),
+    iterationMs,
+    stallMs,
+    iterationFrom: originOf(iterationMs, input.iterationTimeoutMs),
+    stallFrom: originOf(stallMs, input.stallMs),
+  };
+}
+
+/**
+ * The knob names a call's timeout messages give: the caller's, except that a knob its env var set is named by that
+ * env var — the agentic one. On `ask`'s fallback, `ask` forwards its own knobs per call; where it set none of a kind,
+ * the agentic env var of that kind bounds the loop, and the message names it, never an `ask` variable that set nothing.
+ */
+export function messageKnobNames(names: KnobNames, knobs: ResolvedKnobs): KnobNames {
+  return {
+    ...names,
+    ...(knobs.iterationFrom === 'env' ? { totalEnv: ITERATION_TIMEOUT_ENV } : {}),
+    ...(knobs.stallFrom === 'env' ? { stallEnv: AGENTIC_STALL_ENV } : {}),
   };
 }
 
@@ -93,9 +124,9 @@ export interface AgenticRun {
   matchConfig: MatchConfig;
   baseConfig: GenerateContentConfig;
   budget: PassBudget;
-  /** The knobs every pass's clock is built from. */
-  knobs: AgenticKnobs;
-  /** The knob names a timeout message gives: `ask`'s when the call is its fallback. */
+  /** The knobs every pass's clock is built from, with their origins. */
+  knobs: ResolvedKnobs;
+  /** The knob names a timeout message gives (`messageKnobNames`): `ask`'s when the call is its fallback. */
   knobNames: KnobNames;
 }
 

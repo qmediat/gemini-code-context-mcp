@@ -3,17 +3,27 @@
  * reads its bound from it (`docs/DESIGN-agentic-time-bounds.md`). `iterationTimeoutMs` is the pass's wall clock, armed
  * at creation over every phase; `stallMs` bounds the gaps of the stream only — armed at the first chunk, re-armed per
  * chunk, cleared when the pass leaves the stream; a phase's default (`phase-defaults.ts`) applies only where no knob
- * bounds that phase. At most two timers are alive at once: the pass deadline and the current phase's.
+ * bounds that phase — the tools phase's is a bound on silence, which executor progress (`recordProgress`) defers. At
+ * most two timers are alive at once: the pass deadline and the current phase's.
  */
 
-import { type TimeoutKind, timeoutReason, unrefTimer } from '../shared/abort-timeout.js';
+import {
+  type TimeoutKind,
+  getTimeoutKind,
+  timeoutReason,
+  unrefTimer,
+} from '../shared/abort-timeout.js';
 import { PHASE_DEFAULTS, type PhaseDefaults } from './phase-defaults.js';
 
 /** The phases of one pass, in order. The forced pass has `tpm-wait` and `finalization` only. */
 export type PassPhase = 'tpm-wait' | 'opening' | 'stream' | 'tools' | 'finalization';
 
-/** Where the bound that fired comes from. */
-export type BoundSource = 'iterationTimeoutMs' | 'stallMs' | 'default';
+/** Where a bound the clock keeps comes from. */
+export type ClockSource = 'iterationTimeoutMs' | 'stallMs' | 'default';
+
+/** Where the timeout that ended a pass comes from: a bound of the clock, or `external` — a `TimeoutError` the clock did
+ * not raise (an SDK's own), which no bound of this call set. */
+export type BoundSource = ClockSource | 'external';
 
 /** The call's two knobs, resolved once per call (per call, else the environment); `null` when unset. */
 export interface AgenticKnobs {
@@ -21,21 +31,33 @@ export interface AgenticKnobs {
   readonly stallMs: number | null;
 }
 
-/** A bound one timer keeps. */
+/** A bound one timer keeps; an `idle` bound counts silence: executor progress defers it. */
 interface Bound {
   readonly kind: TimeoutKind;
-  readonly source: BoundSource;
+  readonly source: ClockSource;
+  readonly limitMs: number;
+  readonly idle: boolean;
+}
+
+/** A bound of the clock fired: read from the clock, never parsed from a message. */
+export interface ClockTimeout {
+  readonly phase: PassPhase;
+  readonly kind: TimeoutKind;
+  readonly source: ClockSource;
   readonly limitMs: number;
 }
 
-/** What fired: read from the clock, never parsed from a message. */
-export interface PassTimeout {
+/** A `TimeoutError` the clock did not raise ended the pass: no bound of this call fired; `message` is the error's own. */
+export interface ExternalTimeout {
   readonly phase: PassPhase;
   readonly kind: TimeoutKind;
-  readonly source: BoundSource;
-  /** The bound in ms; `null` only for a `TimeoutError` the clock did not raise, with no knob of its kind set. */
-  readonly limitMs: number | null;
+  readonly source: 'external';
+  readonly limitMs: null;
+  readonly message: string;
 }
+
+/** What ended a pass on a timeout. */
+export type PassTimeout = ClockTimeout | ExternalTimeout;
 
 export interface PassClock {
   /** Fires when a bound of the pass fires; its reason is a `TimeoutError` carrying `timeoutPhase` / `timeoutSource`. */
@@ -46,28 +68,39 @@ export interface PassClock {
   readonly stallMs: number | null;
   readonly phase: PassPhase;
   /** The bound that fired, `null` while none has. */
-  readonly timedOut: PassTimeout | null;
+  readonly timedOut: ClockTimeout | null;
   /** Leave the current phase: its timer is cleared and the next phase's armed. */
   enter(phase: PassPhase): void;
   /** A chunk arrived: the first one moves `opening` to `stream`; each one re-arms the gap timer. */
   recordChunk(): void;
+  /** An executor made progress: in phase `tools` the silence its default counts starts again; a no-op in every other
+   * phase, under `iterationTimeoutMs` (no phase timer: the deadline stays a wall clock), after a fire and after
+   * `dispose`. A tick writes one timestamp; the timer is re-armed only when it expires. */
+  recordProgress(): void;
   /** Clear both timers. Idempotent; nothing is armed afterwards. */
   dispose(): void;
 }
 
-const total = (source: BoundSource, limitMs: number): Bound => ({ kind: 'total', source, limitMs });
+const total = (source: ClockSource, limitMs: number, idle = false): Bound => ({
+  kind: 'total',
+  source,
+  limitMs,
+  idle,
+});
 
 /** The default of a phase no knob bounds; `null` while `iterationTimeoutMs` bounds the pass. */
 const unlessDeadline =
-  (defaultMs: (d: PhaseDefaults) => number) =>
+  (defaultMs: (d: PhaseDefaults) => number, idle = false) =>
   (knobs: AgenticKnobs, d: PhaseDefaults): Bound | null =>
-    knobs.iterationMs === null ? total('default', defaultMs(d)) : null;
+    knobs.iterationMs === null ? total('default', defaultMs(d), idle) : null;
 
-/** A stream gap: `stallMs`, else the default when no knob bounds the stream. */
+/** A stream gap: `stallMs`, else the default when no knob bounds the stream. Each chunk re-arms it (`recordChunk`). */
 function streamGapBound(knobs: AgenticKnobs, d: PhaseDefaults): Bound | null {
-  if (knobs.stallMs !== null) return { kind: 'stall', source: 'stallMs', limitMs: knobs.stallMs };
+  if (knobs.stallMs !== null) {
+    return { kind: 'stall', source: 'stallMs', limitMs: knobs.stallMs, idle: false };
+  }
   if (knobs.iterationMs !== null) return null;
-  return { kind: 'stall', source: 'default', limitMs: d.streamGapMs };
+  return { kind: 'stall', source: 'default', limitMs: d.streamGapMs, idle: false };
 }
 
 /** The bound of each phase's own timer. The TPM wait has none: the throttle's delay is finite and known at its start. */
@@ -77,7 +110,7 @@ const PHASE_BOUND: Readonly<
   'tpm-wait': () => null,
   opening: unlessDeadline((d) => d.openingMs),
   stream: streamGapBound,
-  tools: unlessDeadline((d) => d.toolsMs),
+  tools: unlessDeadline((d) => d.toolsIdleMs, true),
   finalization: unlessDeadline((d) => d.finalizationMs),
 };
 
@@ -88,7 +121,9 @@ class Clock implements PassClock {
   readonly stallMs: number | null;
   private readonly controller = new AbortController();
   private current: PassPhase = 'tpm-wait';
-  private fired: PassTimeout | null = null;
+  private fired: ClockTimeout | null = null;
+  /** When the current phase's silence started: its timer's arming, or the last executor progress since. */
+  private quietSince = 0;
   private disposed = false;
   private passTimer: NodeJS.Timeout | null = null;
   private phaseTimer: NodeJS.Timeout | null = null;
@@ -110,7 +145,7 @@ class Clock implements PassClock {
     return this.current;
   }
 
-  get timedOut(): PassTimeout | null {
+  get timedOut(): ClockTimeout | null {
     return this.fired;
   }
 
@@ -124,6 +159,10 @@ class Clock implements PassClock {
     if (this.current === 'stream') this.armPhase();
   }
 
+  recordProgress(): void {
+    if (this.current === 'tools' && this.phaseTimer !== null) this.quietSince = performance.now();
+  }
+
   dispose(): void {
     this.disposed = true;
     this.clearTimers();
@@ -133,13 +172,25 @@ class Clock implements PassClock {
     this.clearPhaseTimer();
     if (this.disposed || this.signal.aborted) return;
     const bound = PHASE_BOUND[this.current](this.knobs, this.defaults);
-    if (bound !== null) this.phaseTimer = unrefTimer(bound.limitMs, () => this.fire(bound));
+    if (bound === null) return;
+    this.quietSince = performance.now();
+    this.phaseTimer = unrefTimer(bound.limitMs, () => this.phaseExpired(bound));
+  }
+
+  /** The phase's timer ran out: an idle bound with progress since its arming waits out the rest of its silence. */
+  private phaseExpired(bound: Bound): void {
+    const quietMs = performance.now() - this.quietSince;
+    if (bound.idle && quietMs < bound.limitMs) {
+      this.phaseTimer = unrefTimer(bound.limitMs - quietMs, () => this.phaseExpired(bound));
+      return;
+    }
+    this.fire(bound);
   }
 
   private fire(bound: Bound): void {
     if (this.signal.aborted) return;
     const phase = this.current;
-    this.fired = { ...bound, phase };
+    this.fired = { phase, kind: bound.kind, source: bound.source, limitMs: bound.limitMs };
     this.clearTimers();
     const extra = { timeoutPhase: phase, timeoutSource: bound.source };
     this.controller.abort(timeoutReason(bound.limitMs, bound.kind, extra));
@@ -163,4 +214,19 @@ export function createPassClock(
   defaults: PhaseDefaults = PHASE_DEFAULTS,
 ): PassClock {
   return new Clock(knobs, defaults);
+}
+
+/**
+ * What ended a pass that failed on a timeout: the bound the clock fired, else an `external` timeout — the error's own
+ * kind and message, in the phase the pass was in, no bound of this call named.
+ */
+export function passTimeoutOf(clock: PassClock, err: unknown): PassTimeout {
+  if (clock.timedOut !== null) return clock.timedOut;
+  return {
+    phase: clock.phase,
+    kind: getTimeoutKind(err) ?? 'total',
+    source: 'external',
+    limitMs: null,
+    message: err instanceof Error ? err.message : String(err),
+  };
 }

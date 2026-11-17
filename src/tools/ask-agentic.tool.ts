@@ -49,6 +49,7 @@ import {
   type LoopState,
   type ResolvedModel,
   baseConfigOf,
+  messageKnobNames,
   newLoopState,
   passBudgetOf,
   resolveAgenticKnobs,
@@ -199,7 +200,7 @@ function startRun(
       baseConfig,
       budget,
       knobs,
-      knobNames,
+      knobNames: messageKnobNames(knobNames, knobs),
     },
   };
 }
